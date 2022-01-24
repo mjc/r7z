@@ -1,30 +1,43 @@
 use r7z::{self, SignatureHeader};
-use std::{
-    env,
-    fs::File,
-    io::{BufReader, Read},
-};
+use std::{env, fs::File, io::Read};
+
+#[test]
+fn parse_signature() {
+    let signature = hex::decode("377abcaf271c").unwrap();
+    let vec = vec![];
+    let result = (vec.as_slice(), vec![55, 122, 188, 175, 39, 28]);
+
+    assert_eq!(r7z::get_file_signature(&signature).unwrap(), result);
+}
+
+#[test]
+fn parse_version() {
+    let version = vec![0, 4];
+    let consumed_input = vec![];
+    let result = (consumed_input.as_slice(), (0, 4));
+
+    assert_eq!(r7z::get_version(&version).unwrap(), result);
+}
 
 #[test]
 fn parse_header_from_string() {
-    let mut path = env::current_dir()
-        .unwrap()
-        .join("tests/signature_header_test.rs");
-    path.join("tests/fixtures/test_1.7z");
+    let path = env::current_dir().unwrap().join("tests/fixtures/test_1.7z");
     let mut file = File::open(path).unwrap();
-    let mut buf = String::new();
-    file.read_to_string(&mut buf);
-    let (input, signature_header) = r7z::parse_signature_header(&buf.as_bytes()).unwrap();
-    let input = assert_eq!(
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+
+    let (input, signature_header) = r7z::parse_signature_header(&buf).unwrap();
+    assert_eq!(input.len(), 625); // not sure if this is correct yet
+    assert_eq!(
         signature_header,
         SignatureHeader {
-            signature: vec![117, 115, 101, 32, 114, 55],
-            major_version: 122u8,
-            minor_version: 58u8,
-            start_header_crc: 1702067002u32,
-            next_header_offset: 7955443072516253292u64,
-            next_header_size: 7018095194875982945u64,
-            next_header_crc: 2104649060u32
+            signature: hex::decode("377abcaf271c").unwrap(),
+            major_version: 0,
+            minor_version: 4,
+            start_header_crc: 3524221515u32,
+            next_header_offset: 590u64,
+            next_header_size: 35u64,
+            next_header_crc: 2771030271u32
         }
     );
 }

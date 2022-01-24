@@ -1,17 +1,9 @@
-use std::io::Read;
-use std::io::Seek;
-
-use nom::bytes;
-use nom::multi::count;
-use nom::number;
-use nom::number::streaming::le_u32;
-use nom::number::streaming::le_u64;
-use nom::number::streaming::le_u8;
-use nom::sequence::tuple;
-use nom::streaming;
-use nom::IResult;
-
-mod constants;
+use nom::{
+    multi::count,
+    number::streaming::{le_u32, le_u64, le_u8},
+    sequence::tuple,
+    IResult,
+};
 
 /*
 Data types in file and Rust equivalent:
@@ -54,11 +46,11 @@ pub struct SignatureHeader {
 }
 
 // this shouldn't ned to allocate
-fn get_file_signature(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
+pub fn get_file_signature(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
     count(le_u8, 6)(input)
 }
 
-fn get_version(input: &[u8]) -> IResult<&[u8], (u8, u8)> {
+pub fn get_version(input: &[u8]) -> IResult<&[u8], (u8, u8)> {
     tuple((le_u8, le_u8))(input)
 }
 
@@ -68,10 +60,6 @@ fn get_next_header_offset(input: &[u8]) -> IResult<&[u8], u64> {
 
 fn get_next_header_size(input: &[u8]) -> IResult<&[u8], u64> {
     le_u64(input)
-}
-
-fn get_next_header_crc32(input: &[u8]) -> IResult<&[u8], u32> {
-    le_u32(input)
 }
 
 fn get_crc32(input: &[u8]) -> IResult<&[u8], u32> {
@@ -84,7 +72,7 @@ pub fn parse_signature_header(input: &[u8]) -> IResult<&[u8], SignatureHeader> {
     let (input, start_header_crc) = get_crc32(input)?;
     let (input, next_header_offset) = get_next_header_offset(input)?;
     let (input, next_header_size) = get_next_header_size(input)?;
-    let (input, next_header_crc) = get_next_header_crc32(input)?;
+    let (input, next_header_crc) = get_crc32(input)?;
     Ok((
         input,
         SignatureHeader {
