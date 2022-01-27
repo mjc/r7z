@@ -1,3 +1,10 @@
+use nom::{
+    error::{Error, ErrorKind},
+    number::streaming::le_u8,
+    IResult,
+};
+use num::FromPrimitive;
+
 #[derive(PartialEq, Debug, FromPrimitive)]
 pub enum Property {
     END = 0x00,
@@ -27,4 +34,17 @@ pub enum Property {
     StartPos = 0x18,
 
     Dummy = 0x19,
+}
+
+impl Property {
+    pub fn from_u8(value: u8) -> Option<Property> {
+        FromPrimitive::from_u8(value)
+    }
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Property> {
+        match le_u8(input) {
+            // I'd like to return an IsNot error but I don't know how to do that
+            Ok((i, o)) => Ok((i, Self::from_u8(o).expect("Invalid property"))),
+            Err(e) => Err(e),
+        }
+    }
 }

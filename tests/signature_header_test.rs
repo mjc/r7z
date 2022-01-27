@@ -37,6 +37,3 @@ fn parse_signature_header_from_string() {
         }
     );
 }
-
-#[test]
-fn parse_header_from_offset_and_string() {}

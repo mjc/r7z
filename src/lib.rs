@@ -3,12 +3,14 @@ extern crate num;
 extern crate num_derive;
 
 mod signature_header;
+use nom::{combinator::peek, number::streaming::le_u8, IResult};
 pub use signature_header::*;
 
 mod property;
 pub use property::Property;
 
 /*
+https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt
 My understanding of the simplest layout:
 SignatureHeader
     (data block
@@ -63,6 +65,8 @@ struct StreamInfo<'sevenzipfile> {
     substream_info: SubstreamInfo,
 }
 
-fn get_header_at_offset(input: &[u8], offset: u64, size: u64) -> Result<&[u8], &[u8]> {
-    unimplemented!()
+pub fn find_next_property_id(input: &[u8], offset: u64) -> IResult<&[u8], Property> {
+    let (input, property_u8) = peek(le_u8)(&input[offset as usize..])?;
+    let property_id = Property::from_u8(property_u8).unwrap();
+    Ok((input, property_id))
 }
