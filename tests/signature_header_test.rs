@@ -1,5 +1,5 @@
 use r7z::{self, SignatureHeader};
-use std::{env, fs::File, io::Read};
+mod support;
 
 #[test]
 fn parse_signature() {
@@ -20,12 +20,8 @@ fn parse_version() {
 }
 
 #[test]
-fn parse_header_from_string() {
-    let path = env::current_dir().unwrap().join("tests/fixtures/test_1.7z");
-    let mut file = File::open(path).unwrap();
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).unwrap();
-
+fn parse_signature_header_from_string() {
+    let buf = support::valid_7z_string();
     let (input, signature_header) = r7z::parse_signature_header(&buf).unwrap();
     assert_eq!(input.len(), 625); // not sure if this is correct yet
     assert_eq!(
@@ -41,3 +37,6 @@ fn parse_header_from_string() {
         }
     );
 }
+
+#[test]
+fn parse_header_from_offset_and_string() {}
