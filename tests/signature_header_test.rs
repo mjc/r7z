@@ -28,12 +28,12 @@ fn parse_signature_header_from_string() {
         signature_header,
         SignatureHeader {
             signature: hex::decode("377abcaf271c").unwrap(),
-            major_version: 0,
-            minor_version: 4,
-            start_header_crc: 3524221515u32,
-            next_header_offset: 590u64,
+            major_version: 0x00,
+            minor_version: 0x04,
+            start_header_crc: 0xd20f5a4b,
+            next_header_offset: 0x24e,
             next_header_size: 35u64,
-            next_header_crc: 2771030271u32
+            next_header_crc: 0xa52a90ff
         }
     );
 }
