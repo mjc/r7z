@@ -6,5 +6,6 @@ pub struct FoldersInfo {
 }
 
 pub struct Folder {
+    num_coders: u64,
     count: u64,
 }

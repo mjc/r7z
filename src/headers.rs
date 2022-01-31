@@ -1,3 +1,4 @@
+use crate::{PackInfo, Property, StreamInfo, UnpackInfo};
 use nom::{
     multi::count,
     number::streaming::{le_u32, le_u64, le_u8},
@@ -7,14 +8,13 @@ use nom::{
 
 pub struct EncodedHeader {
     pack_info: PackInfo,
+    unpack_info: UnpackInfo,
 }
 
 pub struct Header {
     property_id: Property,
     main_stream_info: Vec<StreamInfo>,
 }
-
-use crate::{PackInfo, Property, StreamInfo};
 
 // TODO: getters, setters, constructor, etc.
 #[derive(Debug, PartialEq)]

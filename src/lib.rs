@@ -12,7 +12,7 @@ mod stream_info;
 pub use coder_info::CoderInfo;
 pub use folder::{Folder, FoldersInfo};
 pub use headers::{EncodedHeader, Header, SignatureHeader};
-pub use pack_info::PackInfo;
+pub use pack_info::{PackInfo, UnpackInfo};
 pub use property::{find_next_property_id, Property};
 pub use stream_info::{StreamInfo, SubstreamInfo};
 
@@ -32,6 +32,7 @@ SignatureHeader
 */
 
 /*
+Everything is little endian
 Data types in file and Rust equivalent:
     byte: u8
     bytearray: [u8, usize]
@@ -44,3 +45,5 @@ Data types in file and Rust equivalent:
     booleanlist: Vec<(bool, bitflags)>
     crc32 format: ITU-T V.42
 */
+
+pub struct Digest {}
