@@ -1,3 +1,9 @@
+use nom::{
+    multi::count,
+    number::streaming::{le_u32, le_u64},
+    IResult,
+};
+
 pub struct FoldersInfo {
     num_folders: u64,
     data_stream_index: u64,
@@ -5,7 +11,33 @@ pub struct FoldersInfo {
     unpack_digests: Vec<u32>,
 }
 
+impl FoldersInfo {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], FoldersInfo> {
+        let (input, num_folders) = le_u64(input)?;
+        let (input, data_stream_index) = le_u64(input)?;
+        let (input, unpack_sizes) = count(le_u64, num_folders.try_into().unwrap())(input)?;
+        let (input, unpack_digests) = count(le_u32, num_folders.try_into().unwrap())(input)?;
+        Ok((
+            input,
+            FoldersInfo {
+                num_folders: num_folders,
+                data_stream_index: data_stream_index,
+                unpack_sizes: unpack_sizes,
+                unpack_digests: unpack_digests,
+            },
+        ))
+    }
+}
+
 pub struct Folder {
     num_coders: u64,
     count: u64,
+}
+
+impl Folder {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
+        let (input, num_coders) = le_u64(input)?;
+        let (input, count) = le_u64(input)?;
+        Ok((input, Folder { num_coders, count }))
+    }
 }

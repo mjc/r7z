@@ -12,6 +12,12 @@ mod stream_info;
 pub use coder_info::CoderInfo;
 pub use folder::{Folder, FoldersInfo};
 pub use headers::{EncodedHeader, Header, SignatureHeader};
+use nom::{
+    multi::count,
+    number::streaming::{le_u32, le_u8},
+    sequence::tuple,
+    IResult,
+};
 pub use pack_info::{PackInfo, UnpackInfo};
 pub use property::{find_next_property_id, Property};
 pub use stream_info::{StreamInfo, SubstreamInfo};
@@ -46,4 +52,23 @@ Data types in file and Rust equivalent:
     crc32 format: ITU-T V.42
 */
 
-pub struct Digest {}
+pub struct Digest {
+    id: u8,
+    defined: u8, // bitfield
+    digest: Vec<u32>,
+}
+
+impl Digest {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Digest> {
+        let (input, (id, defined)) = tuple((le_u8, le_u8))(input)?;
+        let (input, digest) = count(le_u32, 8)(input)?;
+        Ok((
+            input,
+            Digest {
+                id,
+                defined,
+                digest,
+            },
+        ))
+    }
+}

@@ -11,6 +11,21 @@ pub struct EncodedHeader {
     unpack_info: UnpackInfo,
 }
 
+impl EncodedHeader {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], EncodedHeader> {
+        let (input, property) = Property::parse(input)?;
+        assert!(property == Property::EncodedHeader);
+        let (input, (pack_info, unpack_info)) = tuple((PackInfo::parse, UnpackInfo::parse))(input)?;
+        Ok((
+            input,
+            EncodedHeader {
+                pack_info,
+                unpack_info,
+            },
+        ))
+    }
+}
+
 pub struct Header {
     property_id: Property,
     main_stream_info: Vec<StreamInfo>,

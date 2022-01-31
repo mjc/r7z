@@ -7,4 +7,6 @@ pub struct StreamInfo {
     substream_info: SubstreamInfo,
 }
 
+impl StreamInfo {}
+
 pub struct SubstreamInfo {}
