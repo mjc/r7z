@@ -45,8 +45,8 @@ impl Property {
     }
 }
 
-pub fn find_next_property_id(input: &[u8], offset: u64) -> IResult<&[u8], Property> {
-    let (input, property_u8) = peek(le_u8)(&input[offset as usize..])?;
+pub fn find_next_property_id(input: &[u8], offset: usize) -> IResult<&[u8], Property> {
+    let (input, property_u8) = le_u8(&input[offset..])?;
     let property_id = Property::from_u8(property_u8).unwrap();
     Ok((input, property_id))
 }
