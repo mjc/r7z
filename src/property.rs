@@ -1,8 +1,4 @@
-use nom::{
-    error::{Error, ErrorKind},
-    number::streaming::le_u8,
-    IResult,
-};
+use nom::{combinator::peek, number::streaming::le_u8, IResult};
 use num::FromPrimitive;
 
 #[derive(PartialEq, Debug, FromPrimitive)]
@@ -47,4 +43,10 @@ impl Property {
             Err(e) => Err(e),
         }
     }
+}
+
+pub fn find_next_property_id(input: &[u8], offset: u64) -> IResult<&[u8], Property> {
+    let (input, property_u8) = peek(le_u8)(&input[offset as usize..])?;
+    let property_id = Property::from_u8(property_u8).unwrap();
+    Ok((input, property_id))
 }

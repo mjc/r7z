@@ -2,12 +2,19 @@ extern crate num;
 #[macro_use]
 extern crate num_derive;
 
-mod signature_header;
-use nom::{combinator::peek, number::streaming::le_u8, IResult};
-pub use signature_header::*;
-
+mod coder_info;
+mod folder;
+mod headers;
+mod pack_info;
 mod property;
-pub use property::Property;
+mod stream_info;
+
+pub use coder_info::CoderInfo;
+pub use folder::{Folder, FoldersInfo};
+pub use headers::{EncodedHeader, Header, SignatureHeader};
+pub use pack_info::PackInfo;
+pub use property::{find_next_property_id, Property};
+pub use stream_info::{StreamInfo, SubstreamInfo};
 
 /*
 https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt
@@ -24,49 +31,16 @@ SignatureHeader
     header
 */
 
-struct Header<'sevenzipfile> {
-    property_id: Property,
-    main_stream_info: Vec<StreamInfo<'sevenzipfile>>,
-}
-
-struct SubstreamInfo {}
-
-struct PackInfo<'packinfo> {
-    property_id: Property,
-    pos: u64,
-    pack_streams_count: u64,
-    pack_streams_size: &'packinfo [u64],
-    pack_streams_crc: &'packinfo [u32],
-}
-
-struct CoderInfo {
-    property_id: Property,
-    folders_info: FoldersInfo,
-}
-
-struct FoldersInfo {
-    property_id: Property,
-    num_folders: u64,
-    data_stream_index: u64,
-    unpack_sizes: Vec<u64>,
-    unpack_digests: Vec<u32>,
-}
-
-struct Folder {
-    count: u64,
-}
-
-struct EncodedHeader {}
-
-struct StreamInfo<'sevenzipfile> {
-    property_id: Property,
-    pack_info: PackInfo<'sevenzipfile>,
-    coder_info: CoderInfo,
-    substream_info: SubstreamInfo,
-}
-
-pub fn find_next_property_id(input: &[u8], offset: u64) -> IResult<&[u8], Property> {
-    let (input, property_u8) = peek(le_u8)(&input[offset as usize..])?;
-    let property_id = Property::from_u8(property_u8).unwrap();
-    Ok((input, property_id))
-}
+/*
+Data types in file and Rust equivalent:
+    byte: u8
+    bytearray: [u8, usize]
+    utf8_string: str::from_utf8(bytearray)
+    utf16_string: str::from_utf16(bytearray) (not sure if lossy is ok)
+    uint32: u32,
+    uint64: u64,
+    number: varuint?
+    bitfield: bitflags
+    booleanlist: Vec<(bool, bitflags)>
+    crc32 format: ITU-T V.42
+*/
