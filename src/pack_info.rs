@@ -13,7 +13,6 @@ pub struct PackInfo {
     size_marker: u8,
     pack_size: Vec<u64>,
     end_marker: u8,
-    pack_streams_crc: Vec<u32>,
 }
 
 impl PackInfo {
@@ -29,15 +28,15 @@ impl PackInfo {
 
         let mut pack_size = Vec::new();
         // array of SZvaruint64
-        for i in 0..(num_pack_streams - 1) {
+        for i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input);
             pack_size.push(a_pack_size);
 
             input = sliced;
         }
 
-        let (input, pack_streams_crc) = count(le_u32, num_pack_streams.to_usize())(input)?;
         let (input, end_marker) = le_u8(input)?;
+
         Ok((
             input,
             PackInfo {
@@ -46,7 +45,6 @@ impl PackInfo {
                 size_marker,
                 pack_size,
                 end_marker,
-                pack_streams_crc,
             },
         ))
     }
@@ -65,10 +63,20 @@ pub struct UnpackInfo {
 
 impl UnpackInfo {
     pub fn parse(input: &[u8]) -> IResult<&[u8], UnpackInfo> {
+        let (input, property_id) = Property::parse(input)?;
+        assert!(property_id == Property::UnPackInfo);
+
         let (input, folder_marker) = le_u8(input)?;
+        println!("folder_marker: {:?}", folder_marker);
+
         let (input, num_folders) = sevenzip_varuint64_decode(input);
+        println!("num_folders: {}", num_folders);
+
         let (input, is_external) = le_u8(input)?;
+        println!("is_external: {}", is_external);
+
         let (input, folders) = count(Folder::parse, num_folders.to_usize())(input)?;
+        println!("folders: {:?}", folders);
         let (input, unpacksize_marker) = le_u8(input)?;
         let (input, unpacksizes) = count(le_u64, num_folders.to_usize())(input)?;
         let (input, digests) = count(Digest::parse, num_folders.to_usize())(input)?;

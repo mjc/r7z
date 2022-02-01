@@ -16,6 +16,7 @@ impl EncodedHeader {
     pub fn parse(input: &[u8]) -> IResult<&[u8], EncodedHeader> {
         println!("encodedheader::parse");
         let (input, pack_info) = PackInfo::parse(input)?;
+        println!("successful packinfo parse");
         let (input, unpack_info) = UnpackInfo::parse(input)?;
         Ok((
             input,
