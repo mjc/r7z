@@ -1,4 +1,3 @@
-use nom::ToUsize;
 use r7z::sevenzip_varuint64_decode;
 
 mod support;

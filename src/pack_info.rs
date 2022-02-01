@@ -25,20 +25,28 @@ impl PackInfo {
         let (input, pack_pos) = sevenzip_varuint64_decode(&input);
         let (input, num_pack_streams) = sevenzip_varuint64_decode(input);
 
-        let (input, size_marker) = le_u8(input)?;
+        let (mut input, size_marker) = le_u8(input)?;
+
+        let mut pack_size = Vec::new();
         // array of SZvaruint64
-        let (input, pack_size) = count(le_u64, num_pack_streams.to_usize())(input)?;
+        for i in 0..(num_pack_streams - 1) {
+            let (sliced, a_pack_size) = sevenzip_varuint64_decode(input);
+            pack_size.push(a_pack_size);
+
+            input = sliced;
+        }
+
         let (input, pack_streams_crc) = count(le_u32, num_pack_streams.to_usize())(input)?;
         let (input, end_marker) = le_u8(input)?;
         Ok((
             input,
             PackInfo {
-                pack_pos: pack_pos,
-                num_pack_streams: num_pack_streams,
-                size_marker: size_marker,
-                pack_size: pack_size,
-                end_marker: end_marker,
-                pack_streams_crc: pack_streams_crc,
+                pack_pos,
+                num_pack_streams,
+                size_marker,
+                pack_size,
+                end_marker,
+                pack_streams_crc,
             },
         ))
     }
