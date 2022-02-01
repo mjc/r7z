@@ -1,7 +1,7 @@
 use nom::{
     multi::count,
     number::streaming::{le_u32, le_u64, le_u8},
-    IResult,
+    IResult, ToUsize,
 };
 
 use crate::{sevenzip_varuint64_decode, Digest, Folder, Property};
@@ -20,15 +20,13 @@ impl PackInfo {
         println!("packinfo::parse");
         let (input, property_id) = Property::parse(input)?;
         assert!(property_id == Property::PackInfo);
+
         let (input, pack_pos) = sevenzip_varuint64_decode(&input);
-
-        println!("pack_pos: {}", pack_pos);
-
         let (input, num_pack_streams) = sevenzip_varuint64_decode(input);
-        println!("num_pack_streams: {}", num_pack_streams);
+
         let (input, size_marker) = le_u8(input)?;
-        let (input, pack_size) = count(le_u64, num_pack_streams.try_into().unwrap())(input)?;
-        let (input, pack_streams_crc) = count(le_u32, num_pack_streams.try_into().unwrap())(input)?;
+        let (input, pack_size) = count(le_u64, num_pack_streams.to_usize())(input)?;
+        let (input, pack_streams_crc) = count(le_u32, num_pack_streams.to_usize())(input)?;
         let (input, end_marker) = le_u8(input)?;
         Ok((
             input,
@@ -60,10 +58,10 @@ impl UnpackInfo {
         let (input, folder_marker) = le_u8(input)?;
         let (input, num_folders) = le_u64(input)?;
         let (input, is_external) = le_u8(input)?;
-        let (input, folders) = count(Folder::parse, num_folders.try_into().unwrap())(input)?;
+        let (input, folders) = count(Folder::parse, num_folders.to_usize())(input)?;
         let (input, unpacksize_marker) = le_u8(input)?;
-        let (input, unpacksizes) = count(le_u64, num_folders.try_into().unwrap())(input)?;
-        let (input, digests) = count(Digest::parse, num_folders.try_into().unwrap())(input)?;
+        let (input, unpacksizes) = count(le_u64, num_folders.to_usize())(input)?;
+        let (input, digests) = count(Digest::parse, num_folders.to_usize())(input)?;
         let (input, defined) = le_u8(input)?;
         Ok((
             input,

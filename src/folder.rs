@@ -1,7 +1,7 @@
 use nom::{
     multi::count,
     number::streaming::{le_u32, le_u64},
-    IResult,
+    IResult, ToUsize,
 };
 
 pub struct FoldersInfo {
@@ -15,8 +15,8 @@ impl FoldersInfo {
     pub fn parse(input: &[u8]) -> IResult<&[u8], FoldersInfo> {
         let (input, num_folders) = le_u64(input)?;
         let (input, data_stream_index) = le_u64(input)?;
-        let (input, unpack_sizes) = count(le_u64, num_folders.try_into().unwrap())(input)?;
-        let (input, unpack_digests) = count(le_u32, num_folders.try_into().unwrap())(input)?;
+        let (input, unpack_sizes) = count(le_u64, num_folders.to_usize())(input)?;
+        let (input, unpack_digests) = count(le_u32, num_folders.to_usize())(input)?;
         Ok((
             input,
             FoldersInfo {
