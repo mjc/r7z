@@ -29,6 +29,7 @@ impl FoldersInfo {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Folder {
     num_coders: u64,
     count: u64,

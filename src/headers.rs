@@ -6,21 +6,22 @@ use nom::{
     IResult,
 };
 
+#[derive(Debug, PartialEq)]
 pub struct EncodedHeader {
     pack_info: PackInfo,
-    // unpack_info: UnpackInfo,
+    unpack_info: UnpackInfo,
 }
 
 impl EncodedHeader {
     pub fn parse(input: &[u8]) -> IResult<&[u8], EncodedHeader> {
         println!("encodedheader::parse");
         let (input, pack_info) = PackInfo::parse(input)?;
-        // let (input, unpack_info) = UnpackInfo::parse(input)?;
+        let (input, unpack_info) = UnpackInfo::parse(input)?;
         Ok((
             input,
             EncodedHeader {
                 pack_info,
-                // unpack_info,
+                unpack_info,
             },
         ))
     }

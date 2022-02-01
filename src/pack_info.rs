@@ -6,6 +6,7 @@ use nom::{
 
 use crate::{sevenzip_varuint64_decode, Digest, Folder, Property};
 
+#[derive(Debug, PartialEq)]
 pub struct PackInfo {
     pack_pos: u64,
     num_pack_streams: u64,
@@ -25,6 +26,7 @@ impl PackInfo {
         let (input, num_pack_streams) = sevenzip_varuint64_decode(input);
 
         let (input, size_marker) = le_u8(input)?;
+        // array of SZvaruint64
         let (input, pack_size) = count(le_u64, num_pack_streams.to_usize())(input)?;
         let (input, pack_streams_crc) = count(le_u32, num_pack_streams.to_usize())(input)?;
         let (input, end_marker) = le_u8(input)?;
@@ -41,7 +43,7 @@ impl PackInfo {
         ))
     }
 }
-
+#[derive(Debug, PartialEq)]
 pub struct UnpackInfo {
     folder_marker: u8,
     num_folders: u64,
@@ -56,7 +58,7 @@ pub struct UnpackInfo {
 impl UnpackInfo {
     pub fn parse(input: &[u8]) -> IResult<&[u8], UnpackInfo> {
         let (input, folder_marker) = le_u8(input)?;
-        let (input, num_folders) = le_u64(input)?;
+        let (input, num_folders) = sevenzip_varuint64_decode(input);
         let (input, is_external) = le_u8(input)?;
         let (input, folders) = count(Folder::parse, num_folders.to_usize())(input)?;
         let (input, unpacksize_marker) = le_u8(input)?;

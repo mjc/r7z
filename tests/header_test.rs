@@ -31,5 +31,6 @@ fn parse_encoded_header_from_string() {
     let (input, property_id) = find_next_property_id(input, offset).unwrap();
     assert_eq!(property_id, r7z::Property::EncodedHeader);
 
-    let (input, encoded_header) = r7z::EncodedHeader::parse(input).unwrap();
+    let (_input, encoded_header) = r7z::EncodedHeader::parse(input).unwrap();
+    println!("encoded_header: {:?}", encoded_header);
 }

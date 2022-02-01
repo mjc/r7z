@@ -55,6 +55,7 @@ Data types in file and Rust equivalent:
     crc32 format: ITU-T V.42
 */
 
+#[derive(Debug, PartialEq)]
 pub struct Digest {
     id: u8,
     defined: u8, // bitfield
