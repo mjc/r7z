@@ -8,19 +8,19 @@ use nom::{
 
 pub struct EncodedHeader {
     pack_info: PackInfo,
-    unpack_info: UnpackInfo,
+    // unpack_info: UnpackInfo,
 }
 
 impl EncodedHeader {
     pub fn parse(input: &[u8]) -> IResult<&[u8], EncodedHeader> {
-        let (input, property) = Property::parse(input)?;
-        assert!(property == Property::EncodedHeader);
-        let (input, (pack_info, unpack_info)) = tuple((PackInfo::parse, UnpackInfo::parse))(input)?;
+        println!("encodedheader::parse");
+        let (input, pack_info) = PackInfo::parse(input)?;
+        // let (input, unpack_info) = UnpackInfo::parse(input)?;
         Ok((
             input,
             EncodedHeader {
                 pack_info,
-                unpack_info,
+                // unpack_info,
             },
         ))
     }

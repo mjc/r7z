@@ -23,13 +23,13 @@ fn parse_signature_header_from_string() {
     );
 }
 
-// #[test]
-// fn parse_encoded_header_from_string() {
-//     let buf = support::valid_7z_string();
-//     let (input, signature_header) = r7z::SignatureHeader::parse(&buf).unwrap();
-//     let offset = signature_header.next_header_offset.to_usize();
-//     let (input, property_id) = find_next_property_id(input, offset).unwrap();
-//     assert_eq!(property_id, r7z::Property::EncodedHeader);
+#[test]
+fn parse_encoded_header_from_string() {
+    let buf = support::valid_7z_string();
+    let (input, signature_header) = r7z::SignatureHeader::parse(&buf).unwrap();
+    let offset = signature_header.next_header_offset.to_usize();
+    let (input, property_id) = find_next_property_id(input, offset).unwrap();
+    assert_eq!(property_id, r7z::Property::EncodedHeader);
 
-//     let (input, encoded_header) = r7z::EncodedHeader::parse(input).unwrap();
-// }
+    let (input, encoded_header) = r7z::EncodedHeader::parse(input).unwrap();
+}

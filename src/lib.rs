@@ -6,6 +6,7 @@ mod coder_info;
 mod folder;
 mod headers;
 mod pack_info;
+mod parsers;
 mod property;
 mod stream_info;
 
@@ -21,6 +22,8 @@ use nom::{
 pub use pack_info::{PackInfo, UnpackInfo};
 pub use property::{find_next_property_id, Property};
 pub use stream_info::{StreamInfo, SubstreamInfo};
+
+pub use parsers::*;
 
 /*
 https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt

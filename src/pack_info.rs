@@ -4,7 +4,7 @@ use nom::{
     IResult,
 };
 
-use crate::{Digest, Folder};
+use crate::{sevenzip_varuint64_decode, Digest, Folder, Property};
 
 pub struct PackInfo {
     pack_pos: u64,
@@ -17,8 +17,15 @@ pub struct PackInfo {
 
 impl PackInfo {
     pub fn parse(input: &[u8]) -> IResult<&[u8], PackInfo> {
-        let (input, pack_pos) = le_u64(input)?;
-        let (input, num_pack_streams) = le_u64(input)?;
+        println!("packinfo::parse");
+        let (input, property_id) = Property::parse(input)?;
+        assert!(property_id == Property::PackInfo);
+        let (input, pack_pos) = sevenzip_varuint64_decode(&input);
+
+        println!("pack_pos: {}", pack_pos);
+
+        let (input, num_pack_streams) = sevenzip_varuint64_decode(input);
+        println!("num_pack_streams: {}", num_pack_streams);
         let (input, size_marker) = le_u8(input)?;
         let (input, pack_size) = count(le_u64, num_pack_streams.try_into().unwrap())(input)?;
         let (input, pack_streams_crc) = count(le_u32, num_pack_streams.try_into().unwrap())(input)?;
