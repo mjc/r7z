@@ -76,14 +76,14 @@ impl UnpackInfo {
         Ok((
             input,
             UnpackInfo {
-                folder_marker: folder_marker,
-                num_folders: num_folders,
-                is_external: is_external,
-                folders: folders,
-                unpacksize_marker: unpacksize_marker,
-                unpacksizes: unpacksizes,
-                digests: digests,
-                defined: defined,
+                folder_marker,
+                num_folders,
+                is_external,
+                folders,
+                unpacksize_marker,
+                unpacksizes,
+                digests,
+                defined,
             },
         ))
     }
