@@ -1,10 +1,3 @@
-use std::ops::RangeFrom;
-
-use nom::{
-    error::{make_error, ErrorKind, ParseError},
-    IResult, InputIter, InputLength, Slice,
-};
-
 pub fn sevenzip_varuint64_decode(input: &[u8]) -> (&[u8], u64) {
     let mut value: u64 = 0;
     let mut mask: u8 = 0x80;

@@ -40,7 +40,7 @@ pub struct Folder {
 impl Folder {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input);
-        let (input, coders) = le_u64(input)?;
+        let (input, _coders) = le_u64(input)?;
         Ok((
             input,
             Folder {

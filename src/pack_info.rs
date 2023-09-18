@@ -1,6 +1,6 @@
 use nom::{
     multi::count,
-    number::streaming::{le_u32, le_u64, le_u8},
+    number::streaming::{le_u64, le_u8},
     IResult, ToUsize,
 };
 
@@ -27,8 +27,8 @@ impl PackInfo {
         let (mut input, size_marker) = le_u8(input)?;
 
         let mut pack_size = Vec::new();
-        // array of SZvaruint64
-        for i in 0..num_pack_streams {
+        // array of varuint64
+        for _i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input);
             pack_size.push(a_pack_size);
 

@@ -1,4 +1,4 @@
-use nom::{combinator::peek, number::streaming::le_u8, IResult};
+use nom::{number::streaming::le_u8, IResult};
 use num::FromPrimitive;
 
 #[derive(PartialEq, Debug, FromPrimitive)]
