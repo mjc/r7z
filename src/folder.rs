@@ -3,8 +3,7 @@ use nom::{
     number::streaming::{le_u32, le_u64},
     IResult, ToUsize,
 };
-
-use crate::sevenzip_varuint64_decode;
+use nom_varint::take_varint;
 
 pub struct FoldersInfo {
     num_folders: u64,
@@ -33,18 +32,18 @@ impl FoldersInfo {
 
 #[derive(Debug, PartialEq)]
 pub struct Folder {
-    num_coders: u64,
+    num_coders: usize,
     // coders: Vec<CoderInfo>,
 }
 
 impl Folder {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
-        let (input, num_coders) = sevenzip_varuint64_decode(input);
+        let (input, num_coders) = take_varint(input)?;
         let (input, _coders) = le_u64(input)?;
         Ok((
             input,
             Folder {
-                num_coders,
+                num_coders: num_coders,
                 // coders
             },
         ))
