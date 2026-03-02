@@ -16,12 +16,12 @@ fn decompress_lzma_packed_header() {
     let data_end = data_start + usize::try_from(pi.pack_size[0]).expect("pack_size fits in usize");
     let packed = &buf[data_start..data_end];
 
-    let folder = &ui.folders[0];
+    let folder = ui.parse_folder(0).unwrap();
     // Sanity: LZMA codec
     assert_eq!(folder.coders[0].codec_id.as_slice(), CODEC_LZMA);
 
     let unpack_size = ui.unpack_sizes[0];
-    let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();
+    let decompressed = decompress_folder(&folder, packed, unpack_size).unwrap();
 
     assert_eq!(
         decompressed.len(),
@@ -45,9 +45,9 @@ fn archive_open_and_decompress_header_stream() {
     let data_end = data_start + usize::try_from(pi.pack_size[0]).expect("pack_size fits in usize");
     let packed = &buf[data_start..data_end];
 
-    let folder = &ui.folders[0];
+    let folder = ui.parse_folder(0).unwrap();
     let unpack_size = ui.unpack_sizes[0];
-    let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();
+    let decompressed = decompress_folder(&folder, packed, unpack_size).unwrap();
 
     assert_eq!(
         decompressed.len(),

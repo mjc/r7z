@@ -182,7 +182,7 @@ impl StreamInfo {
                     input = i;
                 }
                 Property::SubStreamsInfo => {
-                    let num_folders = unpack_info.as_ref().map_or(0, |u| u.folders.len());
+                    let num_folders = unpack_info.as_ref().map_or(0, UnpackInfo::num_folders_usize);
                     let (i, si) = SubstreamInfo::parse(input, num_folders)?;
                     substream_info = Some(si);
                     input = i;

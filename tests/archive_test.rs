@@ -19,10 +19,9 @@ fn parse_archive_metadata_from_test_fixture() {
     // EncodedHeader: UnpackInfo — 1 folder with LZMA coder
     let ui = &meta.encoded_header.unpack_info;
     assert_eq!(ui.num_folders, 1);
-    assert_eq!(ui.folders.len(), 1);
     assert_eq!(ui.unpack_sizes.len(), 1);
 
-    let folder = &ui.folders[0];
+    let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 1);
     // LZMA codec ID
     assert_eq!(folder.coders[0].codec_id.as_slice(), &[0x03, 0x01, 0x01]);
@@ -63,7 +62,7 @@ fn archive_open_full_header() {
     assert_eq!(eh.unpack_info.num_folders, 1);
     // LZMA header codec
     assert_eq!(
-        eh.unpack_info.folders[0].coders[0].codec_id.as_slice(),
+        eh.unpack_info.parse_folder(0).unwrap().coders[0].codec_id.as_slice(),
         &[0x03, 0x01, 0x01]
     );
 
@@ -80,5 +79,5 @@ fn archive_open_full_header() {
     // StreamsInfo: LZMA2 file data codec
     let si = archive.streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
-    assert_eq!(ui.folders[0].coders[0].codec_id.as_slice(), &[0x21]); // LZMA2
+    assert_eq!(ui.parse_folder(0).unwrap().coders[0].codec_id.as_slice(), &[0x21]); // LZMA2
 }

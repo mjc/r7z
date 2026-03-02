@@ -58,8 +58,7 @@ fn parse_encoded_header_coder_details() {
 
     // Validate UnpackInfo
     assert_eq!(eh.unpack_info.num_folders, 1);
-    assert_eq!(eh.unpack_info.folders.len(), 1);
-    let folder = &eh.unpack_info.folders[0];
+    let folder = eh.unpack_info.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 1);
     assert_eq!(folder.coders[0].codec_id.as_slice(), &[0x03, 0x01, 0x01]); // LZMA
     assert!(folder.coders[0].properties.is_some());

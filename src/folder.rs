@@ -2,6 +2,78 @@ use crate::{sevenzip_varuint64_decode, usize_cap, CoderInfo};
 use nom::IResult;
 use smallvec::SmallVec;
 
+/// Validate a single folder's bytes without allocating, returning
+/// `(remaining_input, total_out_streams)`.
+///
+/// This walks the exact same byte layout as [`Folder::parse`] — varints,
+/// coder blocks, bind pairs, packed indices — and performs identical
+/// bounds / overflow checks, but builds no structs.
+///
+/// # Errors
+///
+/// Returns a nom error if the bytes are truncated or malformed.
+pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
+    let (mut input, num_coders) = sevenzip_varuint64_decode(input)?;
+
+    let mut num_in_total: u64 = 0;
+    let mut num_out_total: u64 = 0;
+
+    for _ in 0..num_coders {
+        let (i, flags) = nom::number::complete::le_u8(input)?;
+        let codec_id_size = usize::from(flags & 0x0f);
+        let is_complex = (flags & 0x10) != 0;
+        let has_attributes = (flags & 0x20) != 0;
+
+        let (i, _codec_id) = nom::bytes::complete::take(codec_id_size)(i)?;
+
+        let (i, n_in, n_out) = if is_complex {
+            let (i, n_in) = sevenzip_varuint64_decode(i)?;
+            let (i, n_out) = sevenzip_varuint64_decode(i)?;
+            (i, n_in, n_out)
+        } else {
+            (i, 1u64, 1u64)
+        };
+
+        num_in_total += n_in;
+        num_out_total += n_out;
+
+        input = if has_attributes {
+            let (i, prop_size) = sevenzip_varuint64_decode(i)?;
+            let sz = usize::try_from(prop_size).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
+            })?;
+            let (i, _props) = nom::bytes::complete::take(sz)(i)?;
+            i
+        } else {
+            i
+        };
+    }
+
+    let num_bind_pairs = num_out_total.saturating_sub(1);
+    for _ in 0..num_bind_pairs {
+        let (i, _in_idx) = sevenzip_varuint64_decode(input)?;
+        let (i, _out_idx) = sevenzip_varuint64_decode(i)?;
+        input = i;
+    }
+
+    let num_packed = num_in_total - num_bind_pairs;
+    if num_packed != 1 {
+        for _ in 0..num_packed {
+            let (i, _idx) = sevenzip_varuint64_decode(input)?;
+            input = i;
+        }
+    }
+
+    let total_out = usize::try_from(num_out_total).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+
+    Ok((input, total_out))
+}
+
 /// A compression folder — one or more chained coders applied to a set of streams.
 ///
 /// In the common case a folder contains a single [`CoderInfo`] with no bind pairs.

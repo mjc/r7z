@@ -107,12 +107,12 @@ impl Archive {
                 let data_end =
                     data_start + usize::try_from(pi.pack_size[0]).map_err(|_| R7zError::Parse)?;
                 let packed = &data[data_start..data_end];
-                let folder = ui.folders.first().ok_or(R7zError::Parse)?;
+                let folder = ui.parse_folder(0)?;
                 let unpack_size = ui.unpack_sizes.first().copied().ok_or(R7zError::Parse)?;
                 if unpack_size > MAX_HEADER_UNPACK_BYTES {
                     return Err(R7zError::Parse);
                 }
-                let decompressed = codec::decompress_folder(folder, packed, unpack_size)?;
+                let decompressed = codec::decompress_folder(&folder, packed, unpack_size)?;
                 let decompressed = Bytes::from(decompressed);
 
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
@@ -193,7 +193,7 @@ impl Archive {
         .ok_or(R7zError::Parse)?;
 
         // Decompress the folder
-        let folder = &unpack_info.folders[folder_idx];
+        let folder = unpack_info.parse_folder(folder_idx)?;
         let pack_offset: usize =
             usize::try_from(pack_info.pack_size[..folder_idx].iter().sum::<u64>())
                 .map_err(|_| R7zError::Parse)?;
@@ -205,7 +205,7 @@ impl Archive {
 
         // Folder unpack size = sum of all out-stream sizes in the unpack_info
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info);
-        let decompressed = codec::decompress_folder(folder, packed, folder_unpack_size)?;
+        let decompressed = codec::decompress_folder(&folder, packed, folder_unpack_size)?;
 
         // Slice the target stream out of the decompressed folder data
         let stream_start =

@@ -2,6 +2,7 @@ use nom::{number::complete::le_u8, IResult, ToUsize};
 use smallvec::SmallVec;
 
 use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
+use crate::folder::scan_folder;
 
 /// Describes where the packed (compressed) data streams live in the archive file.
 #[derive(Debug, PartialEq)]
@@ -61,20 +62,59 @@ impl PackInfo {
 }
 
 /// Describes the decompression structure: folders, their coders, and output sizes.
-#[derive(Debug, PartialEq)]
+///
+/// Folder metadata is validated eagerly but parsed lazily: the raw bytes are
+/// stored alongside a lightweight index, and full [`Folder`] structs are
+/// constructed on demand via [`parse_folder`](UnpackInfo::parse_folder).
+#[derive(Debug, Clone)]
 pub struct UnpackInfo {
     /// Number of compression folders.
     pub num_folders: u64,
-    /// One [`Folder`] per compression unit.
-    /// Nearly always length 1; stays on the stack for typical archives.
-    pub folders: SmallVec<[Folder; 4]>,
+    /// Raw bytes of all folder blocks (validated, not yet parsed into structs).
+    folder_data: Vec<u8>,
+    /// Byte offset of each folder within `folder_data`.
+    /// Length = `num_folders + 1` (sentinel at end).
+    folder_offsets: Vec<u32>,
     /// Uncompressed (output) size for each coder out-stream across all folders.
     pub unpack_sizes: SmallVec<[u64; 4]>,
     /// Optional CRC32 digest per folder (used to verify decompressed output).
     pub digests: SmallVec<[Option<u32>; 4]>,
 }
 
+impl PartialEq for UnpackInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_folders == other.num_folders
+            && self.folder_data == other.folder_data
+            && self.folder_offsets == other.folder_offsets
+            && self.unpack_sizes == other.unpack_sizes
+            && self.digests == other.digests
+    }
+}
+
 impl UnpackInfo {
+    /// Parse a single folder on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError`](crate::R7zError) if the stored bytes are malformed
+    /// (should not happen — bytes are validated during [`parse`](UnpackInfo::parse)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= num_folders`.
+    pub fn parse_folder(&self, idx: usize) -> Result<Folder, crate::R7zError> {
+        let start = self.folder_offsets[idx] as usize;
+        let end = self.folder_offsets[idx + 1] as usize;
+        let (_, folder) =
+            Folder::parse(&self.folder_data[start..end]).map_err(|_| crate::R7zError::Parse)?;
+        Ok(folder)
+    }
+
+    /// Number of folders (as `usize`).
+    #[must_use]
+    pub fn num_folders_usize(&self) -> usize {
+        self.folder_offsets.len() - 1
+    }
     /// Parse an `UnpackInfo` block from the header stream.
     ///
     /// # Errors
@@ -102,21 +142,34 @@ impl UnpackInfo {
             input
         };
 
-        // Parse each folder
-        let mut folders: SmallVec<[Folder; 4]> =
-            SmallVec::with_capacity(usize_cap(num_folders, input.len()));
+        // Scan and validate each folder — record byte offsets and total_out_streams
+        // without building Folder structs.
+        let folder_start = input;
+        let mut folder_offsets: Vec<u32> =
+            Vec::with_capacity(usize_cap(num_folders, input.len()) + 1);
+        let mut total_out_streams: usize = 0;
         let mut input = input;
         for _ in 0..num_folders {
-            let (i, folder) = Folder::parse(input)?;
-            folders.push(folder);
+            let offset = u32::try_from(folder_start.len() - input.len()).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            folder_offsets.push(offset);
+            let (i, out_streams) = scan_folder(input)?;
+            total_out_streams += out_streams;
             input = i;
         }
-
-        // Total number of out-streams across all folders
-        let total_out_streams: usize = folders
-            .iter()
-            .map(super::folder::Folder::total_out_streams)
-            .sum();
+        // Sentinel offset marking end of last folder
+        let end_offset = u32::try_from(folder_start.len() - input.len()).map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+        folder_offsets.push(end_offset);
+        let folder_data = folder_start[..end_offset as usize].to_vec();
 
         // Property-tag loop for CodersUnPackSize and CRC
         let mut unpack_sizes: SmallVec<[u64; 4]> =
@@ -156,14 +209,15 @@ impl UnpackInfo {
         }
 
         if digests.is_empty() {
-            digests.resize(folders.len(), None);
+            digests.resize(folder_offsets.len() - 1, None);
         }
 
         Ok((
             input,
             UnpackInfo {
                 num_folders,
-                folders,
+                folder_data,
+                folder_offsets,
                 unpack_sizes,
                 digests,
             },
