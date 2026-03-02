@@ -40,7 +40,7 @@ fn p7zip_read_interop_single_lzma() {
 
     assert_eq!(archive.num_files(), 1);
     let fi = archive.files_info().unwrap();
-    assert_eq!(fi.names[0], "hello.txt");
+    assert_eq!(fi.name(0).unwrap(), "hello.txt");
 
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted, original);
@@ -86,11 +86,11 @@ fn p7zip_read_interop_multi_file_lzma2() {
 
     assert_eq!(archive.num_files(), 3);
     let fi = archive.files_info().unwrap();
-    let names: Vec<&str> = fi.names.iter().map(|s| s.as_str()).collect();
+    let names: Vec<String> = fi.names().collect();
     for (name, original) in &files {
         let idx = names
             .iter()
-            .position(|&n| n == *name)
+            .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} not found in archive"));
         let extracted = archive.extract_to_memory(idx).unwrap();
         assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");

@@ -20,7 +20,7 @@ fn bench_archive_open(c: &mut Criterion) {
 }
 
 fn bench_archive_from_bytes(c: &mut Criterion) {
-    let data = fixture_bytes();
+    let data: bytes::Bytes = fixture_bytes().into();
     c.bench_function("Archive::from_bytes", |b| {
         b.iter(|| r7z::Archive::from_bytes(black_box(data.clone())).unwrap())
     });
@@ -30,7 +30,9 @@ fn bench_extract_to_memory(c: &mut Criterion) {
     let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
     // Find the first non-empty file index
     let fi = archive.files_info().unwrap();
-    let idx = fi.empty_streams.iter().position(|&e| !e).unwrap_or(0);
+    let idx = (0..fi.num_files as usize)
+        .find(|&i| !fi.is_empty_stream(i))
+        .unwrap_or(0);
     c.bench_function("Archive::extract_to_memory", |b| {
         b.iter(|| archive.extract_to_memory(black_box(idx)).unwrap())
     });

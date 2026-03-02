@@ -8,6 +8,7 @@ description = "Pure-Rust library for reading and writing .7z archives"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bytes = "1"
 crc32fast = "1.5.0"
 lzma-rs = "0.3.0"
 nom = "7.1"
@@ -20,7 +21,15 @@ thiserror = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 hex = "0.4"
 tempfile = "3.26.0"
+pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 
 [[bench]]
 name = "parse_bench"
 harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[profile.release]
+debug = true

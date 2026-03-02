@@ -71,11 +71,11 @@ fn archive_open_full_header() {
     assert_eq!(archive.num_files(), 4); // 1 dir + 3 files
 
     let fi = archive.files_info().unwrap();
-    assert_eq!(fi.names.len(), 4);
-    assert_eq!(fi.names[0], "scripts");
-    assert_eq!(fi.names[1], "scripts/py7zr");
-    assert_eq!(fi.names[2], "setup.cfg");
-    assert_eq!(fi.names[3], "setup.py");
+    assert_eq!(fi.num_files, 4);
+    assert_eq!(fi.name(0).unwrap(), "scripts");
+    assert_eq!(fi.name(1).unwrap(), "scripts/py7zr");
+    assert_eq!(fi.name(2).unwrap(), "setup.cfg");
+    assert_eq!(fi.name(3).unwrap(), "setup.py");
 
     // StreamsInfo: LZMA2 file data codec
     let si = archive.streams_info().unwrap();

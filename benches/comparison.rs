@@ -1,0 +1,325 @@
+use bytes::Bytes;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use pprof::criterion::{Output, PProfProfiler};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+// Lazy fixture generation: 1 MB archive
+fn archive_1mb_path() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let fixture_dir = PathBuf::from("target/bench-fixtures");
+        let _ = std::fs::create_dir_all(&fixture_dir);
+        let path = fixture_dir.join("1mb.7z");
+
+        if !path.exists() {
+            let payload = generate_payload(1024 * 1024); // 1 MB
+            let archive = r7z::ArchiveBuilder::new()
+                .add_file("data.bin", &payload)
+                .build()
+                .expect("failed to build 1MB archive");
+            std::fs::write(&path, &archive).expect("failed to write 1MB fixture");
+        }
+        path
+    })
+    .clone()
+}
+
+// Lazy fixture generation: 10 MB archive
+fn archive_10mb_path() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let fixture_dir = PathBuf::from("target/bench-fixtures");
+        let _ = std::fs::create_dir_all(&fixture_dir);
+        let path = fixture_dir.join("10mb.7z");
+
+        if !path.exists() {
+            let payload = generate_payload(10 * 1024 * 1024); // 10 MB
+            let archive = r7z::ArchiveBuilder::new()
+                .add_file("data.bin", &payload)
+                .build()
+                .expect("failed to build 10MB archive");
+            std::fs::write(&path, &archive).expect("failed to write 10MB fixture");
+        }
+        path
+    })
+    .clone()
+}
+
+// Lazy fixture generation: 1 GB archive
+fn archive_1gb_path() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let fixture_dir = PathBuf::from("target/bench-fixtures");
+        let _ = std::fs::create_dir_all(&fixture_dir);
+        let path = fixture_dir.join("1gb.7z");
+
+        if !path.exists() {
+            let payload = generate_payload(1024 * 1024 * 1024); // 1 GB
+            let archive = r7z::ArchiveBuilder::new()
+                .add_file("data.bin", &payload)
+                .build()
+                .expect("failed to build 1GB archive");
+            std::fs::write(&path, &archive).expect("failed to write 1GB fixture");
+        }
+        path
+    })
+    .clone()
+}
+
+// Lazy fixture generation: 10 GB archive
+fn archive_10gb_path() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let fixture_dir = PathBuf::from("target/bench-fixtures");
+        let _ = std::fs::create_dir_all(&fixture_dir);
+        let path = fixture_dir.join("10gb.7z");
+
+        if !path.exists() {
+            let payload = generate_payload(10 * 1024 * 1024 * 1024); // 10 GB
+            let archive = r7z::ArchiveBuilder::new()
+                .add_file("data.bin", &payload)
+                .build()
+                .expect("failed to build 10GB archive");
+            std::fs::write(&path, &archive).expect("failed to write 10GB fixture");
+        }
+        path
+    })
+    .clone()
+}
+
+// Lazy archive bytes for r7z operations — stored as Bytes so clone() is O(1).
+fn archive_1mb_bytes() -> Bytes {
+    static BYTES: OnceLock<Bytes> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        Bytes::from(std::fs::read(archive_1mb_path()).expect("failed to read 1MB fixture"))
+    })
+    .clone()
+}
+
+fn archive_10mb_bytes() -> Bytes {
+    static BYTES: OnceLock<Bytes> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        Bytes::from(std::fs::read(archive_10mb_path()).expect("failed to read 10MB fixture"))
+    })
+    .clone()
+}
+
+fn archive_1gb_bytes() -> Bytes {
+    static BYTES: OnceLock<Bytes> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        Bytes::from(std::fs::read(archive_1gb_path()).expect("failed to read 1GB fixture"))
+    })
+    .clone()
+}
+
+fn archive_10gb_bytes() -> Bytes {
+    static BYTES: OnceLock<Bytes> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        Bytes::from(std::fs::read(archive_10gb_path()).expect("failed to read 10GB fixture"))
+    })
+    .clone()
+}
+
+// Generate pseudo-random payload for consistent benchmarking
+fn generate_payload(size: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(size);
+    let seed = 0x12345678u32;
+    let mut rng = seed;
+
+    for _ in 0..size {
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        data.push((rng >> 8) as u8);
+    }
+    data
+}
+
+// ============================================================================
+// r7z Benchmarks (with flamegraph profiler)
+// ============================================================================
+
+fn r7z_open_1mb(c: &mut Criterion) {
+    let bytes = archive_1mb_bytes();
+    c.bench_function("r7z_open_1mb", |b| {
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+    });
+}
+
+fn r7z_open_10mb(c: &mut Criterion) {
+    let bytes = archive_10mb_bytes();
+    c.bench_function("r7z_open_10mb", |b| {
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+    });
+}
+
+fn r7z_extract_1mb(c: &mut Criterion) {
+    let archive = r7z::Archive::from_bytes(archive_1mb_bytes()).unwrap();
+    c.bench_function("r7z_extract_1mb", |b| {
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+    });
+}
+
+fn r7z_extract_10mb(c: &mut Criterion) {
+    let archive = r7z::Archive::from_bytes(archive_10mb_bytes()).unwrap();
+    c.bench_function("r7z_extract_10mb", |b| {
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+    });
+}
+
+fn r7z_build_1mb(c: &mut Criterion) {
+    let payload = generate_payload(1024 * 1024);
+    c.bench_function("r7z_build_1mb", |b| {
+        b.iter(|| {
+            r7z::ArchiveBuilder::new()
+                .add_file("data.bin", black_box(&payload))
+                .build()
+                .unwrap()
+        })
+    });
+}
+
+fn r7z_build_10mb(c: &mut Criterion) {
+    let payload = generate_payload(10 * 1024 * 1024);
+    c.bench_function("r7z_build_10mb", |b| {
+        b.iter(|| {
+            r7z::ArchiveBuilder::new()
+                .add_file("data.bin", black_box(&payload))
+                .build()
+                .unwrap()
+        })
+    });
+}
+
+fn r7z_open_1gb(c: &mut Criterion) {
+    let bytes = archive_1gb_bytes();
+    c.bench_function("r7z_open_1gb", |b| {
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+    });
+}
+
+fn r7z_open_10gb(c: &mut Criterion) {
+    let bytes = archive_10gb_bytes();
+    c.bench_function("r7z_open_10gb", |b| {
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+    });
+}
+
+fn r7z_extract_1gb(c: &mut Criterion) {
+    let archive = r7z::Archive::from_bytes(archive_1gb_bytes()).unwrap();
+    c.bench_function("r7z_extract_1gb", |b| {
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+    });
+}
+
+fn r7z_extract_10gb(c: &mut Criterion) {
+    let archive = r7z::Archive::from_bytes(archive_10gb_bytes()).unwrap();
+    c.bench_function("r7z_extract_10gb", |b| {
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+    });
+}
+
+fn r7z_build_1gb(c: &mut Criterion) {
+    let payload = generate_payload(1024 * 1024 * 1024);
+    c.bench_function("r7z_build_1gb", |b| {
+        b.iter(|| {
+            r7z::ArchiveBuilder::new()
+                .add_file("data.bin", black_box(&payload))
+                .build()
+                .unwrap()
+        })
+    });
+}
+
+fn r7z_build_10gb(c: &mut Criterion) {
+    let payload = generate_payload(10 * 1024 * 1024 * 1024);
+    c.bench_function("r7z_build_10gb", |b| {
+        b.iter(|| {
+            r7z::ArchiveBuilder::new()
+                .add_file("data.bin", black_box(&payload))
+                .build()
+                .unwrap()
+        })
+    });
+}
+
+// ============================================================================
+// p7zip Benchmarks (subprocess timing, no profiler, gated on availability)
+// ============================================================================
+
+fn p7zip_list_1mb(c: &mut Criterion) {
+    // Skip if 7z not available
+    if std::process::Command::new("7z")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+
+    let fixture_path = archive_1mb_path().to_string_lossy().to_string();
+
+    c.bench_function("p7zip_list_1mb", |b| {
+        b.iter_custom(|iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = std::process::Command::new("7z")
+                    .arg("l")
+                    .arg(&fixture_path)
+                    .output();
+            }
+            start.elapsed()
+        });
+    });
+}
+
+fn p7zip_extract_1mb(c: &mut Criterion) {
+    // Skip if 7z not available
+    if std::process::Command::new("7z")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+
+    let fixture_path = archive_1mb_path().to_string_lossy().to_string();
+
+    c.bench_function("p7zip_extract_1mb", |b| {
+        b.iter_custom(|iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = std::process::Command::new("7z")
+                    .arg("x")
+                    .arg("-so")
+                    .arg(&fixture_path)
+                    .stdout(std::process::Stdio::null())
+                    .output();
+            }
+            start.elapsed()
+        });
+    });
+}
+
+// ============================================================================
+// Criterion Configuration
+// ============================================================================
+
+fn profiled() -> Criterion {
+    Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
+}
+
+criterion_group! {
+    name = r7z_benches;
+    config = profiled();
+    targets = r7z_open_1mb, r7z_open_10mb, r7z_open_1gb, r7z_open_10gb,
+              r7z_extract_1mb, r7z_extract_10mb, r7z_extract_1gb, r7z_extract_10gb,
+              r7z_build_1mb, r7z_build_10mb, r7z_build_1gb, r7z_build_10gb
+}
+
+criterion_group! {
+    name = p7zip_benches;
+    config = Criterion::default();
+    targets = p7zip_list_1mb, p7zip_extract_1mb
+}
+
+criterion_main!(r7z_benches, p7zip_benches);

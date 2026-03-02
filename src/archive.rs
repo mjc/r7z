@@ -2,6 +2,7 @@ use crate::{
     codec, find_next_property_id, EncodedHeader, FilesInfo, Header, Property, R7zError,
     SignatureHeader, StreamInfo,
 };
+use bytes::Bytes;
 use nom::ToUsize;
 use std::path::Path;
 
@@ -39,8 +40,8 @@ impl ArchiveMetadata {
 
 /// Fully decoded archive with file listing and extraction support.
 pub struct Archive {
-    /// Raw archive bytes (loaded into memory).
-    data: Vec<u8>,
+    /// Raw archive bytes (O(1) clone via reference counting).
+    data: Bytes,
     pub signature: SignatureHeader,
     /// Present for EncodedHeader archives; None for uncompressed-header archives.
     pub encoded_header: Option<EncodedHeader>,
@@ -51,11 +52,11 @@ impl Archive {
     /// Open and fully decode a 7z archive from disk.
     pub fn open(path: &Path) -> Result<Archive, R7zError> {
         let data = std::fs::read(path)?;
-        Self::from_bytes(data)
+        Self::from_bytes(Bytes::from(data))
     }
 
     /// Parse a 7z archive from in-memory bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Archive, R7zError> {
+    pub fn from_bytes(data: Bytes) -> Result<Archive, R7zError> {
         let (input, signature) = SignatureHeader::parse(&data).map_err(|_| R7zError::Parse)?;
 
         signature.validate_start_header_crc()?;
@@ -177,14 +178,10 @@ impl Archive {
         let fi = self.header.files_info.as_ref();
 
         for i in 0..num {
-            let name = fi
-                .and_then(|f| f.names.get(i))
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
+            let name_owned = fi.and_then(|f| f.name(i));
+            let name = name_owned.as_deref().unwrap_or("unknown");
 
-            let is_empty = fi
-                .map(|f| f.empty_streams.get(i).copied().unwrap_or(false))
-                .unwrap_or(false);
+            let is_empty = fi.map(|f| f.is_empty_stream(i)).unwrap_or(false);
 
             let dest_path = dest.join(name);
             if let Some(parent) = dest_path.parent() {
@@ -211,9 +208,7 @@ impl Archive {
 fn file_to_data_stream(file_idx: usize, fi: Option<&FilesInfo>) -> Option<usize> {
     let mut data_idx = 0usize;
     for i in 0..=file_idx {
-        let is_empty = fi
-            .map(|f| f.empty_streams.get(i).copied().unwrap_or(false))
-            .unwrap_or(false);
+        let is_empty = fi.map(|f| f.is_empty_stream(i)).unwrap_or(false);
         if i == file_idx {
             if is_empty {
                 return None; // caller should have handled empty-stream files

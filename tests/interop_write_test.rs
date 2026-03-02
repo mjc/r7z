@@ -12,10 +12,10 @@ fn r7z_write_r7z_read_single_file() {
         .build()
         .expect("build failed");
 
-    let archive = r7z::Archive::from_bytes(bytes).expect("from_bytes failed");
+    let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), 1);
     let fi = archive.files_info().unwrap();
-    assert_eq!(fi.names[0], "hello.txt");
+    assert_eq!(fi.name(0).unwrap(), "hello.txt");
 
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted.as_slice(), original);
@@ -36,12 +36,12 @@ fn r7z_write_r7z_read_multi_file() {
     }
     let bytes = builder.build().expect("build failed");
 
-    let archive = r7z::Archive::from_bytes(bytes).expect("from_bytes failed");
+    let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), files.len());
 
     let fi = archive.files_info().unwrap();
     for (i, (name, original)) in files.iter().enumerate() {
-        assert_eq!(fi.names[i], *name);
+        assert_eq!(fi.name(i).unwrap(), *name);
         let extracted = archive.extract_to_memory(i).unwrap();
         assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");
     }
@@ -130,7 +130,7 @@ fn r7z_write_lzma2_r7z_reads() {
         .build()
         .expect("LZMA2 build failed");
 
-    let archive = r7z::Archive::from_bytes(bytes).expect("from_bytes failed");
+    let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted.as_slice(), original);
 }
