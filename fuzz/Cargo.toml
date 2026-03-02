@@ -1,0 +1,34 @@
+[package]
+name = "r7z-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+r7z = { path = ".." }
+
+# Disable default features to avoid pulling in unneeded crates
+[dependencies.r7z]
+path = ".."
+
+[[bin]]
+name = "fuzz_parse_signature"
+path = "fuzz_targets/fuzz_parse_signature.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_archive"
+path = "fuzz_targets/fuzz_parse_archive.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_builder_roundtrip"
+path = "fuzz_targets/fuzz_builder_roundtrip.rs"
+test = false
+bench = false

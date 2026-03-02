@@ -1,5 +1,5 @@
 use crate::{sevenzip_varuint64_decode, Property};
-use nom::{bytes::streaming::take, number::streaming::le_u8, IResult};
+use nom::{bytes::streaming::take, IResult};
 
 /// File listing metadata from the 7z `FilesInfo` block.
 #[derive(Debug, PartialEq)]
@@ -162,10 +162,4 @@ fn parse_utf16le_names(data: &[u8], count: usize) -> Vec<String> {
         names.push(String::from_utf16_lossy(&u16_units).to_string());
     }
     names
-}
-
-// Suppress warnings for unused le_u8 import until more of the parser is used
-#[allow(dead_code)]
-fn _use_le_u8(input: &[u8]) -> IResult<&[u8], u8> {
-    le_u8(input)
 }

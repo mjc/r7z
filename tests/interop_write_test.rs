@@ -83,6 +83,58 @@ fn r7z_write_p7zip_reads_single_file() {
     assert_eq!(extracted, original);
 }
 
+/// r7z builds an LZMA2 archive; p7zip extracts it correctly.
+#[test]
+fn r7z_write_lzma2_p7zip_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let original = b"Hello from r7z LZMA2, extracted by p7zip!";
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("hello.txt", original)
+        .compression(r7z::Codec::Lzma2)
+        .build()
+        .expect("LZMA2 build failed");
+
+    let archive_path = dir.join("r7z_lzma2.7z");
+    std::fs::write(&archive_path, &bytes).unwrap();
+
+    let out_dir = dir.join("extracted");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_7z(
+        &[
+            "e",
+            archive_path.to_str().unwrap(),
+            "-y",
+            &format!("-o{}", out_dir.to_str().unwrap()),
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z e failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let extracted = std::fs::read(out_dir.join("hello.txt")).unwrap();
+    assert_eq!(extracted, original);
+}
+
+/// r7z round-trip with LZMA2: build → from_bytes → extract_to_memory.
+#[test]
+fn r7z_write_lzma2_r7z_reads() {
+    let original = b"LZMA2 round-trip test data";
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("data.bin", original)
+        .compression(r7z::Codec::Lzma2)
+        .build()
+        .expect("LZMA2 build failed");
+
+    let archive = r7z::Archive::from_bytes(bytes).expect("from_bytes failed");
+    let extracted = archive.extract_to_memory(0).unwrap();
+    assert_eq!(extracted.as_slice(), original);
+}
+
 /// r7z builds multi-file archive; p7zip extracts all files correctly.
 #[test]
 fn r7z_write_p7zip_reads_multi_file() {

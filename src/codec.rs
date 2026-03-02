@@ -27,6 +27,20 @@ pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
 /// Codec ID for the no-op copy codec (uncompressed).
 pub const CODEC_COPY: &[u8] = &[0x00];
 
+/// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
+///
+/// The properties byte encodes the maximum dictionary size needed for decompression.
+/// We advertise 32 MB (0x1c), which is sufficient for lzma-rs's default dictionary.
+/// p7zip uses this only for memory estimation — the LZMA2 stream is self-describing.
+pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
+    let mut compressed: Vec<u8> = Vec::new();
+    let mut reader = BufReader::new(Cursor::new(data));
+    lzma_rs::lzma2_compress(&mut reader, &mut compressed)
+        .map_err(|_| R7zError::Decompression)?;
+    // 0x1c → dict_size = 1 << (0x1c/2 + 11) = 1 << 25 = 32 MB
+    Ok((0x1c, compressed))
+}
+
 /// Decompress `input` using the given codec, returning the decompressed bytes.
 ///
 /// * `codec_id`   — codec identifier bytes from CoderInfo
