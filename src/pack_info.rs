@@ -38,7 +38,8 @@ impl PackInfo {
         // Property::Size tag
         let (mut input, _size_marker) = le_u8(input)?;
 
-        let mut pack_size: SmallVec<[u64; 1]> = SmallVec::with_capacity((num_pack_streams as usize).min(input.len()));
+        let mut pack_size: SmallVec<[u64; 1]> =
+            SmallVec::with_capacity((num_pack_streams as usize).min(input.len()));
         for _i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input)?;
             pack_size.push(a_pack_size);
@@ -102,7 +103,8 @@ impl UnpackInfo {
         };
 
         // Parse each folder
-        let mut folders: SmallVec<[Folder; 1]> = SmallVec::with_capacity((num_folders as usize).min(input.len()));
+        let mut folders: SmallVec<[Folder; 1]> =
+            SmallVec::with_capacity((num_folders as usize).min(input.len()));
         let mut input = input;
         for _ in 0..num_folders {
             let (i, folder) = Folder::parse(input)?;
@@ -111,10 +113,14 @@ impl UnpackInfo {
         }
 
         // Total number of out-streams across all folders
-        let total_out_streams: usize = folders.iter().map(super::folder::Folder::total_out_streams).sum();
+        let total_out_streams: usize = folders
+            .iter()
+            .map(super::folder::Folder::total_out_streams)
+            .sum();
 
         // Property-tag loop for CodersUnPackSize and CRC
-        let mut unpack_sizes: SmallVec<[u64; 4]> = SmallVec::with_capacity(total_out_streams.min(input.len()));
+        let mut unpack_sizes: SmallVec<[u64; 4]> =
+            SmallVec::with_capacity(total_out_streams.min(input.len()));
         let mut digests: SmallVec<[Option<u32>; 4]> = SmallVec::new();
 
         loop {
@@ -137,14 +143,13 @@ impl UnpackInfo {
                 _ => {
                     // Skip unknown sections (read size + skip)
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, _) = nom::bytes::complete::take(
-                        usize::try_from(size).map_err(|_| {
+                    let (i, _) =
+                        nom::bytes::complete::take(usize::try_from(size).map_err(|_| {
                             nom::Err::Error(nom::error::Error::new(
                                 input,
                                 nom::error::ErrorKind::TooLarge,
                             ))
-                        })?,
-                    )(i)?;
+                        })?)(i)?;
                     input = i;
                 }
             }
@@ -190,7 +195,8 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
         input
     };
 
-    let mut crcs: SmallVec<[Option<u32>; 4]> = SmallVec::with_capacity(num_streams.min(input.len()));
+    let mut crcs: SmallVec<[Option<u32>; 4]> =
+        SmallVec::with_capacity(num_streams.min(input.len()));
     let mut input = input;
     for is_def in &defined {
         if *is_def {

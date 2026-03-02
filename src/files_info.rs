@@ -161,11 +161,9 @@ impl FilesInfo {
                     mtimes = Vec::with_capacity(n.min(block.len() / 8));
                     let mut pos = data_start;
                     for j in 0..n {
-                        let is_def =
-                            all_defined != 0 || (bitmap[j / 8] >> (j % 8)) & 1 == 1;
+                        let is_def = all_defined != 0 || (bitmap[j / 8] >> (j % 8)) & 1 == 1;
                         if is_def && pos + 8 <= block.len() {
-                            let val =
-                                u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap());
+                            let val = u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap());
                             mtimes.push(Some(val));
                             pos += 8;
                         } else {
@@ -198,11 +196,9 @@ impl FilesInfo {
                     attributes = Vec::with_capacity(n.min(block.len() / 4));
                     let mut pos = data_start;
                     for j in 0..n {
-                        let is_def =
-                            all_defined != 0 || (bitmap[j / 8] >> (j % 8)) & 1 == 1;
+                        let is_def = all_defined != 0 || (bitmap[j / 8] >> (j % 8)) & 1 == 1;
                         if is_def && pos + 4 <= block.len() {
-                            let val =
-                                u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap());
+                            let val = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap());
                             attributes.push(Some(val));
                             pos += 4;
                         } else {

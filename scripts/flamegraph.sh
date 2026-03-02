@@ -12,7 +12,7 @@ FIXTURE="target/bench-fixtures/1mb.7z"
 
 bench_mode() {
     echo "Running cargo bench with pprof flamegraph profiler..."
-    cargo bench --bench comparison -- --profile-time 10
+    cargo bench --bench comparison --profile release -- --profile-time 10
     echo ""
     echo "Flamegraphs written to:"
     find target/criterion -name "flamegraph.svg" | sort

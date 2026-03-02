@@ -13,7 +13,10 @@ fn parse_lzma_coder_info() {
     assert_eq!(coder.codec_id.as_slice(), &[0x03, 0x01, 0x01]);
     assert_eq!(coder.num_in_streams, 1);
     assert_eq!(coder.num_out_streams, 1);
-    assert_eq!(coder.properties.as_deref(), Some(&[0x5d_u8, 0x00, 0x10, 0x00, 0x00][..]));
+    assert_eq!(
+        coder.properties.as_deref(),
+        Some(&[0x5d_u8, 0x00, 0x10, 0x00, 0x00][..])
+    );
 }
 
 #[test]

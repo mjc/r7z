@@ -103,10 +103,9 @@ impl Archive {
                 // Decompress the packed header stream
                 let pi = &encoded_header.pack_info;
                 let ui = &encoded_header.unpack_info;
-                let data_start = 32
-                    + usize::try_from(pi.pack_pos).map_err(|_| R7zError::Parse)?;
-                let data_end = data_start
-                    + usize::try_from(pi.pack_size[0]).map_err(|_| R7zError::Parse)?;
+                let data_start = 32 + usize::try_from(pi.pack_pos).map_err(|_| R7zError::Parse)?;
+                let data_end =
+                    data_start + usize::try_from(pi.pack_size[0]).map_err(|_| R7zError::Parse)?;
                 let packed = &data[data_start..data_end];
                 let folder = ui.folders.first().ok_or(R7zError::Parse)?;
                 let unpack_size = ui.unpack_sizes.first().copied().ok_or(R7zError::Parse)?;
@@ -148,12 +147,9 @@ impl Archive {
     /// realistic platform since 7z archives are limited to far fewer entries.
     #[must_use]
     pub fn num_files(&self) -> usize {
-        self.header
-            .files_info
-            .as_ref()
-            .map_or(0, |f| {
-                usize::try_from(f.num_files).expect("num_files fits in usize")
-            })
+        self.header.files_info.as_ref().map_or(0, |f| {
+            usize::try_from(f.num_files).expect("num_files fits in usize")
+        })
     }
 
     #[must_use]
@@ -196,15 +192,13 @@ impl Archive {
 
         // Decompress the folder
         let folder = &unpack_info.folders[folder_idx];
-        let pack_offset: usize = usize::try_from(
-            pack_info.pack_size[..folder_idx].iter().sum::<u64>(),
-        )
-        .map_err(|_| R7zError::Parse)?;
+        let pack_offset: usize =
+            usize::try_from(pack_info.pack_size[..folder_idx].iter().sum::<u64>())
+                .map_err(|_| R7zError::Parse)?;
         let pack_size =
             usize::try_from(pack_info.pack_size[folder_idx]).map_err(|_| R7zError::Parse)?;
-        let data_start = 32
-            + usize::try_from(pack_info.pack_pos).map_err(|_| R7zError::Parse)?
-            + pack_offset;
+        let data_start =
+            32 + usize::try_from(pack_info.pack_pos).map_err(|_| R7zError::Parse)? + pack_offset;
         let packed = &self.data[data_start..data_start + pack_size];
 
         // Folder unpack size = sum of all out-stream sizes in the unpack_info

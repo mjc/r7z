@@ -11,5 +11,8 @@
         "unpacksizes",
         "varint",
         "varuint"
-    ]
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "cargo search": true
+    }
 }

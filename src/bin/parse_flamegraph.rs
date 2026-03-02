@@ -81,12 +81,20 @@ fn parse_entries(content: &str) -> Vec<Entry> {
         if let Some(end) = chunk.find("</title>") {
             let title = &chunk[..end];
             if let Some((name, samples, percent)) = parse_title(title) {
-                results.push(Entry { name, samples, percent });
+                results.push(Entry {
+                    name,
+                    samples,
+                    percent,
+                });
             }
         }
     }
 
-    results.sort_by(|a, b| b.percent.partial_cmp(&a.percent).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.percent
+            .partial_cmp(&a.percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 
@@ -134,7 +142,10 @@ fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
     }
 
     println!("{}", "-".repeat(90));
-    println!("{:>6.2}%             Total ({} functions shown)", total, shown);
+    println!(
+        "{:>6.2}%             Total ({} functions shown)",
+        total, shown
+    );
 }
 
 fn cmd_search(entries: &[Entry], pattern: &str) {
@@ -168,7 +179,8 @@ fn cmd_syscalls(entries: &[Entry]) {
 
     for e in entries {
         if e.name.starts_with("__x64_sys_") || e.name.starts_with("__x86_sys_") {
-            let syscall_name = e.name
+            let syscall_name = e
+                .name
                 .strip_prefix("__x64_sys_")
                 .or_else(|| e.name.strip_prefix("__x86_sys_"))
                 .unwrap_or(&e.name);
@@ -304,7 +316,12 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
             let display_name = truncate_name(d.name, 42);
             println!(
                 "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {}",
-                d.before_pct, d.after_pct, d.diff_pct, d.before_samples, d.after_samples, display_name
+                d.before_pct,
+                d.after_pct,
+                d.diff_pct,
+                d.before_samples,
+                d.after_samples,
+                display_name
             );
         }
         println!();
@@ -321,7 +338,12 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
             let display_name = truncate_name(d.name, 42);
             println!(
                 "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {}",
-                d.before_pct, d.after_pct, d.diff_pct, d.before_samples, d.after_samples, display_name
+                d.before_pct,
+                d.after_pct,
+                d.diff_pct,
+                d.before_samples,
+                d.after_samples,
+                display_name
             );
         }
         println!();
@@ -345,33 +367,51 @@ fn categorize(name: &str) -> &'static str {
     let lower = name.to_lowercase();
 
     // Cache / foyer (disk cache engine)
-    if lower.contains("foyer") || lower.contains("hybrid_cache") || lower.contains("hybridarticle")
-        || lower.contains("article_cache") || lower.contains("unified_cache")
-        || lower.contains("cache::") || lower.contains("moka")
+    if lower.contains("foyer")
+        || lower.contains("hybrid_cache")
+        || lower.contains("hybridarticle")
+        || lower.contains("article_cache")
+        || lower.contains("unified_cache")
+        || lower.contains("cache::")
+        || lower.contains("moka")
     {
         return "Cache/Foyer";
     }
 
     // NNTP protocol handling
-    if lower.contains("nntp") || lower.contains("precheck") || lower.contains("article_routing")
-        || lower.contains("client_session") || lower.contains("backend_execution")
-        || lower.contains("command_guard") || lower.contains("route_command")
-        || lower.contains("status_code") || lower.contains("message_id")
+    if lower.contains("nntp")
+        || lower.contains("precheck")
+        || lower.contains("article_routing")
+        || lower.contains("client_session")
+        || lower.contains("backend_execution")
+        || lower.contains("command_guard")
+        || lower.contains("route_command")
+        || lower.contains("status_code")
+        || lower.contains("message_id")
     {
         return "NNTP Protocol";
     }
 
     // TLS / crypto
-    if lower.contains("tls") || lower.contains("ssl") || lower.contains("rustls")
-        || lower.contains("aes") || lower.contains("cipher") || lower.contains("encrypt")
-        || lower.contains("decrypt") || lower.contains("handshake") || lower.contains("aws_lc")
-        || lower.contains("ring::") || lower.contains("chacha")
+    if lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("rustls")
+        || lower.contains("aes")
+        || lower.contains("cipher")
+        || lower.contains("encrypt")
+        || lower.contains("decrypt")
+        || lower.contains("handshake")
+        || lower.contains("aws_lc")
+        || lower.contains("ring::")
+        || lower.contains("chacha")
     {
         return "TLS/Crypto";
     }
 
     // Compression (LZ4 for foyer disk cache)
-    if lower.contains("lz4") || lower.contains("compress") || lower.contains("decompress")
+    if lower.contains("lz4")
+        || lower.contains("compress")
+        || lower.contains("decompress")
         || lower.contains("zstd")
     {
         return "Compression";
@@ -384,25 +424,41 @@ fn categorize(name: &str) -> &'static str {
     }
 
     // Network I/O
-    if lower.contains("recv") || lower.contains("send") || lower.contains("tcp")
-        || lower.contains("socket") || lower.contains("inet") || lower.contains("skb")
+    if lower.contains("recv")
+        || lower.contains("send")
+        || lower.contains("tcp")
+        || lower.contains("socket")
+        || lower.contains("inet")
+        || lower.contains("skb")
         || lower.contains("net_")
     {
         return "Network I/O";
     }
 
     // Disk I/O
-    if lower.contains("zfs") || lower.contains("zpl") || lower.contains("zil")
-        || lower.contains("vfs") || lower.contains("write_all") || lower.contains("ext4")
-        || lower.contains("xfs") || lower.contains("btrfs") || lower.contains("block_")
-        || lower.contains("io_uring") || lower.contains("pread") || lower.contains("pwrite")
+    if lower.contains("zfs")
+        || lower.contains("zpl")
+        || lower.contains("zil")
+        || lower.contains("vfs")
+        || lower.contains("write_all")
+        || lower.contains("ext4")
+        || lower.contains("xfs")
+        || lower.contains("btrfs")
+        || lower.contains("block_")
+        || lower.contains("io_uring")
+        || lower.contains("pread")
+        || lower.contains("pwrite")
     {
         return "Disk I/O";
     }
 
     // Locks / synchronization
-    if lower.contains("futex") || lower.contains("mutex") || lower.contains("lock")
-        || lower.contains("rwlock") || lower.contains("semaphore") || lower.contains("parking_lot")
+    if lower.contains("futex")
+        || lower.contains("mutex")
+        || lower.contains("lock")
+        || lower.contains("rwlock")
+        || lower.contains("semaphore")
+        || lower.contains("parking_lot")
     {
         return "Locks/Futex";
     }
@@ -428,15 +484,21 @@ fn categorize(name: &str) -> &'static str {
     }
 
     // Memory allocation
-    if lower.contains("alloc") || lower.contains("malloc") || lower.contains("free")
-        || lower.contains("mmap") || lower.contains("brk") || lower.contains("jemalloc")
+    if lower.contains("alloc")
+        || lower.contains("malloc")
+        || lower.contains("free")
+        || lower.contains("mmap")
+        || lower.contains("brk")
+        || lower.contains("jemalloc")
     {
         return "Memory";
     }
 
     // Raw syscalls
-    if name.starts_with("__x64_sys_") || name.starts_with("syscall")
-        || name.starts_with("do_syscall") || name.starts_with("entry_SYSCALL")
+    if name.starts_with("__x64_sys_")
+        || name.starts_with("syscall")
+        || name.starts_with("do_syscall")
+        || name.starts_with("entry_SYSCALL")
     {
         return "Syscall";
     }

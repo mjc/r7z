@@ -5,8 +5,41 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use memmap2::Mmap;
 use std::fs::File;
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// In-process flamegraph profiler wired to criterion 0.8's `Profiler` trait.
+///
+/// pprof's own `criterion` feature targets criterion 0.5 and won't compile
+/// against 0.8. We implement the trait directly using pprof's `ProfilerGuard`.
+struct FlamegraphProfiler<'a> {
+    frequency: i32,
+    guard: Option<pprof::ProfilerGuard<'a>>,
+}
+
+impl<'a> FlamegraphProfiler<'a> {
+    fn new(frequency: i32) -> Self {
+        Self {
+            frequency,
+            guard: None,
+        }
+    }
+}
+
+impl<'a> criterion::profiler::Profiler for FlamegraphProfiler<'a> {
+    fn start_profiling(&mut self, _id: &str, _dir: &Path) {
+        self.guard = Some(pprof::ProfilerGuard::new(self.frequency).unwrap());
+    }
+
+    fn stop_profiling(&mut self, _id: &str, dir: &Path) {
+        if let Some(guard) = self.guard.take() {
+            let report = guard.report().build().expect("pprof report failed");
+            std::fs::create_dir_all(dir).unwrap();
+            let svg = File::create(dir.join("flamegraph.svg")).unwrap();
+            report.flamegraph(svg).expect("flamegraph write failed");
+        }
+    }
+}
 
 /// Memory-map a file and return a `Bytes` backed by the mapping.
 ///
@@ -106,22 +139,30 @@ fn archive_10gb_path() -> PathBuf {
 // Lazy archive bytes for r7z operations — stored as Bytes so clone() is O(1).
 fn archive_1mb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| mmap_bytes(&archive_1mb_path())).clone()
+    BYTES
+        .get_or_init(|| mmap_bytes(&archive_1mb_path()))
+        .clone()
 }
 
 fn archive_10mb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| mmap_bytes(&archive_10mb_path())).clone()
+    BYTES
+        .get_or_init(|| mmap_bytes(&archive_10mb_path()))
+        .clone()
 }
 
 fn archive_1gb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| mmap_bytes(&archive_1gb_path())).clone()
+    BYTES
+        .get_or_init(|| mmap_bytes(&archive_1gb_path()))
+        .clone()
 }
 
 fn archive_10gb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| mmap_bytes(&archive_10gb_path())).clone()
+    BYTES
+        .get_or_init(|| mmap_bytes(&archive_10gb_path()))
+        .clone()
 }
 
 // Generate a compressible repeating payload of `size` bytes.
@@ -327,13 +368,9 @@ fn p7zip_extract_1mb(c: &mut Criterion) {
 // Criterion Configuration
 // ============================================================================
 
-// Flamegraph generation is handled by scripts/flamegraph.sh (pprof-rs via
-// cargo-flamegraph), not via criterion's with_profiler hook, since pprof-rs
-// is not yet compatible with criterion 0.8.
-
 criterion_group! {
     name = r7z_benches;
-    config = Criterion::default();
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
     targets = r7z_open_1mb, r7z_open_10mb, r7z_open_1gb, r7z_open_10gb,
               r7z_extract_1mb, r7z_extract_10mb, r7z_extract_1gb, r7z_extract_10gb,
               r7z_build_1mb, r7z_build_10mb, r7z_build_1gb, r7z_build_10gb

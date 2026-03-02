@@ -84,8 +84,7 @@ fn decompress_lzma(
     stream.extend_from_slice(input);
 
     let mut reader = BufReader::new(Cursor::new(stream));
-    let mut output =
-        Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
+    let mut output = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
     lzma_rs::lzma_decompress(&mut reader, &mut output).map_err(|_| R7zError::Decompression)?;
     Ok(output)
 }

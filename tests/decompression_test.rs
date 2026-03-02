@@ -23,7 +23,10 @@ fn decompress_lzma_packed_header() {
     let unpack_size = ui.unpack_sizes[0];
     let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();
 
-    assert_eq!(decompressed.len(), usize::try_from(unpack_size).expect("unpack_size fits in usize"));
+    assert_eq!(
+        decompressed.len(),
+        usize::try_from(unpack_size).expect("unpack_size fits in usize")
+    );
 }
 
 #[test]
@@ -46,7 +49,10 @@ fn archive_open_and_decompress_header_stream() {
     let unpack_size = ui.unpack_sizes[0];
     let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();
 
-    assert_eq!(decompressed.len(), usize::try_from(unpack_size).expect("unpack_size fits in usize"));
+    assert_eq!(
+        decompressed.len(),
+        usize::try_from(unpack_size).expect("unpack_size fits in usize")
+    );
 
     // The decompressed bytes should start with a valid 7z property tag
     // (Header = 0x01 or EncodedHeader = 0x17, typically 0x01 for the full header)
