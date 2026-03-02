@@ -1,10 +1,15 @@
 use crate::{sevenzip_varuint64_decode, PackInfo, Property, UnpackInfo};
 use nom::{number::streaming::le_u8, IResult, ToUsize};
 
+/// Per-file stream metadata within a solid (multi-file) folder.
 #[derive(Debug, PartialEq)]
 pub struct SubstreamInfo {
+    /// Number of files (data streams) stored in each folder.
     pub num_unpack_streams_per_folder: Vec<u64>,
+    /// Explicit uncompressed sizes for each stream except the last per folder.
+    /// The last stream's size is implicit: `folder_unpack_size - sum(explicit)`.
     pub unpack_sizes: Vec<u64>,
+    /// CRC32 digest per stream (may be absent for some or all streams).
     pub digests: Vec<Option<u32>>,
 }
 
@@ -113,11 +118,16 @@ fn parse_stream_digests(input: &[u8], num: usize) -> IResult<&[u8], Vec<Option<u
     Ok((input, crcs))
 }
 
-/// StreamsInfo ties together PackInfo, UnpackInfo, and optional SubstreamInfo.
+/// Ties together [`PackInfo`], [`UnpackInfo`], and optional [`SubstreamInfo`].
+///
+/// This is the top-level streams descriptor embedded in the 7z `Header`.
 #[derive(Debug, PartialEq)]
 pub struct StreamInfo {
+    /// Location and sizes of packed (compressed) data in the archive file.
     pub pack_info: Option<PackInfo>,
+    /// Folder/coder layout and uncompressed sizes.
     pub unpack_info: Option<UnpackInfo>,
+    /// Per-file stream breakdown within solid folders (absent for single-file folders).
     pub substream_info: Option<SubstreamInfo>,
 }
 

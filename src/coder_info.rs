@@ -1,11 +1,19 @@
 use crate::sevenzip_varuint64_decode;
 use nom::{bytes::streaming::take, number::streaming::le_u8, IResult};
 
+/// A single coder (codec) within a [`Folder`](crate::Folder).
+///
+/// Each `CoderInfo` identifies a codec by its ID bytes and carries optional
+/// codec-specific properties (e.g. LZMA dictionary/mode settings).
 #[derive(Debug, PartialEq)]
 pub struct CoderInfo {
+    /// Codec identifier bytes (e.g. `[0x03, 0x01, 0x01]` = LZMA, `[0x21]` = LZMA2).
     pub codec_id: Vec<u8>,
+    /// Number of input streams consumed by this coder.
     pub num_in_streams: u64,
+    /// Number of output streams produced by this coder.
     pub num_out_streams: u64,
+    /// Codec-specific properties (e.g. 5 bytes for LZMA, 1 byte for LZMA2).
     pub properties: Option<Vec<u8>>,
 }
 

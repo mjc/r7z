@@ -6,9 +6,16 @@ use nom::{
     IResult,
 };
 
+/// The outer `EncodedHeader` block that describes where the compressed main header lives.
+///
+/// Most 7z archives compress their metadata (the `Header`) using LZMA; the
+/// `EncodedHeader` provides the [`PackInfo`] and [`UnpackInfo`] needed to locate
+/// and decompress it.
 #[derive(Debug, PartialEq)]
 pub struct EncodedHeader {
+    /// Where the compressed header stream is stored.
     pub pack_info: PackInfo,
+    /// How to decompress the header stream.
     pub unpack_info: UnpackInfo,
 }
 
@@ -26,10 +33,12 @@ impl EncodedHeader {
     }
 }
 
-/// Fully decoded 7z archive header.
+/// The fully decoded 7z archive header containing stream and file metadata.
 #[derive(Debug)]
 pub struct Header {
+    /// Stream descriptor for the file data (absent in empty archives).
     pub main_streams_info: Option<StreamInfo>,
+    /// File listing with names, timestamps, and attributes.
     pub files_info: Option<FilesInfo>,
 }
 
@@ -91,15 +100,25 @@ impl Header {
     }
 }
 
-// TODO: getters, setters, constructor, etc.
+/// The 32-byte fixed-size header at the start of every 7z archive.
+///
+/// Contains the magic bytes, format version, and the location and CRC of the
+/// next header (either an [`EncodedHeader`] or a plain `Header`).
 #[derive(Debug, PartialEq)]
 pub struct SignatureHeader {
-    pub signature: Vec<u8>, // always b'7z\xbc\xaf\x27\x1c'
-    pub major_version: u8,  // always b'\x00'
-    pub minor_version: u8,  // always b'\x04'
+    /// Magic bytes: `37 7a bc af 27 1c`.
+    pub signature: Vec<u8>,
+    /// Format major version (always `0x00`).
+    pub major_version: u8,
+    /// Format minor version (typically `0x04`).
+    pub minor_version: u8,
+    /// CRC32 of the 20-byte start-header fields that follow.
     pub start_header_crc: u32,
+    /// Byte offset from the end of this 32-byte header to the next header block.
     pub next_header_offset: u64,
+    /// Byte length of the next header block.
     pub next_header_size: u64,
+    /// CRC32 of the next header block.
     pub next_header_crc: u32,
 }
 

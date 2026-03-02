@@ -5,10 +5,15 @@ use nom::{
 
 use crate::{sevenzip_varuint64_decode, Folder, Property};
 
+/// Describes where the packed (compressed) data streams live in the archive file.
 #[derive(Debug, PartialEq)]
 pub struct PackInfo {
+    /// Byte offset of the first packed stream, measured from the end of the
+    /// 32-byte [`SignatureHeader`](crate::SignatureHeader).
     pub pack_pos: u64,
+    /// Number of packed streams.
     pub num_pack_streams: u64,
+    /// Compressed size of each packed stream in bytes.
     pub pack_size: Vec<u64>,
 }
 
@@ -50,11 +55,16 @@ impl PackInfo {
     }
 }
 
+/// Describes the decompression structure: folders, their coders, and output sizes.
 #[derive(Debug, PartialEq)]
 pub struct UnpackInfo {
+    /// Number of compression folders.
     pub num_folders: u64,
+    /// One [`Folder`] per compression unit.
     pub folders: Vec<Folder>,
+    /// Uncompressed (output) size for each coder out-stream across all folders.
     pub unpack_sizes: Vec<u64>,
+    /// Optional CRC32 digest per folder (used to verify decompressed output).
     pub digests: Vec<Option<u32>>,
 }
 

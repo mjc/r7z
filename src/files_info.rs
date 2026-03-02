@@ -1,13 +1,20 @@
 use crate::{sevenzip_varuint64_decode, Property};
 use nom::{bytes::streaming::take, number::streaming::le_u8, IResult};
 
+/// File listing metadata from the 7z `FilesInfo` block.
 #[derive(Debug, PartialEq)]
 pub struct FilesInfo {
+    /// Total number of entries (files + directories).
     pub num_files: u64,
+    /// File/directory names in archive order (UTF-8, decoded from UTF-16LE).
     pub names: Vec<String>,
+    /// Last-modified timestamps as Windows FILETIME values (100ns intervals since 1601-01-01).
     pub mtimes: Vec<Option<u64>>,
+    /// Windows file attributes per entry.
     pub attributes: Vec<Option<u32>>,
+    /// `true` for entries with no data stream (directories, zero-byte files).
     pub empty_streams: Vec<bool>,
+    /// `true` for entries that are genuinely zero-byte files (subset of `empty_streams`).
     pub empty_files: Vec<bool>,
 }
 

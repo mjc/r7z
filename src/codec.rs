@@ -18,10 +18,13 @@ pub fn compress_lzma(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
     Ok((props, compressed))
 }
 
-/// Well-known codec IDs used by 7z.
+/// Codec ID for LZMA (classic, used in older 7z archives and header streams).
 pub const CODEC_LZMA: &[u8] = &[0x03, 0x01, 0x01];
+/// Codec ID for LZMA2 (used in modern 7z archives).
 pub const CODEC_LZMA2: &[u8] = &[0x21];
+/// Codec ID for the x86 BCJ (Branch/Call/Jump) filter.
 pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
+/// Codec ID for the no-op copy codec (uncompressed).
 pub const CODEC_COPY: &[u8] = &[0x00];
 
 /// Decompress `input` using the given codec, returning the decompressed bytes.

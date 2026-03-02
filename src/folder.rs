@@ -1,14 +1,22 @@
 use crate::{sevenzip_varuint64_decode, CoderInfo};
 use nom::IResult;
 
+/// A compression folder — one or more chained coders applied to a set of streams.
+///
+/// In the common case a folder contains a single [`CoderInfo`] with no bind pairs.
+/// Complex archives may chain multiple coders (e.g. BCJ + LZMA).
 #[derive(Debug, PartialEq)]
 pub struct Folder {
+    /// Ordered list of coders in this folder.
     pub coders: Vec<CoderInfo>,
+    /// Bind pairs connecting coder output streams to coder input streams.
     pub bind_pairs: Vec<(u64, u64)>,
+    /// Indices of packed (externally stored) input streams (empty when there is one).
     pub packed_indices: Vec<u64>,
 }
 
 impl Folder {
+    /// Total number of output streams across all coders in this folder.
     pub fn total_out_streams(&self) -> usize {
         self.coders.iter().map(|c| c.num_out_streams as usize).sum()
     }

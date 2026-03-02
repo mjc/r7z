@@ -1,3 +1,25 @@
+//! # r7z
+//!
+//! A pure-Rust library for reading and writing 7z (`.7z`) archives.
+//!
+//! ## Reading
+//!
+//! ```rust,no_run
+//! let archive = r7z::Archive::open(std::path::Path::new("my.7z")).unwrap();
+//! println!("{} files", archive.num_files());
+//! let bytes = archive.extract_to_memory(0).unwrap();
+//! ```
+//!
+//! ## Writing
+//!
+//! ```rust,no_run
+//! let bytes = r7z::ArchiveBuilder::new()
+//!     .add_file("hello.txt", b"Hello, world!")
+//!     .build()
+//!     .unwrap();
+//! std::fs::write("out.7z", bytes).unwrap();
+//! ```
+
 extern crate num;
 #[macro_use]
 extern crate num_derive;
