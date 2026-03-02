@@ -1,5 +1,6 @@
 use crate::{sevenzip_varuint64_decode, CoderInfo};
 use nom::IResult;
+use smallvec::SmallVec;
 
 /// A compression folder — one or more chained coders applied to a set of streams.
 ///
@@ -8,11 +9,12 @@ use nom::IResult;
 #[derive(Debug, PartialEq)]
 pub struct Folder {
     /// Ordered list of coders in this folder.
-    pub coders: Vec<CoderInfo>,
+    /// Typically 1 (simple archive) or 2 (e.g. BCJ + LZMA); stays on the stack.
+    pub coders: SmallVec<[CoderInfo; 2]>,
     /// Bind pairs connecting coder output streams to coder input streams.
-    pub bind_pairs: Vec<(u64, u64)>,
+    pub bind_pairs: SmallVec<[(u64, u64); 1]>,
     /// Indices of packed (externally stored) input streams (empty when there is one).
-    pub packed_indices: Vec<u64>,
+    pub packed_indices: SmallVec<[u64; 1]>,
 }
 
 impl Folder {
@@ -36,7 +38,7 @@ impl Folder {
     /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
-        let mut coders = Vec::with_capacity(num_coders as usize);
+        let mut coders: SmallVec<[CoderInfo; 2]> = SmallVec::with_capacity(num_coders as usize);
         let mut input = input;
         for _ in 0..num_coders {
             let (i, coder) = CoderInfo::parse(input)?;
@@ -48,7 +50,7 @@ impl Folder {
         let num_out_total: u64 = coders.iter().map(|c| c.num_out_streams).sum();
         let num_bind_pairs = num_out_total.saturating_sub(1);
 
-        let mut bind_pairs = Vec::with_capacity(num_bind_pairs as usize);
+        let mut bind_pairs: SmallVec<[(u64, u64); 1]> = SmallVec::with_capacity(num_bind_pairs as usize);
         for _ in 0..num_bind_pairs {
             let (i, in_idx) = sevenzip_varuint64_decode(input)?;
             let (i, out_idx) = sevenzip_varuint64_decode(i)?;
@@ -59,7 +61,7 @@ impl Folder {
         // NumPackedStreams = NumInStreams_Total - NumBindPairs
         // Only written explicitly when NumPackedStreams != 1
         let num_packed = num_in_total - num_bind_pairs;
-        let mut packed_indices = Vec::new();
+        let mut packed_indices: SmallVec<[u64; 1]> = SmallVec::new();
         if num_packed != 1 {
             packed_indices.reserve_exact(num_packed as usize);
             for _ in 0..num_packed {

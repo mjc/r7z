@@ -1,4 +1,5 @@
 use nom::{number::complete::le_u8, IResult, ToUsize};
+use smallvec::SmallVec;
 
 use crate::{sevenzip_varuint64_decode, Folder, Property};
 
@@ -11,7 +12,8 @@ pub struct PackInfo {
     /// Number of packed streams.
     pub num_pack_streams: u64,
     /// Compressed size of each packed stream in bytes.
-    pub pack_size: Vec<u64>,
+    /// Nearly always length 1; stays on the stack for the common case.
+    pub pack_size: SmallVec<[u64; 1]>,
 }
 
 impl PackInfo {
@@ -36,7 +38,7 @@ impl PackInfo {
         // Property::Size tag
         let (mut input, _size_marker) = le_u8(input)?;
 
-        let mut pack_size = Vec::with_capacity(num_pack_streams as usize);
+        let mut pack_size: SmallVec<[u64; 1]> = SmallVec::with_capacity(num_pack_streams as usize);
         for _i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input)?;
             pack_size.push(a_pack_size);
@@ -63,11 +65,12 @@ pub struct UnpackInfo {
     /// Number of compression folders.
     pub num_folders: u64,
     /// One [`Folder`] per compression unit.
-    pub folders: Vec<Folder>,
+    /// Nearly always length 1; stays on the stack for the common case.
+    pub folders: SmallVec<[Folder; 1]>,
     /// Uncompressed (output) size for each coder out-stream across all folders.
-    pub unpack_sizes: Vec<u64>,
+    pub unpack_sizes: SmallVec<[u64; 4]>,
     /// Optional CRC32 digest per folder (used to verify decompressed output).
-    pub digests: Vec<Option<u32>>,
+    pub digests: SmallVec<[Option<u32>; 4]>,
 }
 
 impl UnpackInfo {
@@ -99,7 +102,7 @@ impl UnpackInfo {
         };
 
         // Parse each folder
-        let mut folders = Vec::with_capacity(num_folders as usize);
+        let mut folders: SmallVec<[Folder; 1]> = SmallVec::with_capacity(num_folders as usize);
         let mut input = input;
         for _ in 0..num_folders {
             let (i, folder) = Folder::parse(input)?;
@@ -111,8 +114,8 @@ impl UnpackInfo {
         let total_out_streams: usize = folders.iter().map(super::folder::Folder::total_out_streams).sum();
 
         // Property-tag loop for CodersUnPackSize and CRC
-        let mut unpack_sizes = Vec::with_capacity(total_out_streams);
-        let mut digests: Vec<Option<u32>> = Vec::new();
+        let mut unpack_sizes: SmallVec<[u64; 4]> = SmallVec::with_capacity(total_out_streams);
+        let mut digests: SmallVec<[Option<u32>; 4]> = SmallVec::new();
 
         loop {
             let (i, tag) = Property::parse(input)?;
@@ -164,7 +167,7 @@ impl UnpackInfo {
 }
 
 /// Parse CRC digests for `num_streams` streams using `AllAreDefined` + optional bitmap.
-fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], Vec<Option<u32>>> {
+fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[Option<u32>; 4]>> {
     use nom::number::complete::le_u32;
 
     let (input, all_defined) = le_u8(input)?;
@@ -187,7 +190,7 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], Vec<Option<
         input
     };
 
-    let mut crcs = Vec::new();
+    let mut crcs: SmallVec<[Option<u32>; 4]> = SmallVec::with_capacity(num_streams);
     let mut input = input;
     for is_def in &defined {
         if *is_def {
