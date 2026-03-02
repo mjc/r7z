@@ -149,19 +149,17 @@ impl Archive {
     /// realistic platform since 7z archives are limited to far fewer entries.
     #[must_use]
     pub fn num_files(&self) -> usize {
-        self.header.files_info.as_ref().map_or(0, |f| {
-            usize::try_from(f.num_files).expect("num_files fits in usize")
-        })
+        usize::try_from(self.header.num_files()).unwrap_or(0)
     }
 
     #[must_use]
     pub fn files_info(&self) -> Option<&FilesInfo> {
-        self.header.files_info.as_ref()
+        self.header.files_info()
     }
 
     #[must_use]
     pub fn streams_info(&self) -> Option<&StreamInfo> {
-        self.header.main_streams_info.as_ref()
+        self.header.streams_info()
     }
 
     /// Extract a single file by its index in the `FilesInfo` list to memory.
@@ -180,7 +178,7 @@ impl Archive {
         let substream_info = streams.substream_info.as_ref();
 
         // Map file_index → (data_stream_index) by skipping empty files
-        let fi = self.header.files_info.as_ref();
+        let fi = self.header.files_info();
         let data_stream_idx = file_to_data_stream(file_index, fi);
         let data_stream_idx = data_stream_idx.ok_or(R7zError::Parse)?;
 
@@ -223,7 +221,7 @@ impl Archive {
     /// that [`extract_to_memory`](Self::extract_to_memory) can return.
     pub fn extract_all(&self, dest: &Path) -> Result<(), R7zError> {
         let num = self.num_files();
-        let fi = self.header.files_info.as_ref();
+        let fi = self.header.files_info();
 
         for i in 0..num {
             let name_owned = fi.and_then(|f| f.name(i));

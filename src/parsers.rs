@@ -1,4 +1,4 @@
-use nom::IResult;
+use nom::{bytes::complete::take, number::complete::le_u8, IResult};
 
 /// Saturate a `u64` count down to `usize`, capped at `max` so that
 /// `with_capacity` / `reserve_exact` never over-allocates more than the input
@@ -72,4 +72,26 @@ pub fn sevenzip_varuint64_decode(input: &[u8]) -> IResult<&[u8], u64> {
         mask >>= 1;
     }
     Ok((&input[addr..], value))
+}
+
+/// Walk a digest (CRC32) block without allocating.
+///
+/// Reads the `AllAreDefined` flag, optional bitmap, and the corresponding
+/// `le_u32` CRC values, advancing past all of them.  Returns `()` — no data
+/// is retained.
+///
+/// # Errors
+///
+/// Returns a nom error if the input is truncated.
+pub(crate) fn scan_digests(input: &[u8], num: usize) -> IResult<&[u8], ()> {
+    let (input, all_defined) = le_u8(input)?;
+    if all_defined != 0 {
+        let (input, _) = take(num * 4)(input)?;
+        return Ok((input, ()));
+    }
+    let num_bytes = num.div_ceil(8);
+    let (input, bitmap) = take(num_bytes)(input)?;
+    let num_defined = (0..num).filter(|&i| (bitmap[i / 8] >> (i % 8)) & 1 == 1).count();
+    let (input, _) = take(num_defined * 4)(input)?;
+    Ok((input, ()))
 }

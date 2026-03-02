@@ -3,6 +3,7 @@ use smallvec::SmallVec;
 
 use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
 use crate::folder::scan_folder;
+use crate::parsers::scan_digests;
 
 /// Describes where the packed (compressed) data streams live in the archive file.
 #[derive(Debug, PartialEq)]
@@ -223,6 +224,108 @@ impl UnpackInfo {
             },
         ))
     }
+}
+
+/// Walk a `PackInfo` block without allocating.  Used for header validation.
+///
+/// # Errors
+///
+/// Returns a nom error if the input is truncated or does not start with the `PackInfo` tag.
+pub(crate) fn scan_pack_info(input: &[u8]) -> IResult<&[u8], ()> {
+    let orig = input;
+    let (input, tag) = Property::parse(input)?;
+    if tag != Property::PackInfo {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            orig,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
+    let (input, _pack_pos) = sevenzip_varuint64_decode(input)?;
+    let (input, num_pack_streams) = sevenzip_varuint64_decode(input)?;
+    let (mut input, _size_marker) = le_u8(input)?;
+    for _ in 0..num_pack_streams {
+        let (i, _) = sevenzip_varuint64_decode(input)?;
+        input = i;
+    }
+    let (input, _end) = le_u8(input)?;
+    Ok((input, ()))
+}
+
+/// Walk an `UnpackInfo` block without allocating.  Returns the number of folders.
+///
+/// Validates the folder layout via [`scan_folder`], then walks the
+/// `CodersUnPackSize` and optional `CRC` sections.
+///
+/// # Errors
+///
+/// Returns a nom error if the input is truncated or does not start with the
+/// `UnPackInfo` tag.
+pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
+    let orig = input;
+    let (input, tag) = Property::parse(input)?;
+    if tag != Property::UnPackInfo {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            orig,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
+
+    let (input, _folder_marker) = le_u8(input)?;
+    let (input, num_folders) = sevenzip_varuint64_decode(input)?;
+    let (input, is_external) = le_u8(input)?;
+
+    let input = if is_external != 0 {
+        let (input, _) = sevenzip_varuint64_decode(input)?;
+        input
+    } else {
+        input
+    };
+
+    let mut total_out_streams: usize = 0;
+    let mut input = input;
+    for _ in 0..num_folders {
+        let (i, out_streams) = scan_folder(input)?;
+        total_out_streams += out_streams;
+        input = i;
+    }
+
+    let nf = usize::try_from(num_folders).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+
+    loop {
+        let (i, tag) = Property::parse(input)?;
+        input = i;
+        match tag {
+            Property::END => break,
+            Property::CodersUnPackSize => {
+                for _ in 0..total_out_streams {
+                    let (i, _) = sevenzip_varuint64_decode(input)?;
+                    input = i;
+                }
+            }
+            Property::CRC => {
+                let (i, ()) = scan_digests(input, nf)?;
+                input = i;
+            }
+            _ => {
+                let (i, size) = sevenzip_varuint64_decode(input)?;
+                let sz = usize::try_from(size).map_err(|_| {
+                    nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                let (i, _) = nom::bytes::complete::take(sz)(i)?;
+                input = i;
+            }
+        }
+    }
+
+    Ok((input, nf))
 }
 
 /// Parse CRC digests for `num_streams` streams using `AllAreDefined` + optional bitmap.

@@ -1,3 +1,5 @@
+use crate::pack_info::{scan_pack_info, scan_unpack_info};
+use crate::parsers::scan_digests;
 use crate::{sevenzip_varuint64_decode, PackInfo, Property, UnpackInfo};
 use nom::{number::complete::le_u8, IResult, ToUsize};
 
@@ -212,4 +214,121 @@ impl StreamInfo {
             },
         ))
     }
+}
+
+// ── zero-alloc scanners ──────────────────────────────────────────────────────
+
+/// Walk a `SubstreamInfo` block without allocating.
+///
+/// # Errors
+///
+/// Returns a nom error if the input is truncated or does not start with the
+/// `SubStreamsInfo` property tag.
+fn scan_substream_info(input: &[u8], num_folders: usize) -> IResult<&[u8], ()> {
+    let orig = input;
+    let (input, tag) = Property::parse(input)?;
+    if tag != Property::SubStreamsInfo {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            orig,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
+
+    let mut sizes_to_read = 0usize;
+    let mut total_streams = num_folders; // default: 1 stream per folder
+    let mut input = input;
+
+    loop {
+        let (i, tag) = Property::parse(input)?;
+        input = i;
+        match tag {
+            Property::END => break,
+            Property::NumUnPackStream => {
+                sizes_to_read = 0;
+                total_streams = 0;
+                for _ in 0..num_folders {
+                    let (i, n) = sevenzip_varuint64_decode(input)?;
+                    let nu = n.to_usize();
+                    sizes_to_read += nu.saturating_sub(1);
+                    total_streams += nu;
+                    input = i;
+                }
+            }
+            Property::Size => {
+                for _ in 0..sizes_to_read {
+                    let (i, _) = sevenzip_varuint64_decode(input)?;
+                    input = i;
+                }
+            }
+            Property::CRC => {
+                let (i, ()) = scan_digests(input, total_streams)?;
+                input = i;
+            }
+            _ => {
+                let (i, size) = sevenzip_varuint64_decode(input)?;
+                let sz = usize::try_from(size).map_err(|_| {
+                    nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                let (i, _) = nom::bytes::complete::take(sz)(i)?;
+                input = i;
+            }
+        }
+    }
+
+    Ok((input, ()))
+}
+
+/// Walk a `StreamInfo` block (`PackInfo` + `UnpackInfo` + `SubstreamInfo`)
+/// without allocating.  Used for header validation.
+///
+/// Expects the input to start *after* the `MainStreamsInfo` tag (the caller
+/// has already consumed it).
+///
+/// # Errors
+///
+/// Returns a nom error if the input is truncated or malformed.
+pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
+    let mut num_folders = 0usize;
+    let mut input = input;
+
+    loop {
+        let (i, tag) = Property::parse(input)?;
+        match tag {
+            Property::END => {
+                input = i;
+                break;
+            }
+            Property::PackInfo => {
+                // input still includes the PackInfo tag
+                let (i, ()) = scan_pack_info(input)?;
+                input = i;
+            }
+            Property::UnPackInfo => {
+                let (i, nf) = scan_unpack_info(input)?;
+                num_folders = nf;
+                input = i;
+            }
+            Property::SubStreamsInfo => {
+                let (i, ()) = scan_substream_info(input, num_folders)?;
+                input = i;
+            }
+            _ => {
+                input = i;
+                let (i, size) = sevenzip_varuint64_decode(input)?;
+                let sz = usize::try_from(size).map_err(|_| {
+                    nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                let (i, _) = nom::bytes::complete::take(sz)(i)?;
+                input = i;
+            }
+        }
+    }
+
+    Ok((input, ()))
 }

@@ -258,3 +258,46 @@ impl FilesInfo {
         ))
     }
 }
+
+/// Walk a `FilesInfo` block without allocating.  Returns `num_files`.
+///
+/// Every sub-property is size-prefixed, so we simply verify the tag, read
+/// `num_files`, then skip each sub-block by its declared size until `END`.
+///
+/// # Errors
+///
+/// Returns a nom error if the input is truncated or does not start with
+/// the `FilesInfo` property tag.
+pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
+    let orig = input;
+    let (input, tag) = Property::parse(input)?;
+    if tag != Property::FilesInfo {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            orig,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
+
+    let (input, num_files) = sevenzip_varuint64_decode(input)?;
+    let mut input = input;
+
+    loop {
+        let (i, tag) = Property::parse(input)?;
+        input = i;
+        if tag == Property::END {
+            break;
+        }
+        // All FilesInfo sub-properties are size-prefixed
+        let (i, size) = sevenzip_varuint64_decode(input)?;
+        let sz = usize::try_from(size).map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+        let (i, _) = take(sz)(i)?;
+        input = i;
+    }
+
+    Ok((input, num_files))
+}
