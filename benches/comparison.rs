@@ -6,16 +6,16 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 /// Memory-map a file and return a `Bytes` backed by the mapping.
 ///
 /// The OS pages the file on demand — no heap allocation proportional to file size.
 fn mmap_bytes(path: &PathBuf) -> Bytes {
     let file = File::open(path).expect("failed to open fixture");
-    // SAFETY: we hold the file open for the lifetime of the Mmap, and the
-    // benchmark process does not modify the fixture files.
-    let mmap = Arc::new(unsafe { Mmap::map(&file).expect("mmap failed") });
+    // SAFETY: we do not modify the fixture files during the benchmark process.
+    // On Linux the mapping stays valid after the File is dropped.
+    let mmap = unsafe { Mmap::map(&file).expect("mmap failed") };
     Bytes::from_owner(mmap)
 }
 
