@@ -301,3 +301,52 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
 
     Ok((input, num_files))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::scan_files_info;
+
+    /// Minimal: 3 files, no sub-properties.
+    #[test]
+    fn scan_files_info_no_props() {
+        // FilesInfo (0x05), num_files=3, END (0x00)
+        let input = [0x05u8, 0x03, 0x00];
+        let (rem, n) = scan_files_info(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(n, 3);
+    }
+
+    /// num_files=0 is valid.
+    #[test]
+    fn scan_files_info_zero_files() {
+        let input = [0x05u8, 0x00, 0x00];
+        let (rem, n) = scan_files_info(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(n, 0);
+    }
+
+    /// One size-prefixed sub-property is skipped correctly.
+    #[test]
+    fn scan_files_info_with_sub_property() {
+        // FilesInfo, num_files=2, MTime (0x14), size=5, 5 dummy bytes, END
+        let input = [0x05u8, 0x02, 0x14, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05, 0x00];
+        let (rem, n) = scan_files_info(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(n, 2);
+    }
+
+    /// Trailing bytes after END are preserved in the remainder.
+    #[test]
+    fn scan_files_info_trailing_bytes() {
+        let input = [0x05u8, 0x07, 0x00, 0xFF];
+        let (rem, n) = scan_files_info(&input).unwrap();
+        assert_eq!(rem, &[0xFF]);
+        assert_eq!(n, 7);
+    }
+
+    /// Wrong opening tag returns a hard Failure.
+    #[test]
+    fn scan_files_info_wrong_tag() {
+        assert!(scan_files_info(&[0x06u8]).is_err());
+    }
+}

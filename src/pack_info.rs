@@ -360,3 +360,98 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_pack_info, scan_unpack_info};
+
+    // ── scan_pack_info ──────────────────────────────────────────────
+
+    /// Minimal valid PackInfo: 1 stream, pack_pos=0, size=100.
+    #[test]
+    fn scan_pack_info_one_stream() {
+        // 0x06=PackInfo, pack_pos=0, num_streams=1, 0x09=Size, 100, 0x00=END
+        let input = [0x06u8, 0x00, 0x01, 0x09, 0x64, 0x00];
+        let (rem, ()) = scan_pack_info(&input).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// Three streams; trailing byte left in remainder.
+    #[test]
+    fn scan_pack_info_three_streams_trailing() {
+        // sizes: 100, 50, 25
+        let input = [0x06u8, 0x00, 0x03, 0x09, 0x64, 0x32, 0x19, 0x00, 0xFF];
+        let (rem, ()) = scan_pack_info(&input).unwrap();
+        assert_eq!(rem, &[0xFF]);
+    }
+
+    /// Wrong tag (UnPackInfo) returns a hard Failure.
+    #[test]
+    fn scan_pack_info_wrong_tag() {
+        assert!(scan_pack_info(&[0x07u8]).is_err());
+    }
+
+    /// Truncated before sizes returns an error.
+    #[test]
+    fn scan_pack_info_truncated() {
+        let input = [0x06u8, 0x00, 0x01, 0x09]; // missing size + END
+        assert!(scan_pack_info(&input).is_err());
+    }
+
+    // ── scan_unpack_info ────────────────────────────────────────────
+
+    /// One folder with copy codec → returns num_folders=1.
+    #[test]
+    fn scan_unpack_info_one_folder() {
+        // UnPackInfo, Folder tag, 1 folder, not external,
+        // folder=[copy coder], CodersUnPackSize, 100, END
+        let input = [0x07u8, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00];
+        let (rem, nf) = scan_unpack_info(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(nf, 1);
+    }
+
+    /// Two folders each with copy codec → returns num_folders=2.
+    #[test]
+    fn scan_unpack_info_two_folders() {
+        let input = [
+            0x07u8, 0x0B, 0x02, 0x00,
+            // folder 0: copy
+            0x01, 0x01, 0x00,
+            // folder 1: copy
+            0x01, 0x01, 0x00,
+            // CodersUnPackSize: 2 out-streams (one per folder)
+            0x0C, 0x64, 0x32,
+            // END
+            0x00,
+        ];
+        let (rem, nf) = scan_unpack_info(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(nf, 2);
+    }
+
+    /// CRC section (all_defined=1, 1 CRC) is skipped correctly.
+    #[test]
+    fn scan_unpack_info_with_crc() {
+        let input = [
+            0x07u8, 0x0B, 0x01, 0x00,
+            // folder: copy
+            0x01, 0x01, 0x00,
+            // CodersUnPackSize
+            0x0C, 0x64,
+            // CRC section: all_defined=1, 1 CRC (4 bytes)
+            0x0A, 0x01, 0xAA, 0xBB, 0xCC, 0xDD,
+            // END
+            0x00,
+        ];
+        let (rem, nf) = scan_unpack_info(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(nf, 1);
+    }
+
+    /// Wrong tag returns an error.
+    #[test]
+    fn scan_unpack_info_wrong_tag() {
+        assert!(scan_unpack_info(&[0x06u8]).is_err());
+    }
+}

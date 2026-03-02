@@ -155,3 +155,65 @@ impl Folder {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::scan_folder;
+
+    /// Single copy coder (id_size=1, not complex, no props).
+    #[test]
+    fn scan_folder_copy_codec() {
+        // num_coders=1, flags=0x01 (id_size=1, simple, no props), codec_id=[0x00]
+        let input = [0x01u8, 0x01, 0x00];
+        let (rem, out) = scan_folder(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(out, 1);
+    }
+
+    /// Single LZMA coder with properties (mirrors LZMA_CODER_BYTES from coder tests).
+    #[test]
+    fn scan_folder_lzma_with_props() {
+        // num_coders=1, flags=0x23 (id_size=3, simple, has_props)
+        // codec_id=[0x03,0x01,0x01], prop_size=5, props=[5d,00,10,00,00]
+        let input = [
+            0x01u8, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5d, 0x00, 0x10, 0x00, 0x00,
+        ];
+        let (rem, out) = scan_folder(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(out, 1);
+    }
+
+    /// Trailing bytes after a valid folder are left in the remainder.
+    #[test]
+    fn scan_folder_trailing_bytes() {
+        let input = [0x01u8, 0x01, 0x00, 0xDE, 0xAD];
+        let (rem, out) = scan_folder(&input).unwrap();
+        assert_eq!(rem, &[0xDE, 0xAD]);
+        assert_eq!(out, 1);
+    }
+
+    /// Complex coder (is_complex flag): 2 in-streams, 1 out-stream → 2 packed indices.
+    #[test]
+    fn scan_folder_complex_two_in_one_out() {
+        // num_coders=1, flags=0x12 (id_size=2, is_complex, no props)
+        // codec_id=[0x21,0x00], n_in=2, n_out=1
+        // bind_pairs=0 (out-1=0), num_packed=2 → two packed-index varints
+        let input = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x01, 0x00, 0x01];
+        let (rem, out) = scan_folder(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(out, 1);
+    }
+
+    /// Truncated mid-coder returns an error.
+    #[test]
+    fn scan_folder_truncated() {
+        // num_coders=1 but no coder bytes
+        assert!(scan_folder(&[0x01u8]).is_err());
+    }
+
+    /// Empty input returns an error.
+    #[test]
+    fn scan_folder_empty() {
+        assert!(scan_folder(&[]).is_err());
+    }
+}

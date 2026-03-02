@@ -95,3 +95,53 @@ pub(crate) fn scan_digests(input: &[u8], num: usize) -> IResult<&[u8], ()> {
     let (input, _) = take(num_defined * 4)(input)?;
     Ok((input, ()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::scan_digests;
+
+    /// all_defined=1: reads num*4 CRC bytes then leaves the rest.
+    #[test]
+    fn scan_digests_all_defined() {
+        let input = [0x01u8, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0xFF];
+        let (rem, ()) = scan_digests(&input, 2).unwrap();
+        assert_eq!(rem, &[0xFF]);
+    }
+
+    /// all_defined=0, bitmap=0x03 (both bits set for 2 entries) → reads 2 CRCs.
+    #[test]
+    fn scan_digests_bitmap_all_set() {
+        let input = [0x00u8, 0x03, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let (rem, ()) = scan_digests(&input, 2).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// all_defined=0, bitmap=0x04 (only bit 2 set) for 3 entries → 1 CRC read.
+    #[test]
+    fn scan_digests_bitmap_sparse() {
+        let input = [0x00u8, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+        let (rem, ()) = scan_digests(&input, 3).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// num=0: only the all_defined flag is consumed.
+    #[test]
+    fn scan_digests_zero_count() {
+        let input = [0x01u8];
+        let (rem, ()) = scan_digests(&input, 0).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// Truncated: all_defined=1 but no CRC bytes.
+    #[test]
+    fn scan_digests_truncated() {
+        let input = [0x01u8];
+        assert!(scan_digests(&input, 1).is_err());
+    }
+
+    /// Empty input.
+    #[test]
+    fn scan_digests_empty() {
+        assert!(scan_digests(&[], 1).is_err());
+    }
+}

@@ -333,3 +333,85 @@ pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
 
     Ok((input, ()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_stream_info, scan_substream_info};
+
+    // ── scan_substream_info ────────────────────────────────────────────────────
+
+    /// Minimal: just END immediately.
+    #[test]
+    fn scan_substream_info_just_end() {
+        // SubStreamsInfo tag (0x08), then END (0x00)
+        let input = [0x08u8, 0x00];
+        let (rem, ()) = scan_substream_info(&input, 1).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// NumUnPackStream + Size: 2 folders with [2, 1] streams → 1 size to skip.
+    #[test]
+    fn scan_substream_info_num_unpack_stream() {
+        // NumUnPackStream (0x0D): folder[0]=2, folder[1]=1
+        // sizes_to_read=(2-1)+(1-1)=1, Size (0x09): one varint, END (0x00)
+        let input = [0x08u8, 0x0D, 0x02, 0x01, 0x09, 0x64, 0x00];
+        let (rem, ()) = scan_substream_info(&input, 2).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// Wrong opening tag returns a hard Failure.
+    #[test]
+    fn scan_substream_info_wrong_tag() {
+        assert!(scan_substream_info(&[0x06u8], 1).is_err());
+    }
+
+    // ── scan_stream_info ──────────────────────────────────────────────────────
+
+    /// Just END — empty stream-info block.
+    #[test]
+    fn scan_stream_info_empty() {
+        let input = [0x00u8];
+        let (rem, ()) = scan_stream_info(&input).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// PackInfo + UnpackInfo + END.
+    #[test]
+    fn scan_stream_info_pack_and_unpack() {
+        let input: &[u8] = &[
+            // PackInfo: pos=0, 1 stream, size=100
+            0x06, 0x00, 0x01, 0x09, 0x64, 0x00,
+            // UnPackInfo: 1 folder (copy), unpack_size=100
+            0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00,
+            // END
+            0x00,
+        ];
+        let (rem, ()) = scan_stream_info(input).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// PackInfo + UnpackInfo + SubStreamsInfo + END.
+    #[test]
+    fn scan_stream_info_with_substreams() {
+        let input: &[u8] = &[
+            // PackInfo
+            0x06, 0x00, 0x01, 0x09, 0x64, 0x00,
+            // UnPackInfo (1 folder, copy codec)
+            0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00,
+            // SubStreamsInfo (just END)
+            0x08, 0x00,
+            // stream_info END
+            0x00,
+        ];
+        let (rem, ()) = scan_stream_info(input).unwrap();
+        assert!(rem.is_empty());
+    }
+
+    /// Trailing bytes after END are preserved in the remainder.
+    #[test]
+    fn scan_stream_info_trailing_bytes() {
+        let input: &[u8] = &[0x00, 0xBE, 0xEF];
+        let (rem, ()) = scan_stream_info(input).unwrap();
+        assert_eq!(rem, &[0xBE, 0xEF]);
+    }
+}
