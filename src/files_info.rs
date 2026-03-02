@@ -105,17 +105,13 @@ impl FilesInfo {
                 Property::EmptyStream => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
                     let (i, block) = take(size as usize)(i)?;
-                    empty_streams = (0..n)
-                        .map(|i| (block[i / 8] >> (i % 8)) & 1 == 1)
-                        .collect();
+                    empty_streams = (0..n).map(|i| (block[i / 8] >> (i % 8)) & 1 == 1).collect();
                     input = i;
                 }
                 Property::EmptyFile => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
                     let (i, block) = take(size as usize)(i)?;
-                    empty_files = (0..n)
-                        .map(|i| (block[i / 8] >> (i % 8)) & 1 == 1)
-                        .collect();
+                    empty_files = (0..n).map(|i| (block[i / 8] >> (i % 8)) & 1 == 1).collect();
                     input = i;
                 }
                 _ => {

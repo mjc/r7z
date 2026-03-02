@@ -81,7 +81,12 @@ fn build_archive(files: &[(String, Vec<u8>)], codec: Codec) -> Result<Vec<u8>, R
     let pack_size = compressed.len() as u64;
     let folder_unpack_size = all_data.len() as u64;
 
-    let header = build_header(files, &coder_flags_and_id_and_props, pack_size, folder_unpack_size);
+    let header = build_header(
+        files,
+        &coder_flags_and_id_and_props,
+        pack_size,
+        folder_unpack_size,
+    );
 
     // Layout: [32-byte SignatureHeader][compressed data][header]
     let mut archive: Vec<u8> = vec![0u8; 32];

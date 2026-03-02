@@ -10,7 +10,6 @@ fn decompress_lzma_packed_header() {
     let pi = &meta.encoded_header.pack_info;
     let ui = &meta.encoded_header.unpack_info;
 
-
     // The packed header stream starts right after the 32-byte SignatureHeader
     // at pack_pos bytes offset.
     let data_start = 32 + pi.pack_pos as usize;

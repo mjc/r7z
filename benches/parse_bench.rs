@@ -30,11 +30,7 @@ fn bench_extract_to_memory(c: &mut Criterion) {
     let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
     // Find the first non-empty file index
     let fi = archive.files_info().unwrap();
-    let idx = fi
-        .empty_streams
-        .iter()
-        .position(|&e| !e)
-        .unwrap_or(0);
+    let idx = fi.empty_streams.iter().position(|&e| !e).unwrap_or(0);
     c.bench_function("Archive::extract_to_memory", |b| {
         b.iter(|| archive.extract_to_memory(black_box(idx)).unwrap())
     });

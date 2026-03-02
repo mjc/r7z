@@ -27,7 +27,10 @@ fn parse_archive_metadata_from_test_fixture() {
     // LZMA codec ID
     assert_eq!(folder.coders[0].codec_id, vec![0x03, 0x01, 0x01]);
     // LZMA properties present (5 bytes)
-    assert_eq!(folder.coders[0].properties.as_ref().map(|p| p.len()), Some(5));
+    assert_eq!(
+        folder.coders[0].properties.as_ref().map(|p| p.len()),
+        Some(5)
+    );
     // 1 in-stream, 1 out-stream
     assert_eq!(folder.coders[0].num_in_streams, 1);
     assert_eq!(folder.coders[0].num_out_streams, 1);
@@ -59,7 +62,10 @@ fn archive_open_full_header() {
     let eh = archive.encoded_header.as_ref().unwrap();
     assert_eq!(eh.unpack_info.num_folders, 1);
     // LZMA header codec
-    assert_eq!(eh.unpack_info.folders[0].coders[0].codec_id, vec![0x03, 0x01, 0x01]);
+    assert_eq!(
+        eh.unpack_info.folders[0].coders[0].codec_id,
+        vec![0x03, 0x01, 0x01]
+    );
 
     // Full header: file listing
     assert_eq!(archive.num_files(), 4); // 1 dir + 3 files

@@ -15,14 +15,12 @@ pub struct ArchiveMetadata {
 impl ArchiveMetadata {
     /// Parse the outer header of a 7z archive from raw bytes.
     pub fn parse(data: &[u8]) -> Result<ArchiveMetadata, R7zError> {
-        let (input, signature) =
-            SignatureHeader::parse(data).map_err(|_| R7zError::Parse)?;
+        let (input, signature) = SignatureHeader::parse(data).map_err(|_| R7zError::Parse)?;
 
         signature.validate_start_header_crc()?;
 
         let offset = signature.next_header_offset.to_usize();
-        let (input, prop) =
-            find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
+        let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
 
         match prop {
             Property::EncodedHeader => {
@@ -58,14 +56,12 @@ impl Archive {
 
     /// Parse a 7z archive from in-memory bytes.
     pub fn from_bytes(data: Vec<u8>) -> Result<Archive, R7zError> {
-        let (input, signature) =
-            SignatureHeader::parse(&data).map_err(|_| R7zError::Parse)?;
+        let (input, signature) = SignatureHeader::parse(&data).map_err(|_| R7zError::Parse)?;
 
         signature.validate_start_header_crc()?;
 
         let offset = signature.next_header_offset.to_usize();
-        let (input, prop) =
-            find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
+        let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
 
         // Validate next_header_crc over the raw encoded/header bytes
         let header_start = 32 + offset;
@@ -92,8 +88,7 @@ impl Archive {
                 let unpack_size = ui.unpack_sizes[0];
                 let decompressed = codec::decompress_folder(folder, packed, unpack_size)?;
 
-                let (_, header) =
-                    Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
+                let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
 
                 Ok(Archive {
                     data,
@@ -105,8 +100,7 @@ impl Archive {
             Property::Header => {
                 // Header is stored uncompressed at next_header_offset (the raw bytes
                 // include the 0x01 tag, so we slice from header_start, not header_start+1)
-                let (_, header) =
-                    Header::parse(header_raw).map_err(|_| R7zError::Parse)?;
+                let (_, header) = Header::parse(header_raw).map_err(|_| R7zError::Parse)?;
 
                 Ok(Archive {
                     data,
@@ -151,9 +145,12 @@ impl Archive {
         let data_stream_idx = data_stream_idx.ok_or(R7zError::Parse)?;
 
         // Find which folder + in-folder offset holds data_stream_idx
-        let (folder_idx, stream_in_folder) =
-            data_stream_to_folder(data_stream_idx, substream_info, unpack_info.num_folders as usize)
-                .ok_or(R7zError::Parse)?;
+        let (folder_idx, stream_in_folder) = data_stream_to_folder(
+            data_stream_idx,
+            substream_info,
+            unpack_info.num_folders as usize,
+        )
+        .ok_or(R7zError::Parse)?;
 
         // Decompress the folder
         let folder = &unpack_info.folders[folder_idx];
@@ -163,26 +160,13 @@ impl Archive {
         let packed = &self.data[data_start..data_start + pack_size];
 
         // Folder unpack size = sum of all out-stream sizes in the unpack_info
-        let folder_unpack_size = folder_total_unpack_size(
-            folder_idx,
-            unpack_info,
-            substream_info,
-        );
+        let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info);
         let decompressed = codec::decompress_folder(folder, packed, folder_unpack_size)?;
 
         // Slice the target stream out of the decompressed folder data
-        let stream_start = stream_offset_in_folder(
-            folder_idx,
-            stream_in_folder,
-            substream_info,
-            unpack_info,
-        );
-        let stream_size = stream_size_at(
-            folder_idx,
-            stream_in_folder,
-            substream_info,
-            unpack_info,
-        );
+        let stream_start =
+            stream_offset_in_folder(folder_idx, stream_in_folder, substream_info, unpack_info);
+        let stream_size = stream_size_at(folder_idx, stream_in_folder, substream_info, unpack_info);
 
         Ok(decompressed[stream_start..stream_start + stream_size].to_vec())
     }
@@ -334,13 +318,21 @@ fn stream_size_at(
 
     if n_streams == 1 {
         // Single stream: use folder unpack size
-        return unpack_info.unpack_sizes.get(folder_idx).copied().unwrap_or(0) as usize;
+        return unpack_info
+            .unpack_sizes
+            .get(folder_idx)
+            .copied()
+            .unwrap_or(0) as usize;
     }
 
     let si = match substream_info {
         Some(s) => s,
         None => {
-            return unpack_info.unpack_sizes.get(folder_idx).copied().unwrap_or(0) as usize;
+            return unpack_info
+                .unpack_sizes
+                .get(folder_idx)
+                .copied()
+                .unwrap_or(0) as usize;
         }
     };
 
@@ -354,8 +346,11 @@ fn stream_size_at(
         si.unpack_sizes[base_global + stream_in_folder] as usize
     } else {
         // Last stream: folder_size - sum(explicit_sizes)
-        let folder_size =
-            unpack_info.unpack_sizes.get(folder_idx).copied().unwrap_or(0) as usize;
+        let folder_size = unpack_info
+            .unpack_sizes
+            .get(folder_idx)
+            .copied()
+            .unwrap_or(0) as usize;
         let explicit_sum: usize = si.unpack_sizes[base_global..base_global + n_streams - 1]
             .iter()
             .map(|&s| s as usize)

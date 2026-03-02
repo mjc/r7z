@@ -35,8 +35,7 @@ pub const CODEC_COPY: &[u8] = &[0x00];
 pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
     let mut compressed: Vec<u8> = Vec::new();
     let mut reader = BufReader::new(Cursor::new(data));
-    lzma_rs::lzma2_compress(&mut reader, &mut compressed)
-        .map_err(|_| R7zError::Decompression)?;
+    lzma_rs::lzma2_compress(&mut reader, &mut compressed).map_err(|_| R7zError::Decompression)?;
     // 0x1c → dict_size = 1 << (0x1c/2 + 11) = 1 << 25 = 32 MB
     Ok((0x1c, compressed))
 }
@@ -93,8 +92,7 @@ fn decompress_lzma(
 fn decompress_lzma2(input: &[u8]) -> Result<Vec<u8>, R7zError> {
     let mut reader = BufReader::new(Cursor::new(input));
     let mut output = Vec::new();
-    lzma_rs::lzma2_decompress(&mut reader, &mut output)
-        .map_err(|_| R7zError::Decompression)?;
+    lzma_rs::lzma2_decompress(&mut reader, &mut output).map_err(|_| R7zError::Decompression)?;
     Ok(output)
 }
 

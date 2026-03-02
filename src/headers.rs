@@ -96,7 +96,13 @@ impl Header {
             }
         }
 
-        Ok((input, Header { main_streams_info, files_info }))
+        Ok((
+            input,
+            Header {
+                main_streams_info,
+                files_info,
+            },
+        ))
     }
 }
 

@@ -1,7 +1,4 @@
-use nom::{
-    number::streaming::{le_u8},
-    IResult, ToUsize,
-};
+use nom::{number::streaming::le_u8, IResult, ToUsize};
 
 use crate::{sevenzip_varuint64_decode, Folder, Property};
 
@@ -101,10 +98,7 @@ impl UnpackInfo {
         }
 
         // Total number of out-streams across all folders
-        let total_out_streams: usize = folders
-            .iter()
-            .map(|f| f.total_out_streams())
-            .sum();
+        let total_out_streams: usize = folders.iter().map(|f| f.total_out_streams()).sum();
 
         // Property-tag loop for CodersUnPackSize and CRC
         let mut unpack_sizes = Vec::new();
