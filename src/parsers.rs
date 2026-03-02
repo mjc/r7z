@@ -1,5 +1,28 @@
 use nom::{IResult, Needed};
 
+/// Encode a u64 as a 7z variable-length integer (1–9 bytes).
+///
+/// Format mirrors `sevenzip_varuint64_decode`: bit (7-i) of the first byte is set
+/// when byte (i+1) carries value bits [8i .. 8i+7].
+pub fn sevenzip_varuint64_encode(mut value: u64) -> Vec<u8> {
+    let mut result = vec![0u8];
+    let mut mask: u8 = 0x80;
+    loop {
+        if value < mask as u64 {
+            result[0] |= value as u8;
+            break;
+        }
+        result[0] |= mask;
+        result.push((value & 0xFF) as u8);
+        value >>= 8;
+        mask = mask.wrapping_shr(1);
+        if mask == 0 {
+            break; // all 8 extra bytes pushed; first byte = 0xFF
+        }
+    }
+    result
+}
+
 pub fn sevenzip_varuint64_decode(input: &[u8]) -> IResult<&[u8], u64> {
     if input.is_empty() {
         return Err(nom::Err::Incomplete(Needed::new(1)));

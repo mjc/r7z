@@ -3,26 +3,9 @@
 //! These tests require `7z` (p7zip) to be available in PATH or via nix-shell.
 //! Run with: `nix-shell -p p7zip --run "cargo test interop"`
 
-use std::process::Command;
-
 mod support;
 
-/// Run 7z via nix-shell if not in PATH, otherwise directly.
-fn run_7z(args: &[&str], dir: &std::path::Path) -> std::process::Output {
-    // Try direct 7z first
-    if let Ok(out) = Command::new("7z").args(args).current_dir(dir).output() {
-        return out;
-    }
-    // Fallback: nix-shell
-    let mut nix_args = vec!["-p", "p7zip", "--run"];
-    let cmd = format!("7z {}", args.join(" "));
-    nix_args.push(&cmd);
-    Command::new("nix-shell")
-        .args(&nix_args)
-        .current_dir(dir)
-        .output()
-        .expect("nix-shell not available; install p7zip or enter a nix shell with p7zip")
-}
+use support::run_7z;
 
 #[test]
 fn p7zip_read_interop_single_lzma() {

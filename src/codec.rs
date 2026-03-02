@@ -1,6 +1,23 @@
 use crate::R7zError;
 use std::io::{BufReader, Cursor};
 
+/// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
+///
+/// `properties` is the 5-byte LZMA properties block to store in CoderInfo.
+/// `compressed_stream` is the raw compressed bytes (LZMA_ALONE header stripped).
+pub fn compress_lzma(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
+    let mut alone: Vec<u8> = Vec::new();
+    let mut reader = BufReader::new(Cursor::new(data));
+    lzma_rs::lzma_compress(&mut reader, &mut alone).map_err(|_| R7zError::Decompression)?;
+    // LZMA_ALONE layout: 5-byte props | 8-byte unpack_size | compressed bytes
+    if alone.len() < 13 {
+        return Err(R7zError::Decompression);
+    }
+    let props = alone[..5].to_vec();
+    let compressed = alone[13..].to_vec();
+    Ok((props, compressed))
+}
+
 /// Well-known codec IDs used by 7z.
 pub const CODEC_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 pub const CODEC_LZMA2: &[u8] = &[0x21];
