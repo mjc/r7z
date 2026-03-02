@@ -1,98 +1,178 @@
 use nom::{
-    multi::count,
-    number::streaming::{le_u64, le_u8},
+    number::streaming::{le_u8},
     IResult, ToUsize,
 };
 
-use crate::{sevenzip_varuint64_decode, Digest, Folder, Property};
+use crate::{sevenzip_varuint64_decode, Folder, Property};
 
 #[derive(Debug, PartialEq)]
 pub struct PackInfo {
-    pack_pos: u64,
-    num_pack_streams: u64,
-    size_marker: u8,
-    pack_size: Vec<u64>,
-    end_marker: u8,
+    pub pack_pos: u64,
+    pub num_pack_streams: u64,
+    pub pack_size: Vec<u64>,
 }
 
 impl PackInfo {
     pub fn parse(input: &[u8]) -> IResult<&[u8], PackInfo> {
-        println!("packinfo::parse");
+        let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
-        assert!(property_id == Property::PackInfo);
+        if property_id != Property::PackInfo {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                orig_input,
+                nom::error::ErrorKind::Satisfy,
+            )));
+        }
 
-        let (input, pack_pos) = sevenzip_varuint64_decode(&input);
-        let (input, num_pack_streams) = sevenzip_varuint64_decode(input);
+        let (input, pack_pos) = sevenzip_varuint64_decode(input)?;
+        let (input, num_pack_streams) = sevenzip_varuint64_decode(input)?;
 
-        let (mut input, size_marker) = le_u8(input)?;
+        // Property::Size tag
+        let (mut input, _size_marker) = le_u8(input)?;
 
         let mut pack_size = Vec::new();
-        // array of varuint64
         for _i in 0..num_pack_streams {
-            let (sliced, a_pack_size) = sevenzip_varuint64_decode(input);
+            let (sliced, a_pack_size) = sevenzip_varuint64_decode(input)?;
             pack_size.push(a_pack_size);
-
             input = sliced;
         }
 
-        let (input, end_marker) = le_u8(input)?;
+        // Property::END tag
+        let (input, _end_marker) = le_u8(input)?;
 
         Ok((
             input,
             PackInfo {
                 pack_pos,
                 num_pack_streams,
-                size_marker,
                 pack_size,
-                end_marker,
             },
         ))
     }
 }
+
 #[derive(Debug, PartialEq)]
 pub struct UnpackInfo {
-    folder_marker: u8,
-    num_folders: u64,
-    is_external: u8,
-    folders: Vec<Folder>,
-    unpacksize_marker: u8,
-    unpacksizes: Vec<u64>,
-    digests: Vec<Digest>,
-    defined: u8, // bitfield
+    pub num_folders: u64,
+    pub folders: Vec<Folder>,
+    pub unpack_sizes: Vec<u64>,
+    pub digests: Vec<Option<u32>>,
 }
 
 impl UnpackInfo {
     pub fn parse(input: &[u8]) -> IResult<&[u8], UnpackInfo> {
+        let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
-        assert!(property_id == Property::UnPackInfo);
+        if property_id != Property::UnPackInfo {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                orig_input,
+                nom::error::ErrorKind::Satisfy,
+            )));
+        }
 
-        let (input, folder_marker) = le_u8(input)?;
-        println!("folder_marker: {:?}", folder_marker);
-
-        let (input, num_folders) = sevenzip_varuint64_decode(input);
-        println!("num_folders: {}", num_folders);
-
+        // Folder tag
+        let (input, _folder_marker) = le_u8(input)?;
+        let (input, num_folders) = sevenzip_varuint64_decode(input)?;
         let (input, is_external) = le_u8(input)?;
-        println!("is_external: {}", is_external);
 
-        let (input, folders) = count(Folder::parse, num_folders.to_usize())(input)?;
-        println!("folders: {:?}", folders);
-        let (input, unpacksize_marker) = le_u8(input)?;
-        let (input, unpacksizes) = count(le_u64, num_folders.to_usize())(input)?;
-        let (input, digests) = count(Digest::parse, num_folders.to_usize())(input)?;
-        let (input, defined) = le_u8(input)?;
+        let input = if is_external != 0 {
+            let (input, _data_stream_index) = sevenzip_varuint64_decode(input)?;
+            input
+        } else {
+            input
+        };
+
+        // Parse each folder
+        let mut folders = Vec::new();
+        let mut input = input;
+        for _ in 0..num_folders {
+            let (i, folder) = Folder::parse(input)?;
+            folders.push(folder);
+            input = i;
+        }
+
+        // Total number of out-streams across all folders
+        let total_out_streams: usize = folders
+            .iter()
+            .map(|f| f.total_out_streams())
+            .sum();
+
+        // Property-tag loop for CodersUnPackSize and CRC
+        let mut unpack_sizes = Vec::new();
+        let mut digests = vec![None; num_folders.to_usize()];
+
+        loop {
+            let (i, tag) = Property::parse(input)?;
+            input = i;
+            match tag {
+                Property::END => break,
+                Property::CodersUnPackSize => {
+                    for _ in 0..total_out_streams {
+                        let (i, size) = sevenzip_varuint64_decode(input)?;
+                        unpack_sizes.push(size);
+                        input = i;
+                    }
+                }
+                Property::CRC => {
+                    let (i, crcs) = parse_digests(input, num_folders.to_usize())?;
+                    digests = crcs;
+                    input = i;
+                }
+                _ => {
+                    // Skip unknown sections (read size + skip)
+                    let (i, size) = sevenzip_varuint64_decode(input)?;
+                    let (i, _) = nom::bytes::streaming::take(size as usize)(i)?;
+                    input = i;
+                }
+            }
+        }
+
         Ok((
             input,
             UnpackInfo {
-                folder_marker,
                 num_folders,
-                is_external,
                 folders,
-                unpacksize_marker,
-                unpacksizes,
+                unpack_sizes,
                 digests,
-                defined,
             },
         ))
     }
+}
+
+/// Parse CRC digests for `num_streams` streams using AllAreDefined + optional bitmap.
+fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], Vec<Option<u32>>> {
+    use nom::number::streaming::le_u32;
+
+    let (input, all_defined) = le_u8(input)?;
+
+    let defined: Vec<bool> = if all_defined != 0 {
+        vec![true; num_streams]
+    } else {
+        let num_bytes = num_streams.div_ceil(8);
+        let (_, bitmap) = nom::bytes::streaming::take(num_bytes)(input)?;
+        (0..num_streams)
+            .map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
+            .collect()
+    };
+
+    // If all_defined == 0, we consumed bitmap bytes
+    let input = if all_defined == 0 {
+        let num_bytes = num_streams.div_ceil(8);
+        &input[num_bytes..]
+    } else {
+        input
+    };
+
+    let mut crcs = Vec::new();
+    let mut input = input;
+    for is_def in &defined {
+        if *is_def {
+            let (i, crc) = le_u32(input)?;
+            crcs.push(Some(crc));
+            input = i;
+        } else {
+            crcs.push(None);
+        }
+    }
+
+    Ok((input, crcs))
 }

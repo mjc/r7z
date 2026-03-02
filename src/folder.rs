@@ -1,50 +1,58 @@
-use nom::{
-    multi::count,
-    number::streaming::{le_u32, le_u64},
-    IResult, ToUsize,
-};
-use nom_varint::take_varint;
-
-pub struct FoldersInfo {
-    num_folders: u64,
-    data_stream_index: u64,
-    unpack_sizes: Vec<u64>,
-    unpack_digests: Vec<u32>,
-}
-
-impl FoldersInfo {
-    pub fn parse(input: &[u8]) -> IResult<&[u8], FoldersInfo> {
-        let (input, num_folders) = le_u64(input)?;
-        let (input, data_stream_index) = le_u64(input)?;
-        let (input, unpack_sizes) = count(le_u64, num_folders.to_usize())(input)?;
-        let (input, unpack_digests) = count(le_u32, num_folders.to_usize())(input)?;
-        Ok((
-            input,
-            FoldersInfo {
-                num_folders: num_folders,
-                data_stream_index: data_stream_index,
-                unpack_sizes: unpack_sizes,
-                unpack_digests: unpack_digests,
-            },
-        ))
-    }
-}
+use crate::{sevenzip_varuint64_decode, CoderInfo};
+use nom::IResult;
 
 #[derive(Debug, PartialEq)]
 pub struct Folder {
-    num_coders: usize,
-    // coders: Vec<CoderInfo>,
+    pub coders: Vec<CoderInfo>,
+    pub bind_pairs: Vec<(u64, u64)>,
+    pub packed_indices: Vec<u64>,
 }
 
 impl Folder {
+    pub fn total_out_streams(&self) -> usize {
+        self.coders.iter().map(|c| c.num_out_streams as usize).sum()
+    }
+
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
-        let (input, num_coders) = take_varint(input)?;
-        let (input, _coders) = le_u64(input)?;
+        let (input, num_coders) = sevenzip_varuint64_decode(input)?;
+        let mut coders = Vec::new();
+        let mut input = input;
+        for _ in 0..num_coders {
+            let (i, coder) = CoderInfo::parse(input)?;
+            coders.push(coder);
+            input = i;
+        }
+
+        let num_in_total: u64 = coders.iter().map(|c| c.num_in_streams).sum();
+        let num_out_total: u64 = coders.iter().map(|c| c.num_out_streams).sum();
+        let num_bind_pairs = num_out_total.saturating_sub(1);
+
+        let mut bind_pairs = Vec::new();
+        for _ in 0..num_bind_pairs {
+            let (i, in_idx) = sevenzip_varuint64_decode(input)?;
+            let (i, out_idx) = sevenzip_varuint64_decode(i)?;
+            bind_pairs.push((in_idx, out_idx));
+            input = i;
+        }
+
+        // NumPackedStreams = NumInStreams_Total - NumBindPairs
+        // Only written explicitly when NumPackedStreams != 1
+        let num_packed = num_in_total - num_bind_pairs;
+        let mut packed_indices = Vec::new();
+        if num_packed != 1 {
+            for _ in 0..num_packed {
+                let (i, idx) = sevenzip_varuint64_decode(input)?;
+                packed_indices.push(idx);
+                input = i;
+            }
+        }
+
         Ok((
             input,
             Folder {
-                num_coders: num_coders,
-                // coders
+                coders,
+                bind_pairs,
+                packed_indices,
             },
         ))
     }
