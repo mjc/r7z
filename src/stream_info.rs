@@ -108,35 +108,30 @@ fn parse_stream_digests(input: &[u8], num: usize) -> IResult<&[u8], Vec<Option<u
     use nom::number::complete::le_u32;
 
     let (input, all_defined) = le_u8(input)?;
-    let defined: Vec<bool> = if all_defined != 0 {
-        vec![true; num]
-    } else {
+
+    let (bitmap, input) = if all_defined == 0 {
         let num_bytes = num.div_ceil(8);
-        let (_, bitmap) = nom::bytes::complete::take(num_bytes)(input)?;
-        (0..num)
-            .map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
-            .collect()
-    };
-
-    let input = if all_defined == 0 {
-        &input[num.div_ceil(8)..]
+        let (rest, bm) = nom::bytes::complete::take(num_bytes)(input)?;
+        (bm, rest)
     } else {
-        input
+        (&[][..], input)
     };
 
-    let mut crcs = Vec::new();
-    let mut input = input;
-    for is_def in &defined {
-        if *is_def {
-            let (i, crc) = le_u32(input)?;
-            crcs.push(Some(crc));
-            input = i;
-        } else {
-            crcs.push(None);
-        }
-    }
+    let is_defined = |i: usize| -> bool { all_defined != 0 || (bitmap[i / 8] >> (i % 8)) & 1 == 1 };
 
-    Ok((input, crcs))
+    (0..num).try_fold(
+        (input, Vec::with_capacity(num.min(input.len()))),
+        |(input, mut crcs), i| {
+            if is_defined(i) {
+                let (input, crc) = le_u32(input)?;
+                crcs.push(Some(crc));
+                Ok((input, crcs))
+            } else {
+                crcs.push(None);
+                Ok((input, crcs))
+            }
+        },
+    )
 }
 
 /// Ties together [`PackInfo`], [`UnpackInfo`], and optional [`SubstreamInfo`].

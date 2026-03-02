@@ -35,7 +35,12 @@ impl CoderInfo {
         let has_attributes = (flags & 0x20) != 0;
 
         let (input, codec_id_bytes) = take(codec_id_size)(input)?;
-        let codec_id: ArrayVec<u8, 15> = codec_id_bytes.iter().copied().collect();
+        let codec_id: ArrayVec<u8, 15> = ArrayVec::try_from(codec_id_bytes).map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
 
         let (input, num_in_streams, num_out_streams) = if is_complex {
             let (input, n_in) = sevenzip_varuint64_decode(input)?;
@@ -54,7 +59,7 @@ impl CoderInfo {
                 ))
             })?;
             let (input, prop_bytes) = take(sz)(input)?;
-            (input, Some(prop_bytes.iter().copied().collect()))
+            (input, Some(SmallVec::from_slice(prop_bytes)))
         } else {
             (input, None)
         };

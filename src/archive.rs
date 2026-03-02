@@ -113,6 +113,7 @@ impl Archive {
                     return Err(R7zError::Parse);
                 }
                 let decompressed = codec::decompress_folder(folder, packed, unpack_size)?;
+                let decompressed = Bytes::from(decompressed);
 
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
 
@@ -126,7 +127,8 @@ impl Archive {
             Property::Header => {
                 // Header is stored uncompressed at next_header_offset (the raw bytes
                 // include the 0x01 tag, so we slice from header_start, not header_start+1)
-                let (_, header) = Header::parse(header_raw).map_err(|_| R7zError::Parse)?;
+                let header_bytes = data.slice(header_start..header_end);
+                let (_, header) = Header::parse(&header_bytes).map_err(|_| R7zError::Parse)?;
 
                 Ok(Archive {
                     data,

@@ -1,4 +1,4 @@
-use nom::{error::ErrorKind, number::complete::le_u8, IResult};
+use nom::{error::ErrorKind, IResult};
 use num::FromPrimitive;
 
 #[derive(PartialEq, Debug, FromPrimitive)]
@@ -43,14 +43,14 @@ impl Property {
     ///
     /// Returns `nom::Err::Error` if the byte is not a recognised property tag.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Property> {
-        let (i, o) = le_u8(input)?;
-        match Self::from_u8(o) {
-            Some(p) => Ok((i, p)),
-            None => Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                ErrorKind::Satisfy,
-            ))),
-        }
+        input
+            .split_first()
+            .ok_or_else(|| nom::Err::Error(nom::error::Error::new(input, ErrorKind::Eof)))
+            .and_then(|(&b, rest)| {
+                Self::from_u8(b).map(|p| (rest, p)).ok_or_else(|| {
+                    nom::Err::Error(nom::error::Error::new(input, ErrorKind::Satisfy))
+                })
+            })
     }
 }
 
@@ -60,12 +60,14 @@ impl Property {
 ///
 /// Returns `nom::Err::Error` if the byte at the offset is not a recognised property tag.
 pub fn find_next_property_id(input: &[u8], offset: usize) -> IResult<&[u8], Property> {
-    let (input, property_u8) = le_u8(&input[offset..])?;
-    match Property::from_u8(property_u8) {
-        Some(p) => Ok((input, p)),
-        None => Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            ErrorKind::Satisfy,
-        ))),
-    }
+    let rest = input
+        .get(offset..)
+        .ok_or_else(|| nom::Err::Error(nom::error::Error::new(input, ErrorKind::Eof)))?;
+    rest.split_first()
+        .ok_or_else(|| nom::Err::Error(nom::error::Error::new(rest, ErrorKind::Eof)))
+        .and_then(|(&b, tail)| {
+            Property::from_u8(b)
+                .map(|p| (tail, p))
+                .ok_or_else(|| nom::Err::Error(nom::error::Error::new(rest, ErrorKind::Satisfy)))
+        })
 }

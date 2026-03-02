@@ -93,7 +93,7 @@ impl FilesInfo {
     /// Panics if a block size encoded in the archive exceeds `usize::MAX`, which
     /// cannot happen in practice on any platform that can hold the archive in memory.
     #[allow(clippy::too_many_lines)]
-    pub fn parse(input: &[u8]) -> IResult<&[u8], FilesInfo> {
+    pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], FilesInfo> {
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
         if tag != Property::FilesInfo {
@@ -134,7 +134,7 @@ impl FilesInfo {
                     })?;
                     let (i, block) = take(sz)(i)?;
                     // block[0] is the external flag; block[1..] is the raw UTF-16LE name data.
-                    name_data = Bytes::copy_from_slice(&block[1..]);
+                    name_data = backing.slice_ref(&block[1..]);
                     input = i;
                 }
                 Property::MTime => {
@@ -216,7 +216,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    empty_streams = Bytes::copy_from_slice(block);
+                    empty_streams = backing.slice_ref(block);
                     input = i;
                 }
                 Property::EmptyFile => {
@@ -228,7 +228,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    empty_files = Bytes::copy_from_slice(block);
+                    empty_files = backing.slice_ref(block);
                     input = i;
                 }
                 _ => {

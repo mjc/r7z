@@ -1,6 +1,7 @@
 use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
+use bytes::Bytes;
 use nom::{
-    multi::count,
+    bytes::complete::take,
     number::complete::{le_u32, le_u64, le_u8},
     IResult, Parser,
 };
@@ -55,7 +56,8 @@ impl Header {
     ///
     /// Returns a nom error if the input is truncated, malformed, or does not start with
     /// the `Header` property tag.
-    pub fn parse(input: &[u8]) -> IResult<&[u8], Header> {
+    pub fn parse(backing: &Bytes) -> IResult<&[u8], Header> {
+        let input: &[u8] = backing;
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
         if tag != Property::Header {
@@ -85,7 +87,7 @@ impl Header {
                 }
                 Property::FilesInfo => {
                     // FilesInfo::parse reads and validates its own tag byte
-                    let (i, fi) = FilesInfo::parse(input)?;
+                    let (i, fi) = FilesInfo::parse(input, backing)?;
                     files_info = Some(fi);
                     input = i;
                 }
@@ -134,7 +136,7 @@ impl Header {
 #[derive(Debug, PartialEq)]
 pub struct SignatureHeader {
     /// Magic bytes: `37 7a bc af 27 1c`.
-    pub signature: Vec<u8>,
+    pub signature: [u8; 6],
     /// Format major version (always `0x00`).
     pub major_version: u8,
     /// Format minor version (typically `0x04`).
@@ -150,8 +152,12 @@ pub struct SignatureHeader {
 }
 
 impl SignatureHeader {
-    fn get_file_signature(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
-        count(le_u8, 6).parse(input)
+    fn get_file_signature(input: &[u8]) -> IResult<&[u8], [u8; 6]> {
+        let (input, bytes) = take(6usize)(input)?;
+        let sig: [u8; 6] = bytes.try_into().map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Count))
+        })?;
+        Ok((input, sig))
     }
 
     fn get_version(input: &[u8]) -> IResult<&[u8], (u8, u8)> {

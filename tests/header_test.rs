@@ -12,7 +12,7 @@ fn parse_signature_header_from_string() {
     assert_eq!(
         signature_header,
         SignatureHeader {
-            signature: hex::decode("377abcaf271c").unwrap(),
+            signature: [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c],
             major_version: 0x00,
             minor_version: 0x04,
             start_header_crc: 0xd20f_5a4b,

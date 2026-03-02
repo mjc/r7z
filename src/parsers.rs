@@ -1,4 +1,4 @@
-use nom::{IResult, Needed};
+use nom::IResult;
 
 /// Encode a u64 as a 7z variable-length integer (1–9 bytes).
 ///
@@ -37,7 +37,10 @@ pub fn sevenzip_varuint64_encode(mut value: u64) -> Vec<u8> {
 /// Returns `nom::Err::Incomplete` if the input is empty or truncated.
 pub fn sevenzip_varuint64_decode(input: &[u8]) -> IResult<&[u8], u64> {
     if input.is_empty() {
-        return Err(nom::Err::Incomplete(Needed::new(1)));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Eof,
+        )));
     }
     let first_byte = input[0];
     let mut value: u64 = 0;
@@ -50,7 +53,10 @@ pub fn sevenzip_varuint64_decode(input: &[u8]) -> IResult<&[u8], u64> {
             break;
         }
         if addr >= input.len() {
-            return Err(nom::Err::Incomplete(Needed::new(1)));
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Eof,
+            )));
         }
         let next = input[addr];
         value |= u64::from(next) << (8 * i);

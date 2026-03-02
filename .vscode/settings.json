@@ -13,6 +13,7 @@
         "varuint"
     ],
     "chat.tools.terminal.autoApprove": {
-        "cargo search": true
+        "cargo search": true,
+        "./target/release/parse_flamegraph": true
     }
 }

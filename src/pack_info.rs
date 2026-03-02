@@ -13,7 +13,7 @@ pub struct PackInfo {
     pub num_pack_streams: u64,
     /// Compressed size of each packed stream in bytes.
     /// Nearly always length 1; stays on the stack for the common case.
-    pub pack_size: SmallVec<[u64; 1]>,
+    pub pack_size: SmallVec<[u64; 4]>,
 }
 
 impl PackInfo {
@@ -38,7 +38,7 @@ impl PackInfo {
         // Property::Size tag
         let (mut input, _size_marker) = le_u8(input)?;
 
-        let mut pack_size: SmallVec<[u64; 1]> =
+        let mut pack_size: SmallVec<[u64; 4]> =
             SmallVec::with_capacity((num_pack_streams as usize).min(input.len()));
         for _i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input)?;
@@ -66,8 +66,8 @@ pub struct UnpackInfo {
     /// Number of compression folders.
     pub num_folders: u64,
     /// One [`Folder`] per compression unit.
-    /// Nearly always length 1; stays on the stack for the common case.
-    pub folders: SmallVec<[Folder; 1]>,
+    /// Nearly always length 1; stays on the stack for typical archives.
+    pub folders: SmallVec<[Folder; 4]>,
     /// Uncompressed (output) size for each coder out-stream across all folders.
     pub unpack_sizes: SmallVec<[u64; 4]>,
     /// Optional CRC32 digest per folder (used to verify decompressed output).
@@ -103,7 +103,7 @@ impl UnpackInfo {
         };
 
         // Parse each folder
-        let mut folders: SmallVec<[Folder; 1]> =
+        let mut folders: SmallVec<[Folder; 4]> =
             SmallVec::with_capacity((num_folders as usize).min(input.len()));
         let mut input = input;
         for _ in 0..num_folders {
@@ -177,36 +177,27 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
 
     let (input, all_defined) = le_u8(input)?;
 
-    let defined: Vec<bool> = if all_defined != 0 {
-        vec![true; num_streams]
-    } else {
+    let (bitmap, input) = if all_defined == 0 {
         let num_bytes = num_streams.div_ceil(8);
-        let (_, bitmap) = nom::bytes::complete::take(num_bytes)(input)?;
-        (0..num_streams)
-            .map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
-            .collect()
+        let (rest, bm) = nom::bytes::complete::take(num_bytes)(input)?;
+        (bm, rest)
+    } else {
+        (&[][..], input)
     };
 
-    // If all_defined == 0, we consumed bitmap bytes
-    let input = if all_defined == 0 {
-        let num_bytes = num_streams.div_ceil(8);
-        &input[num_bytes..]
-    } else {
-        input
-    };
+    let is_defined = |i: usize| -> bool { all_defined != 0 || (bitmap[i / 8] >> (i % 8)) & 1 == 1 };
 
-    let mut crcs: SmallVec<[Option<u32>; 4]> =
-        SmallVec::with_capacity(num_streams.min(input.len()));
-    let mut input = input;
-    for is_def in &defined {
-        if *is_def {
-            let (i, crc) = le_u32(input)?;
-            crcs.push(Some(crc));
-            input = i;
-        } else {
-            crcs.push(None);
-        }
-    }
-
-    Ok((input, crcs))
+    (0..num_streams).try_fold(
+        (input, SmallVec::with_capacity(num_streams.min(input.len()))),
+        |(input, mut crcs), i| {
+            if is_defined(i) {
+                let (input, crc) = le_u32(input)?;
+                crcs.push(Some(crc));
+                Ok((input, crcs))
+            } else {
+                crcs.push(None);
+                Ok((input, crcs))
+            }
+        },
+    )
 }

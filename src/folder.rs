@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 pub struct Folder {
     /// Ordered list of coders in this folder.
     /// Typically 1 (simple archive) or 2 (e.g. BCJ + LZMA); stays on the stack.
-    pub coders: SmallVec<[CoderInfo; 2]>,
+    pub coders: SmallVec<[CoderInfo; 4]>,
     /// Bind pairs connecting coder output streams to coder input streams.
     pub bind_pairs: SmallVec<[(u64, u64); 1]>,
     /// Indices of packed (externally stored) input streams (empty when there is one).
@@ -38,7 +38,7 @@ impl Folder {
     /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
-        let mut coders: SmallVec<[CoderInfo; 2]> =
+        let mut coders: SmallVec<[CoderInfo; 4]> =
             SmallVec::with_capacity((num_coders as usize).min(input.len()));
         let mut input = input;
         for _ in 0..num_coders {
