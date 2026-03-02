@@ -32,7 +32,7 @@ fn main() -> io::Result<()> {
     }
 
     let svg_path = &args[1];
-    let command = args.get(2).map(|s| s.as_str()).unwrap_or("top");
+    let command = args.get(2).map_or("top", String::as_str);
 
     let content = fs::read_to_string(svg_path)?;
     let entries = parse_entries(&content);
@@ -44,7 +44,7 @@ fn main() -> io::Result<()> {
             cmd_top(&entries, n, min_pct);
         }
         "search" => {
-            let pattern = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let pattern = args.get(3).map_or("", String::as_str);
             cmd_search(&entries, pattern);
         }
         "syscalls" => {
@@ -54,19 +54,16 @@ fn main() -> io::Result<()> {
             cmd_summary(&entries);
         }
         "diff" => {
-            let other_path = match args.get(3) {
-                Some(p) => p,
-                None => {
-                    eprintln!("Usage: {} <before.svg> diff <after.svg>", args[0]);
-                    std::process::exit(1);
-                }
+            let Some(other_path) = args.get(3) else {
+                eprintln!("Usage: {} <before.svg> diff <after.svg>", args[0]);
+                std::process::exit(1);
             };
             let other_content = fs::read_to_string(other_path)?;
             let other_entries = parse_entries(&other_content);
             cmd_diff(&entries, &other_entries);
         }
         _ => {
-            eprintln!("Unknown command: {}", command);
+            eprintln!("Unknown command: {command}");
             std::process::exit(1);
         }
     }
@@ -120,7 +117,7 @@ fn parse_title(title: &str) -> Option<(String, u64, f64)> {
 }
 
 fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
-    println!("Top {} functions (>= {:.1}%):\n", n, min_pct);
+    println!("Top {n} functions (>= {min_pct:.1}%):\n");
     println!("{:>7} {:>10}  Function", "%", "samples");
     println!("{}", "-".repeat(90));
 
@@ -142,15 +139,12 @@ fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
     }
 
     println!("{}", "-".repeat(90));
-    println!(
-        "{:>6.2}%             Total ({} functions shown)",
-        total, shown
-    );
+    println!("{total:>6.2}%             Total ({shown} functions shown)");
 }
 
 fn cmd_search(entries: &[Entry], pattern: &str) {
     let pattern_lower = pattern.to_lowercase();
-    println!("Functions matching '{}':\n", pattern);
+    println!("Functions matching '{pattern}':\n");
     println!("{:>7} {:>10}  Function", "%", "samples");
     println!("{}", "-".repeat(90));
 
@@ -167,7 +161,7 @@ fn cmd_search(entries: &[Entry], pattern: &str) {
     }
 
     println!("{}", "-".repeat(90));
-    println!("{:>6.2}%             Total ({} matches)", total, count);
+    println!("{total:>6.2}%             Total ({count} matches)");
 }
 
 fn cmd_syscalls(entries: &[Entry]) {
@@ -190,7 +184,7 @@ fn cmd_syscalls(entries: &[Entry]) {
     }
 
     println!("{}", "-".repeat(60));
-    println!("{:>6.2}%  Total syscall time", total);
+    println!("{total:>6.2}%  Total syscall time");
 }
 
 fn cmd_summary(entries: &[Entry]) {
@@ -209,7 +203,7 @@ fn cmd_summary(entries: &[Entry]) {
     println!("{}", "-".repeat(40));
 
     for (cat, pct) in &cats {
-        println!("{:>6.2}%  {}", pct, cat);
+        println!("{pct:>6.2}%  {cat}");
     }
 
     println!("\n{}", "=".repeat(60));
@@ -232,7 +226,7 @@ fn cmd_summary(entries: &[Entry]) {
             .collect();
 
         if !funcs.is_empty() {
-            println!("{}:", cat);
+            println!("{cat}:");
             for e in funcs {
                 let short = truncate_name(&e.name, 55);
                 println!("  {:>5.2}%  {}", e.percent, short);
@@ -242,8 +236,19 @@ fn cmd_summary(entries: &[Entry]) {
     }
 }
 
-fn cmd_diff(before: &[Entry], after: &[Entry]) {
-    // Build maps: function name -> (samples, percent)
+struct Delta<'a> {
+    name: &'a str,
+    before_pct: f64,
+    after_pct: f64,
+    diff_pct: f64,
+    before_samples: u64,
+    after_samples: u64,
+}
+
+fn compute_deltas<'a>(
+    before: &'a [Entry],
+    after: &'a [Entry],
+) -> Vec<Delta<'a>> {
     let before_map: HashMap<&str, (u64, f64)> = before
         .iter()
         .map(|e| (e.name.as_str(), (e.samples, e.percent)))
@@ -253,100 +258,68 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
         .map(|e| (e.name.as_str(), (e.samples, e.percent)))
         .collect();
 
-    // Collect all function names
-    let mut all_names: Vec<&str> = Vec::new();
-    for e in before {
-        all_names.push(&e.name);
-    }
+    let mut all_names: Vec<&str> = before.iter().map(|e| e.name.as_str()).collect();
     for e in after {
         if !before_map.contains_key(e.name.as_str()) {
             all_names.push(&e.name);
         }
     }
 
-    // Compute deltas
-    struct Delta<'a> {
-        name: &'a str,
-        before_pct: f64,
-        after_pct: f64,
-        diff_pct: f64,
-        before_samples: u64,
-        after_samples: u64,
-    }
-
-    let mut deltas: Vec<Delta> = Vec::new();
-    for name in &all_names {
-        let (bs, bp) = before_map.get(name).copied().unwrap_or((0, 0.0));
-        let (a_s, ap) = after_map.get(name).copied().unwrap_or((0, 0.0));
-        let diff = ap - bp;
-        if diff.abs() >= 0.01 {
-            deltas.push(Delta {
+    let mut deltas: Vec<Delta> = all_names
+        .iter()
+        .filter_map(|name| {
+            let (bs, bp) = before_map.get(name).copied().unwrap_or((0, 0.0));
+            let (a_s, ap) = after_map.get(name).copied().unwrap_or((0, 0.0));
+            let diff = ap - bp;
+            (diff.abs() >= 0.01).then_some(Delta {
                 name,
                 before_pct: bp,
                 after_pct: ap,
                 diff_pct: diff,
                 before_samples: bs,
                 after_samples: a_s,
-            });
-        }
-    }
+            })
+        })
+        .collect();
 
-    // Sort by absolute delta descending
     deltas.sort_by(|a, b| {
         b.diff_pct
             .abs()
             .partial_cmp(&a.diff_pct.abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    deltas
+}
 
-    // Print regressions (gained CPU)
+fn print_delta_table(label: &str, deltas: &[&Delta], limit: usize) {
+    println!("{label}:\n");
+    println!(
+        "{:>8} {:>8} {:>8}  {:>10} {:>10}  Function",
+        "before%", "after%", "delta%", "before_n", "after_n"
+    );
+    println!("{}", "-".repeat(100));
+    for d in deltas.iter().take(limit) {
+        let display_name = truncate_name(d.name, 42);
+        println!(
+            "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {display_name}",
+            d.before_pct, d.after_pct, d.diff_pct, d.before_samples, d.after_samples,
+        );
+    }
+    println!();
+}
+
+fn cmd_diff(before: &[Entry], after: &[Entry]) {
+    let deltas = compute_deltas(before, after);
     let regressions: Vec<_> = deltas.iter().filter(|d| d.diff_pct > 0.0).collect();
     let improvements: Vec<_> = deltas.iter().filter(|d| d.diff_pct < 0.0).collect();
 
     println!("Flamegraph diff: before vs after\n");
 
     if !regressions.is_empty() {
-        println!("REGRESSIONS (gained CPU):\n");
-        println!(
-            "{:>8} {:>8} {:>8}  {:>10} {:>10}  Function",
-            "before%", "after%", "delta%", "before_n", "after_n"
-        );
-        println!("{}", "-".repeat(100));
-        for d in regressions.iter().take(30) {
-            let display_name = truncate_name(d.name, 42);
-            println!(
-                "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {}",
-                d.before_pct,
-                d.after_pct,
-                d.diff_pct,
-                d.before_samples,
-                d.after_samples,
-                display_name
-            );
-        }
-        println!();
+        print_delta_table("REGRESSIONS (gained CPU)", &regressions, 30);
     }
-
     if !improvements.is_empty() {
-        println!("IMPROVEMENTS (lost CPU):\n");
-        println!(
-            "{:>8} {:>8} {:>8}  {:>10} {:>10}  Function",
-            "before%", "after%", "delta%", "before_n", "after_n"
-        );
-        println!("{}", "-".repeat(100));
-        for d in improvements.iter().take(30) {
-            let display_name = truncate_name(d.name, 42);
-            println!(
-                "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {}",
-                d.before_pct,
-                d.after_pct,
-                d.diff_pct,
-                d.before_samples,
-                d.after_samples,
-                display_name
-            );
-        }
-        println!();
+        print_delta_table("IMPROVEMENTS (lost CPU)", &improvements, 30);
     }
 
     if regressions.is_empty() && improvements.is_empty() {
@@ -355,151 +328,40 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
         let total_regression: f64 = regressions.iter().map(|d| d.diff_pct).sum();
         let total_improvement: f64 = improvements.iter().map(|d| d.diff_pct).sum();
         println!(
-            "Summary: {:>+.2}% regressions, {:>+.2}% improvements ({} functions changed)",
-            total_regression,
-            total_improvement,
+            "Summary: {total_regression:>+.2}% regressions, {total_improvement:>+.2}% improvements ({} functions changed)",
             deltas.len()
         );
     }
 }
 
+const CATEGORIES: &[(&str, &[&str])] = &[
+    ("Cache/Foyer", &["foyer", "hybrid_cache", "hybridarticle", "article_cache", "unified_cache", "cache::", "moka"]),
+    ("NNTP Protocol", &["nntp", "precheck", "article_routing", "client_session", "backend_execution", "command_guard", "route_command", "status_code", "message_id"]),
+    ("TLS/Crypto", &["tls", "ssl", "rustls", "aes", "cipher", "encrypt", "decrypt", "handshake", "aws_lc", "ring::", "chacha"]),
+    ("Compression", &["lz4", "compress", "decompress", "zstd"]),
+    ("Connection Pool", &["deadpool", "pool", "connection_provider"]),
+    ("Network I/O", &["recv", "send", "tcp", "socket", "inet", "skb", "net_"]),
+    ("Disk I/O", &["zfs", "zpl", "zil", "vfs", "write_all", "ext4", "xfs", "btrfs", "block_", "io_uring", "pread", "pwrite"]),
+    ("Locks/Futex", &["futex", "mutex", "lock", "rwlock", "semaphore", "parking_lot"]),
+    ("Event Loop", &["epoll", "poll", "mio"]),
+    ("Tokio Runtime", &["tokio", "runtime"]),
+    ("Async/Futures", &["futures", "async", "waker"]),
+    ("Scheduling", &["schedule", "switch", "context"]),
+    ("Memory", &["alloc", "malloc", "free", "mmap", "brk", "jemalloc"]),
+];
+
+const SYSCALL_PREFIXES: &[&str] = &["__x64_sys_", "syscall", "do_syscall", "entry_SYSCALL"];
+
 fn categorize(name: &str) -> &'static str {
     let lower = name.to_lowercase();
 
-    // Cache / foyer (disk cache engine)
-    if lower.contains("foyer")
-        || lower.contains("hybrid_cache")
-        || lower.contains("hybridarticle")
-        || lower.contains("article_cache")
-        || lower.contains("unified_cache")
-        || lower.contains("cache::")
-        || lower.contains("moka")
-    {
-        return "Cache/Foyer";
+    for &(category, keywords) in CATEGORIES {
+        if keywords.iter().any(|kw| lower.contains(kw)) {
+            return category;
+        }
     }
 
-    // NNTP protocol handling
-    if lower.contains("nntp")
-        || lower.contains("precheck")
-        || lower.contains("article_routing")
-        || lower.contains("client_session")
-        || lower.contains("backend_execution")
-        || lower.contains("command_guard")
-        || lower.contains("route_command")
-        || lower.contains("status_code")
-        || lower.contains("message_id")
-    {
-        return "NNTP Protocol";
-    }
-
-    // TLS / crypto
-    if lower.contains("tls")
-        || lower.contains("ssl")
-        || lower.contains("rustls")
-        || lower.contains("aes")
-        || lower.contains("cipher")
-        || lower.contains("encrypt")
-        || lower.contains("decrypt")
-        || lower.contains("handshake")
-        || lower.contains("aws_lc")
-        || lower.contains("ring::")
-        || lower.contains("chacha")
-    {
-        return "TLS/Crypto";
-    }
-
-    // Compression (LZ4 for foyer disk cache)
-    if lower.contains("lz4")
-        || lower.contains("compress")
-        || lower.contains("decompress")
-        || lower.contains("zstd")
-    {
-        return "Compression";
-    }
-
-    // Connection pooling
-    if lower.contains("deadpool") || lower.contains("pool") || lower.contains("connection_provider")
-    {
-        return "Connection Pool";
-    }
-
-    // Network I/O
-    if lower.contains("recv")
-        || lower.contains("send")
-        || lower.contains("tcp")
-        || lower.contains("socket")
-        || lower.contains("inet")
-        || lower.contains("skb")
-        || lower.contains("net_")
-    {
-        return "Network I/O";
-    }
-
-    // Disk I/O
-    if lower.contains("zfs")
-        || lower.contains("zpl")
-        || lower.contains("zil")
-        || lower.contains("vfs")
-        || lower.contains("write_all")
-        || lower.contains("ext4")
-        || lower.contains("xfs")
-        || lower.contains("btrfs")
-        || lower.contains("block_")
-        || lower.contains("io_uring")
-        || lower.contains("pread")
-        || lower.contains("pwrite")
-    {
-        return "Disk I/O";
-    }
-
-    // Locks / synchronization
-    if lower.contains("futex")
-        || lower.contains("mutex")
-        || lower.contains("lock")
-        || lower.contains("rwlock")
-        || lower.contains("semaphore")
-        || lower.contains("parking_lot")
-    {
-        return "Locks/Futex";
-    }
-
-    // Event loop
-    if lower.contains("epoll") || lower.contains("poll") || lower.contains("mio") {
-        return "Event Loop";
-    }
-
-    // Tokio runtime
-    if lower.contains("tokio") || lower.contains("runtime") {
-        return "Tokio Runtime";
-    }
-
-    // Async machinery
-    if lower.contains("futures") || lower.contains("async") || lower.contains("waker") {
-        return "Async/Futures";
-    }
-
-    // Scheduling
-    if lower.contains("schedule") || lower.contains("switch") || lower.contains("context") {
-        return "Scheduling";
-    }
-
-    // Memory allocation
-    if lower.contains("alloc")
-        || lower.contains("malloc")
-        || lower.contains("free")
-        || lower.contains("mmap")
-        || lower.contains("brk")
-        || lower.contains("jemalloc")
-    {
-        return "Memory";
-    }
-
-    // Raw syscalls
-    if name.starts_with("__x64_sys_")
-        || name.starts_with("syscall")
-        || name.starts_with("do_syscall")
-        || name.starts_with("entry_SYSCALL")
-    {
+    if SYSCALL_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return "Syscall";
     }
 

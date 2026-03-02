@@ -7,7 +7,7 @@ use nom::ToUsize;
 use std::path::Path;
 
 /// Maximum decompressed size accepted for the compressed archive header (metadata only).
-/// A malicious archive could declare an enormous unpack_size to cause OOM during header
+/// A malicious archive could declare an enormous `unpack_size` to cause OOM during header
 /// decompression; this cap bounds the allocation to a sane limit. File data extracted
 /// via [`Archive::extract_to_memory`] is not subject to this limit.
 const MAX_HEADER_UNPACK_BYTES: u64 = 64 * 1024 * 1024;

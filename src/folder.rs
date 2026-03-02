@@ -1,4 +1,4 @@
-use crate::{sevenzip_varuint64_decode, CoderInfo};
+use crate::{sevenzip_varuint64_decode, usize_cap, CoderInfo};
 use nom::IResult;
 use smallvec::SmallVec;
 
@@ -39,7 +39,7 @@ impl Folder {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
         let mut coders: SmallVec<[CoderInfo; 4]> =
-            SmallVec::with_capacity((num_coders as usize).min(input.len()));
+            SmallVec::with_capacity(usize_cap(num_coders, input.len()));
         let mut input = input;
         for _ in 0..num_coders {
             let (i, coder) = CoderInfo::parse(input)?;
@@ -52,7 +52,7 @@ impl Folder {
         let num_bind_pairs = num_out_total.saturating_sub(1);
 
         let mut bind_pairs: SmallVec<[(u64, u64); 1]> =
-            SmallVec::with_capacity((num_bind_pairs as usize).min(input.len()));
+            SmallVec::with_capacity(usize_cap(num_bind_pairs, input.len()));
         for _ in 0..num_bind_pairs {
             let (i, in_idx) = sevenzip_varuint64_decode(input)?;
             let (i, out_idx) = sevenzip_varuint64_decode(i)?;
@@ -65,7 +65,7 @@ impl Folder {
         let num_packed = num_in_total - num_bind_pairs;
         let mut packed_indices: SmallVec<[u64; 1]> = SmallVec::new();
         if num_packed != 1 {
-            packed_indices.reserve_exact(num_packed as usize);
+            packed_indices.reserve_exact(usize_cap(num_packed, input.len()));
             for _ in 0..num_packed {
                 let (i, idx) = sevenzip_varuint64_decode(input)?;
                 packed_indices.push(idx);

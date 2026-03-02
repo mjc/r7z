@@ -1,5 +1,14 @@
 use nom::IResult;
 
+/// Saturate a `u64` count down to `usize`, capped at `max` so that
+/// `with_capacity` / `reserve_exact` never over-allocates more than the input
+/// actually contains.
+#[inline]
+#[must_use]
+pub fn usize_cap(n: u64, max: usize) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX).min(max)
+}
+
 /// Encode a u64 as a 7z variable-length integer (1–9 bytes).
 ///
 /// Format mirrors `sevenzip_varuint64_decode`: bit (7-i) of the first byte is set

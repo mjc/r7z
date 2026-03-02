@@ -1,7 +1,7 @@
 use nom::{number::complete::le_u8, IResult, ToUsize};
 use smallvec::SmallVec;
 
-use crate::{sevenzip_varuint64_decode, Folder, Property};
+use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
 
 /// Describes where the packed (compressed) data streams live in the archive file.
 #[derive(Debug, PartialEq)]
@@ -39,7 +39,7 @@ impl PackInfo {
         let (mut input, _size_marker) = le_u8(input)?;
 
         let mut pack_size: SmallVec<[u64; 4]> =
-            SmallVec::with_capacity((num_pack_streams as usize).min(input.len()));
+            SmallVec::with_capacity(usize_cap(num_pack_streams, input.len()));
         for _i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input)?;
             pack_size.push(a_pack_size);
@@ -104,7 +104,7 @@ impl UnpackInfo {
 
         // Parse each folder
         let mut folders: SmallVec<[Folder; 4]> =
-            SmallVec::with_capacity((num_folders as usize).min(input.len()));
+            SmallVec::with_capacity(usize_cap(num_folders, input.len()));
         let mut input = input;
         for _ in 0..num_folders {
             let (i, folder) = Folder::parse(input)?;
