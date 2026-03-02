@@ -18,7 +18,7 @@ fn decompress_lzma_packed_header() {
 
     let folder = &ui.folders[0];
     // Sanity: LZMA codec
-    assert_eq!(folder.coders[0].codec_id, CODEC_LZMA);
+    assert_eq!(folder.coders[0].codec_id.as_slice(), CODEC_LZMA);
 
     let unpack_size = ui.unpack_sizes[0];
     let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();

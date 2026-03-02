@@ -25,10 +25,10 @@ fn parse_archive_metadata_from_test_fixture() {
     let folder = &ui.folders[0];
     assert_eq!(folder.coders.len(), 1);
     // LZMA codec ID
-    assert_eq!(folder.coders[0].codec_id, vec![0x03, 0x01, 0x01]);
+    assert_eq!(folder.coders[0].codec_id.as_slice(), &[0x03, 0x01, 0x01]);
     // LZMA properties present (5 bytes)
     assert_eq!(
-        folder.coders[0].properties.as_ref().map(Vec::len),
+        folder.coders[0].properties.as_deref().map(<[u8]>::len),
         Some(5)
     );
     // 1 in-stream, 1 out-stream
@@ -63,8 +63,8 @@ fn archive_open_full_header() {
     assert_eq!(eh.unpack_info.num_folders, 1);
     // LZMA header codec
     assert_eq!(
-        eh.unpack_info.folders[0].coders[0].codec_id,
-        vec![0x03, 0x01, 0x01]
+        eh.unpack_info.folders[0].coders[0].codec_id.as_slice(),
+        &[0x03, 0x01, 0x01]
     );
 
     // Full header: file listing
@@ -80,5 +80,5 @@ fn archive_open_full_header() {
     // StreamsInfo: LZMA2 file data codec
     let si = archive.streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
-    assert_eq!(ui.folders[0].coders[0].codec_id, vec![0x21]); // LZMA2
+    assert_eq!(ui.folders[0].coders[0].codec_id.as_slice(), &[0x21]); // LZMA2
 }

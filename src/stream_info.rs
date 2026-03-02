@@ -1,5 +1,5 @@
 use crate::{sevenzip_varuint64_decode, PackInfo, Property, UnpackInfo};
-use nom::{number::streaming::le_u8, IResult, ToUsize};
+use nom::{number::complete::le_u8, IResult, ToUsize};
 
 /// Per-file stream metadata within a solid (multi-file) folder.
 #[derive(Debug, PartialEq)]
@@ -105,14 +105,14 @@ impl SubstreamInfo {
 }
 
 fn parse_stream_digests(input: &[u8], num: usize) -> IResult<&[u8], Vec<Option<u32>>> {
-    use nom::number::streaming::le_u32;
+    use nom::number::complete::le_u32;
 
     let (input, all_defined) = le_u8(input)?;
     let defined: Vec<bool> = if all_defined != 0 {
         vec![true; num]
     } else {
         let num_bytes = num.div_ceil(8);
-        let (_, bitmap) = nom::bytes::streaming::take(num_bytes)(input)?;
+        let (_, bitmap) = nom::bytes::complete::take(num_bytes)(input)?;
         (0..num)
             .map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
             .collect()
@@ -207,7 +207,7 @@ impl StreamInfo {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
+                    let (i, _) = nom::bytes::complete::take(sz)(i)?;
                     input = i;
                 }
             }

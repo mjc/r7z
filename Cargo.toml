@@ -8,6 +8,8 @@ description = "Pure-Rust library for reading and writing .7z archives"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+arrayvec = "0.7"
+smallvec = "1"
 bytes = "1"
 crc32fast = "1.5.0"
 lzma-rs = "0.3.0"

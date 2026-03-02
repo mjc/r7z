@@ -1,4 +1,4 @@
-use nom::{number::streaming::le_u8, IResult, ToUsize};
+use nom::{number::complete::le_u8, IResult, ToUsize};
 
 use crate::{sevenzip_varuint64_decode, Folder, Property};
 
@@ -36,7 +36,7 @@ impl PackInfo {
         // Property::Size tag
         let (mut input, _size_marker) = le_u8(input)?;
 
-        let mut pack_size = Vec::new();
+        let mut pack_size = Vec::with_capacity(num_pack_streams as usize);
         for _i in 0..num_pack_streams {
             let (sliced, a_pack_size) = sevenzip_varuint64_decode(input)?;
             pack_size.push(a_pack_size);
@@ -99,7 +99,7 @@ impl UnpackInfo {
         };
 
         // Parse each folder
-        let mut folders = Vec::new();
+        let mut folders = Vec::with_capacity(num_folders as usize);
         let mut input = input;
         for _ in 0..num_folders {
             let (i, folder) = Folder::parse(input)?;
@@ -111,8 +111,8 @@ impl UnpackInfo {
         let total_out_streams: usize = folders.iter().map(super::folder::Folder::total_out_streams).sum();
 
         // Property-tag loop for CodersUnPackSize and CRC
-        let mut unpack_sizes = Vec::new();
-        let mut digests = vec![None; num_folders.to_usize()];
+        let mut unpack_sizes = Vec::with_capacity(total_out_streams);
+        let mut digests: Vec<Option<u32>> = Vec::new();
 
         loop {
             let (i, tag) = Property::parse(input)?;
@@ -147,6 +147,10 @@ impl UnpackInfo {
             }
         }
 
+        if digests.is_empty() {
+            digests.resize(num_folders.to_usize(), None);
+        }
+
         Ok((
             input,
             UnpackInfo {
@@ -161,7 +165,7 @@ impl UnpackInfo {
 
 /// Parse CRC digests for `num_streams` streams using `AllAreDefined` + optional bitmap.
 fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], Vec<Option<u32>>> {
-    use nom::number::streaming::le_u32;
+    use nom::number::complete::le_u32;
 
     let (input, all_defined) = le_u8(input)?;
 
@@ -169,7 +173,7 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], Vec<Option<
         vec![true; num_streams]
     } else {
         let num_bytes = num_streams.div_ceil(8);
-        let (_, bitmap) = nom::bytes::streaming::take(num_bytes)(input)?;
+        let (_, bitmap) = nom::bytes::complete::take(num_bytes)(input)?;
         (0..num_streams)
             .map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
             .collect()

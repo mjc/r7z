@@ -36,7 +36,7 @@ impl Folder {
     /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
-        let mut coders = Vec::new();
+        let mut coders = Vec::with_capacity(num_coders as usize);
         let mut input = input;
         for _ in 0..num_coders {
             let (i, coder) = CoderInfo::parse(input)?;
@@ -48,7 +48,7 @@ impl Folder {
         let num_out_total: u64 = coders.iter().map(|c| c.num_out_streams).sum();
         let num_bind_pairs = num_out_total.saturating_sub(1);
 
-        let mut bind_pairs = Vec::new();
+        let mut bind_pairs = Vec::with_capacity(num_bind_pairs as usize);
         for _ in 0..num_bind_pairs {
             let (i, in_idx) = sevenzip_varuint64_decode(input)?;
             let (i, out_idx) = sevenzip_varuint64_decode(i)?;
@@ -61,6 +61,7 @@ impl Folder {
         let num_packed = num_in_total - num_bind_pairs;
         let mut packed_indices = Vec::new();
         if num_packed != 1 {
+            packed_indices.reserve_exact(num_packed as usize);
             for _ in 0..num_packed {
                 let (i, idx) = sevenzip_varuint64_decode(input)?;
                 packed_indices.push(idx);

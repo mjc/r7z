@@ -10,10 +10,10 @@ const LZMA_CODER_BYTES: &[u8] = &[0x23, 0x03, 0x01, 0x01, 0x05, 0x5d, 0x00, 0x10
 fn parse_lzma_coder_info() {
     let (remaining, coder) = CoderInfo::parse(LZMA_CODER_BYTES).unwrap();
     assert!(remaining.is_empty());
-    assert_eq!(coder.codec_id, vec![0x03, 0x01, 0x01]);
+    assert_eq!(coder.codec_id.as_slice(), &[0x03, 0x01, 0x01]);
     assert_eq!(coder.num_in_streams, 1);
     assert_eq!(coder.num_out_streams, 1);
-    assert_eq!(coder.properties, Some(vec![0x5d, 0x00, 0x10, 0x00, 0x00]));
+    assert_eq!(coder.properties.as_deref(), Some(&[0x5d_u8, 0x00, 0x10, 0x00, 0x00][..]));
 }
 
 #[test]
@@ -22,7 +22,7 @@ fn parse_simple_coder_no_props() {
     let bytes = &[0x01, 0x00];
     let (remaining, coder) = CoderInfo::parse(bytes).unwrap();
     assert!(remaining.is_empty());
-    assert_eq!(coder.codec_id, vec![0x00]);
+    assert_eq!(coder.codec_id.as_slice(), &[0x00]);
     assert_eq!(coder.num_in_streams, 1);
     assert_eq!(coder.num_out_streams, 1);
     assert_eq!(coder.properties, None);
@@ -37,7 +37,7 @@ fn parse_folder_single_lzma() {
     let (remaining, folder) = Folder::parse(&bytes).unwrap();
     assert!(remaining.is_empty());
     assert_eq!(folder.coders.len(), 1);
-    assert_eq!(folder.coders[0].codec_id, vec![0x03, 0x01, 0x01]);
+    assert_eq!(folder.coders[0].codec_id.as_slice(), &[0x03, 0x01, 0x01]);
     assert_eq!(folder.bind_pairs.len(), 0);
     assert_eq!(folder.packed_indices.len(), 0); // implicit single packed index
 }
@@ -58,6 +58,6 @@ fn parse_encoded_header_coder_details() {
     assert_eq!(eh.unpack_info.folders.len(), 1);
     let folder = &eh.unpack_info.folders[0];
     assert_eq!(folder.coders.len(), 1);
-    assert_eq!(folder.coders[0].codec_id, vec![0x03, 0x01, 0x01]); // LZMA
+    assert_eq!(folder.coders[0].codec_id.as_slice(), &[0x03, 0x01, 0x01]); // LZMA
     assert!(folder.coders[0].properties.is_some());
 }

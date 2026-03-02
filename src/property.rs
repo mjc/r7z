@@ -1,4 +1,4 @@
-use nom::{error::ErrorKind, number::streaming::le_u8, IResult};
+use nom::{error::ErrorKind, number::complete::le_u8, IResult};
 use num::FromPrimitive;
 
 #[derive(PartialEq, Debug, FromPrimitive)]

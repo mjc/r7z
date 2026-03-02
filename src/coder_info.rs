@@ -1,5 +1,7 @@
+use arrayvec::ArrayVec;
+use smallvec::SmallVec;
 use crate::sevenzip_varuint64_decode;
-use nom::{bytes::streaming::take, number::streaming::le_u8, IResult};
+use nom::{bytes::complete::take, number::complete::le_u8, IResult};
 
 /// A single coder (codec) within a [`Folder`](crate::Folder).
 ///
@@ -8,13 +10,16 @@ use nom::{bytes::streaming::take, number::streaming::le_u8, IResult};
 #[derive(Debug, PartialEq)]
 pub struct CoderInfo {
     /// Codec identifier bytes (e.g. `[0x03, 0x01, 0x01]` = LZMA, `[0x21]` = LZMA2).
-    pub codec_id: Vec<u8>,
+    /// The 7z format encodes the length in a 4-bit field, so this is at most 15 bytes,
+    /// fitting entirely on the stack.
+    pub codec_id: ArrayVec<u8, 15>,
     /// Number of input streams consumed by this coder.
     pub num_in_streams: u64,
     /// Number of output streams produced by this coder.
     pub num_out_streams: u64,
     /// Codec-specific properties (e.g. 5 bytes for LZMA, 1 byte for LZMA2).
-    pub properties: Option<Vec<u8>>,
+    /// Stored inline for all common codecs; spills to heap only for exotic ones.
+    pub properties: Option<SmallVec<[u8; 16]>>,
 }
 
 impl CoderInfo {
@@ -30,7 +35,7 @@ impl CoderInfo {
         let has_attributes = (flags & 0x20) != 0;
 
         let (input, codec_id_bytes) = take(codec_id_size)(input)?;
-        let codec_id = codec_id_bytes.to_vec();
+        let codec_id: ArrayVec<u8, 15> = codec_id_bytes.iter().copied().collect();
 
         let (input, num_in_streams, num_out_streams) = if is_complex {
             let (input, n_in) = sevenzip_varuint64_decode(input)?;
@@ -49,7 +54,7 @@ impl CoderInfo {
                 ))
             })?;
             let (input, prop_bytes) = take(sz)(input)?;
-            (input, Some(prop_bytes.to_vec()))
+            (input, Some(prop_bytes.iter().copied().collect()))
         } else {
             (input, None)
         };

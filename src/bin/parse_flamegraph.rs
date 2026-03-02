@@ -113,7 +113,7 @@ fn parse_title(title: &str) -> Option<(String, u64, f64)> {
 
 fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
     println!("Top {} functions (>= {:.1}%):\n", n, min_pct);
-    println!("{:>7} {:>10}  {}", "%", "samples", "Function");
+    println!("{:>7} {:>10}  Function", "%", "samples");
     println!("{}", "-".repeat(90));
 
     let mut shown = 0;
@@ -140,7 +140,7 @@ fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
 fn cmd_search(entries: &[Entry], pattern: &str) {
     let pattern_lower = pattern.to_lowercase();
     println!("Functions matching '{}':\n", pattern);
-    println!("{:>7} {:>10}  {}", "%", "samples", "Function");
+    println!("{:>7} {:>10}  Function", "%", "samples");
     println!("{}", "-".repeat(90));
 
     let mut total = 0.0;
@@ -161,7 +161,7 @@ fn cmd_search(entries: &[Entry], pattern: &str) {
 
 fn cmd_syscalls(entries: &[Entry]) {
     println!("Syscall breakdown:\n");
-    println!("{:>7}  {}", "%", "Syscall");
+    println!("{:>7}  Syscall", "%");
     println!("{}", "-".repeat(60));
 
     let mut total = 0.0;
@@ -193,7 +193,7 @@ fn cmd_summary(entries: &[Entry]) {
     cats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     println!("Category summary:\n");
-    println!("{:>7}  {}", "%", "Category");
+    println!("{:>7}  Category", "%");
     println!("{}", "-".repeat(40));
 
     for (cat, pct) in &cats {
@@ -296,8 +296,8 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
     if !regressions.is_empty() {
         println!("REGRESSIONS (gained CPU):\n");
         println!(
-            "{:>8} {:>8} {:>8}  {:>10} {:>10}  {}",
-            "before%", "after%", "delta%", "before_n", "after_n", "Function"
+            "{:>8} {:>8} {:>8}  {:>10} {:>10}  Function",
+            "before%", "after%", "delta%", "before_n", "after_n"
         );
         println!("{}", "-".repeat(100));
         for d in regressions.iter().take(30) {
@@ -313,8 +313,8 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
     if !improvements.is_empty() {
         println!("IMPROVEMENTS (lost CPU):\n");
         println!(
-            "{:>8} {:>8} {:>8}  {:>10} {:>10}  {}",
-            "before%", "after%", "delta%", "before_n", "after_n", "Function"
+            "{:>8} {:>8} {:>8}  {:>10} {:>10}  Function",
+            "before%", "after%", "delta%", "before_n", "after_n"
         );
         println!("{}", "-".repeat(100));
         for d in improvements.iter().take(30) {

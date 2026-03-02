@@ -1,7 +1,7 @@
 use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
 use nom::{
     multi::count,
-    number::streaming::{le_u32, le_u64, le_u8},
+    number::complete::{le_u32, le_u64, le_u8},
     IResult, Parser,
 };
 
@@ -99,7 +99,7 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
+                    let (i, _) = nom::bytes::complete::take(sz)(i)?;
                     input = i;
                 }
                 _ => {
@@ -111,7 +111,7 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
+                    let (i, _) = nom::bytes::complete::take(sz)(i)?;
                     input = i;
                 }
             }
