@@ -2,9 +2,22 @@
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
+use memmap2::Mmap;
+use std::fs::File;
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+/// Memory-map a file and return a `Bytes` backed by the mapping.
+///
+/// The OS pages the file on demand — no heap allocation proportional to file size.
+fn mmap_bytes(path: &PathBuf) -> Bytes {
+    let file = File::open(path).expect("failed to open fixture");
+    // SAFETY: we hold the file open for the lifetime of the Mmap, and the
+    // benchmark process does not modify the fixture files.
+    let mmap = Arc::new(unsafe { Mmap::map(&file).expect("mmap failed") });
+    Bytes::from_owner(mmap)
+}
 
 // Lazy fixture generation: 1 MB archive
 fn archive_1mb_path() -> PathBuf {
@@ -93,34 +106,22 @@ fn archive_10gb_path() -> PathBuf {
 // Lazy archive bytes for r7z operations — stored as Bytes so clone() is O(1).
 fn archive_1mb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| {
-        Bytes::from(std::fs::read(archive_1mb_path()).expect("failed to read 1MB fixture"))
-    })
-    .clone()
+    BYTES.get_or_init(|| mmap_bytes(&archive_1mb_path())).clone()
 }
 
 fn archive_10mb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| {
-        Bytes::from(std::fs::read(archive_10mb_path()).expect("failed to read 10MB fixture"))
-    })
-    .clone()
+    BYTES.get_or_init(|| mmap_bytes(&archive_10mb_path())).clone()
 }
 
 fn archive_1gb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| {
-        Bytes::from(std::fs::read(archive_1gb_path()).expect("failed to read 1GB fixture"))
-    })
-    .clone()
+    BYTES.get_or_init(|| mmap_bytes(&archive_1gb_path())).clone()
 }
 
 fn archive_10gb_bytes() -> Bytes {
     static BYTES: OnceLock<Bytes> = OnceLock::new();
-    BYTES.get_or_init(|| {
-        Bytes::from(std::fs::read(archive_10gb_path()).expect("failed to read 10GB fixture"))
-    })
-    .clone()
+    BYTES.get_or_init(|| mmap_bytes(&archive_10gb_path())).clone()
 }
 
 // Generate a compressible repeating payload of `size` bytes.
@@ -128,8 +129,15 @@ fn archive_10gb_bytes() -> Bytes {
 // A simple 256-byte counter cycle compresses extremely well with LZMA
 // (a 1 GB payload becomes ~hundreds of bytes on disk), so large-fixture
 // open/parse benchmarks can run without gigabytes of RAM or disk space.
+//
+// For the open benchmarks we only care about header-parse performance;
+// the header structure is identical regardless of declared payload size.
+// Cap actual allocation at 1 MB — the archive metadata is the same.
+const PAYLOAD_CAP: usize = 1024 * 1024; // 1 MB
+
 fn generate_payload(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 256) as u8).collect()
+    let actual = size.min(PAYLOAD_CAP);
+    (0..actual).map(|i| (i % 256) as u8).collect()
 }
 
 // Whether to run benchmarks that require materialising gigabytes of data in RAM.

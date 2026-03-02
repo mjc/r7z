@@ -6,6 +6,12 @@ use bytes::Bytes;
 use nom::ToUsize;
 use std::path::Path;
 
+/// Maximum decompressed size accepted for the compressed archive header (metadata only).
+/// A malicious archive could declare an enormous unpack_size to cause OOM during header
+/// decompression; this cap bounds the allocation to a sane limit. File data extracted
+/// via [`Archive::extract_to_memory`] is not subject to this limit.
+const MAX_HEADER_UNPACK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Metadata extracted from the outer 7z header (`EncodedHeader` only).
 #[derive(Debug)]
 pub struct ArchiveMetadata {
@@ -102,8 +108,11 @@ impl Archive {
                 let data_end = data_start
                     + usize::try_from(pi.pack_size[0]).map_err(|_| R7zError::Parse)?;
                 let packed = &data[data_start..data_end];
-                let folder = &ui.folders[0];
-                let unpack_size = ui.unpack_sizes[0];
+                let folder = ui.folders.first().ok_or(R7zError::Parse)?;
+                let unpack_size = ui.unpack_sizes.first().copied().ok_or(R7zError::Parse)?;
+                if unpack_size > MAX_HEADER_UNPACK_BYTES {
+                    return Err(R7zError::Parse);
+                }
                 let decompressed = codec::decompress_folder(folder, packed, unpack_size)?;
 
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;

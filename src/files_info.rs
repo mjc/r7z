@@ -1,6 +1,6 @@
 use crate::{sevenzip_varuint64_decode, Property};
 use bytes::Bytes;
-use nom::{bytes::streaming::take, IResult};
+use nom::{bytes::complete::take, IResult};
 
 /// File listing metadata from the 7z `FilesInfo` block.
 #[derive(Debug, PartialEq)]
@@ -158,7 +158,7 @@ impl FilesInfo {
                     } else {
                         &block[1..=num_bytes]
                     };
-                    mtimes = Vec::with_capacity(n);
+                    mtimes = Vec::with_capacity(n.min(block.len() / 8));
                     let mut pos = data_start;
                     for j in 0..n {
                         let is_def =
@@ -195,7 +195,7 @@ impl FilesInfo {
                     } else {
                         &block[1..=num_bytes]
                     };
-                    attributes = Vec::with_capacity(n);
+                    attributes = Vec::with_capacity(n.min(block.len() / 4));
                     let mut pos = data_start;
                     for j in 0..n {
                         let is_def =

@@ -87,7 +87,7 @@ impl SubstreamInfo {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
+                    let (i, _) = nom::bytes::complete::take(sz)(i)?;
                     input = i;
                 }
             }
@@ -189,10 +189,7 @@ impl StreamInfo {
                 Property::SubStreamsInfo => {
                     let num_folders = unpack_info
                         .as_ref()
-                        .map_or(0, |u| {
-                            usize::try_from(u.num_folders)
-                                .expect("num_folders fits in usize")
-                        });
+                        .map_or(0, |u| u.folders.len());
                     let (i, si) = SubstreamInfo::parse(input, num_folders)?;
                     substream_info = Some(si);
                     input = i;

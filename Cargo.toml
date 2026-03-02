@@ -22,6 +22,7 @@ thiserror = "2"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 hex = "0.4"
+memmap2 = "0.9"
 tempfile = "3.26.0"
 pprof = { version = "0.15", features = ["flamegraph"] }
 
