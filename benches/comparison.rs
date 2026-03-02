@@ -123,17 +123,18 @@ fn archive_10gb_bytes() -> Bytes {
     .clone()
 }
 
-// Generate pseudo-random payload for consistent benchmarking
+// Generate a compressible repeating payload of `size` bytes.
+//
+// A simple 256-byte counter cycle compresses extremely well with LZMA
+// (a 1 GB payload becomes ~hundreds of bytes on disk), so large-fixture
+// open/parse benchmarks can run without gigabytes of RAM or disk space.
 fn generate_payload(size: usize) -> Vec<u8> {
-    let mut data = Vec::with_capacity(size);
-    let seed = 0x1234_5678_u32;
-    let mut rng = seed;
+    (0..size).map(|i| (i % 256) as u8).collect()
+}
 
-    for _ in 0..size {
-        rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
-        data.push(u8::try_from((rng >> 8) & 0xFF).expect("masked to 8 bits"));
-    }
-    data
+// Whether to run benchmarks that require materialising gigabytes of data in RAM.
+fn run_huge_benches() -> bool {
+    std::env::var("RUN_HUGE_BENCHES").is_ok()
 }
 
 // ============================================================================
@@ -207,6 +208,9 @@ fn r7z_open_10gb(c: &mut Criterion) {
 }
 
 fn r7z_extract_1gb(c: &mut Criterion) {
+    if !run_huge_benches() {
+        return;
+    }
     let archive = r7z::Archive::from_bytes(archive_1gb_bytes()).unwrap();
     c.bench_function("r7z_extract_1gb", |b| {
         b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
@@ -214,6 +218,9 @@ fn r7z_extract_1gb(c: &mut Criterion) {
 }
 
 fn r7z_extract_10gb(c: &mut Criterion) {
+    if !run_huge_benches() {
+        return;
+    }
     let archive = r7z::Archive::from_bytes(archive_10gb_bytes()).unwrap();
     c.bench_function("r7z_extract_10gb", |b| {
         b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
@@ -221,6 +228,9 @@ fn r7z_extract_10gb(c: &mut Criterion) {
 }
 
 fn r7z_build_1gb(c: &mut Criterion) {
+    if !run_huge_benches() {
+        return;
+    }
     let payload = generate_payload(1024 * 1024 * 1024);
     c.bench_function("r7z_build_1gb", |b| {
         b.iter(|| {
@@ -233,6 +243,9 @@ fn r7z_build_1gb(c: &mut Criterion) {
 }
 
 fn r7z_build_10gb(c: &mut Criterion) {
+    if !run_huge_benches() {
+        return;
+    }
     let payload = generate_payload(10 * 1024 * 1024 * 1024);
     c.bench_function("r7z_build_10gb", |b| {
         b.iter(|| {
