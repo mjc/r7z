@@ -12,8 +12,8 @@ fn decompress_lzma_packed_header() {
 
     // The packed header stream starts right after the 32-byte SignatureHeader
     // at pack_pos bytes offset.
-    let data_start = 32 + pi.pack_pos as usize;
-    let data_end = data_start + pi.pack_size[0] as usize;
+    let data_start = 32 + usize::try_from(pi.pack_pos).expect("pack_pos fits in usize");
+    let data_end = data_start + usize::try_from(pi.pack_size[0]).expect("pack_size fits in usize");
     let packed = &buf[data_start..data_end];
 
     let folder = &ui.folders[0];
@@ -23,7 +23,7 @@ fn decompress_lzma_packed_header() {
     let unpack_size = ui.unpack_sizes[0];
     let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();
 
-    assert_eq!(decompressed.len(), unpack_size as usize);
+    assert_eq!(decompressed.len(), usize::try_from(unpack_size).expect("unpack_size fits in usize"));
 }
 
 #[test]
@@ -38,22 +38,21 @@ fn archive_open_and_decompress_header_stream() {
 
     // Re-read the file to get the packed data
     let buf = std::fs::read(&path).unwrap();
-    let data_start = 32 + pi.pack_pos as usize;
-    let data_end = data_start + pi.pack_size[0] as usize;
+    let data_start = 32 + usize::try_from(pi.pack_pos).expect("pack_pos fits in usize");
+    let data_end = data_start + usize::try_from(pi.pack_size[0]).expect("pack_size fits in usize");
     let packed = &buf[data_start..data_end];
 
     let folder = &ui.folders[0];
     let unpack_size = ui.unpack_sizes[0];
     let decompressed = decompress_folder(folder, packed, unpack_size).unwrap();
 
-    assert_eq!(decompressed.len(), unpack_size as usize);
+    assert_eq!(decompressed.len(), usize::try_from(unpack_size).expect("unpack_size fits in usize"));
 
     // The decompressed bytes should start with a valid 7z property tag
     // (Header = 0x01 or EncodedHeader = 0x17, typically 0x01 for the full header)
     let first_byte = decompressed[0];
     assert!(
         first_byte == 0x01 || first_byte == 0x04,
-        "Expected Header (0x01) or MainStreamsInfo (0x04) tag, got 0x{:02x}",
-        first_byte
+        "Expected Header (0x01) or MainStreamsInfo (0x04) tag, got 0x{first_byte:02x}"
     );
 }

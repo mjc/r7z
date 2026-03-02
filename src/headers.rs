@@ -2,8 +2,7 @@ use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
 use nom::{
     multi::count,
     number::streaming::{le_u32, le_u64, le_u8},
-    sequence::tuple,
-    IResult,
+    IResult, Parser,
 };
 
 /// The outer `EncodedHeader` block that describes where the compressed main header lives.
@@ -20,6 +19,11 @@ pub struct EncodedHeader {
 }
 
 impl EncodedHeader {
+    /// Parse an `EncodedHeader` block (pack info + unpack info).
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], EncodedHeader> {
         let (input, pack_info) = PackInfo::parse(input)?;
         let (input, unpack_info) = UnpackInfo::parse(input)?;
@@ -46,6 +50,11 @@ impl Header {
     /// Parse a decompressed 7z header block.
     ///
     /// Expects the input to start with the `Property::Header` (0x01) tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated, malformed, or does not start with
+    /// the `Header` property tag.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Header> {
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
@@ -84,13 +93,25 @@ impl Header {
                     // Skip: size-prefixed block
                     input = i;
                     let (i, size) = crate::sevenzip_varuint64_decode(input)?;
-                    let (i, _) = nom::bytes::streaming::take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
                     input = i;
                 }
                 _ => {
                     input = i;
                     let (i, size) = crate::sevenzip_varuint64_decode(input)?;
-                    let (i, _) = nom::bytes::streaming::take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
                     input = i;
                 }
             }
@@ -130,11 +151,11 @@ pub struct SignatureHeader {
 
 impl SignatureHeader {
     fn get_file_signature(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
-        count(le_u8, 6)(input)
+        count(le_u8, 6).parse(input)
     }
 
     fn get_version(input: &[u8]) -> IResult<&[u8], (u8, u8)> {
-        tuple((le_u8, le_u8))(input)
+        (le_u8, le_u8).parse(input)
     }
 
     fn get_next_header_offset(input: &[u8]) -> IResult<&[u8], u64> {
@@ -149,10 +170,14 @@ impl SignatureHeader {
         le_u32(input)
     }
 
-    /// Validate the CRC over the 20-byte StartHeader (offset+size+crc).
+    /// Validate the CRC over the 20-byte `StartHeader` (offset+size+crc).
     ///
     /// The `start_header_crc` field covers:
     /// `[next_header_offset (8), next_header_size (8), next_header_crc (4)]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Crc`] if the computed CRC does not match `start_header_crc`.
     pub fn validate_start_header_crc(&self) -> Result<(), R7zError> {
         let mut buf = [0u8; 20];
         buf[..8].copy_from_slice(&self.next_header_offset.to_le_bytes());
@@ -166,6 +191,11 @@ impl SignatureHeader {
         }
     }
 
+    /// Parse the 32-byte `SignatureHeader` from the start of a 7z archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is shorter than 32 bytes or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], SignatureHeader> {
         let (input, signature) = Self::get_file_signature(input)?;
         let (input, (major_version, minor_version)) = Self::get_version(input)?;

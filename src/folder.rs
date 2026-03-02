@@ -17,10 +17,23 @@ pub struct Folder {
 
 impl Folder {
     /// Total number of output streams across all coders in this folder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_out_streams` for any coder exceeds `usize::MAX` (impossible in practice).
+    #[must_use]
     pub fn total_out_streams(&self) -> usize {
-        self.coders.iter().map(|c| c.num_out_streams as usize).sum()
+        self.coders
+            .iter()
+            .map(|c| usize::try_from(c.num_out_streams).expect("num_out_streams fits in usize"))
+            .sum()
     }
 
+    /// Parse a single `Folder` block (`num_coders`, coders, bind pairs, packed indices).
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
         let mut coders = Vec::new();

@@ -28,7 +28,7 @@ fn parse_archive_metadata_from_test_fixture() {
     assert_eq!(folder.coders[0].codec_id, vec![0x03, 0x01, 0x01]);
     // LZMA properties present (5 bytes)
     assert_eq!(
-        folder.coders[0].properties.as_ref().map(|p| p.len()),
+        folder.coders[0].properties.as_ref().map(Vec::len),
         Some(5)
     );
     // 1 in-stream, 1 out-stream

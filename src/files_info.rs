@@ -58,8 +58,13 @@ impl FilesInfo {
     }
 
     /// Iterator over all decoded names (in archive order).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_files` exceeds `usize::MAX` (impossible in practice).
     pub fn names(&self) -> impl Iterator<Item = String> + '_ {
-        (0..self.num_files as usize).filter_map(move |i| self.name(i))
+        let n = usize::try_from(self.num_files).expect("num_files fits in usize");
+        (0..n).filter_map(move |i| self.name(i))
     }
 
     /// Returns `true` if entry `i` has no data stream (directory or zero-byte file).
@@ -76,6 +81,18 @@ impl FilesInfo {
             .is_some_and(|b| (b >> (i % 8)) & 1 == 1)
     }
 
+    /// Parse a `FilesInfo` block from the header stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated, malformed, or does not start
+    /// with the `FilesInfo` property tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a block size encoded in the archive exceeds `usize::MAX`, which
+    /// cannot happen in practice on any platform that can hold the archive in memory.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &[u8]) -> IResult<&[u8], FilesInfo> {
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
@@ -87,7 +104,12 @@ impl FilesInfo {
         }
 
         let (input, num_files) = sevenzip_varuint64_decode(input)?;
-        let n = num_files as usize;
+        let n = usize::try_from(num_files).map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
 
         // Lazy init: no allocations until the relevant property is seen.
         let mut name_data = Bytes::new();
@@ -104,14 +126,26 @@ impl FilesInfo {
                 Property::END => break,
                 Property::Name => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, block) = take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, block) = take(sz)(i)?;
                     // block[0] is the external flag; block[1..] is the raw UTF-16LE name data.
                     name_data = Bytes::copy_from_slice(&block[1..]);
                     input = i;
                 }
                 Property::MTime => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, block) = take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, block) = take(sz)(i)?;
                     let all_defined = block[0];
                     let (data_start, num_bytes) = if all_defined != 0 {
                         (1usize, 0usize)
@@ -122,7 +156,7 @@ impl FilesInfo {
                     let bitmap = if all_defined != 0 {
                         &[][..]
                     } else {
-                        &block[1..1 + num_bytes]
+                        &block[1..=num_bytes]
                     };
                     mtimes = Vec::with_capacity(n);
                     let mut pos = data_start;
@@ -142,7 +176,13 @@ impl FilesInfo {
                 }
                 Property::Attributes => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, block) = take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, block) = take(sz)(i)?;
                     let all_defined = block[0];
                     let (data_start, num_bytes) = if all_defined != 0 {
                         (1usize, 0usize)
@@ -153,7 +193,7 @@ impl FilesInfo {
                     let bitmap = if all_defined != 0 {
                         &[][..]
                     } else {
-                        &block[1..1 + num_bytes]
+                        &block[1..=num_bytes]
                     };
                     attributes = Vec::with_capacity(n);
                     let mut pos = data_start;
@@ -173,19 +213,37 @@ impl FilesInfo {
                 }
                 Property::EmptyStream => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, block) = take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, block) = take(sz)(i)?;
                     empty_streams = Bytes::copy_from_slice(block);
                     input = i;
                 }
                 Property::EmptyFile => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, block) = take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, block) = take(sz)(i)?;
                     empty_files = Bytes::copy_from_slice(block);
                     input = i;
                 }
                 _ => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, _) = take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, _) = take(sz)(i)?;
                     input = i;
                 }
             }

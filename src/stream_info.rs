@@ -14,6 +14,17 @@ pub struct SubstreamInfo {
 }
 
 impl SubstreamInfo {
+    /// Parse a `SubstreamInfo` block from the header stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or does not start with the
+    /// `SubStreamsInfo` property tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_unpack_streams_per_folder` values exceed `usize::MAX`
+    /// (impossible in practice).
     pub fn parse(input: &[u8], num_folders: usize) -> IResult<&[u8], SubstreamInfo> {
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
@@ -47,7 +58,11 @@ impl SubstreamInfo {
                     // the last stream's size is: folder_unpack_size - sum(explicit_sizes)
                     let sizes_to_read: usize = num_unpack_streams_per_folder
                         .iter()
-                        .map(|&n| (n as usize).saturating_sub(1))
+                        .map(|&n| {
+                            usize::try_from(n)
+                                .expect("num_unpack_streams_per_folder fits in usize")
+                                .saturating_sub(1)
+                        })
                         .sum();
                     for _ in 0..sizes_to_read {
                         let (i, size) = sevenzip_varuint64_decode(input)?;
@@ -66,7 +81,13 @@ impl SubstreamInfo {
                 }
                 _ => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, _) = nom::bytes::streaming::take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
                     input = i;
                 }
             }
@@ -132,6 +153,15 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    /// Parse a `StreamInfo` block from the header stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or malformed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_folders` exceeds `usize::MAX` (impossible in practice).
     pub fn parse(input: &[u8]) -> IResult<&[u8], StreamInfo> {
         let mut pack_info = None;
         let mut unpack_info = None;
@@ -159,8 +189,10 @@ impl StreamInfo {
                 Property::SubStreamsInfo => {
                     let num_folders = unpack_info
                         .as_ref()
-                        .map(|u| u.num_folders as usize)
-                        .unwrap_or(0);
+                        .map_or(0, |u| {
+                            usize::try_from(u.num_folders)
+                                .expect("num_folders fits in usize")
+                        });
                     let (i, si) = SubstreamInfo::parse(input, num_folders)?;
                     substream_info = Some(si);
                     input = i;
@@ -169,7 +201,13 @@ impl StreamInfo {
                     // Skip unknown section (size-prefixed)
                     input = i;
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, _) = nom::bytes::streaming::take(size as usize)(i)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, _) = nom::bytes::streaming::take(sz)(i)?;
                     input = i;
                 }
             }

@@ -1,4 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#![allow(clippy::semicolon_if_nothing_returned)]
+
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use std::path::Path;
 
 fn fixture_bytes() -> Vec<u8> {
@@ -30,7 +33,8 @@ fn bench_extract_to_memory(c: &mut Criterion) {
     let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
     // Find the first non-empty file index
     let fi = archive.files_info().unwrap();
-    let idx = (0..fi.num_files as usize)
+    let num_files = usize::try_from(fi.num_files).expect("num_files fits in usize");
+    let idx = (0..num_files)
         .find(|&i| !fi.is_empty_stream(i))
         .unwrap_or(0);
     c.bench_function("Archive::extract_to_memory", |b| {

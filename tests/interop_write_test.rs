@@ -3,7 +3,7 @@
 mod support;
 use support::run_7z;
 
-/// r7z round-trip: build → from_bytes → extract_to_memory.
+/// r7z round-trip: build → `from_bytes` → `extract_to_memory`.
 #[test]
 fn r7z_write_r7z_read_single_file() {
     let original = b"Hello, world from r7z!";
@@ -120,7 +120,7 @@ fn r7z_write_lzma2_p7zip_reads() {
     assert_eq!(extracted, original);
 }
 
-/// r7z round-trip with LZMA2: build → from_bytes → extract_to_memory.
+/// r7z round-trip with LZMA2: build → `from_bytes` → `extract_to_memory`.
 #[test]
 fn r7z_write_lzma2_r7z_reads() {
     let original = b"LZMA2 round-trip test data";

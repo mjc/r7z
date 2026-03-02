@@ -32,10 +32,16 @@ pub enum Property {
 }
 
 impl Property {
+    #[must_use]
     pub fn from_u8(value: u8) -> Option<Property> {
         FromPrimitive::from_u8(value)
     }
 
+    /// Parse a single property tag byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns `nom::Err::Error` if the byte is not a recognised property tag.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Property> {
         let (i, o) = le_u8(input)?;
         match Self::from_u8(o) {
@@ -48,6 +54,11 @@ impl Property {
     }
 }
 
+/// Advance `offset` bytes into `input`, then parse a property tag.
+///
+/// # Errors
+///
+/// Returns `nom::Err::Error` if the byte at the offset is not a recognised property tag.
 pub fn find_next_property_id(input: &[u8], offset: usize) -> IResult<&[u8], Property> {
     let (input, property_u8) = le_u8(&input[offset..])?;
     match Property::from_u8(property_u8) {

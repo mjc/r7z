@@ -3,8 +3,8 @@ use std::io::{BufReader, Cursor};
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
 ///
-/// `properties` is the 5-byte LZMA properties block to store in CoderInfo.
-/// `compressed_stream` is the raw compressed bytes (LZMA_ALONE header stripped).
+/// `properties` is the 5-byte LZMA properties block to store in `CoderInfo`.
+/// `compressed_stream` is the raw compressed bytes (`LZMA_ALONE` header stripped).
 pub fn compress_lzma(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
     let mut alone: Vec<u8> = Vec::new();
     let mut reader = BufReader::new(Cursor::new(data));
@@ -42,9 +42,9 @@ pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
 
 /// Decompress `input` using the given codec, returning the decompressed bytes.
 ///
-/// * `codec_id`   — codec identifier bytes from CoderInfo
-/// * `properties` — optional codec properties from CoderInfo
-/// * `input`      — compressed data (not including any LZMA_ALONE header)
+/// * `codec_id`   — codec identifier bytes from `CoderInfo`
+/// * `properties` — optional codec properties from `CoderInfo`
+/// * `input`      — compressed data (not including any `LZMA_ALONE` header)
 /// * `unpack_size`— expected output size (used to build LZMA header)
 pub fn decompress(
     codec_id: &[u8],
@@ -84,7 +84,8 @@ fn decompress_lzma(
     stream.extend_from_slice(input);
 
     let mut reader = BufReader::new(Cursor::new(stream));
-    let mut output = Vec::with_capacity(unpack_size as usize);
+    let mut output =
+        Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
     lzma_rs::lzma_decompress(&mut reader, &mut output).map_err(|_| R7zError::Decompression)?;
     Ok(output)
 }
@@ -100,6 +101,11 @@ fn decompress_lzma2(input: &[u8]) -> Result<Vec<u8>, R7zError> {
 ///
 /// For simple single-coder folders this just calls `decompress` once.
 /// BCJ+LZMA chaining (bind pairs) is resolved in order.
+///
+/// # Errors
+///
+/// Returns [`R7zError::Decompression`] if decompression fails, or
+/// [`R7zError::UnsupportedCodec`] if a coder uses an unrecognised codec ID.
 pub fn decompress_folder(
     folder: &crate::Folder,
     packed_data: &[u8],

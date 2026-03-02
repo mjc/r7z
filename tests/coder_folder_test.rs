@@ -46,7 +46,7 @@ fn parse_folder_single_lzma() {
 fn parse_encoded_header_coder_details() {
     let buf = support::valid_7z_string();
     let (input, sig) = r7z::SignatureHeader::parse(&buf).unwrap();
-    let offset = sig.next_header_offset as usize;
+    let offset = usize::try_from(sig.next_header_offset).expect("next_header_offset fits in usize");
     let (input, _tag) = r7z::find_next_property_id(input, offset).unwrap();
     let (_input, eh) = r7z::EncodedHeader::parse(input).unwrap();
 

@@ -15,6 +15,11 @@ pub struct PackInfo {
 }
 
 impl PackInfo {
+    /// Parse a `PackInfo` block from the header stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or does not start with the `PackInfo` tag.
     pub fn parse(input: &[u8]) -> IResult<&[u8], PackInfo> {
         let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
@@ -66,6 +71,11 @@ pub struct UnpackInfo {
 }
 
 impl UnpackInfo {
+    /// Parse an `UnpackInfo` block from the header stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or does not start with the `UnPackInfo` tag.
     pub fn parse(input: &[u8]) -> IResult<&[u8], UnpackInfo> {
         let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
@@ -98,7 +108,7 @@ impl UnpackInfo {
         }
 
         // Total number of out-streams across all folders
-        let total_out_streams: usize = folders.iter().map(|f| f.total_out_streams()).sum();
+        let total_out_streams: usize = folders.iter().map(super::folder::Folder::total_out_streams).sum();
 
         // Property-tag loop for CodersUnPackSize and CRC
         let mut unpack_sizes = Vec::new();
@@ -124,7 +134,14 @@ impl UnpackInfo {
                 _ => {
                     // Skip unknown sections (read size + skip)
                     let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let (i, _) = nom::bytes::streaming::take(size as usize)(i)?;
+                    let (i, _) = nom::bytes::streaming::take(
+                        usize::try_from(size).map_err(|_| {
+                            nom::Err::Error(nom::error::Error::new(
+                                input,
+                                nom::error::ErrorKind::TooLarge,
+                            ))
+                        })?,
+                    )(i)?;
                     input = i;
                 }
             }
@@ -142,7 +159,7 @@ impl UnpackInfo {
     }
 }
 
-/// Parse CRC digests for `num_streams` streams using AllAreDefined + optional bitmap.
+/// Parse CRC digests for `num_streams` streams using `AllAreDefined` + optional bitmap.
 fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], Vec<Option<u32>>> {
     use nom::number::streaming::le_u32;
 

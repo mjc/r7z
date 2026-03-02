@@ -15,10 +15,10 @@ fn parse_signature_header_from_string() {
             signature: hex::decode("377abcaf271c").unwrap(),
             major_version: 0x00,
             minor_version: 0x04,
-            start_header_crc: 0xd20f5a4b,
+            start_header_crc: 0xd20f_5a4b,
             next_header_offset: 0x24e,
             next_header_size: 35u64,
-            next_header_crc: 0xa52a90ff
+            next_header_crc: 0xa52a_90ff
         }
     );
 }
@@ -32,5 +32,5 @@ fn parse_encoded_header_from_string() {
     assert_eq!(property_id, r7z::Property::EncodedHeader);
 
     let (_input, encoded_header) = r7z::EncodedHeader::parse(input).unwrap();
-    println!("encoded_header: {:?}", encoded_header);
+    println!("encoded_header: {encoded_header:?}");
 }

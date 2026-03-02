@@ -18,6 +18,11 @@ pub struct CoderInfo {
 }
 
 impl CoderInfo {
+    /// Parse a single `CoderInfo` block from the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], CoderInfo> {
         let (input, flags) = le_u8(input)?;
         let codec_id_size = (flags & 0x0f) as usize;
@@ -37,7 +42,13 @@ impl CoderInfo {
 
         let (input, properties) = if has_attributes {
             let (input, prop_size) = sevenzip_varuint64_decode(input)?;
-            let (input, prop_bytes) = take(prop_size as usize)(input)?;
+            let sz = usize::try_from(prop_size).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            let (input, prop_bytes) = take(sz)(input)?;
             (input, Some(prop_bytes.to_vec()))
         } else {
             (input, None)

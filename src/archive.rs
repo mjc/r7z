@@ -6,7 +6,7 @@ use bytes::Bytes;
 use nom::ToUsize;
 use std::path::Path;
 
-/// Metadata extracted from the outer 7z header (EncodedHeader only).
+/// Metadata extracted from the outer 7z header (`EncodedHeader` only).
 #[derive(Debug)]
 pub struct ArchiveMetadata {
     pub signature: SignatureHeader,
@@ -15,6 +15,11 @@ pub struct ArchiveMetadata {
 
 impl ArchiveMetadata {
     /// Parse the outer header of a 7z archive from raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the bytes are not a valid `EncodedHeader` archive,
+    /// or [`R7zError::Crc`] if the start-header CRC does not match.
     pub fn parse(data: &[u8]) -> Result<ArchiveMetadata, R7zError> {
         let (input, signature) = SignatureHeader::parse(data).map_err(|_| R7zError::Parse)?;
 
@@ -32,7 +37,6 @@ impl ArchiveMetadata {
                     encoded_header,
                 })
             }
-            Property::Header => Err(R7zError::Parse),
             _ => Err(R7zError::Parse),
         }
     }
@@ -43,19 +47,29 @@ pub struct Archive {
     /// Raw archive bytes (O(1) clone via reference counting).
     data: Bytes,
     pub signature: SignatureHeader,
-    /// Present for EncodedHeader archives; None for uncompressed-header archives.
+    /// Present for `EncodedHeader` archives; None for uncompressed-header archives.
     pub encoded_header: Option<EncodedHeader>,
     pub header: Header,
 }
 
 impl Archive {
     /// Open and fully decode a 7z archive from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Io`] if the file cannot be read, or a parse/CRC error if the
+    /// archive is malformed.
     pub fn open(path: &Path) -> Result<Archive, R7zError> {
         let data = std::fs::read(path)?;
         Self::from_bytes(Bytes::from(data))
     }
 
     /// Parse a 7z archive from in-memory bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the bytes are not a valid 7z archive, or
+    /// [`R7zError::Crc`] if any CRC check fails.
     pub fn from_bytes(data: Bytes) -> Result<Archive, R7zError> {
         let (input, signature) = SignatureHeader::parse(&data).map_err(|_| R7zError::Parse)?;
 
@@ -66,7 +80,8 @@ impl Archive {
 
         // Validate next_header_crc over the raw encoded/header bytes
         let header_start = 32 + offset;
-        let header_end = header_start + signature.next_header_size as usize;
+        let header_end = header_start
+            + usize::try_from(signature.next_header_size).map_err(|_| R7zError::Parse)?;
         let header_raw = &data[header_start..header_end];
         let computed_crc = crc32fast::hash(header_raw);
         if computed_crc != signature.next_header_crc {
@@ -82,8 +97,10 @@ impl Archive {
                 // Decompress the packed header stream
                 let pi = &encoded_header.pack_info;
                 let ui = &encoded_header.unpack_info;
-                let data_start = 32 + pi.pack_pos as usize;
-                let data_end = data_start + pi.pack_size[0] as usize;
+                let data_start = 32
+                    + usize::try_from(pi.pack_pos).map_err(|_| R7zError::Parse)?;
+                let data_end = data_start
+                    + usize::try_from(pi.pack_size[0]).map_err(|_| R7zError::Parse)?;
                 let packed = &data[data_start..data_end];
                 let folder = &ui.folders[0];
                 let unpack_size = ui.unpack_sizes[0];
@@ -115,25 +132,40 @@ impl Archive {
     }
 
     /// Number of files (and directories) listed in the archive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_files` exceeds `usize::MAX`, which cannot happen on any
+    /// realistic platform since 7z archives are limited to far fewer entries.
+    #[must_use]
     pub fn num_files(&self) -> usize {
         self.header
             .files_info
             .as_ref()
-            .map(|f| f.num_files as usize)
-            .unwrap_or(0)
+            .map_or(0, |f| {
+                usize::try_from(f.num_files).expect("num_files fits in usize")
+            })
     }
 
+    #[must_use]
     pub fn files_info(&self) -> Option<&FilesInfo> {
         self.header.files_info.as_ref()
     }
 
+    #[must_use]
     pub fn streams_info(&self) -> Option<&StreamInfo> {
         self.header.main_streams_info.as_ref()
     }
 
-    /// Extract a single file by its index in the FilesInfo list to memory.
+    /// Extract a single file by its index in the `FilesInfo` list to memory.
     ///
     /// Skips empty-stream entries (directories, zero-byte files).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the index is out of range, the file is an
+    /// empty-stream entry, or the archive structure is inconsistent.
+    /// Returns [`R7zError::Decompression`] if decompression fails.
     pub fn extract_to_memory(&self, file_index: usize) -> Result<Vec<u8>, R7zError> {
         let streams = self.streams_info().ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
@@ -149,15 +181,21 @@ impl Archive {
         let (folder_idx, stream_in_folder) = data_stream_to_folder(
             data_stream_idx,
             substream_info,
-            unpack_info.num_folders as usize,
+            usize::try_from(unpack_info.num_folders).map_err(|_| R7zError::Parse)?,
         )
         .ok_or(R7zError::Parse)?;
 
         // Decompress the folder
         let folder = &unpack_info.folders[folder_idx];
-        let pack_offset: usize = pack_info.pack_size[..folder_idx].iter().sum::<u64>() as usize;
-        let pack_size = pack_info.pack_size[folder_idx] as usize;
-        let data_start = 32 + pack_info.pack_pos as usize + pack_offset;
+        let pack_offset: usize = usize::try_from(
+            pack_info.pack_size[..folder_idx].iter().sum::<u64>(),
+        )
+        .map_err(|_| R7zError::Parse)?;
+        let pack_size =
+            usize::try_from(pack_info.pack_size[folder_idx]).map_err(|_| R7zError::Parse)?;
+        let data_start = 32
+            + usize::try_from(pack_info.pack_pos).map_err(|_| R7zError::Parse)?
+            + pack_offset;
         let packed = &self.data[data_start..data_start + pack_size];
 
         // Folder unpack size = sum of all out-stream sizes in the unpack_info
@@ -173,6 +211,11 @@ impl Archive {
     }
 
     /// Extract all files to a directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Io`] if a file or directory cannot be created, or any error
+    /// that [`extract_to_memory`](Self::extract_to_memory) can return.
     pub fn extract_all(&self, dest: &Path) -> Result<(), R7zError> {
         let num = self.num_files();
         let fi = self.header.files_info.as_ref();
@@ -181,7 +224,7 @@ impl Archive {
             let name_owned = fi.and_then(|f| f.name(i));
             let name = name_owned.as_deref().unwrap_or("unknown");
 
-            let is_empty = fi.map(|f| f.is_empty_stream(i)).unwrap_or(false);
+            let is_empty = fi.is_some_and(|f| f.is_empty_stream(i));
 
             let dest_path = dest.join(name);
             if let Some(parent) = dest_path.parent() {
@@ -204,11 +247,11 @@ impl Archive {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/// Map a FilesInfo index to a data-stream index (skipping empty-stream entries).
+/// Map a `FilesInfo` index to a data-stream index (skipping empty-stream entries).
 fn file_to_data_stream(file_idx: usize, fi: Option<&FilesInfo>) -> Option<usize> {
     let mut data_idx = 0usize;
     for i in 0..=file_idx {
-        let is_empty = fi.map(|f| f.is_empty_stream(i)).unwrap_or(false);
+        let is_empty = fi.is_some_and(|f| f.is_empty_stream(i));
         if i == file_idx {
             if is_empty {
                 return None; // caller should have handled empty-stream files
@@ -222,7 +265,7 @@ fn file_to_data_stream(file_idx: usize, fi: Option<&FilesInfo>) -> Option<usize>
     None
 }
 
-/// Map a global data-stream index to (folder_idx, stream_within_folder).
+/// Map a global data-stream index to (`folder_idx`, `stream_within_folder`).
 fn data_stream_to_folder(
     data_idx: usize,
     substream_info: Option<&crate::SubstreamInfo>,
@@ -231,7 +274,7 @@ fn data_stream_to_folder(
     let num_streams: Vec<usize> = if let Some(si) = substream_info {
         si.num_unpack_streams_per_folder
             .iter()
-            .map(|&n| n as usize)
+            .map(|&n| usize::try_from(n).expect("num_unpack_streams_per_folder fits in usize"))
             .collect()
     } else {
         vec![1; num_folders]
@@ -264,9 +307,10 @@ fn folder_total_unpack_size(
     if let Some(si) = substream_info {
         let start: usize = si.num_unpack_streams_per_folder[..folder_idx]
             .iter()
-            .map(|&n| n as usize)
+            .map(|&n| usize::try_from(n).expect("num_unpack_streams_per_folder fits in usize"))
             .sum();
-        let n = si.num_unpack_streams_per_folder[folder_idx] as usize;
+        let n = usize::try_from(si.num_unpack_streams_per_folder[folder_idx])
+            .expect("num_unpack_streams_per_folder fits in usize");
         return si.unpack_sizes[start..start + n].iter().sum();
     }
     0
@@ -282,20 +326,21 @@ fn stream_offset_in_folder(
     if stream_in_folder == 0 {
         return 0;
     }
-    let si = match substream_info {
-        Some(s) => s,
-        None => return 0,
-    };
+    let Some(si) = substream_info else { return 0 };
     // Global index of the first explicit size for this folder
     let base_global: usize = si.num_unpack_streams_per_folder[..folder_idx]
         .iter()
-        .map(|&n| n.saturating_sub(1) as usize)
+        .map(|&n| {
+            usize::try_from(n)
+                .expect("num_unpack_streams_per_folder fits in usize")
+                .saturating_sub(1)
+        })
         .sum();
 
     // The explicit sizes stored are for streams 0..n-2; stream n-1 is implicit
     si.unpack_sizes[base_global..base_global + stream_in_folder]
         .iter()
-        .map(|&s| s as usize)
+        .map(|&s| usize::try_from(s).expect("unpack_size fits in usize"))
         .sum()
 }
 
@@ -306,49 +351,63 @@ fn stream_size_at(
     substream_info: Option<&crate::SubstreamInfo>,
     unpack_info: &crate::UnpackInfo,
 ) -> usize {
-    let n_streams = substream_info
-        .and_then(|s| s.num_unpack_streams_per_folder.get(folder_idx))
-        .copied()
-        .unwrap_or(1) as usize;
+    let n_streams = usize::try_from(
+        substream_info
+            .and_then(|s| s.num_unpack_streams_per_folder.get(folder_idx))
+            .copied()
+            .unwrap_or(1),
+    )
+    .expect("num_unpack_streams_per_folder fits in usize");
 
     if n_streams == 1 {
         // Single stream: use folder unpack size
-        return unpack_info
-            .unpack_sizes
-            .get(folder_idx)
-            .copied()
-            .unwrap_or(0) as usize;
-    }
-
-    let si = match substream_info {
-        Some(s) => s,
-        None => {
-            return unpack_info
+        return usize::try_from(
+            unpack_info
                 .unpack_sizes
                 .get(folder_idx)
                 .copied()
-                .unwrap_or(0) as usize;
-        }
+                .unwrap_or(0),
+        )
+        .expect("unpack_size fits in usize");
+    }
+
+    let Some(si) = substream_info else {
+        return usize::try_from(
+            unpack_info
+                .unpack_sizes
+                .get(folder_idx)
+                .copied()
+                .unwrap_or(0),
+        )
+        .expect("unpack_size fits in usize");
     };
 
     let base_global: usize = si.num_unpack_streams_per_folder[..folder_idx]
         .iter()
-        .map(|&n| n.saturating_sub(1) as usize)
+        .map(|&n| {
+            usize::try_from(n)
+                .expect("num_unpack_streams_per_folder fits in usize")
+                .saturating_sub(1)
+        })
         .sum();
 
     if stream_in_folder < n_streams - 1 {
         // Explicit size
-        si.unpack_sizes[base_global + stream_in_folder] as usize
+        usize::try_from(si.unpack_sizes[base_global + stream_in_folder])
+            .expect("unpack_size fits in usize")
     } else {
         // Last stream: folder_size - sum(explicit_sizes)
-        let folder_size = unpack_info
-            .unpack_sizes
-            .get(folder_idx)
-            .copied()
-            .unwrap_or(0) as usize;
+        let folder_size = usize::try_from(
+            unpack_info
+                .unpack_sizes
+                .get(folder_idx)
+                .copied()
+                .unwrap_or(0),
+        )
+        .expect("unpack_size fits in usize");
         let explicit_sum: usize = si.unpack_sizes[base_global..base_global + n_streams - 1]
             .iter()
-            .map(|&s| s as usize)
+            .map(|&s| usize::try_from(s).expect("unpack_size fits in usize"))
             .sum();
         folder_size - explicit_sum
     }

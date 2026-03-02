@@ -1,6 +1,8 @@
+#![allow(clippy::semicolon_if_nothing_returned)]
+
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use pprof::criterion::{Output, PProfProfiler};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -124,12 +126,12 @@ fn archive_10gb_bytes() -> Bytes {
 // Generate pseudo-random payload for consistent benchmarking
 fn generate_payload(size: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
-    let seed = 0x12345678u32;
+    let seed = 0x1234_5678_u32;
     let mut rng = seed;
 
     for _ in 0..size {
-        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
-        data.push((rng >> 8) as u8);
+        rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        data.push(u8::try_from((rng >> 8) & 0xFF).expect("masked to 8 bits"));
     }
     data
 }
@@ -141,28 +143,28 @@ fn generate_payload(size: usize) -> Vec<u8> {
 fn r7z_open_1mb(c: &mut Criterion) {
     let bytes = archive_1mb_bytes();
     c.bench_function("r7z_open_1mb", |b| {
-        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap());
     });
 }
 
 fn r7z_open_10mb(c: &mut Criterion) {
     let bytes = archive_10mb_bytes();
     c.bench_function("r7z_open_10mb", |b| {
-        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap());
     });
 }
 
 fn r7z_extract_1mb(c: &mut Criterion) {
     let archive = r7z::Archive::from_bytes(archive_1mb_bytes()).unwrap();
     c.bench_function("r7z_extract_1mb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
     });
 }
 
 fn r7z_extract_10mb(c: &mut Criterion) {
     let archive = r7z::Archive::from_bytes(archive_10mb_bytes()).unwrap();
     c.bench_function("r7z_extract_10mb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
     });
 }
 
@@ -173,8 +175,8 @@ fn r7z_build_1mb(c: &mut Criterion) {
             r7z::ArchiveBuilder::new()
                 .add_file("data.bin", black_box(&payload))
                 .build()
-                .unwrap()
-        })
+                .unwrap();
+        });
     });
 }
 
@@ -185,36 +187,36 @@ fn r7z_build_10mb(c: &mut Criterion) {
             r7z::ArchiveBuilder::new()
                 .add_file("data.bin", black_box(&payload))
                 .build()
-                .unwrap()
-        })
+                .unwrap();
+        });
     });
 }
 
 fn r7z_open_1gb(c: &mut Criterion) {
     let bytes = archive_1gb_bytes();
     c.bench_function("r7z_open_1gb", |b| {
-        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap());
     });
 }
 
 fn r7z_open_10gb(c: &mut Criterion) {
     let bytes = archive_10gb_bytes();
     c.bench_function("r7z_open_10gb", |b| {
-        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap())
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap());
     });
 }
 
 fn r7z_extract_1gb(c: &mut Criterion) {
     let archive = r7z::Archive::from_bytes(archive_1gb_bytes()).unwrap();
     c.bench_function("r7z_extract_1gb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
     });
 }
 
 fn r7z_extract_10gb(c: &mut Criterion) {
     let archive = r7z::Archive::from_bytes(archive_10gb_bytes()).unwrap();
     c.bench_function("r7z_extract_10gb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap())
+        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
     });
 }
 
@@ -225,8 +227,8 @@ fn r7z_build_1gb(c: &mut Criterion) {
             r7z::ArchiveBuilder::new()
                 .add_file("data.bin", black_box(&payload))
                 .build()
-                .unwrap()
-        })
+                .unwrap();
+        });
     });
 }
 
@@ -237,8 +239,8 @@ fn r7z_build_10gb(c: &mut Criterion) {
             r7z::ArchiveBuilder::new()
                 .add_file("data.bin", black_box(&payload))
                 .build()
-                .unwrap()
-        })
+                .unwrap();
+        });
     });
 }
 
@@ -304,13 +306,13 @@ fn p7zip_extract_1mb(c: &mut Criterion) {
 // Criterion Configuration
 // ============================================================================
 
-fn profiled() -> Criterion {
-    Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-}
+// Flamegraph generation is handled by scripts/flamegraph.sh (pprof-rs via
+// cargo-flamegraph), not via criterion's with_profiler hook, since pprof-rs
+// is not yet compatible with criterion 0.8.
 
 criterion_group! {
     name = r7z_benches;
-    config = profiled();
+    config = Criterion::default();
     targets = r7z_open_1mb, r7z_open_10mb, r7z_open_1gb, r7z_open_10gb,
               r7z_extract_1mb, r7z_extract_10mb, r7z_extract_1gb, r7z_extract_10gb,
               r7z_build_1mb, r7z_build_10mb, r7z_build_1gb, r7z_build_10gb
