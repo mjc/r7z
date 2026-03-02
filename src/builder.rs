@@ -3,11 +3,11 @@ use crate::{codec, parsers::sevenzip_varuint64_encode, R7zError};
 /// Codec selection for [`ArchiveBuilder`].
 #[derive(Clone, Copy, Default)]
 pub enum Codec {
-    /// Classic LZMA (id `[0x03, 0x01, 0x01]`). Widely supported; lzma-rs exposes
+    /// Classic LZMA (id `\[0x03, 0x01, 0x01\]`). Widely supported; lzma-rs exposes
     /// the 5-byte properties directly from its LZMA_ALONE output.
     #[default]
     Lzma,
-    /// LZMA2 (id `[0x21]`). Modern default in p7zip/7-Zip; slightly better
+    /// LZMA2 (id `\[0x21\]`). Modern default in p7zip/7-Zip; slightly better
     /// compression ratio and supports multi-threading on the encode side.
     Lzma2,
 }
@@ -115,7 +115,7 @@ fn build_archive(files: &[(String, Vec<u8>)], codec: Codec) -> Result<Vec<u8>, R
     Ok(archive)
 }
 
-/// Encode a CoderInfo block for LZMA (codec_id = [0x03,0x01,0x01], 5-byte properties).
+/// Encode a CoderInfo block for LZMA (codec_id = \[0x03,0x01,0x01\], 5-byte properties).
 fn encode_coder_info_lzma(props: &[u8]) -> Vec<u8> {
     // flags byte: id_size=3 (bits 0-3), is_complex=0 (bit 4), has_attrs=1 (bit 5) → 0x23
     let mut bytes = vec![0x23u8, 0x03, 0x01, 0x01];
@@ -124,7 +124,7 @@ fn encode_coder_info_lzma(props: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Encode a CoderInfo block for LZMA2 (codec_id = [0x21], 1-byte properties).
+/// Encode a CoderInfo block for LZMA2 (codec_id = \[0x21\], 1-byte properties).
 ///
 /// The properties byte encodes the dictionary size hint:
 /// `dict_size = 1 << (props_byte / 2 + 11)` for even values.
