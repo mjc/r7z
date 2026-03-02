@@ -2,11 +2,7 @@ use crate::files_info::scan_files_info;
 use crate::stream_info::scan_stream_info;
 use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
 use bytes::Bytes;
-use nom::{
-    bytes::complete::take,
-    number::complete::{le_u32, le_u64, le_u8},
-    IResult, Parser,
-};
+use nom::IResult;
 use std::cell::OnceCell;
 
 /// The outer `EncodedHeader` block that describes where the compressed main header lives.
@@ -28,9 +24,9 @@ impl EncodedHeader {
     /// # Errors
     ///
     /// Returns a nom error if the input is truncated or malformed.
-    pub fn parse(input: &[u8]) -> IResult<&[u8], EncodedHeader> {
+    pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], EncodedHeader> {
         let (input, pack_info) = PackInfo::parse(input)?;
-        let (input, unpack_info) = UnpackInfo::parse(input)?;
+        let (input, unpack_info) = UnpackInfo::parse(input, backing)?;
         Ok((
             input,
             EncodedHeader {
@@ -98,7 +94,8 @@ impl Header {
     pub fn streams_info(&self) -> Option<&StreamInfo> {
         let off = self.streams_info_start? as usize;
         Some(self.streams_cache.get_or_init(|| {
-            let (_, si) = StreamInfo::parse(&self.data[off..]).expect("pre-validated header");
+            let (_, si) = StreamInfo::parse(&self.data[off..], &self.data)
+                .expect("pre-validated header");
             si
         }))
     }
@@ -247,30 +244,6 @@ pub struct SignatureHeader {
 }
 
 impl SignatureHeader {
-    fn get_file_signature(input: &[u8]) -> IResult<&[u8], [u8; 6]> {
-        let (input, bytes) = take(6usize)(input)?;
-        let sig: [u8; 6] = bytes.try_into().map_err(|_| {
-            nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Count))
-        })?;
-        Ok((input, sig))
-    }
-
-    fn get_version(input: &[u8]) -> IResult<&[u8], (u8, u8)> {
-        (le_u8, le_u8).parse(input)
-    }
-
-    fn get_next_header_offset(input: &[u8]) -> IResult<&[u8], u64> {
-        le_u64(input)
-    }
-
-    fn get_next_header_size(input: &[u8]) -> IResult<&[u8], u64> {
-        le_u64(input)
-    }
-
-    fn get_crc32(input: &[u8]) -> IResult<&[u8], u32> {
-        le_u32(input)
-    }
-
     /// Validate the CRC over the 20-byte `StartHeader` (offset+size+crc).
     ///
     /// The `start_header_crc` field covers:
@@ -297,15 +270,38 @@ impl SignatureHeader {
     /// # Errors
     ///
     /// Returns a nom error if the input is shorter than 32 bytes or malformed.
+    ///
+    /// # Panics
+    ///
+    /// Never panics; all slice-to-array conversions are guarded by the `len < 32` check above.
     pub fn parse(input: &[u8]) -> IResult<&[u8], SignatureHeader> {
-        let (input, signature) = Self::get_file_signature(input)?;
-        let (input, (major_version, minor_version)) = Self::get_version(input)?;
-        let (input, start_header_crc) = Self::get_crc32(input)?;
-        let (input, next_header_offset) = Self::get_next_header_offset(input)?;
-        let (input, next_header_size) = Self::get_next_header_size(input)?;
-        let (input, next_header_crc) = Self::get_crc32(input)?;
+        if input.len() < 32 {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Eof,
+            )));
+        }
+        // 7z signature header layout (32 bytes):
+        //  [0..6]   magic bytes
+        //  [6]      major_version
+        //  [7]      minor_version
+        //  [8..12]  start_header_crc  (u32 le)
+        //  [12..20] next_header_offset (u64 le)
+        //  [20..28] next_header_size   (u64 le)
+        //  [28..32] next_header_crc   (u32 le)
+        let signature: [u8; 6] = input[0..6].try_into().expect("slice is 6 bytes");
+        let major_version = input[6];
+        let minor_version = input[7];
+        let start_header_crc =
+            u32::from_le_bytes(input[8..12].try_into().expect("slice is 4 bytes"));
+        let next_header_offset =
+            u64::from_le_bytes(input[12..20].try_into().expect("slice is 8 bytes"));
+        let next_header_size =
+            u64::from_le_bytes(input[20..28].try_into().expect("slice is 8 bytes"));
+        let next_header_crc =
+            u32::from_le_bytes(input[28..32].try_into().expect("slice is 4 bytes"));
         Ok((
-            input,
+            &input[32..],
             SignatureHeader {
                 signature,
                 major_version,

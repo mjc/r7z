@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use nom::{number::complete::le_u8, IResult, ToUsize};
 use smallvec::SmallVec;
 
@@ -71,8 +72,9 @@ impl PackInfo {
 pub struct UnpackInfo {
     /// Number of compression folders.
     pub num_folders: u64,
-    /// Raw bytes of all folder blocks (validated, not yet parsed into structs).
-    folder_data: Vec<u8>,
+    /// Raw bytes of all folder blocks (validated, not yet parsed).
+    /// Arc-backed slice of the original archive `Bytes` — zero copy.
+    folder_data: Bytes,
     /// Byte offset of each folder within `folder_data`.
     /// Length = `num_folders + 1` (sentinel at end).
     folder_offsets: Vec<u32>,
@@ -106,8 +108,8 @@ impl UnpackInfo {
     pub fn parse_folder(&self, idx: usize) -> Result<Folder, crate::R7zError> {
         let start = self.folder_offsets[idx] as usize;
         let end = self.folder_offsets[idx + 1] as usize;
-        let (_, folder) =
-            Folder::parse(&self.folder_data[start..end]).map_err(|_| crate::R7zError::Parse)?;
+        let (_, folder) = Folder::parse(&self.folder_data[start..end])
+            .map_err(|_| crate::R7zError::Parse)?;
         Ok(folder)
     }
 
@@ -121,7 +123,7 @@ impl UnpackInfo {
     /// # Errors
     ///
     /// Returns a nom error if the input is truncated or does not start with the `UnPackInfo` tag.
-    pub fn parse(input: &[u8]) -> IResult<&[u8], UnpackInfo> {
+    pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], UnpackInfo> {
         let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
         if property_id != Property::UnPackInfo {
@@ -170,7 +172,7 @@ impl UnpackInfo {
             ))
         })?;
         folder_offsets.push(end_offset);
-        let folder_data = folder_start[..end_offset as usize].to_vec();
+        let folder_data = backing.slice_ref(&folder_start[..end_offset as usize]);
 
         // Property-tag loop for CodersUnPackSize and CRC
         let mut unpack_sizes: SmallVec<[u64; 4]> =

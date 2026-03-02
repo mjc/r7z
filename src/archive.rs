@@ -27,7 +27,9 @@ impl ArchiveMetadata {
     /// Returns [`R7zError::Parse`] if the bytes are not a valid `EncodedHeader` archive,
     /// or [`R7zError::Crc`] if the start-header CRC does not match.
     pub fn parse(data: &[u8]) -> Result<ArchiveMetadata, R7zError> {
-        let (input, signature) = SignatureHeader::parse(data).map_err(|_| R7zError::Parse)?;
+        let backing = Bytes::copy_from_slice(data);
+        let (input, signature) =
+            SignatureHeader::parse(&backing).map_err(|_| R7zError::Parse)?;
 
         signature.validate_start_header_crc()?;
 
@@ -37,7 +39,8 @@ impl ArchiveMetadata {
         match prop {
             Property::EncodedHeader => {
                 let (_, encoded_header) =
-                    EncodedHeader::parse(input).map_err(|_| R7zError::Parse)?;
+                    EncodedHeader::parse(input, &backing)
+                        .map_err(|_| R7zError::Parse)?;
                 Ok(ArchiveMetadata {
                     signature,
                     encoded_header,
@@ -98,7 +101,8 @@ impl Archive {
             Property::EncodedHeader => {
                 // Parse the EncodedHeader (describes how the full header is compressed)
                 let (_, encoded_header) =
-                    EncodedHeader::parse(input).map_err(|_| R7zError::Parse)?;
+                    EncodedHeader::parse(input, &data)
+                        .map_err(|_| R7zError::Parse)?;
 
                 // Decompress the packed header stream
                 let pi = &encoded_header.pack_info;

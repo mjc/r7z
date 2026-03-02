@@ -1,6 +1,7 @@
 use crate::pack_info::{scan_pack_info, scan_unpack_info};
 use crate::parsers::scan_digests;
 use crate::{sevenzip_varuint64_decode, PackInfo, Property, UnpackInfo};
+use bytes::Bytes;
 use nom::{number::complete::le_u8, IResult, ToUsize};
 
 /// Per-file stream metadata within a solid (multi-file) folder.
@@ -159,7 +160,7 @@ impl StreamInfo {
     /// # Panics
     ///
     /// Panics if `num_folders` exceeds `usize::MAX` (impossible in practice).
-    pub fn parse(input: &[u8]) -> IResult<&[u8], StreamInfo> {
+    pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], StreamInfo> {
         let mut pack_info = None;
         let mut unpack_info = None;
         let mut substream_info = None;
@@ -179,7 +180,7 @@ impl StreamInfo {
                     input = i;
                 }
                 Property::UnPackInfo => {
-                    let (i, ui) = UnpackInfo::parse(input)?;
+                    let (i, ui) = UnpackInfo::parse(input, backing)?;
                     unpack_info = Some(ui);
                     input = i;
                 }
