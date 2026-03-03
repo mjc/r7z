@@ -37,7 +37,6 @@
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           perf
           valgrind
-          mold
         ];
 
       cargoTargetEnvPrefix =
@@ -49,7 +48,7 @@
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
-          export CARGO_TARGET_${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native${pkgs.lib.optionalString pkgs.stdenv.isLinux " -C link-arg=-fuse-ld=mold"}"
+          export CARGO_TARGET_${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native"
           echo "r7z dev shell  ($(rustc --version))"
         '';
       };
