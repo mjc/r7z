@@ -26,4 +26,12 @@ pub enum R7zError {
     /// Decompression failed (corrupt or truncated stream).
     #[error("decompression error")]
     Decompression,
+
+    /// The archive is encrypted and a password is required.
+    #[error("password required")]
+    PasswordRequired,
+
+    /// The supplied password was incorrect (decryption produced garbage).
+    #[error("wrong password")]
+    WrongPassword,
 }

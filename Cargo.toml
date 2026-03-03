@@ -19,12 +19,16 @@ num = "0.4"
 num-derive = "0.4"
 num-traits = "0.2"
 thiserror = "2"
+aes = "0.8"
+cbc = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 hex = "0.4"
 tempfile = "3.26.0"
 pprof = { version = "0.15", features = ["flamegraph"] }
+xz2 = "0.1.7"
 
 [[bench]]
 name = "parse_bench"

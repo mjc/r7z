@@ -24,6 +24,7 @@ extern crate num;
 #[macro_use]
 extern crate num_derive;
 
+mod aes;
 mod archive;
 pub mod bcj;
 mod builder;
@@ -40,7 +41,10 @@ mod stream_info;
 
 pub use archive::{Archive, ArchiveMetadata};
 pub use builder::{build_streaming, ArchiveBuilder, ArchiveWriter, Codec, EntryMeta};
-pub use codec::{decompress_folder, CODEC_BCJ_X86, CODEC_COPY, CODEC_LZMA, CODEC_LZMA2};
+pub use codec::{
+    decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ_X86,
+    CODEC_COPY, CODEC_LZMA, CODEC_LZMA2,
+};
 pub use coder_info::CoderInfo;
 pub use error::R7zError;
 pub use files_info::FilesInfo;

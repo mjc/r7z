@@ -221,7 +221,23 @@ impl Archive {
     /// Returns [`R7zError::Parse`] if the index is out of range, the file is an
     /// empty-stream entry, or the archive structure is inconsistent.
     /// Returns [`R7zError::Decompression`] if decompression fails.
+    /// Returns [`R7zError::PasswordRequired`] if the archive is encrypted.
     pub fn extract_to_memory(&self, file_index: usize) -> Result<Vec<u8>, R7zError> {
+        self.extract_to_memory_with_password(file_index, None)
+    }
+
+    /// Extract a single file by index, supplying a password for encrypted archives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::PasswordRequired`] if the file is encrypted and no
+    /// password is supplied, or [`R7zError::Decompression`] if decryption/
+    /// decompression fails (e.g. wrong password).
+    pub fn extract_to_memory_with_password(
+        &self,
+        file_index: usize,
+        password: Option<&str>,
+    ) -> Result<Vec<u8>, R7zError> {
         let streams = self.streams_info().ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
@@ -251,9 +267,9 @@ impl Archive {
             32 + usize::try_from(pack_info.pack_pos).map_err(|_| R7zError::Parse)? + pack_offset;
         let packed = &self.data[data_start..data_start + pack_size];
 
-        // Folder unpack size = sum of all out-stream sizes in the unpack_info
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info);
-        let decompressed = codec::decompress_folder(&folder, packed, folder_unpack_size)?;
+        let decompressed =
+            codec::decompress_folder_with_password(&folder, packed, folder_unpack_size, password)?;
 
         // Slice the target stream out of the decompressed folder data
         let stream_start =
@@ -270,6 +286,18 @@ impl Archive {
     /// Returns [`R7zError::Io`] if a file or directory cannot be created, or any error
     /// that [`extract_to_memory`](Self::extract_to_memory) can return.
     pub fn extract_all(&self, dest: &Path) -> Result<(), R7zError> {
+        self.extract_all_with_password(dest, None)
+    }
+
+    /// Extract all files to a directory, supplying a password for encrypted archives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Io`] if a file or directory cannot be created,
+    /// [`R7zError::PasswordRequired`] if encrypted with no password, or any
+    /// error that [`extract_to_memory_with_password`](Self::extract_to_memory_with_password)
+    /// can return.
+    pub fn extract_all_with_password(&self, dest: &Path, password: Option<&str>) -> Result<(), R7zError> {
         let num = self.num_files();
         let fi = self.header.files_info();
 
@@ -290,7 +318,7 @@ impl Archive {
                     std::fs::File::create(&dest_path)?;
                 }
             } else {
-                let bytes = self.extract_to_memory(i)?;
+                let bytes = self.extract_to_memory_with_password(i, password)?;
                 std::fs::write(&dest_path, &bytes)?;
             }
         }
@@ -456,26 +484,14 @@ fn stream_size_at(
     .expect("num_unpack_streams_per_folder fits in usize");
 
     if n_streams == 1 {
-        // Single stream: use folder unpack size
-        return usize::try_from(
-            unpack_info
-                .unpack_sizes
-                .get(folder_idx)
-                .copied()
-                .unwrap_or(0),
-        )
-        .expect("unpack_size fits in usize");
+        // Single stream: use folder's final unpack size (multi-coder-aware)
+        return usize::try_from(folder_total_unpack_size(folder_idx, unpack_info, substream_info))
+            .expect("unpack_size fits in usize");
     }
 
     let Some(si) = substream_info else {
-        return usize::try_from(
-            unpack_info
-                .unpack_sizes
-                .get(folder_idx)
-                .copied()
-                .unwrap_or(0),
-        )
-        .expect("unpack_size fits in usize");
+        return usize::try_from(folder_total_unpack_size(folder_idx, unpack_info, substream_info))
+            .expect("unpack_size fits in usize");
     };
 
     let base_global: usize = si.num_unpack_streams_per_folder[..folder_idx]
@@ -493,13 +509,11 @@ fn stream_size_at(
             .expect("unpack_size fits in usize")
     } else {
         // Last stream: folder_size - sum(explicit_sizes)
-        let folder_size = usize::try_from(
-            unpack_info
-                .unpack_sizes
-                .get(folder_idx)
-                .copied()
-                .unwrap_or(0),
-        )
+        let folder_size = usize::try_from(folder_total_unpack_size(
+            folder_idx,
+            unpack_info,
+            substream_info,
+        ))
         .expect("unpack_size fits in usize");
         let explicit_sum: usize = si.unpack_sizes[base_global..base_global + n_streams - 1]
             .iter()

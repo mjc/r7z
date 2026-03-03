@@ -184,3 +184,85 @@ fn p7zip_read_interop_bcj_lzma2() {
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted, data, "extracted data should match original");
 }
+
+// ── AES-256-SHA-256 encrypted archive tests ──────────────────────────────────
+
+/// Decrypt a pre-built AES-encrypted fixture with the correct password.
+#[test]
+fn aes_decrypt_fixture_correct_password() {
+    let archive = r7z::Archive::open(std::path::Path::new("tests/fixtures/aes256.7z"))
+        .expect("failed to open AES fixture");
+
+    assert_eq!(archive.num_files(), 1);
+
+    let fi = archive.files_info().unwrap();
+    assert_eq!(fi.name(0).unwrap(), "encrypted_test.txt");
+
+    let extracted = archive
+        .extract_to_memory_with_password(0, Some("test123"))
+        .expect("decryption should succeed");
+    assert_eq!(
+        extracted,
+        b"Hello from an encrypted 7z archive!\n",
+        "decrypted content mismatch"
+    );
+}
+
+/// Attempting to extract an AES-encrypted file without a password gives PasswordRequired.
+#[test]
+fn aes_decrypt_no_password_returns_error() {
+    let archive = r7z::Archive::open(std::path::Path::new("tests/fixtures/aes256.7z")).unwrap();
+
+    let err = archive.extract_to_memory(0).unwrap_err();
+    assert!(
+        matches!(err, r7z::R7zError::PasswordRequired),
+        "expected PasswordRequired, got {err:?}"
+    );
+}
+
+/// extract_all_with_password round-trips the AES fixture to disk.
+#[test]
+fn aes_extract_all_with_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = r7z::Archive::open(std::path::Path::new("tests/fixtures/aes256.7z")).unwrap();
+
+    archive
+        .extract_all_with_password(tmp.path(), Some("test123"))
+        .expect("extract_all_with_password should succeed");
+
+    let content = std::fs::read(tmp.path().join("encrypted_test.txt")).unwrap();
+    assert_eq!(content, b"Hello from an encrypted 7z archive!\n");
+}
+
+/// p7zip creates an AES+LZMA2 archive on the fly; r7z decrypts it.
+#[test]
+fn p7zip_aes_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let original = b"Encryption round-trip test payload for r7z!";
+    std::fs::write(dir.join("secret.txt"), original).unwrap();
+
+    let archive_path = dir.join("encrypted.7z");
+    let out = run_7z(
+        &[
+            "a",
+            archive_path.to_str().unwrap(),
+            "secret.txt",
+            "-pMyS3cret!",
+            "-mhe=off",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z a failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let extracted = archive
+        .extract_to_memory_with_password(0, Some("MyS3cret!"))
+        .expect("round-trip decryption failed");
+    assert_eq!(extracted, original.as_slice());
+}

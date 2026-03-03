@@ -34,6 +34,8 @@ pub const CODEC_LZMA2: &[u8] = &[0x21];
 pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
 /// Codec ID for the no-op copy codec (uncompressed).
 pub const CODEC_COPY: &[u8] = &[0x00];
+/// Codec ID for AES-256-SHA-256 encryption (7zAES).
+pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
@@ -83,7 +85,35 @@ pub fn decompress(
         return Ok(buf);
     }
 
+    if codec_id == CODEC_AES_256_SHA_256 {
+        // AES requires a password — when called through the simple decompress
+        // path without one, signal that a password is needed.
+        return Err(R7zError::PasswordRequired);
+    }
+
     Err(R7zError::UnsupportedCodec(codec_id.to_vec()))
+}
+
+/// Decompress or decrypt a single coder, with optional password for AES.
+fn decompress_coder(
+    coder: &crate::CoderInfo,
+    input: &[u8],
+    unpack_size: u64,
+    password: Option<&str>,
+) -> Result<Vec<u8>, R7zError> {
+    if *coder.codec_id == *CODEC_AES_256_SHA_256 {
+        let pwd = password.ok_or(R7zError::PasswordRequired)?;
+        let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        let props = crate::aes::AesProperties::parse(props_bytes)?;
+        let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power);
+        return crate::aes::decrypt_aes256_cbc(input, &key, &props.iv);
+    }
+    decompress(
+        &coder.codec_id,
+        coder.properties.as_deref(),
+        input,
+        unpack_size,
+    )
 }
 
 fn decompress_lzma(
@@ -145,14 +175,25 @@ pub fn decompress_folder(
     packed_data: &[u8],
     unpack_size: u64,
 ) -> Result<Vec<u8>, R7zError> {
+    decompress_folder_with_password(folder, packed_data, unpack_size, None)
+}
+
+/// Decompress a folder, optionally decrypting with `password` if AES-encrypted.
+///
+/// # Errors
+///
+/// Returns [`R7zError::PasswordRequired`] if the folder uses AES but no password
+/// was supplied, or [`R7zError::Decompression`] / [`R7zError::UnsupportedCodec`]
+/// for other failures.
+pub fn decompress_folder_with_password(
+    folder: &crate::Folder,
+    packed_data: &[u8],
+    unpack_size: u64,
+    password: Option<&str>,
+) -> Result<Vec<u8>, R7zError> {
     if folder.coders.len() == 1 {
         let coder = &folder.coders[0];
-        return decompress(
-            &coder.codec_id,
-            coder.properties.as_deref(),
-            packed_data,
-            unpack_size,
-        );
+        return decompress_coder(coder, packed_data, unpack_size, password);
     }
 
     // Multi-coder chain: resolve bind-pair ordering so that each coder's
@@ -171,7 +212,7 @@ pub fn decompress_folder(
         let coder = &folder.coders[coder_idx];
         // For chained coders we don't know intermediate sizes; use 0 to signal "unknown".
         let size = if i == order.len() - 1 { unpack_size } else { 0 };
-        data = decompress(&coder.codec_id, coder.properties.as_deref(), &data, size)?;
+        data = decompress_coder(coder, &data, size, password)?;
     }
     Ok(data)
 }
