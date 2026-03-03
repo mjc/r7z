@@ -12,6 +12,9 @@ pub enum Codec {
     /// LZMA2 (id `\[0x21\]`). Modern default in p7zip/7-Zip; slightly better
     /// compression ratio and supports multi-threading on the encode side.
     Lzma2,
+    /// LZMA2 with x86 BCJ pre-filter. Improves compression of executable code
+    /// by converting relative CALL/JMP addresses to absolute form before compression.
+    Lzma2Bcj,
 }
 
 /// Builds a 7z archive in memory from one or more files.
@@ -116,8 +119,10 @@ struct FolderMeta {
     files: Vec<FileMeta>,
     /// Compressed byte count for this folder's pack stream.
     pack_size: u64,
-    /// Encoded `CoderInfo` bytes for this folder's codec.
+    /// Encoded full Folder block (num_coders + coders + bind pairs + packed indices).
     coder_info: Vec<u8>,
+    /// Number of coder output streams in this folder (1 for single coder, 2 for BCJ+LZMA2).
+    num_out_streams: usize,
 }
 
 /// Active compressor state inside [`ArchiveWriter`].
@@ -126,6 +131,8 @@ enum CompressorState<W: Write> {
     Lzma2(Box<lzma_rust2::Lzma2Writer<CountWriter<W>>>),
     /// LZMA buffers the full folder in memory before compressing on seal.
     Lzma { buf: Vec<u8>, out: W },
+    /// BCJ + LZMA2: buffers uncompressed data, applies BCJ encode then LZMA2 on seal.
+    Lzma2Bcj { buf: Vec<u8>, out: W },
 }
 
 /// Current I/O state of the underlying writer inside [`ArchiveWriter`].
@@ -245,6 +252,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                     buf: Vec::new(),
                     out: w,
                 },
+                Codec::Lzma2Bcj => CompressorState::Lzma2Bcj {
+                    buf: Vec::new(),
+                    out: w,
+                },
             }));
         }
 
@@ -255,6 +266,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                     std::io::copy(&mut hr, lzma2.as_mut()).map_err(|_| R7zError::Parse)?;
                 }
                 CompressorState::Lzma { buf, .. } => {
+                    std::io::copy(&mut hr, buf).map_err(|_| R7zError::Parse)?;
+                }
+                CompressorState::Lzma2Bcj { buf, .. } => {
                     std::io::copy(&mut hr, buf).map_err(|_| R7zError::Parse)?;
                 }
             },
@@ -337,18 +351,27 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         }
 
         let state = std::mem::replace(&mut self.state, WriterState::Dead);
-        let (w, pack_size, coder_info) = match state {
+        let (w, pack_size, coder_info, num_out_streams) = match state {
             WriterState::Writing(cs) => match *cs {
                 CompressorState::Lzma2(lzma2) => {
                     let cw = lzma2.finish().map_err(|_| R7zError::Parse)?;
                     let pack_size = cw.count;
-                    (cw.inner, pack_size, encode_coder_info_lzma2(0x1c))
+                    (cw.inner, pack_size, encode_coder_info_lzma2(0x1c), 1)
                 }
                 CompressorState::Lzma { buf, mut out } => {
                     let (props, compressed) = codec::compress_lzma(&buf)?;
                     let pack_size = compressed.len() as u64;
                     out.write_all(&compressed).map_err(|_| R7zError::Parse)?;
-                    (out, pack_size, encode_coder_info_lzma(&props))
+                    (out, pack_size, encode_coder_info_lzma(&props), 1)
+                }
+                CompressorState::Lzma2Bcj { mut buf, mut out } => {
+                    // Apply BCJ encode pre-filter in place
+                    crate::bcj::bcj_x86_encode(&mut buf);
+                    // Compress with LZMA2
+                    let (props_byte, compressed) = codec::compress_lzma2(&buf)?;
+                    let pack_size = compressed.len() as u64;
+                    out.write_all(&compressed).map_err(|_| R7zError::Parse)?;
+                    (out, pack_size, encode_coder_info_bcj_lzma2(props_byte), 2)
                 }
             },
             WriterState::Open(_) | WriterState::Dead => return Err(R7zError::Parse),
@@ -359,6 +382,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             files: std::mem::take(&mut self.current_files),
             pack_size,
             coder_info,
+            num_out_streams,
         });
         Ok(())
     }
@@ -371,14 +395,21 @@ fn build_archive(files: &[(String, Vec<u8>)], codec: Codec) -> Result<Vec<u8>, R
         all_data.extend_from_slice(data);
     }
 
-    let (coder_flags_and_id_and_props, compressed) = match codec {
+    let (coder_flags_and_id_and_props, compressed, num_out_streams) = match codec {
         Codec::Lzma => {
             let (props, compressed) = codec::compress_lzma(&all_data)?;
-            (encode_coder_info_lzma(&props), compressed)
+            (encode_coder_info_lzma(&props), compressed, 1usize)
         }
         Codec::Lzma2 => {
             let (props_byte, compressed) = codec::compress_lzma2(&all_data)?;
-            (encode_coder_info_lzma2(props_byte), compressed)
+            (encode_coder_info_lzma2(props_byte), compressed, 1)
+        }
+        Codec::Lzma2Bcj => {
+            // Apply BCJ encode pre-filter
+            let mut filtered = all_data.clone();
+            crate::bcj::bcj_x86_encode(&mut filtered);
+            let (props_byte, compressed) = codec::compress_lzma2(&filtered)?;
+            (encode_coder_info_bcj_lzma2(props_byte), compressed, 2)
         }
     };
 
@@ -390,6 +421,7 @@ fn build_archive(files: &[(String, Vec<u8>)], codec: Codec) -> Result<Vec<u8>, R
         &coder_flags_and_id_and_props,
         pack_size,
         folder_unpack_size,
+        num_out_streams,
     );
 
     // Layout: [32-byte SignatureHeader][compressed data][header]
@@ -572,7 +604,6 @@ fn build_header_from_meta(
     h.push(0x0b);
     h.extend_from_slice(&sevenzip_varuint64_encode(1));
     h.push(0x00);
-    h.extend_from_slice(&sevenzip_varuint64_encode(1));
     h.extend_from_slice(coder_info_bytes);
     h.push(0x0c);
     h.extend_from_slice(&sevenzip_varuint64_encode(folder_unpack_size));
@@ -650,15 +681,17 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
     h.extend_from_slice(&sevenzip_varuint64_encode(num_folders as u64));
     h.push(0x00); // external = 0
     for folder in folders {
-        h.extend_from_slice(&sevenzip_varuint64_encode(1)); // num_coders = 1
+        // coder_info contains the full folder block: num_coders + coders + bind pairs
         h.extend_from_slice(&folder.coder_info);
-        // 0 bind pairs (single coder: total_out_streams = 1)
-        // packed_indices omitted (num_packed = 1, implicit)
     }
-    h.push(0x0c); // CodersUnPackSize: one entry per folder
+    h.push(0x0c); // CodersUnPackSize: one entry per coder out-stream
     for folder in folders {
         let unpack: u64 = folder.files.iter().map(|f| f.unpack_size).sum();
-        h.extend_from_slice(&sevenzip_varuint64_encode(unpack));
+        // For multi-coder folders (e.g. BCJ+LZMA2), write one size per out-stream.
+        // BCJ doesn't change the data size, so all out-stream sizes are the same.
+        for _ in 0..folder.num_out_streams {
+            h.extend_from_slice(&sevenzip_varuint64_encode(unpack));
+        }
     }
     h.push(0x00); // END UnpackInfo
 
@@ -767,10 +800,15 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
 
 /// Encode a `CoderInfo` block for LZMA (`codec_id` = \[0x03,0x01,0x01\], 5-byte properties).
 fn encode_coder_info_lzma(props: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    // num_coders = 1
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(1));
     // flags byte: id_size=3 (bits 0-3), is_complex=0 (bit 4), has_attrs=1 (bit 5) → 0x23
-    let mut bytes = vec![0x23u8, 0x03, 0x01, 0x01];
+    bytes.extend_from_slice(&[0x23u8, 0x03, 0x01, 0x01]);
     bytes.extend_from_slice(&sevenzip_varuint64_encode(5)); // props_size
     bytes.extend_from_slice(props);
+    // 0 bind pairs (single coder: total_out_streams = 1)
+    // packed_indices omitted (num_packed = 1, implicit)
     bytes
 }
 
@@ -780,10 +818,50 @@ fn encode_coder_info_lzma(props: &[u8]) -> Vec<u8> {
 /// `dict_size = 1 << (props_byte / 2 + 11)` for even values.
 /// We claim 32 MB (prop = 0x1c) which covers lzma-rs's default dictionary.
 fn encode_coder_info_lzma2(props_byte: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    // num_coders = 1
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(1));
     // flags byte: id_size=1 (bits 0-3), is_complex=0 (bit 4), has_attrs=1 (bit 5) → 0x21
-    let mut bytes = vec![0x21u8, 0x21];
+    bytes.push(0x21);
+    bytes.push(0x21); // codec_id = [0x21]
     bytes.extend_from_slice(&sevenzip_varuint64_encode(1)); // props_size
     bytes.push(props_byte);
+    // 0 bind pairs (single coder)
+    bytes
+}
+
+/// Encode a full Folder block for BCJ x86 + LZMA2: 2 coders + 1 bind pair.
+///
+/// Layout matches p7zip: coder\[0\] = LZMA2, coder\[1\] = BCJ x86.
+/// Bind pair: `(in_stream=1, out_stream=0)` — BCJ input comes from LZMA2 output.
+///
+/// The *packed* data stream enters coder 0 (LZMA2), whose output feeds coder 1 (BCJ).
+fn encode_coder_info_bcj_lzma2(props_byte: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+
+    // num_coders = 2
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(2));
+
+    // Coder 0: LZMA2 (has properties)
+    // flags: id_size=1, is_complex=0, has_attrs=1 → 0x21
+    bytes.push(0x21);
+    bytes.push(0x21); // codec_id = [0x21]
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(1)); // props_size=1
+    bytes.push(props_byte);
+
+    // Coder 1: BCJ x86 (no properties)
+    // flags: id_size=4, is_complex=0, has_attrs=0 → 0x04
+    bytes.push(0x04);
+    bytes.extend_from_slice(&[0x03, 0x03, 0x01, 0x03]); // codec_id
+
+    // Bind pairs: num_out_total = 2, so num_bind_pairs = 1
+    // bind_pair: (in_index=1, out_index=0)
+    // BCJ (coder 1, in_stream 1) reads from LZMA2 (coder 0, out_stream 0)
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(1)); // in_index
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(0)); // out_index
+
+    // num_packed_streams = num_in_total - num_bind_pairs = 2 - 1 = 1 → implicit, not written
+
     bytes
 }
 
@@ -805,6 +883,7 @@ fn build_header(
     coder_info_bytes: &[u8],
     pack_size: u64,
     folder_unpack_size: u64,
+    num_out_streams: usize,
 ) -> Vec<u8> {
     let mut h: Vec<u8> = Vec::new();
 
@@ -827,14 +906,14 @@ fn build_header(
     h.extend_from_slice(&sevenzip_varuint64_encode(1)); // num_folders = 1
     h.push(0x00); // external = 0
 
-    // Folder: num_coders=1, CoderInfo, no bind pairs (single coder → 0 bind pairs)
-    h.extend_from_slice(&sevenzip_varuint64_encode(1)); // num_coders
+    // Folder: num_coders + CoderInfo (fully encoded in coder_info_bytes)
     h.extend_from_slice(coder_info_bytes);
-    // bind_pairs count = total_out_streams - 1 = 1 - 1 = 0 (nothing to write)
-    // num_packed = num_in_total - bind_pairs = 1 - 0 = 1 (skip explicit packed_indices)
+    // bind_pairs and packed_indices are included in coder_info_bytes
 
     h.push(0x0c); // CodersUnPackSize tag
-    h.extend_from_slice(&sevenzip_varuint64_encode(folder_unpack_size));
+    for _ in 0..num_out_streams {
+        h.extend_from_slice(&sevenzip_varuint64_encode(folder_unpack_size));
+    }
     h.push(0x00); // END UnpackInfo
 
     // SubstreamsInfo — only needed for solid multi-file archives

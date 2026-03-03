@@ -1,4 +1,4 @@
-use r7z::{decompress_folder, Archive, CODEC_LZMA};
+use r7z::{decompress_folder, Archive, CODEC_BCJ_X86, CODEC_LZMA, CODEC_LZMA2};
 
 mod support;
 
@@ -61,4 +61,42 @@ fn archive_open_and_decompress_header_stream() {
         first_byte == 0x01 || first_byte == 0x04,
         "Expected Header (0x01) or MainStreamsInfo (0x04) tag, got 0x{first_byte:02x}"
     );
+}
+#[test]
+fn decompress_bcj_lzma2_fixture() {
+    let path = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/bcj_lzma2.7z");
+    let archive = Archive::open(&path).expect("failed to open BCJ+LZMA2 fixture");
+
+    // Verify the file listing
+    assert_eq!(archive.num_files(), 1);
+    let fi = archive.files_info().unwrap();
+    assert_eq!(fi.name(0).unwrap(), "prog.bin");
+
+    // Verify streams_info shows BCJ + LZMA2 coders
+    let si = archive.streams_info().unwrap();
+    let ui = si.unpack_info.as_ref().unwrap();
+    let folder = ui.parse_folder(0).unwrap();
+    assert_eq!(folder.coders.len(), 2, "expected 2 coders (LZMA2 + BCJ)");
+
+    // Check that one coder is LZMA2 and the other is BCJ
+    let codec_ids: Vec<&[u8]> = folder
+        .coders
+        .iter()
+        .map(|c| c.codec_id.as_slice())
+        .collect();
+    assert!(codec_ids.contains(&CODEC_LZMA2), "expected LZMA2 coder");
+    assert!(codec_ids.contains(&CODEC_BCJ_X86), "expected BCJ x86 coder");
+
+    // Verify bind pairs exist
+    assert_eq!(folder.bind_pairs.len(), 1, "expected 1 bind pair");
+
+    // Extract the file and compare with the original
+    let extracted = archive.extract_to_memory(0).unwrap();
+    assert_eq!(extracted.len(), 4096, "expected 4096 bytes");
+
+    // Compare with original file
+    let original = std::fs::read("/tmp/bcj_original.bin").unwrap();
+    assert_eq!(extracted, original, "extracted data should match original");
 }

@@ -346,12 +346,55 @@ fn data_stream_to_folder(
 }
 
 /// Total uncompressed size for a folder (used as the decompression target size).
+///
+/// This returns the size of the *final* output stream — the one not consumed
+/// by any bind pair.  For single-coder folders the index is trivial; for
+/// chained coders (e.g. BCJ + LZMA2) we must skip bound output streams.
 fn folder_total_unpack_size(
     folder_idx: usize,
     unpack_info: &crate::UnpackInfo,
     substream_info: Option<&crate::SubstreamInfo>,
 ) -> u64 {
-    // Use the folder's out-stream unpack_size if available in UnpackInfo
+    // Compute the global out-stream base for this folder by parsing all
+    // preceding folders' total_out_streams.
+    let mut global_base: usize = 0;
+    for i in 0..folder_idx {
+        if let Ok(f) = unpack_info.parse_folder(i) {
+            global_base += f.total_out_streams();
+        } else {
+            global_base += 1; // fallback
+        }
+    }
+
+    if let Ok(folder) = unpack_info.parse_folder(folder_idx) {
+        let num_out = folder.total_out_streams();
+        if num_out == 1 {
+            // Single coder: direct index
+            if let Some(sz) = unpack_info.unpack_sizes.get(global_base) {
+                return *sz;
+            }
+        } else {
+            // Multi-coder: find the out-stream NOT bound as an output in any bind pair
+            // (the one that produces the final decompressed data).
+            for out_idx in 0..num_out {
+                let is_bound = folder
+                    .bind_pairs
+                    .iter()
+                    .any(|&(_, bound_out)| bound_out == out_idx as u64);
+                if !is_bound {
+                    if let Some(sz) = unpack_info.unpack_sizes.get(global_base + out_idx) {
+                        return *sz;
+                    }
+                }
+            }
+            // Fallback: last out-stream
+            if let Some(sz) = unpack_info.unpack_sizes.get(global_base + num_out - 1) {
+                return *sz;
+            }
+        }
+    }
+
+    // Legacy fallback: try direct index
     if let Some(sz) = unpack_info.unpack_sizes.get(folder_idx) {
         return *sz;
     }

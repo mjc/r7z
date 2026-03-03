@@ -1,5 +1,6 @@
 use crate::R7zError;
 use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
+use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
@@ -74,6 +75,14 @@ pub fn decompress(
         return decompress_lzma2(properties, input);
     }
 
+    if codec_id == CODEC_BCJ_X86 {
+        // BCJ is applied in-place as a post-processing step after a prior
+        // decompressor.  When called standalone, clone the input and decode.
+        let mut buf = input.to_vec();
+        crate::bcj::bcj_x86_decode(&mut buf);
+        return Ok(buf);
+    }
+
     Err(R7zError::UnsupportedCodec(codec_id.to_vec()))
 }
 
@@ -146,17 +155,97 @@ pub fn decompress_folder(
         );
     }
 
-    // Multi-coder chain: execute coders in order (simple linear chain assumed).
-    // Full bind-pair resolution is left for Phase 3.5.
+    // Multi-coder chain: resolve bind-pair ordering so that each coder's
+    // output feeds the next one's input.
+    //
+    // In a BCJ+LZMA folder: coder[0]=LZMA, coder[1]=BCJ, bind_pair=(1,0)
+    // meaning BCJ's in-stream (1) ← LZMA's out-stream (0).
+    // Execution order: LZMA first (produces decompressed bytes), then BCJ.
+    //
+    // We build a topological order by figuring out which coder receives the
+    // packed stream (starts first) and following the bind pairs.
+    let order = coder_execution_order(folder);
+
     let mut data = packed_data.to_vec();
-    for (i, coder) in folder.coders.iter().enumerate() {
+    for (i, &coder_idx) in order.iter().enumerate() {
+        let coder = &folder.coders[coder_idx];
         // For chained coders we don't know intermediate sizes; use 0 to signal "unknown".
-        let size = if i == folder.coders.len() - 1 {
-            unpack_size
-        } else {
-            0
-        };
+        let size = if i == order.len() - 1 { unpack_size } else { 0 };
         data = decompress(&coder.codec_id, coder.properties.as_deref(), &data, size)?;
     }
     Ok(data)
+}
+
+/// Determine the order in which coders should be executed for decompression.
+///
+/// The packed (compressed) stream enters one coder first, its output feeds the
+/// next via bind pairs, and so on.  We return coder indices in execution order.
+fn coder_execution_order(folder: &crate::Folder) -> SmallVec<[usize; 4]> {
+    let n = folder.coders.len();
+    if n <= 1 {
+        return (0..n).collect();
+    }
+
+    // Find which coder's input stream is NOT bound to any other coder's output.
+    // That coder receives the packed data and runs first.
+    //
+    // Bind pairs: (in_index, out_index) — in_index is a global input stream
+    // index, out_index is a global output stream index.
+    //
+    // For a 2-coder folder:
+    //   coder 0: in_stream 0, out_stream 0
+    //   coder 1: in_stream 1, out_stream 1
+    //   bind_pair (1, 0) means: in_stream 1 ← out_stream 0
+    //   So coder 1's input comes from coder 0's output.
+    //   The packed data goes to the stream NOT appearing as any bind_pair's in_index.
+    //   Stream 0 (coder 0) is not bound as input → coder 0 runs first.
+
+    // Build a set of bound input streams
+    let bound_in: SmallVec<[u64; 4]> = folder
+        .bind_pairs
+        .iter()
+        .map(|&(in_idx, _)| in_idx)
+        .collect();
+
+    // Map global stream index → coder index
+    // For simple 1-in/1-out coders: stream i belongs to coder i.
+    // For complex coders we'd need cumulative sums, but 7z BCJ uses simple coders.
+    let mut order = SmallVec::with_capacity(n);
+
+    // Find the first coder (the one whose input stream is not bound)
+    let mut current_stream: u64 = 0;
+    for i in 0..n {
+        let stream = i as u64;
+        if !bound_in.contains(&stream) {
+            current_stream = stream;
+            order.push(i);
+            break;
+        }
+    }
+
+    // Follow the chain: find bind pair where out_index == current_stream,
+    // then the coder that owns in_index is next.
+    while order.len() < n {
+        let mut found = false;
+        for &(in_idx, out_idx) in &folder.bind_pairs {
+            if out_idx == current_stream {
+                let coder_idx = in_idx as usize; // stream i → coder i (simple case)
+                order.push(coder_idx);
+                current_stream = in_idx;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // No more bind pairs; add remaining coders in order
+            for i in 0..n {
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+            break;
+        }
+    }
+
+    order
 }

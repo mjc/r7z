@@ -388,3 +388,106 @@ fn archive_writer_mtime_p7zip_reads() {
         "expected year 2024 in p7zip listing:\n{stdout}"
     );
 }
+/// r7z builds BCJ+LZMA2 archive; round-trips through `from_bytes`.
+#[test]
+fn r7z_write_bcj_lzma2_r7z_reads() {
+    // Create data with CALL instructions that BCJ should filter
+    let mut original = vec![0x90u8; 512];
+    for &pos in &[10u32, 50, 100, 200, 300, 400] {
+        let p = pos as usize;
+        original[p] = 0xE8;
+        original[p + 1] = (pos * 3) as u8;
+        original[p + 2] = ((pos * 3) >> 8) as u8;
+        original[p + 3] = 0x00;
+        original[p + 4] = 0x00;
+    }
+
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Lzma2Bcj)
+        .add_file("prog.bin", &original)
+        .build()
+        .expect("build with BCJ+LZMA2 failed");
+
+    let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
+    assert_eq!(archive.num_files(), 1);
+
+    // Verify the archive uses BCJ + LZMA2
+    let si = archive.streams_info().unwrap();
+    let ui = si.unpack_info.as_ref().unwrap();
+    let folder = ui.parse_folder(0).unwrap();
+    assert_eq!(folder.coders.len(), 2, "expected 2 coders for BCJ+LZMA2");
+
+    let extracted = archive.extract_to_memory(0).unwrap();
+    assert_eq!(extracted, original);
+}
+
+/// r7z builds BCJ+LZMA2 archive; p7zip extracts it and contents match.
+#[test]
+fn r7z_write_bcj_lzma2_p7zip_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let mut original = vec![0x90u8; 1024];
+    for &pos in &[10u32, 50, 100, 200, 400, 600, 800] {
+        let p = pos as usize;
+        original[p] = 0xE8;
+        original[p + 1] = (pos * 5) as u8;
+        original[p + 2] = ((pos * 5) >> 8) as u8;
+        original[p + 3] = 0x00;
+        original[p + 4] = 0x00;
+    }
+
+    let archive_path = dir.join("bcj_test.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Lzma2Bcj)
+        .add_file("prog.bin", &original)
+        .build()
+        .expect("build with BCJ+LZMA2 failed");
+    std::fs::write(&archive_path, &bytes).unwrap();
+
+    // p7zip extracts
+    let out = run_7z(&["x", "-y", archive_path.to_str().unwrap()], dir);
+    assert!(
+        out.status.success(),
+        "7z x failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let extracted = std::fs::read(dir.join("prog.bin")).unwrap();
+    assert_eq!(extracted, original, "p7zip extracted data != original");
+}
+
+/// p7zip reads BCJ+LZMA2 archive created by r7z via ArchiveWriter.
+#[test]
+fn archive_writer_bcj_lzma2_p7zip_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let mut data = vec![0xCCu8; 2048];
+    for &pos in &[16u32, 64, 128, 256, 512, 1024, 1536] {
+        let p = pos as usize;
+        data[p] = 0xE9; // JMP
+        data[p + 1] = 0x10;
+        data[p + 2] = 0x00;
+        data[p + 3] = 0x00;
+        data[p + 4] = 0x00;
+    }
+
+    let archive_path = dir.join("bcj_writer.7z");
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut w = r7z::ArchiveWriter::new(file)
+        .unwrap()
+        .compression(r7z::Codec::Lzma2Bcj);
+    w.append("code.bin", &mut data.as_slice()).unwrap();
+    w.finish().unwrap();
+
+    let out = run_7z(&["x", "-y", archive_path.to_str().unwrap()], dir);
+    assert!(
+        out.status.success(),
+        "7z x failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let extracted = std::fs::read(dir.join("code.bin")).unwrap();
+    assert_eq!(extracted, data);
+}

@@ -136,3 +136,51 @@ fn p7zip_read_interop_extract_all() {
         b"content B long long long"
     );
 }
+/// p7zip creates a BCJ+LZMA2 archive; r7z extracts it correctly.
+#[test]
+fn p7zip_read_interop_bcj_lzma2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Create a file with CALL/JMP patterns that BCJ will filter
+    let mut data = vec![0x90u8; 2048];
+    for &pos in &[16u32, 64, 128, 256, 512, 1024, 1536] {
+        let p = pos as usize;
+        data[p] = 0xE8; // CALL
+        data[p + 1] = (pos * 7) as u8;
+        data[p + 2] = ((pos * 7) >> 8) as u8;
+        data[p + 3] = 0x00;
+        data[p + 4] = 0x00;
+    }
+    std::fs::write(dir.join("code.bin"), &data).unwrap();
+
+    // Create 7z with BCJ + LZMA2
+    let archive_path = dir.join("bcj_test.7z");
+    let out = run_7z(
+        &[
+            "a",
+            archive_path.to_str().unwrap(),
+            "code.bin",
+            "-mf=BCJ",
+            "-mx=7",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z a failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    assert_eq!(archive.num_files(), 1);
+
+    // Verify that the folder has 2 coders (BCJ + LZMA2)
+    let si = archive.streams_info().unwrap();
+    let ui = si.unpack_info.as_ref().unwrap();
+    let folder = ui.parse_folder(0).unwrap();
+    assert_eq!(folder.coders.len(), 2, "expected BCJ + LZMA2");
+
+    let extracted = archive.extract_to_memory(0).unwrap();
+    assert_eq!(extracted, data, "extracted data should match original");
+}

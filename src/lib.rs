@@ -25,6 +25,7 @@ extern crate num;
 extern crate num_derive;
 
 mod archive;
+pub mod bcj;
 mod builder;
 mod codec;
 mod coder_info;

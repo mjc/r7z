@@ -48,8 +48,10 @@ Key layout:
 | `src/parsers.rs` | `sevenzip_varuint64_decode` |
 | `src/property.rs` | Property tag enum |
 | `src/coder_info.rs` | CoderInfo parser |
+| `src/bcj.rs` | x86 BCJ (Branch/Call/Jump) filter encode/decode |
 | `src/folder.rs` | Folder parser |
 | `src/pack_info.rs` | PackInfo + UnpackInfo |
 | `src/headers.rs` | SignatureHeader, EncodedHeader |
 | `src/error.rs` | Public `R7zError` |
 | `tests/fixtures/test_1.7z` | LZMA-compressed single-file 7z fixture |
+| `tests/fixtures/bcj_lzma2.7z` | BCJ+LZMA2-compressed 7z fixture (p7zip-created) |

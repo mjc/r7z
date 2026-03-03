@@ -366,6 +366,55 @@ fn p7zip_extract_1mb(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Nintendo64 real-world archive (~6 GB, not committed to repo)
+// ============================================================================
+
+fn n64_path() -> PathBuf {
+    PathBuf::from("/mnt/emulation/Nintendo64Archive-unencrypted.7z")
+}
+
+fn n64_bytes() -> Bytes {
+    static BYTES: OnceLock<Bytes> = OnceLock::new();
+    BYTES.get_or_init(|| mmap_bytes(&n64_path())).clone()
+}
+
+fn r7z_open_n64(c: &mut Criterion) {
+    if !n64_path().exists() {
+        return;
+    }
+    let bytes = n64_bytes();
+    // Probe once — encrypted or unsupported-codec archives can't be opened; skip.
+    if r7z::Archive::from_bytes(bytes.clone()).is_err() {
+        eprintln!("r7z_open_n64: skipping — archive open failed (encrypted / unsupported codec)");
+        return;
+    }
+    c.bench_function("r7z_open_n64", |b| {
+        b.iter(|| r7z::Archive::from_bytes(black_box(bytes.clone())).unwrap());
+    });
+}
+
+fn r7z_extract_n64(c: &mut Criterion) {
+    if !n64_path().exists() {
+        return;
+    }
+    let archive = match r7z::Archive::from_bytes(n64_bytes()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("r7z_extract_n64: skipping — archive open failed: {e:?}");
+            return;
+        }
+    };
+    // find first file that has actual data (not dir / empty-stream entry)
+    let idx = archive
+        .files_info()
+        .and_then(|fi| (0..archive.num_files()).find(|&i| !fi.is_empty_stream(i)))
+        .unwrap_or(0);
+    c.bench_function("r7z_extract_n64", |b| {
+        b.iter(|| archive.extract_to_memory(black_box(idx)).unwrap());
+    });
+}
+
+// ============================================================================
 // Criterion Configuration
 // ============================================================================
 
@@ -374,7 +423,8 @@ criterion_group! {
     config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
     targets = r7z_open_1mb, r7z_open_10mb, r7z_open_1gb, r7z_open_10gb,
               r7z_extract_1mb, r7z_extract_10mb, r7z_extract_1gb, r7z_extract_10gb,
-              r7z_build_1mb, r7z_build_10mb, r7z_build_1gb, r7z_build_10gb
+              r7z_build_1mb, r7z_build_10mb, r7z_build_1gb, r7z_build_10gb,
+              r7z_open_n64, r7z_extract_n64
 }
 
 criterion_group! {
