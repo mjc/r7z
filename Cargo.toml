@@ -12,7 +12,7 @@ arrayvec = "0.7"
 smallvec = "1"
 bytes = "1"
 crc32fast = "1.5.0"
-lzma-rs = "0.3.0"
+lzma-rust2 = { version = "0.16.2", features = ["encoder", "optimization"] }
 nom = "8"
 num = "0.4"
 num-derive = "0.4"

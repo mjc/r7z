@@ -1,20 +1,25 @@
 use crate::R7zError;
-use std::io::{BufReader, Cursor};
+use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
+use std::io::{Cursor, Read, Write};
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
 ///
 /// `properties` is the 5-byte LZMA properties block to store in `CoderInfo`.
-/// `compressed_stream` is the raw compressed bytes (`LZMA_ALONE` header stripped).
+/// `compressed_stream` is the raw compressed bytes (no `LZMA_ALONE` header).
 pub fn compress_lzma(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
-    let mut alone: Vec<u8> = Vec::new();
-    let mut reader = BufReader::new(Cursor::new(data));
-    lzma_rs::lzma_compress(&mut reader, &mut alone).map_err(|_| R7zError::Decompression)?;
-    // LZMA_ALONE layout: 5-byte props | 8-byte unpack_size | compressed bytes
-    if alone.len() < 13 {
-        return Err(R7zError::Decompression);
-    }
-    let props = alone[..5].to_vec();
-    let compressed = alone[13..].to_vec();
+    let options = LzmaOptions::with_preset(6);
+    let dict_size = options.dict_size;
+    let buf = Vec::new();
+    let mut writer =
+        LzmaWriter::new_no_header(buf, &options, false).map_err(|_| R7zError::Decompression)?;
+    writer.write_all(data).map_err(|_| R7zError::Decompression)?;
+    let props_byte = writer.props();
+    let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
+
+    // 5-byte props block: 1-byte properties + 4-byte dict size LE
+    let mut props = Vec::with_capacity(5);
+    props.push(props_byte);
+    props.extend_from_slice(&dict_size.to_le_bytes());
     Ok((props, compressed))
 }
 
@@ -30,12 +35,13 @@ pub const CODEC_COPY: &[u8] = &[0x00];
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
 /// The properties byte encodes the maximum dictionary size needed for decompression.
-/// We advertise 32 MB (0x1c), which is sufficient for lzma-rs's default dictionary.
+/// We advertise 32 MB (0x1c), which matches the default preset dictionary.
 /// p7zip uses this only for memory estimation — the LZMA2 stream is self-describing.
 pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
-    let mut compressed: Vec<u8> = Vec::new();
-    let mut reader = BufReader::new(Cursor::new(data));
-    lzma_rs::lzma2_compress(&mut reader, &mut compressed).map_err(|_| R7zError::Decompression)?;
+    let buf = Vec::new();
+    let mut writer = Lzma2Writer::new(buf, lzma_rust2::Lzma2Options::default());
+    writer.write_all(data).map_err(|_| R7zError::Decompression)?;
+    let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
     // 0x1c → dict_size = 1 << (0x1c/2 + 11) = 1 << 25 = 32 MB
     Ok((0x1c, compressed))
 }
@@ -61,7 +67,7 @@ pub fn decompress(
     }
 
     if codec_id == CODEC_LZMA2 {
-        return decompress_lzma2(input);
+        return decompress_lzma2(properties, input);
     }
 
     Err(R7zError::UnsupportedCodec(codec_id.to_vec()))
@@ -76,24 +82,36 @@ fn decompress_lzma(
     if props.len() != 5 {
         return Err(R7zError::Decompression);
     }
+    let props_byte = props[0];
+    let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
 
-    // Build an LZMA_ALONE stream: 5-byte props + 8-byte uncompressed size + data
-    let mut stream = Vec::with_capacity(13 + input.len());
-    stream.extend_from_slice(props);
-    stream.extend_from_slice(&unpack_size.to_le_bytes());
-    stream.extend_from_slice(input);
-
-    let mut reader = BufReader::new(Cursor::new(stream));
+    let mut reader =
+        LzmaReader::new_with_props(Cursor::new(input), unpack_size, props_byte, dict_size, None)
+            .map_err(|_| R7zError::Decompression)?;
     let mut output = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
-    lzma_rs::lzma_decompress(&mut reader, &mut output).map_err(|_| R7zError::Decompression)?;
+    reader.read_to_end(&mut output).map_err(|_| R7zError::Decompression)?;
     Ok(output)
 }
 
-fn decompress_lzma2(input: &[u8]) -> Result<Vec<u8>, R7zError> {
-    let mut reader = BufReader::new(Cursor::new(input));
+fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, R7zError> {
+    let dict_size = lzma2_dict_size(properties);
+    let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
     let mut output = Vec::new();
-    lzma_rs::lzma2_decompress(&mut reader, &mut output).map_err(|_| R7zError::Decompression)?;
+    reader.read_to_end(&mut output).map_err(|_| R7zError::Decompression)?;
     Ok(output)
+}
+
+/// Decode the LZMA2 dictionary size from the 7z properties byte.
+///
+/// The 7z spec encodes: `dict_size = (2 | (p & 1)) << ((p >> 1) + 11)` for p < 40,
+/// and `u32::MAX` for p == 40 (meaning "as large as needed").
+fn lzma2_dict_size(props: Option<&[u8]>) -> u32 {
+    let p = props.and_then(|b| b.first().copied()).unwrap_or(40);
+    if p >= 40 {
+        u32::MAX
+    } else {
+        (2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11)
+    }
 }
 
 /// Decompress all folders in a Folder chain and return the concatenated output.
