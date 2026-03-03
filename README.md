@@ -6,7 +6,7 @@ A pure-Rust library for reading and writing `.7z` archives.
 [![docs.rs](https://docs.rs/r7z/badge.svg)](https://docs.rs/r7z)
 [![License: LGPL-2.1-or-later](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue)](LICENSE)
 
-r7z implements the 7z binary format spec in pure Rust using `nom` parser combinators. It reads archives created by p7zip / 7-Zip and can build new archives that those tools can open. No C FFI, no unsafe liblzma — compression is handled by the `lzma-rs` crate.
+r7z implements the 7z binary format spec in pure Rust using `nom` parser combinators. It reads archives created by p7zip / 7-Zip and can build new archives that those tools can open. No C FFI, no unsafe liblzma — compression is handled by the `lzma-rust2` crate.
 
 ## Features
 
@@ -78,6 +78,22 @@ let bytes = ArchiveBuilder::new()
     .build()?;
 ```
 
+### Streaming builder — process large archives without loading all data into memory
+
+```rust
+use r7z::build_streaming;
+use std::fs::File;
+use std::io::BufWriter;
+
+let out_file = BufWriter::new(File::create("large.7z")?);  
+let entries = vec![
+    ("file1.bin".to_string(), File::open("file1.bin")?),
+    ("file2.bin".to_string(), File::open("file2.bin")?),
+].into_iter();
+
+build_streaming(entries, out_file)?;  // Pipes files through compressor directly to disk
+```
+
 ### Parsing from an in-memory buffer
 
 ```rust
@@ -111,6 +127,20 @@ Builder pattern — all methods consume `self` and return `Self` for chaining:
 | `.build()` | Produce the final `.7z` bytes as `Result<Vec<u8>, R7zError>` |
 
 The builder uses **solid compression**: all files are concatenated into one stream before compressing, which gives better ratios for many small files.
+
+### `build_streaming` — Streaming builder for large archives
+
+For archives too large to fit in memory, use the streaming builder:
+
+```rust
+pub fn build_streaming<W, I, R>(entries: I, out: W) -> Result<(), R7zError>
+where
+    W: Write + Seek,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+```
+
+Each `entry` (filename, `impl Read`) is piped through the LZMA2 compressor directly to the output file. Neither all input data nor all compressed output is held in memory simultaneously — only one file at a time.
 
 ### `Codec` — Compression algorithms
 
@@ -186,12 +216,29 @@ Archives written by r7z use format version 0.4 (standard), are in uncompressed-H
 
 ## Development
 
+### Setup (NixOS / Nix Flakes)
+
+With `nix flake` support, `direnv`, and the flake:
+
+```bash
+direnv allow
+```
+
+This loads the dev shell with:
+- **Rust toolchain** (stable + clippy + rustfmt)
+- **Profiling**: `perf`, `cargo-flamegraph`, `valgrind`
+- **Build**: `cargo-nextest`, `gnuplot`, `hyperfine`
+
+Running `cargo flamegraph --bin build_n64 -- /mnt/emulation/n64 /tmp/n64_build.7z` will build a streaming 7z archive from a directory tree and profile the codepath.
+
+### Without Nix
+
 ```bash
 # Run all tests (unit + integration + p7zip interop)
 cargo test
 
-# Linting — must be clean before commit
-cargo clippy
+# Linting — must pass before commit
+cargo clippy --all-targets --all-features -- -D clippy::pedantic
 
 # Benchmarks (Criterion — parse, open, extract, build)
 cargo bench
@@ -200,7 +247,7 @@ cargo bench
 cargo doc --no-deps --open
 ```
 
-**Interop tests** require `7z` (p7zip) in `PATH`. On NixOS / Nix: `nix-shell -p p7zip`.
+**Interop tests** require `7z` (p7zip) in `PATH`. On macOS: `brew install p7zip`; on Ubuntu: `apt install p7zip-full`.
 
 **CI** runs on GitHub Actions: format check → clippy → p7zip interop tests → rustdoc.
 
