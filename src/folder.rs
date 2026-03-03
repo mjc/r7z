@@ -157,11 +157,10 @@ impl Folder {
 }
 
 #[cfg(test)]
-#[allow(clippy::doc_markdown)]
 mod tests {
     use super::scan_folder;
 
-    /// Single copy coder (id_size=1, not complex, no props).
+    /// Single copy coder (`id_size=1`, not complex, no props).
     #[test]
     fn scan_folder_copy_codec() {
         // num_coders=1, flags=0x01 (id_size=1, simple, no props), codec_id=[0x00]
@@ -171,7 +170,7 @@ mod tests {
         assert_eq!(out, 1);
     }
 
-    /// Single LZMA coder with properties (mirrors LZMA_CODER_BYTES from coder tests).
+    /// Single LZMA coder with properties (mirrors `LZMA_CODER_BYTES` from coder tests).
     #[test]
     fn scan_folder_lzma_with_props() {
         // num_coders=1, flags=0x23 (id_size=3, simple, has_props)
@@ -193,7 +192,7 @@ mod tests {
         assert_eq!(out, 1);
     }
 
-    /// Complex coder (is_complex flag): 2 in-streams, 1 out-stream → 2 packed indices.
+    /// Complex coder (`is_complex` flag): 2 in-streams, 1 out-stream → 2 packed indices.
     #[test]
     fn scan_folder_complex_two_in_one_out() {
         // num_coders=1, flags=0x12 (id_size=2, is_complex, no props)

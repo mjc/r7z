@@ -362,13 +362,12 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
 }
 
 #[cfg(test)]
-#[allow(clippy::doc_markdown)]
 mod tests {
     use super::{scan_pack_info, scan_unpack_info};
 
     // ── scan_pack_info ──────────────────────────────────────────────
 
-    /// Minimal valid PackInfo: 1 stream, pack_pos=0, size=100.
+    /// Minimal valid `PackInfo`: `1 stream, pack_pos=0, size=100`.
     #[test]
     fn scan_pack_info_one_stream() {
         // 0x06=PackInfo, pack_pos=0, num_streams=1, 0x09=Size, 100, 0x00=END
@@ -386,7 +385,7 @@ mod tests {
         assert_eq!(rem, &[0xFF]);
     }
 
-    /// Wrong tag (UnPackInfo) returns a hard Failure.
+    /// Wrong tag (`UnPackInfo`) returns a hard Failure.
     #[test]
     fn scan_pack_info_wrong_tag() {
         assert!(scan_pack_info(&[0x07u8]).is_err());
@@ -401,7 +400,7 @@ mod tests {
 
     // ── scan_unpack_info ────────────────────────────────────────────
 
-    /// One folder with copy codec → returns num_folders=1.
+    /// One folder with `copy` codec → returns `num_folders=1`.
     #[test]
     fn scan_unpack_info_one_folder() {
         // UnPackInfo, Folder tag, 1 folder, not external,
@@ -412,7 +411,7 @@ mod tests {
         assert_eq!(nf, 1);
     }
 
-    /// Two folders each with copy codec → returns num_folders=2.
+    /// Two folders each with `copy` codec → returns `num_folders=2`.
     #[test]
     fn scan_unpack_info_two_folders() {
         let input = [
@@ -431,7 +430,7 @@ mod tests {
         assert_eq!(nf, 2);
     }
 
-    /// CRC section (all_defined=1, 1 CRC) is skipped correctly.
+    /// CRC section (`all_defined=1`, 1 CRC) is skipped correctly.
     #[test]
     fn scan_unpack_info_with_crc() {
         let input = [

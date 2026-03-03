@@ -335,7 +335,6 @@ pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::doc_markdown)]
 mod tests {
     use super::{scan_stream_info, scan_substream_info};
 
@@ -350,7 +349,7 @@ mod tests {
         assert!(rem.is_empty());
     }
 
-    /// NumUnPackStream + Size: 2 folders with [2, 1] streams → 1 size to skip.
+    /// `NumUnPackStream` + `Size`: 2 folders with `[2, 1]` streams → 1 size to skip.
     #[test]
     fn scan_substream_info_num_unpack_stream() {
         // NumUnPackStream (0x0D): folder[0]=2, folder[1]=1
@@ -376,7 +375,7 @@ mod tests {
         assert!(rem.is_empty());
     }
 
-    /// PackInfo + UnpackInfo + END.
+    /// `PackInfo` + `UnpackInfo` + `END`.
     #[test]
     fn scan_stream_info_pack_and_unpack() {
         let input: &[u8] = &[
@@ -391,7 +390,7 @@ mod tests {
         assert!(rem.is_empty());
     }
 
-    /// PackInfo + UnpackInfo + SubStreamsInfo + END.
+    /// `PackInfo` + `UnpackInfo` + `SubStreamsInfo` + `END`.
     #[test]
     fn scan_stream_info_with_substreams() {
         let input: &[u8] = &[

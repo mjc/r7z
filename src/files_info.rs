@@ -303,7 +303,6 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::doc_markdown)]
 mod tests {
     use super::scan_files_info;
 
@@ -317,7 +316,7 @@ mod tests {
         assert_eq!(n, 3);
     }
 
-    /// num_files=0 is valid.
+    /// `num_files=0` is valid.
     #[test]
     fn scan_files_info_zero_files() {
         let input = [0x05u8, 0x00, 0x00];
