@@ -13,6 +13,7 @@ smallvec = "1"
 bytes = "1"
 crc32fast = "1.5.0"
 lzma-rust2 = { version = "0.16.2", features = ["encoder", "optimization"] }
+memmap2 = "0.9"
 nom = "8"
 num = "0.4"
 num-derive = "0.4"
@@ -22,7 +23,6 @@ thiserror = "2"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 hex = "0.4"
-memmap2 = "0.9"
 tempfile = "3.26.0"
 pprof = { version = "0.15", features = ["flamegraph"] }
 

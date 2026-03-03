@@ -69,6 +69,238 @@ impl ArchiveBuilder {
     }
 }
 
+// ── ArchiveWriter ────────────────────────────────────────────────────────────
+
+/// Metadata for one completed compression folder.
+struct FolderMeta {
+    /// Per-file `(name, unpack_size, crc32)`.
+    files: Vec<(String, u64, u32)>,
+    /// Compressed byte count for this folder's pack stream.
+    pack_size: u64,
+    /// Encoded `CoderInfo` bytes for this folder's codec.
+    coder_info: Vec<u8>,
+}
+
+/// Active compressor state inside [`ArchiveWriter`].
+enum CompressorState<W: Write> {
+    /// LZMA2 streaming compressor writing through a [`CountWriter`].
+    Lzma2(Box<lzma_rust2::Lzma2Writer<CountWriter<W>>>),
+    /// LZMA buffers the full folder in memory before compressing on seal.
+    Lzma { buf: Vec<u8>, out: W },
+}
+
+/// Current I/O state of the underlying writer inside [`ArchiveWriter`].
+enum WriterState<W: Write> {
+    /// No folder is open; `W` is directly accessible.
+    Open(W),
+    /// A folder is being filled; the compressor owns `W`.
+    Writing(Box<CompressorState<W>>),
+    /// Transient variant used during `seal_current_folder` to take ownership.
+    Dead,
+}
+
+/// Streaming 7z archive writer with multi-folder (multi-compression-unit) support.
+///
+/// Drive the write imperatively:
+/// 1. Create with [`ArchiveWriter::new`].
+/// 2. Call [`append`](ArchiveWriter::append) for each file.
+/// 3. Optionally call [`new_folder`](ArchiveWriter::new_folder) to start a new
+///    compression unit; files added after the call go into the new folder.
+/// 4. Call [`finish`](ArchiveWriter::finish) to seal the archive and recover
+///    the underlying writer.
+///
+/// A *folder* in 7z is an independent compression unit.  Solid compression
+/// (all files in one folder) yields the best ratio; separate folders allow
+/// random access to individual files without decompressing everything.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::fs::File;
+///
+/// let file = File::create("out.7z").unwrap();
+/// let mut w = r7z::ArchiveWriter::new(file).unwrap();
+/// w.append("a.txt", &mut b"hello".as_ref()).unwrap();
+/// w.new_folder().unwrap();
+/// w.append("b.txt", &mut b"world".as_ref()).unwrap();
+/// w.finish().unwrap();
+/// ```
+pub struct ArchiveWriter<W: Write + Seek> {
+    state: WriterState<W>,
+    completed: Vec<FolderMeta>,
+    current_files: Vec<(String, u64, u32)>,
+    codec: Codec,
+}
+
+impl<W: Write + Seek> ArchiveWriter<W> {
+    /// Create a new [`ArchiveWriter`] writing to `out`.
+    ///
+    /// Immediately reserves 32 bytes at the start of `out` for the signature
+    /// header, which is filled in by [`finish`](Self::finish).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError`] if the initial write to `out` fails.
+    pub fn new(mut out: W) -> Result<Self, R7zError> {
+        out.write_all(&[0u8; 32]).map_err(|_| R7zError::Parse)?;
+        Ok(ArchiveWriter {
+            state: WriterState::Open(out),
+            completed: Vec::new(),
+            current_files: Vec::new(),
+            codec: Codec::default(),
+        })
+    }
+
+    /// Set the compression codec for all subsequent folders.
+    ///
+    /// Must be called before the first [`append`](Self::append) to take effect
+    /// on the current folder; calling it mid-folder has no effect until
+    /// [`new_folder`](Self::new_folder) is called.
+    #[must_use]
+    pub fn compression(mut self, codec: Codec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// Append a file to the current compression folder.
+    ///
+    /// The reader is streamed directly through the compressor to the underlying
+    /// writer.  [`Codec::Lzma`] is an exception: it must buffer the entire
+    /// folder in memory because LZMA has no streaming encoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError`] on I/O failure or compression error.
+    pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
+        // Transition Open → Writing on first append in a folder.
+        if matches!(self.state, WriterState::Open(_)) {
+            let state = std::mem::replace(&mut self.state, WriterState::Dead);
+            let WriterState::Open(w) = state else {
+                unreachable!()
+            };
+            self.state = WriterState::Writing(Box::new(match self.codec {
+                Codec::Lzma2 => CompressorState::Lzma2(Box::new(lzma_rust2::Lzma2Writer::new(
+                    CountWriter::new(w),
+                    lzma_rust2::Lzma2Options::default(),
+                ))),
+                Codec::Lzma => CompressorState::Lzma {
+                    buf: Vec::new(),
+                    out: w,
+                },
+            }));
+        }
+
+        let mut hr = HashRead::new(reader);
+        match &mut self.state {
+            WriterState::Writing(cs) => match cs.as_mut() {
+                CompressorState::Lzma2(lzma2) => {
+                    std::io::copy(&mut hr, lzma2.as_mut()).map_err(|_| R7zError::Parse)?;
+                }
+                CompressorState::Lzma { buf, .. } => {
+                    std::io::copy(&mut hr, buf).map_err(|_| R7zError::Parse)?;
+                }
+            },
+            _ => return Err(R7zError::Parse),
+        }
+
+        let (crc, size) = hr.finish();
+        self.current_files.push((name.to_string(), size, crc));
+        Ok(())
+    }
+
+    /// Seal the current compression folder and start a new one.
+    ///
+    /// Files appended after this call go into a separate compression unit.
+    /// Calling `new_folder` when no files have been appended since the last
+    /// folder boundary is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError`] if sealing the current folder fails.
+    pub fn new_folder(&mut self) -> Result<(), R7zError> {
+        self.seal_current_folder()
+    }
+
+    /// Seal the archive, write the 7z header and signature, and return the
+    /// underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if no files have been added, or on any I/O
+    /// or compression error.
+    pub fn finish(mut self) -> Result<W, R7zError> {
+        self.seal_current_folder()?;
+        if self.completed.is_empty() {
+            return Err(R7zError::Parse);
+        }
+
+        let WriterState::Open(mut w) = self.state else {
+            return Err(R7zError::Parse);
+        };
+
+        let next_header_offset: u64 = self.completed.iter().map(|f| f.pack_size).sum();
+        let header = build_header_multi_folder(&self.completed);
+        let next_header_size = header.len() as u64;
+        let next_header_crc = crc32fast::hash(&header);
+
+        w.write_all(&header).map_err(|_| R7zError::Parse)?;
+
+        let mut start_header = [0u8; 20];
+        start_header[..8].copy_from_slice(&next_header_offset.to_le_bytes());
+        start_header[8..16].copy_from_slice(&next_header_size.to_le_bytes());
+        start_header[16..].copy_from_slice(&next_header_crc.to_le_bytes());
+        let start_header_crc = crc32fast::hash(&start_header);
+
+        w.seek(SeekFrom::Start(0)).map_err(|_| R7zError::Parse)?;
+        let mut sig = [0u8; 32];
+        sig[..6].copy_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+        sig[6] = 0x00; // major version
+        sig[7] = 0x04; // minor version
+        sig[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
+        sig[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
+        sig[20..28].copy_from_slice(&next_header_size.to_le_bytes());
+        sig[28..32].copy_from_slice(&next_header_crc.to_le_bytes());
+        w.write_all(&sig).map_err(|_| R7zError::Parse)?;
+        w.flush().map_err(|_| R7zError::Parse)?;
+        Ok(w)
+    }
+
+    /// Compress and flush the current folder to the underlying writer.
+    ///
+    /// No-op when no files have been appended since the last folder boundary.
+    fn seal_current_folder(&mut self) -> Result<(), R7zError> {
+        if self.current_files.is_empty() {
+            return Ok(());
+        }
+
+        let state = std::mem::replace(&mut self.state, WriterState::Dead);
+        let (w, pack_size, coder_info) = match state {
+            WriterState::Writing(cs) => match *cs {
+                CompressorState::Lzma2(lzma2) => {
+                    let cw = lzma2.finish().map_err(|_| R7zError::Parse)?;
+                    let pack_size = cw.count;
+                    (cw.inner, pack_size, encode_coder_info_lzma2(0x1c))
+                }
+                CompressorState::Lzma { buf, mut out } => {
+                    let (props, compressed) = codec::compress_lzma(&buf)?;
+                    let pack_size = compressed.len() as u64;
+                    out.write_all(&compressed).map_err(|_| R7zError::Parse)?;
+                    (out, pack_size, encode_coder_info_lzma(&props))
+                }
+            },
+            WriterState::Open(_) | WriterState::Dead => return Err(R7zError::Parse),
+        };
+
+        self.state = WriterState::Open(w);
+        self.completed.push(FolderMeta {
+            files: std::mem::take(&mut self.current_files),
+            pack_size,
+            coder_info,
+        });
+        Ok(())
+    }
+}
+
 fn build_archive(files: &[(String, Vec<u8>)], codec: Codec) -> Result<Vec<u8>, R7zError> {
     // Solid compression: concatenate all file data into one stream.
     let mut all_data: Vec<u8> = Vec::new();
@@ -320,6 +552,109 @@ fn build_header_from_meta(
     let name_block_size = 1 + name_data.len() as u64;
     h.extend_from_slice(&sevenzip_varuint64_encode(name_block_size));
     h.push(0x00);
+    h.extend_from_slice(&name_data);
+
+    h.push(0x00); // END FilesInfo
+    h.push(0x00); // END Header
+    h
+}
+
+/// Build a 7z `Header` block for an archive with N compression folders.
+///
+/// Handles both single-folder and multi-folder archives.  All files across all
+/// folders are listed sequentially in `FilesInfo`.
+fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
+    let mut h: Vec<u8> = Vec::new();
+    let num_folders = folders.len();
+    let total_files: usize = folders.iter().map(|f| f.files.len()).sum();
+
+    h.push(0x01); // Header
+    h.push(0x04); // MainStreamsInfo
+
+    // PackInfo (0x06): one pack stream per folder
+    h.push(0x06);
+    h.extend_from_slice(&sevenzip_varuint64_encode(0)); // pack_pos = 0
+    h.extend_from_slice(&sevenzip_varuint64_encode(num_folders as u64));
+    h.push(0x09); // Size
+    for folder in folders {
+        h.extend_from_slice(&sevenzip_varuint64_encode(folder.pack_size));
+    }
+    h.push(0x00); // END PackInfo
+
+    // UnpackInfo (0x07): one folder block per compression unit
+    h.push(0x07);
+    h.push(0x0b); // Folder
+    h.extend_from_slice(&sevenzip_varuint64_encode(num_folders as u64));
+    h.push(0x00); // external = 0
+    for folder in folders {
+        h.extend_from_slice(&sevenzip_varuint64_encode(1)); // num_coders = 1
+        h.extend_from_slice(&folder.coder_info);
+        // 0 bind pairs (single coder: total_out_streams = 1)
+        // packed_indices omitted (num_packed = 1, implicit)
+    }
+    h.push(0x0c); // CodersUnPackSize: one entry per folder
+    for folder in folders {
+        let unpack: u64 = folder.files.iter().map(|(_, s, _)| s).sum();
+        h.extend_from_slice(&sevenzip_varuint64_encode(unpack));
+    }
+    h.push(0x00); // END UnpackInfo
+
+    // SubstreamsInfo — needed when total_files > 1 to carry per-file sizes/CRCs
+    if total_files > 1 {
+        h.push(0x08); // SubstreamsInfo
+
+        // NumUnPackStream: one varint per folder
+        h.push(0x0d);
+        for folder in folders {
+            h.extend_from_slice(&sevenzip_varuint64_encode(folder.files.len() as u64));
+        }
+
+        // Size: for each folder with > 1 file, (n-1) substream sizes; last is implicit
+        if folders.iter().any(|f| f.files.len() > 1) {
+            h.push(0x09);
+            for folder in folders {
+                let n = folder.files.len();
+                for (_, size, _) in &folder.files[..n.saturating_sub(1)] {
+                    h.extend_from_slice(&sevenzip_varuint64_encode(*size));
+                }
+            }
+        }
+
+        // CRC: one per file across all folders
+        h.push(0x0a);
+        h.push(0x01); // all_defined = 1
+        for folder in folders {
+            for (_, _, crc) in &folder.files {
+                h.extend_from_slice(&crc.to_le_bytes());
+            }
+        }
+        h.push(0x00); // END SubstreamsInfo
+    }
+
+    h.push(0x00); // END StreamInfo
+
+    // FilesInfo
+    h.push(0x05);
+    h.extend_from_slice(&sevenzip_varuint64_encode(total_files as u64));
+
+    // Names property (0x11)
+    h.push(0x11);
+    let name_data: Vec<u8> = {
+        let mut nd = Vec::new();
+        for folder in folders {
+            for (name, _, _) in &folder.files {
+                for unit in name.encode_utf16() {
+                    nd.extend_from_slice(&unit.to_le_bytes());
+                }
+                nd.push(0);
+                nd.push(0); // UTF-16LE null terminator
+            }
+        }
+        nd
+    };
+    let name_block_size = 1 + name_data.len() as u64;
+    h.extend_from_slice(&sevenzip_varuint64_encode(name_block_size));
+    h.push(0x00); // external = 0
     h.extend_from_slice(&name_data);
 
     h.push(0x00); // END FilesInfo

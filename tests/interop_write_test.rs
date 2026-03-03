@@ -178,3 +178,107 @@ fn r7z_write_p7zip_reads_multi_file() {
         assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");
     }
 }
+
+/// [`ArchiveWriter`] single-folder r7z round-trip.
+#[test]
+fn archive_writer_single_folder_r7z_reads() {
+    let files = [
+        ("a.txt", b"hello from ArchiveWriter" as &[u8]),
+        ("b.txt", b"second file"),
+    ];
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut w = r7z::ArchiveWriter::new(&mut buf).expect("new failed");
+    for (name, data) in &files {
+        w.append(name, *data).expect("append failed");
+    }
+    w.finish().expect("finish failed");
+
+    let archive = r7z::Archive::from_bytes(buf.into_inner().into()).expect("from_bytes failed");
+    assert_eq!(archive.num_files(), files.len());
+    let fi = archive.files_info().unwrap();
+    for (i, (name, original)) in files.iter().enumerate() {
+        assert_eq!(fi.name(i).unwrap(), *name);
+        let extracted = archive.extract_to_memory(i).unwrap();
+        assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");
+    }
+}
+
+/// [`ArchiveWriter`] multi-folder r7z round-trip: two folders, two files each.
+#[test]
+fn archive_writer_multi_folder_r7z_reads() {
+    let folder0 = [("f0a.txt", b"folder zero file A" as &[u8]), ("f0b.txt", b"folder zero file B")];
+    let folder1 = [("f1a.txt", b"folder one file A" as &[u8]), ("f1b.txt", b"folder one file B")];
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut w = r7z::ArchiveWriter::new(&mut buf).expect("new failed");
+    for (name, data) in &folder0 {
+        w.append(name, *data).expect("append failed");
+    }
+    w.new_folder().expect("new_folder failed");
+    for (name, data) in &folder1 {
+        w.append(name, *data).expect("append failed");
+    }
+    w.finish().expect("finish failed");
+
+    let archive = r7z::Archive::from_bytes(buf.into_inner().into()).expect("from_bytes failed");
+    assert_eq!(archive.num_files(), 4);
+
+    let fi = archive.files_info().unwrap();
+    let all = [folder0[0], folder0[1], folder1[0], folder1[1]];
+    for (i, (name, original)) in all.iter().enumerate() {
+        assert_eq!(fi.name(i).unwrap(), *name);
+        let extracted = archive.extract_to_memory(i).unwrap();
+        assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");
+    }
+}
+
+/// [`ArchiveWriter`] multi-folder archive; p7zip extracts all files correctly.
+#[test]
+fn archive_writer_multi_folder_p7zip_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let folder0 = [("alpha.txt", b"solid block A" as &[u8]), ("beta.txt", b"solid block B")];
+    let folder1 = [("gamma.txt", b"solid block C" as &[u8])];
+
+    let archive_path = dir.join("writer_multi.7z");
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut w = r7z::ArchiveWriter::new(file).expect("new failed");
+    for (name, data) in &folder0 {
+        w.append(name, *data).expect("append failed");
+    }
+    w.new_folder().expect("new_folder failed");
+    for (name, data) in &folder1 {
+        w.append(name, *data).expect("append failed");
+    }
+    w.finish().expect("finish failed");
+
+    let out_dir = dir.join("extracted");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_7z(
+        &["e", archive_path.to_str().unwrap(), "-y", &format!("-o{}", out_dir.to_str().unwrap())],
+        dir,
+    );
+    assert!(out.status.success(), "7z e failed:\n{}", String::from_utf8_lossy(&out.stderr));
+
+    for (name, original) in folder0.iter().chain(folder1.iter()) {
+        let extracted = std::fs::read(out_dir.join(name)).unwrap();
+        assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");
+    }
+}
+
+/// [`Archive::from_reader`] round-trip: write to a cursor, rewind, read back.
+#[test]
+fn from_reader_round_trip() {
+    let original = b"data read back via from_reader";
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("data.txt", original)
+        .build()
+        .expect("build failed");
+
+    let archive = r7z::Archive::from_reader(std::io::Cursor::new(bytes)).expect("from_reader failed");
+    assert_eq!(archive.num_files(), 1);
+    let extracted = archive.extract_to_memory(0).unwrap();
+    assert_eq!(extracted.as_slice(), original);
+}

@@ -3,7 +3,9 @@ use crate::{
     SignatureHeader, StreamInfo,
 };
 use bytes::Bytes;
+use memmap2::Mmap;
 use nom::ToUsize;
+use std::io::Read;
 use std::path::Path;
 
 /// Maximum decompressed size accepted for the compressed archive header (metadata only).
@@ -71,13 +73,46 @@ pub struct Archive {
 impl Archive {
     /// Open and fully decode a 7z archive from disk.
     ///
+    /// The file is memory-mapped rather than read into a heap buffer, so the OS
+    /// pages in only the regions that are actually accessed.  This avoids loading
+    /// the entire archive into RAM when only a few files are extracted.
+    ///
     /// # Errors
     ///
-    /// Returns [`R7zError::Io`] if the file cannot be read, or a parse/CRC error if the
-    /// archive is malformed.
+    /// Returns [`R7zError::Io`] if the file cannot be opened or mapped, or a
+    /// parse/CRC error if the archive is malformed.
+    ///
+    /// # Safety
+    ///
+    /// The underlying `mmap(2)` call is unsafe because another process could
+    /// truncate the file while it is mapped, causing a `SIGBUS`.  In practice
+    /// this is rarely an issue for archive files, but callers that need
+    /// stronger guarantees should use [`Archive::from_reader`] instead.
     pub fn open(path: &Path) -> Result<Archive, R7zError> {
-        let data = std::fs::read(path)?;
-        Self::from_bytes(Bytes::from(data))
+        let file = std::fs::File::open(path)?;
+        // SAFETY: The file is opened read-only and we do not mutate the mapping.
+        // A concurrent truncation of the file could cause SIGBUS; callers that
+        // need to guard against this should use `from_reader` instead.
+        let mmap = unsafe { Mmap::map(&file)? };
+        Self::from_bytes(Bytes::from_owner(mmap))
+    }
+
+    /// Fully read a [`Read`] source and decode it as a 7z archive.
+    ///
+    /// Because the 7z format requires random access (the header lives at the
+    /// end of the file while the data blocks are near the start), the entire
+    /// source is buffered into memory before parsing begins.  For local files
+    /// prefer [`Archive::open`], which uses `mmap` to avoid an upfront
+    /// allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Io`] if reading fails, or a parse/CRC error if the
+    /// archive is malformed.
+    pub fn from_reader(mut reader: impl Read) -> Result<Archive, R7zError> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Self::from_bytes(Bytes::from(buf))
     }
 
     /// Parse a 7z archive from in-memory bytes.
