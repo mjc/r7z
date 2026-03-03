@@ -303,6 +303,7 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::doc_markdown)]
 mod tests {
     use super::scan_files_info;
 

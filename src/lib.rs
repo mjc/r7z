@@ -38,7 +38,7 @@ mod property;
 mod stream_info;
 
 pub use archive::{Archive, ArchiveMetadata};
-pub use builder::{ArchiveBuilder, Codec};
+pub use builder::{build_streaming, ArchiveBuilder, Codec};
 pub use codec::{decompress_folder, CODEC_BCJ_X86, CODEC_COPY, CODEC_LZMA, CODEC_LZMA2};
 pub use coder_info::CoderInfo;
 pub use error::R7zError;

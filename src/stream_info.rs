@@ -335,6 +335,7 @@ pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::doc_markdown)]
 mod tests {
     use super::{scan_stream_info, scan_substream_info};
 

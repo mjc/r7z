@@ -1,4 +1,5 @@
 use crate::{codec, parsers::sevenzip_varuint64_encode, R7zError};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Codec selection for [`ArchiveBuilder`].
 #[derive(Clone, Copy, Default)]
@@ -121,6 +122,209 @@ fn build_archive(files: &[(String, Vec<u8>)], codec: Codec) -> Result<Vec<u8>, R
     archive[28..32].copy_from_slice(&next_header_crc.to_le_bytes());
 
     Ok(archive)
+}
+
+/// Counts bytes written through it.
+struct CountWriter<W: Write> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> CountWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+}
+
+impl<W: Write> Write for CountWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Hashes and counts bytes as they are read.
+struct HashRead<R: Read> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+    count: u64,
+}
+
+impl<R: Read> HashRead<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            count: 0,
+        }
+    }
+
+    fn finish(self) -> (u32, u64) {
+        (self.hasher.finalize(), self.count)
+    }
+}
+
+impl<R: Read> Read for HashRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+            self.count += n as u64;
+        }
+        Ok(n)
+    }
+}
+
+/// Build a solid LZMA2 7z archive from an iterator of `(name, reader)` pairs, writing
+/// directly into `out` (a file or any `Write + Seek`).
+///
+/// Neither all input data nor all compressed output is held in memory simultaneously —
+/// each file is piped from `reader` through the compressor into `out` as it goes.
+///
+/// # Errors
+///
+/// Returns [`R7zError`] on I/O or compression failure.
+pub fn build_streaming<W, I, R>(entries: I, mut out: W) -> Result<(), R7zError>
+where
+    W: Write + Seek,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+{
+    // Reserve 32 bytes for the signature header (filled in at the end via seek).
+    out.write_all(&[0u8; 32]).map_err(|_| R7zError::Parse)?;
+
+    // Wrap the output so we can count how many compressed bytes are written.
+    let count_writer = CountWriter::new(&mut out);
+    let mut lzma2 = lzma_rust2::Lzma2Writer::new(count_writer, lzma_rust2::Lzma2Options::default());
+
+    let mut file_meta: Vec<(String, u64, u32)> = Vec::new(); // (name, unpack_size, crc)
+
+    for (name, reader) in entries {
+        let mut hr = HashRead::new(reader);
+        std::io::copy(&mut hr, &mut lzma2).map_err(|_| R7zError::Parse)?;
+        let (crc, size) = hr.finish();
+        file_meta.push((name, size, crc));
+    }
+
+    if file_meta.is_empty() {
+        return Err(R7zError::Parse);
+    }
+
+    // Finish the LZMA2 stream. Block-scope releases the &mut out borrow naturally.
+    let pack_size = {
+        let cw = lzma2.finish().map_err(|_| R7zError::Parse)?;
+        cw.count
+    };
+
+    let folder_unpack_size: u64 = file_meta.iter().map(|(_, s, _)| s).sum();
+    let props_byte = 0x1c_u8;
+    let coder_info = encode_coder_info_lzma2(props_byte);
+
+    let header = build_header_from_meta(&file_meta, &coder_info, pack_size, folder_unpack_size);
+
+    out.write_all(&header).map_err(|_| R7zError::Parse)?;
+
+    let next_header_offset = pack_size;
+    let next_header_size = header.len() as u64;
+    let next_header_crc = crc32fast::hash(&header);
+
+    let mut start_header = [0u8; 20];
+    start_header[..8].copy_from_slice(&next_header_offset.to_le_bytes());
+    start_header[8..16].copy_from_slice(&next_header_size.to_le_bytes());
+    start_header[16..].copy_from_slice(&next_header_crc.to_le_bytes());
+    let start_header_crc = crc32fast::hash(&start_header);
+
+    out.seek(SeekFrom::Start(0)).map_err(|_| R7zError::Parse)?;
+    let mut sig = [0u8; 32];
+    sig[..6].copy_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+    sig[6] = 0x00;
+    sig[7] = 0x04;
+    sig[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
+    sig[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
+    sig[20..28].copy_from_slice(&next_header_size.to_le_bytes());
+    sig[28..32].copy_from_slice(&next_header_crc.to_le_bytes());
+    out.write_all(&sig).map_err(|_| R7zError::Parse)?;
+    out.flush().map_err(|_| R7zError::Parse)?;
+    Ok(())
+}
+
+/// Variant of [`build_header`] that takes pre-computed per-file metadata instead of owned data.
+fn build_header_from_meta(
+    file_meta: &[(String, u64, u32)],
+    coder_info_bytes: &[u8],
+    pack_size: u64,
+    folder_unpack_size: u64,
+) -> Vec<u8> {
+    let mut h: Vec<u8> = Vec::new();
+
+    h.push(0x01); // Header tag
+    h.push(0x04); // MainStreamsInfo tag
+
+    // PackInfo
+    h.push(0x06);
+    h.extend_from_slice(&sevenzip_varuint64_encode(0));
+    h.extend_from_slice(&sevenzip_varuint64_encode(1));
+    h.push(0x09);
+    h.extend_from_slice(&sevenzip_varuint64_encode(pack_size));
+    h.push(0x00);
+
+    // UnpackInfo
+    h.push(0x07);
+    h.push(0x0b);
+    h.extend_from_slice(&sevenzip_varuint64_encode(1));
+    h.push(0x00);
+    h.extend_from_slice(&sevenzip_varuint64_encode(1));
+    h.extend_from_slice(coder_info_bytes);
+    h.push(0x0c);
+    h.extend_from_slice(&sevenzip_varuint64_encode(folder_unpack_size));
+    h.push(0x00);
+
+    // SubstreamsInfo (only needed for multi-file solid archives)
+    if file_meta.len() > 1 {
+        h.push(0x08);
+        h.push(0x0d);
+        h.extend_from_slice(&sevenzip_varuint64_encode(file_meta.len() as u64));
+        h.push(0x09);
+        for (_, size, _) in &file_meta[..file_meta.len() - 1] {
+            h.extend_from_slice(&sevenzip_varuint64_encode(*size));
+        }
+        h.push(0x0a);
+        h.push(0x01); // all_defined
+        for (_, _, crc) in file_meta {
+            h.extend_from_slice(&crc.to_le_bytes());
+        }
+        h.push(0x00);
+    }
+
+    h.push(0x00); // END StreamInfo
+
+    h.push(0x05);
+    h.extend_from_slice(&sevenzip_varuint64_encode(file_meta.len() as u64));
+
+    h.push(0x11);
+    let name_data: Vec<u8> = {
+        let mut nd = Vec::new();
+        for (name, _, _) in file_meta {
+            for unit in name.encode_utf16() {
+                nd.extend_from_slice(&unit.to_le_bytes());
+            }
+            nd.push(0);
+            nd.push(0);
+        }
+        nd
+    };
+    let name_block_size = 1 + name_data.len() as u64;
+    h.extend_from_slice(&sevenzip_varuint64_encode(name_block_size));
+    h.push(0x00);
+    h.extend_from_slice(&name_data);
+
+    h.push(0x00); // END FilesInfo
+    h.push(0x00); // END Header
+    h
 }
 
 /// Encode a `CoderInfo` block for LZMA (`codec_id` = \[0x03,0x01,0x01\], 5-byte properties).

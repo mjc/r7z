@@ -17,7 +17,7 @@ struct FlamegraphProfiler<'a> {
     guard: Option<pprof::ProfilerGuard<'a>>,
 }
 
-impl<'a> FlamegraphProfiler<'a> {
+impl FlamegraphProfiler<'_> {
     fn new(frequency: i32) -> Self {
         Self {
             frequency,
@@ -26,7 +26,7 @@ impl<'a> FlamegraphProfiler<'a> {
     }
 }
 
-impl<'a> criterion::profiler::Profiler for FlamegraphProfiler<'a> {
+impl criterion::profiler::Profiler for FlamegraphProfiler<'_> {
     fn start_profiling(&mut self, _id: &str, _dir: &Path) {
         self.guard = Some(pprof::ProfilerGuard::new(self.frequency).unwrap());
     }
@@ -176,6 +176,7 @@ fn archive_10gb_bytes() -> Bytes {
 // Cap actual allocation at 1 MB — the archive metadata is the same.
 const PAYLOAD_CAP: usize = 1024 * 1024; // 1 MB
 
+#[allow(clippy::cast_possible_truncation)]
 fn generate_payload(size: usize) -> Vec<u8> {
     let actual = size.min(PAYLOAD_CAP);
     (0..actual).map(|i| (i % 256) as u8).collect()

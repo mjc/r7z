@@ -97,6 +97,7 @@ pub(crate) fn scan_digests(input: &[u8], num: usize) -> IResult<&[u8], ()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::doc_markdown)]
 mod tests {
     use super::scan_digests;
 

@@ -157,6 +157,7 @@ impl Folder {
 }
 
 #[cfg(test)]
+#[allow(clippy::doc_markdown)]
 mod tests {
     use super::scan_folder;
 
