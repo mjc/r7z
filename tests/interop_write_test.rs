@@ -282,3 +282,71 @@ fn from_reader_round_trip() {
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted.as_slice(), original);
 }
+
+/// [`ArchiveWriter::append_entry`] round-trip: mtime survives write → read.
+#[test]
+fn archive_writer_mtime_r7z_reads() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // A known Unix timestamp: 2024-03-15 12:00:00 UTC = 1710504000
+    let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000);
+    let meta = r7z::EntryMeta { mtime: Some(ts), unix_mode: None };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut w = r7z::ArchiveWriter::new(&mut buf).unwrap();
+    w.append_entry("ts.txt", b"timestamp test".as_ref(), meta).unwrap();
+    w.finish().unwrap();
+
+    let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
+    let fi = archive.files_info().unwrap();
+
+    // The raw FILETIME: seconds since Windows epoch × 10_000_000
+    // Windows epoch offset = 11_644_473_600 s
+    let expected_ft: u64 = (1_710_504_000 + 11_644_473_600) * 10_000_000;
+    assert_eq!(fi.mtimes.first().copied().flatten(), Some(expected_ft));
+}
+
+/// [`ArchiveWriter::append_entry`] with unix_mode: attributes survive write → read.
+#[test]
+fn archive_writer_unix_mode_r7z_reads() {
+    // Regular file, rw-r--r-- = 0o100644
+    let mode: u32 = 0o100_644;
+    let meta = r7z::EntryMeta { mtime: None, unix_mode: Some(mode) };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut w = r7z::ArchiveWriter::new(&mut buf).unwrap();
+    w.append_entry("perms.txt", b"permissions test".as_ref(), meta).unwrap();
+    w.finish().unwrap();
+
+    let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
+    let fi = archive.files_info().unwrap();
+
+    let attrs = fi.attributes.first().copied().flatten().unwrap();
+    // High 16 bits = st_mode, low 16 bits = Windows attribs (0x20)
+    assert_eq!(attrs >> 16, mode);
+    assert_eq!(attrs & 0xFFFF, 0x20);
+}
+
+/// p7zip lists a non-epoch timestamp for an archive written with mtime via [`ArchiveWriter`].
+#[test]
+fn archive_writer_mtime_p7zip_reads() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000); // 2024-03-15T12:00:00Z
+    let meta = r7z::EntryMeta { mtime: Some(ts), unix_mode: None };
+
+    let archive_path = dir.join("ts.7z");
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut w = r7z::ArchiveWriter::new(file).unwrap();
+    w.append_entry("ts.txt", b"timestamp data".as_ref(), meta).unwrap();
+    w.finish().unwrap();
+
+    // `7z l` lists the archive; check it contains "2024" in output
+    let out = run_7z(&["l", archive_path.to_str().unwrap()], dir);
+    assert!(out.status.success(), "7z l failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("2024"), "expected year 2024 in p7zip listing:\n{stdout}");
+}
