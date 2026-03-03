@@ -49,10 +49,7 @@
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
-          export CARGO_TARGET_${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native"
-          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-            export CARGO_TARGET_${cargoTargetEnvPrefix}_LINKER="${pkgs.mold}/bin/mold -run ${pkgs.stdenv.cc}/bin/cc"
-          ''}
+          export CARGO_TARGET_${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native${pkgs.lib.optionalString pkgs.stdenv.isLinux " -C link-arg=-fuse-ld=mold"}"
           echo "r7z dev shell  ($(rustc --version))"
         '';
       };
