@@ -39,8 +39,7 @@ impl ArchiveMetadata {
             return Err(R7zError::Crc);
         }
         let backing = Bytes::copy_from_slice(data);
-        let (input, signature) =
-            SignatureHeader::parse(&backing).map_err(|_| R7zError::Parse)?;
+        let (input, signature) = SignatureHeader::parse(&backing).map_err(|_| R7zError::Parse)?;
 
         let offset = signature.next_header_offset.to_usize();
         let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
@@ -48,8 +47,7 @@ impl ArchiveMetadata {
         match prop {
             Property::EncodedHeader => {
                 let (_, encoded_header) =
-                    EncodedHeader::parse(input, &backing)
-                        .map_err(|_| R7zError::Parse)?;
+                    EncodedHeader::parse(input, &backing).map_err(|_| R7zError::Parse)?;
                 Ok(ArchiveMetadata {
                     signature,
                     encoded_header,
@@ -150,8 +148,7 @@ impl Archive {
             Property::EncodedHeader => {
                 // Parse the EncodedHeader (describes how the full header is compressed)
                 let (_, encoded_header) =
-                    EncodedHeader::parse(input, &data)
-                        .map_err(|_| R7zError::Parse)?;
+                    EncodedHeader::parse(input, &data).map_err(|_| R7zError::Parse)?;
 
                 // Decompress the packed header stream
                 let pi = &encoded_header.pack_info;

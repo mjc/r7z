@@ -245,10 +245,7 @@ struct Delta<'a> {
     after_samples: u64,
 }
 
-fn compute_deltas<'a>(
-    before: &'a [Entry],
-    after: &'a [Entry],
-) -> Vec<Delta<'a>> {
+fn compute_deltas<'a>(before: &'a [Entry], after: &'a [Entry]) -> Vec<Delta<'a>> {
     let before_map: HashMap<&str, (u64, f64)> = before
         .iter()
         .map(|e| (e.name.as_str(), (e.samples, e.percent)))
@@ -335,19 +332,93 @@ fn cmd_diff(before: &[Entry], after: &[Entry]) {
 }
 
 const CATEGORIES: &[(&str, &[&str])] = &[
-    ("Cache/Foyer", &["foyer", "hybrid_cache", "hybridarticle", "article_cache", "unified_cache", "cache::", "moka"]),
-    ("NNTP Protocol", &["nntp", "precheck", "article_routing", "client_session", "backend_execution", "command_guard", "route_command", "status_code", "message_id"]),
-    ("TLS/Crypto", &["tls", "ssl", "rustls", "aes", "cipher", "encrypt", "decrypt", "handshake", "aws_lc", "ring::", "chacha"]),
+    (
+        "Cache/Foyer",
+        &[
+            "foyer",
+            "hybrid_cache",
+            "hybridarticle",
+            "article_cache",
+            "unified_cache",
+            "cache::",
+            "moka",
+        ],
+    ),
+    (
+        "NNTP Protocol",
+        &[
+            "nntp",
+            "precheck",
+            "article_routing",
+            "client_session",
+            "backend_execution",
+            "command_guard",
+            "route_command",
+            "status_code",
+            "message_id",
+        ],
+    ),
+    (
+        "TLS/Crypto",
+        &[
+            "tls",
+            "ssl",
+            "rustls",
+            "aes",
+            "cipher",
+            "encrypt",
+            "decrypt",
+            "handshake",
+            "aws_lc",
+            "ring::",
+            "chacha",
+        ],
+    ),
     ("Compression", &["lz4", "compress", "decompress", "zstd"]),
-    ("Connection Pool", &["deadpool", "pool", "connection_provider"]),
-    ("Network I/O", &["recv", "send", "tcp", "socket", "inet", "skb", "net_"]),
-    ("Disk I/O", &["zfs", "zpl", "zil", "vfs", "write_all", "ext4", "xfs", "btrfs", "block_", "io_uring", "pread", "pwrite"]),
-    ("Locks/Futex", &["futex", "mutex", "lock", "rwlock", "semaphore", "parking_lot"]),
+    (
+        "Connection Pool",
+        &["deadpool", "pool", "connection_provider"],
+    ),
+    (
+        "Network I/O",
+        &["recv", "send", "tcp", "socket", "inet", "skb", "net_"],
+    ),
+    (
+        "Disk I/O",
+        &[
+            "zfs",
+            "zpl",
+            "zil",
+            "vfs",
+            "write_all",
+            "ext4",
+            "xfs",
+            "btrfs",
+            "block_",
+            "io_uring",
+            "pread",
+            "pwrite",
+        ],
+    ),
+    (
+        "Locks/Futex",
+        &[
+            "futex",
+            "mutex",
+            "lock",
+            "rwlock",
+            "semaphore",
+            "parking_lot",
+        ],
+    ),
     ("Event Loop", &["epoll", "poll", "mio"]),
     ("Tokio Runtime", &["tokio", "runtime"]),
     ("Async/Futures", &["futures", "async", "waker"]),
     ("Scheduling", &["schedule", "switch", "context"]),
-    ("Memory", &["alloc", "malloc", "free", "mmap", "brk", "jemalloc"]),
+    (
+        "Memory",
+        &["alloc", "malloc", "free", "mmap", "brk", "jemalloc"],
+    ),
 ];
 
 const SYSCALL_PREFIXES: &[&str] = &["__x64_sys_", "syscall", "do_syscall", "entry_SYSCALL"];

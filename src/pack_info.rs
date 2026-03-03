@@ -2,9 +2,9 @@ use bytes::Bytes;
 use nom::{number::complete::le_u8, IResult, ToUsize};
 use smallvec::SmallVec;
 
-use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
 use crate::folder::scan_folder;
 use crate::parsers::scan_digests;
+use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
 
 /// Describes where the packed (compressed) data streams live in the archive file.
 #[derive(Debug, PartialEq)]
@@ -108,8 +108,8 @@ impl UnpackInfo {
     pub fn parse_folder(&self, idx: usize) -> Result<Folder, crate::R7zError> {
         let start = self.folder_offsets[idx] as usize;
         let end = self.folder_offsets[idx + 1] as usize;
-        let (_, folder) = Folder::parse(&self.folder_data[start..end])
-            .map_err(|_| crate::R7zError::Parse)?;
+        let (_, folder) =
+            Folder::parse(&self.folder_data[start..end]).map_err(|_| crate::R7zError::Parse)?;
         Ok(folder)
     }
 
@@ -415,14 +415,10 @@ mod tests {
     #[test]
     fn scan_unpack_info_two_folders() {
         let input = [
-            0x07u8, 0x0B, 0x02, 0x00,
-            // folder 0: copy
-            0x01, 0x01, 0x00,
-            // folder 1: copy
-            0x01, 0x01, 0x00,
-            // CodersUnPackSize: 2 out-streams (one per folder)
-            0x0C, 0x64, 0x32,
-            // END
+            0x07u8, 0x0B, 0x02, 0x00, // folder 0: copy
+            0x01, 0x01, 0x00, // folder 1: copy
+            0x01, 0x01, 0x00, // CodersUnPackSize: 2 out-streams (one per folder)
+            0x0C, 0x64, 0x32, // END
             0x00,
         ];
         let (rem, nf) = scan_unpack_info(&input).unwrap();
@@ -434,14 +430,10 @@ mod tests {
     #[test]
     fn scan_unpack_info_with_crc() {
         let input = [
-            0x07u8, 0x0B, 0x01, 0x00,
-            // folder: copy
-            0x01, 0x01, 0x00,
-            // CodersUnPackSize
-            0x0C, 0x64,
-            // CRC section: all_defined=1, 1 CRC (4 bytes)
-            0x0A, 0x01, 0xAA, 0xBB, 0xCC, 0xDD,
-            // END
+            0x07u8, 0x0B, 0x01, 0x00, // folder: copy
+            0x01, 0x01, 0x00, // CodersUnPackSize
+            0x0C, 0x64, // CRC section: all_defined=1, 1 CRC (4 bytes)
+            0x0A, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, // END
             0x00,
         ];
         let (rem, nf) = scan_unpack_info(&input).unwrap();

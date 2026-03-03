@@ -103,7 +103,8 @@ fn system_time_to_filetime(t: SystemTime) -> u64 {
         Ok(d) => {
             let secs = d.as_secs().saturating_add(EPOCH_DIFF_SECS);
             let subsec_ticks = u64::from(d.subsec_nanos()) / 100;
-            secs.saturating_mul(TICKS_PER_SEC).saturating_add(subsec_ticks)
+            secs.saturating_mul(TICKS_PER_SEC)
+                .saturating_add(subsec_ticks)
         }
         Err(_) => 0, // pre-epoch; clamp to Windows epoch
     }
@@ -753,10 +754,7 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
         h.push(0x00); // external = 0 (data is inline)
         for folder in folders {
             for file in &folder.files {
-                let attrs = file
-                    .entry
-                    .unix_mode
-                    .map_or(0x20_u32, |m| (m << 16) | 0x20);
+                let attrs = file.entry.unix_mode.map_or(0x20_u32, |m| (m << 16) | 0x20);
                 h.extend_from_slice(&attrs.to_le_bytes());
             }
         }

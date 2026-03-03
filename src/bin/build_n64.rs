@@ -70,8 +70,7 @@ fn main() -> io::Result<()> {
     let out_file = BufWriter::new(File::create(&out_path)?);
 
     let entries = paths.iter().map(|(rel, path)| {
-        let f = File::open(path)
-            .unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
+        let f = File::open(path).unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
         (rel.clone(), f)
     });
 

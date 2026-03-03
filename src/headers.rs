@@ -94,8 +94,8 @@ impl Header {
     pub fn streams_info(&self) -> Option<&StreamInfo> {
         let off = self.streams_info_start? as usize;
         Some(self.streams_cache.get_or_init(|| {
-            let (_, si) = StreamInfo::parse(&self.data[off..], &self.data)
-                .expect("pre-validated header");
+            let (_, si) =
+                StreamInfo::parse(&self.data[off..], &self.data).expect("pre-validated header");
             si
         }))
     }

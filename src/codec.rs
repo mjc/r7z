@@ -12,7 +12,9 @@ pub fn compress_lzma(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
     let buf = Vec::new();
     let mut writer =
         LzmaWriter::new_no_header(buf, &options, false).map_err(|_| R7zError::Decompression)?;
-    writer.write_all(data).map_err(|_| R7zError::Decompression)?;
+    writer
+        .write_all(data)
+        .map_err(|_| R7zError::Decompression)?;
     let props_byte = writer.props();
     let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
 
@@ -40,7 +42,9 @@ pub const CODEC_COPY: &[u8] = &[0x00];
 pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
     let buf = Vec::new();
     let mut writer = Lzma2Writer::new(buf, lzma_rust2::Lzma2Options::default());
-    writer.write_all(data).map_err(|_| R7zError::Decompression)?;
+    writer
+        .write_all(data)
+        .map_err(|_| R7zError::Decompression)?;
     let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
     // 0x1c → dict_size = 1 << (0x1c/2 + 11) = 1 << 25 = 32 MB
     Ok((0x1c, compressed))
@@ -89,7 +93,9 @@ fn decompress_lzma(
         LzmaReader::new_with_props(Cursor::new(input), unpack_size, props_byte, dict_size, None)
             .map_err(|_| R7zError::Decompression)?;
     let mut output = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
-    reader.read_to_end(&mut output).map_err(|_| R7zError::Decompression)?;
+    reader
+        .read_to_end(&mut output)
+        .map_err(|_| R7zError::Decompression)?;
     Ok(output)
 }
 
@@ -97,7 +103,9 @@ fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, 
     let dict_size = lzma2_dict_size(properties);
     let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
     let mut output = Vec::new();
-    reader.read_to_end(&mut output).map_err(|_| R7zError::Decompression)?;
+    reader
+        .read_to_end(&mut output)
+        .map_err(|_| R7zError::Decompression)?;
     Ok(output)
 }
 

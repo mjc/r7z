@@ -207,8 +207,14 @@ fn archive_writer_single_folder_r7z_reads() {
 /// [`ArchiveWriter`] multi-folder r7z round-trip: two folders, two files each.
 #[test]
 fn archive_writer_multi_folder_r7z_reads() {
-    let folder0 = [("f0a.txt", b"folder zero file A" as &[u8]), ("f0b.txt", b"folder zero file B")];
-    let folder1 = [("f1a.txt", b"folder one file A" as &[u8]), ("f1b.txt", b"folder one file B")];
+    let folder0 = [
+        ("f0a.txt", b"folder zero file A" as &[u8]),
+        ("f0b.txt", b"folder zero file B"),
+    ];
+    let folder1 = [
+        ("f1a.txt", b"folder one file A" as &[u8]),
+        ("f1b.txt", b"folder one file B"),
+    ];
 
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut w = r7z::ArchiveWriter::new(&mut buf).expect("new failed");
@@ -239,7 +245,10 @@ fn archive_writer_multi_folder_p7zip_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    let folder0 = [("alpha.txt", b"solid block A" as &[u8]), ("beta.txt", b"solid block B")];
+    let folder0 = [
+        ("alpha.txt", b"solid block A" as &[u8]),
+        ("beta.txt", b"solid block B"),
+    ];
     let folder1 = [("gamma.txt", b"solid block C" as &[u8])];
 
     let archive_path = dir.join("writer_multi.7z");
@@ -257,10 +266,19 @@ fn archive_writer_multi_folder_p7zip_reads() {
     let out_dir = dir.join("extracted");
     std::fs::create_dir_all(&out_dir).unwrap();
     let out = run_7z(
-        &["e", archive_path.to_str().unwrap(), "-y", &format!("-o{}", out_dir.to_str().unwrap())],
+        &[
+            "e",
+            archive_path.to_str().unwrap(),
+            "-y",
+            &format!("-o{}", out_dir.to_str().unwrap()),
+        ],
         dir,
     );
-    assert!(out.status.success(), "7z e failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "7z e failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     for (name, original) in folder0.iter().chain(folder1.iter()) {
         let extracted = std::fs::read(out_dir.join(name)).unwrap();
@@ -277,7 +295,8 @@ fn from_reader_round_trip() {
         .build()
         .expect("build failed");
 
-    let archive = r7z::Archive::from_reader(std::io::Cursor::new(bytes)).expect("from_reader failed");
+    let archive =
+        r7z::Archive::from_reader(std::io::Cursor::new(bytes)).expect("from_reader failed");
     assert_eq!(archive.num_files(), 1);
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted.as_slice(), original);
@@ -290,11 +309,15 @@ fn archive_writer_mtime_r7z_reads() {
 
     // A known Unix timestamp: 2024-03-15 12:00:00 UTC = 1710504000
     let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000);
-    let meta = r7z::EntryMeta { mtime: Some(ts), unix_mode: None };
+    let meta = r7z::EntryMeta {
+        mtime: Some(ts),
+        unix_mode: None,
+    };
 
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut w = r7z::ArchiveWriter::new(&mut buf).unwrap();
-    w.append_entry("ts.txt", b"timestamp test".as_ref(), meta).unwrap();
+    w.append_entry("ts.txt", b"timestamp test".as_ref(), meta)
+        .unwrap();
     w.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
@@ -311,11 +334,15 @@ fn archive_writer_mtime_r7z_reads() {
 fn archive_writer_unix_mode_r7z_reads() {
     // Regular file, rw-r--r-- = 0o100644
     let mode: u32 = 0o100_644;
-    let meta = r7z::EntryMeta { mtime: None, unix_mode: Some(mode) };
+    let meta = r7z::EntryMeta {
+        mtime: None,
+        unix_mode: Some(mode),
+    };
 
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut w = r7z::ArchiveWriter::new(&mut buf).unwrap();
-    w.append_entry("perms.txt", b"permissions test".as_ref(), meta).unwrap();
+    w.append_entry("perms.txt", b"permissions test".as_ref(), meta)
+        .unwrap();
     w.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
@@ -336,17 +363,28 @@ fn archive_writer_mtime_p7zip_reads() {
     let dir = tmp.path();
 
     let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000); // 2024-03-15T12:00:00Z
-    let meta = r7z::EntryMeta { mtime: Some(ts), unix_mode: None };
+    let meta = r7z::EntryMeta {
+        mtime: Some(ts),
+        unix_mode: None,
+    };
 
     let archive_path = dir.join("ts.7z");
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut w = r7z::ArchiveWriter::new(file).unwrap();
-    w.append_entry("ts.txt", b"timestamp data".as_ref(), meta).unwrap();
+    w.append_entry("ts.txt", b"timestamp data".as_ref(), meta)
+        .unwrap();
     w.finish().unwrap();
 
     // `7z l` lists the archive; check it contains "2024" in output
     let out = run_7z(&["l", archive_path.to_str().unwrap()], dir);
-    assert!(out.status.success(), "7z l failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "7z l failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("2024"), "expected year 2024 in p7zip listing:\n{stdout}");
+    assert!(
+        stdout.contains("2024"),
+        "expected year 2024 in p7zip listing:\n{stdout}"
+    );
 }

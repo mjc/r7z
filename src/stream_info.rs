@@ -185,7 +185,9 @@ impl StreamInfo {
                     input = i;
                 }
                 Property::SubStreamsInfo => {
-                    let num_folders = unpack_info.as_ref().map_or(0, UnpackInfo::num_folders_usize);
+                    let num_folders = unpack_info
+                        .as_ref()
+                        .map_or(0, UnpackInfo::num_folders_usize);
                     let (i, si) = SubstreamInfo::parse(input, num_folders)?;
                     substream_info = Some(si);
                     input = i;
@@ -382,8 +384,7 @@ mod tests {
             // PackInfo: pos=0, 1 stream, size=100
             0x06, 0x00, 0x01, 0x09, 0x64, 0x00,
             // UnPackInfo: 1 folder (copy), unpack_size=100
-            0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00,
-            // END
+            0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00, // END
             0x00,
         ];
         let (rem, ()) = scan_stream_info(input).unwrap();
@@ -395,12 +396,10 @@ mod tests {
     fn scan_stream_info_with_substreams() {
         let input: &[u8] = &[
             // PackInfo
-            0x06, 0x00, 0x01, 0x09, 0x64, 0x00,
-            // UnPackInfo (1 folder, copy codec)
+            0x06, 0x00, 0x01, 0x09, 0x64, 0x00, // UnPackInfo (1 folder, copy codec)
             0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00,
             // SubStreamsInfo (just END)
-            0x08, 0x00,
-            // stream_info END
+            0x08, 0x00, // stream_info END
             0x00,
         ];
         let (rem, ()) = scan_stream_info(input).unwrap();

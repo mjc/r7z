@@ -91,7 +91,9 @@ pub(crate) fn scan_digests(input: &[u8], num: usize) -> IResult<&[u8], ()> {
     }
     let num_bytes = num.div_ceil(8);
     let (input, bitmap) = take(num_bytes)(input)?;
-    let num_defined = (0..num).filter(|&i| (bitmap[i / 8] >> (i % 8)) & 1 == 1).count();
+    let num_defined = (0..num)
+        .filter(|&i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
+        .count();
     let (input, _) = take(num_defined * 4)(input)?;
     Ok((input, ()))
 }
