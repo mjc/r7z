@@ -147,11 +147,13 @@ impl FilesInfo {
                     })?;
                     let (i, block) = take(sz)(i)?;
                     let all_defined = block[0];
+                    // Layout: all_defined [bitmap if !all_defined] external [data...]
+                    // external byte position: 1 (all_defined) or 1+nb (all_defined + bitmap)
                     let (data_start, num_bytes) = if all_defined != 0 {
-                        (1usize, 0usize)
+                        (2usize, 0usize) // skip all_defined + external
                     } else {
                         let nb = n.div_ceil(8);
-                        (1 + nb, nb)
+                        (2 + nb, nb) // skip all_defined + bitmap + external
                     };
                     let bitmap = if all_defined != 0 {
                         &[][..]
@@ -182,11 +184,12 @@ impl FilesInfo {
                     })?;
                     let (i, block) = take(sz)(i)?;
                     let all_defined = block[0];
+                    // Layout: all_defined [bitmap if !all_defined] external [data...]
                     let (data_start, num_bytes) = if all_defined != 0 {
-                        (1usize, 0usize)
+                        (2usize, 0usize) // skip all_defined + external
                     } else {
                         let nb = n.div_ceil(8);
-                        (1 + nb, nb)
+                        (2 + nb, nb) // skip all_defined + bitmap + external
                     };
                     let bitmap = if all_defined != 0 {
                         &[][..]

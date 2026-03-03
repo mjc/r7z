@@ -1,5 +1,6 @@
 use crate::{codec, parsers::sevenzip_varuint64_encode, R7zError};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::SystemTime;
 
 /// Codec selection for [`ArchiveBuilder`].
 #[derive(Clone, Copy, Default)]
@@ -71,10 +72,47 @@ impl ArchiveBuilder {
 
 // ── ArchiveWriter ────────────────────────────────────────────────────────────
 
+/// Per-entry filesystem metadata embedded in the archive header.
+///
+/// All fields are optional; absent fields are not encoded in the archive.
+/// Pass [`EntryMeta::default`] (all `None`) to omit metadata.
+#[derive(Clone, Default)]
+pub struct EntryMeta {
+    /// Last-modified time.  Stored as Windows FILETIME (100 ns ticks since 1601-01-01).
+    pub mtime: Option<SystemTime>,
+    /// Unix file mode (`st_mode`).  Stored in the high 16 bits of the `WinAttrib` field.
+    pub unix_mode: Option<u32>,
+}
+
+/// Per-file metadata held inside a [`FolderMeta`] until the header is written.
+struct FileMeta {
+    name: String,
+    unpack_size: u64,
+    crc: u32,
+    entry: EntryMeta,
+}
+
+/// Convert a [`SystemTime`] to a Windows FILETIME value.
+///
+/// Windows FILETIME counts 100-nanosecond intervals since 1601-01-01T00:00:00Z.
+/// The Unix epoch (1970-01-01) is 11 644 473 600 seconds after the Windows epoch.
+fn system_time_to_filetime(t: SystemTime) -> u64 {
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => {
+            let secs = d.as_secs().saturating_add(EPOCH_DIFF_SECS);
+            let subsec_ticks = u64::from(d.subsec_nanos()) / 100;
+            secs.saturating_mul(TICKS_PER_SEC).saturating_add(subsec_ticks)
+        }
+        Err(_) => 0, // pre-epoch; clamp to Windows epoch
+    }
+}
+
 /// Metadata for one completed compression folder.
 struct FolderMeta {
-    /// Per-file `(name, unpack_size, crc32)`.
-    files: Vec<(String, u64, u32)>,
+    /// Per-file metadata.
+    files: Vec<FileMeta>,
     /// Compressed byte count for this folder's pack stream.
     pack_size: u64,
     /// Encoded `CoderInfo` bytes for this folder's codec.
@@ -128,7 +166,7 @@ enum WriterState<W: Write> {
 pub struct ArchiveWriter<W: Write + Seek> {
     state: WriterState<W>,
     completed: Vec<FolderMeta>,
-    current_files: Vec<(String, u64, u32)>,
+    current_files: Vec<FileMeta>,
     codec: Codec,
 }
 
@@ -164,6 +202,20 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
     /// Append a file to the current compression folder.
     ///
+    /// Equivalent to `append_entry(name, reader, EntryMeta::default())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError`] on I/O failure or compression error.
+    pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
+        self.append_entry(name, reader, EntryMeta::default())
+    }
+
+    /// Append a file with filesystem metadata to the current compression folder.
+    ///
+    /// `meta.mtime` is stored as a Windows FILETIME in the `MTime` property block.
+    /// `meta.unix_mode` is stored in the high 16 bits of the `Attributes` block.
+    ///
     /// The reader is streamed directly through the compressor to the underlying
     /// writer.  [`Codec::Lzma`] is an exception: it must buffer the entire
     /// folder in memory because LZMA has no streaming encoder.
@@ -171,7 +223,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// # Errors
     ///
     /// Returns [`R7zError`] on I/O failure or compression error.
-    pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
+    pub fn append_entry(
+        &mut self,
+        name: &str,
+        reader: impl Read,
+        meta: EntryMeta,
+    ) -> Result<(), R7zError> {
         // Transition Open → Writing on first append in a folder.
         if matches!(self.state, WriterState::Open(_)) {
             let state = std::mem::replace(&mut self.state, WriterState::Dead);
@@ -204,7 +261,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         }
 
         let (crc, size) = hr.finish();
-        self.current_files.push((name.to_string(), size, crc));
+        self.current_files.push(FileMeta {
+            name: name.to_string(),
+            unpack_size: size,
+            crc,
+            entry: meta,
+        });
         Ok(())
     }
 
@@ -594,7 +656,7 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
     }
     h.push(0x0c); // CodersUnPackSize: one entry per folder
     for folder in folders {
-        let unpack: u64 = folder.files.iter().map(|(_, s, _)| s).sum();
+        let unpack: u64 = folder.files.iter().map(|f| f.unpack_size).sum();
         h.extend_from_slice(&sevenzip_varuint64_encode(unpack));
     }
     h.push(0x00); // END UnpackInfo
@@ -614,8 +676,8 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
             h.push(0x09);
             for folder in folders {
                 let n = folder.files.len();
-                for (_, size, _) in &folder.files[..n.saturating_sub(1)] {
-                    h.extend_from_slice(&sevenzip_varuint64_encode(*size));
+                for file in &folder.files[..n.saturating_sub(1)] {
+                    h.extend_from_slice(&sevenzip_varuint64_encode(file.unpack_size));
                 }
             }
         }
@@ -624,8 +686,8 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
         h.push(0x0a);
         h.push(0x01); // all_defined = 1
         for folder in folders {
-            for (_, _, crc) in &folder.files {
-                h.extend_from_slice(&crc.to_le_bytes());
+            for file in &folder.files {
+                h.extend_from_slice(&file.crc.to_le_bytes());
             }
         }
         h.push(0x00); // END SubstreamsInfo
@@ -642,8 +704,8 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
     let name_data: Vec<u8> = {
         let mut nd = Vec::new();
         for folder in folders {
-            for (name, _, _) in &folder.files {
-                for unit in name.encode_utf16() {
+            for file in &folder.files {
+                for unit in file.name.encode_utf16() {
                     nd.extend_from_slice(&unit.to_le_bytes());
                 }
                 nd.push(0);
@@ -656,6 +718,49 @@ fn build_header_multi_folder(folders: &[FolderMeta]) -> Vec<u8> {
     h.extend_from_slice(&sevenzip_varuint64_encode(name_block_size));
     h.push(0x00); // external = 0
     h.extend_from_slice(&name_data);
+
+    // MTime property (0x14): written when any entry has a timestamp.
+    // Uses all_defined=1; entries without a timestamp get FILETIME 0 (Windows epoch).
+    let any_mtime = folders
+        .iter()
+        .flat_map(|f| &f.files)
+        .any(|f| f.entry.mtime.is_some());
+    if any_mtime {
+        h.push(0x14); // MTime tag
+        let block_size = 2 + 8 * total_files as u64; // all_defined + external + n×8
+        h.extend_from_slice(&sevenzip_varuint64_encode(block_size));
+        h.push(0x01); // all_defined = 1
+        h.push(0x00); // external = 0 (data is inline)
+        for folder in folders {
+            for file in &folder.files {
+                let ft = file.entry.mtime.map(system_time_to_filetime).unwrap_or(0);
+                h.extend_from_slice(&ft.to_le_bytes());
+            }
+        }
+    }
+
+    // Attributes property (0x15): written when any entry has a Unix mode.
+    // High 16 bits = st_mode; low 16 bits = Windows attribs (0x20 = archive bit).
+    let any_attrs = folders
+        .iter()
+        .flat_map(|f| &f.files)
+        .any(|f| f.entry.unix_mode.is_some());
+    if any_attrs {
+        h.push(0x15); // Attributes tag
+        let block_size = 2 + 4 * total_files as u64; // all_defined + external + n×4
+        h.extend_from_slice(&sevenzip_varuint64_encode(block_size));
+        h.push(0x01); // all_defined = 1
+        h.push(0x00); // external = 0 (data is inline)
+        for folder in folders {
+            for file in &folder.files {
+                let attrs = file
+                    .entry
+                    .unix_mode
+                    .map_or(0x20_u32, |m| (m << 16) | 0x20);
+                h.extend_from_slice(&attrs.to_le_bytes());
+            }
+        }
+    }
 
     h.push(0x00); // END FilesInfo
     h.push(0x00); // END Header
