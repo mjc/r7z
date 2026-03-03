@@ -87,12 +87,27 @@ impl Archive {
     /// this is rarely an issue for archive files, but callers that need
     /// stronger guarantees should use [`Archive::from_reader`] instead.
     pub fn open(path: &Path) -> Result<Archive, R7zError> {
+        Self::open_with_password(path, None)
+    }
+
+    /// Open a 7z archive from a file path, supplying a password for encrypted archives.
+    ///
+    /// When the archive has encrypted headers (`-mhe=on`), the password is needed
+    /// just to read the file listing.  For archives whose *content* is encrypted
+    /// but headers are not, the password is only required at extraction time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Io`] if the file cannot be opened or mapped,
+    /// [`R7zError::PasswordRequired`] if the headers are encrypted and no password
+    /// is supplied, or a parse/CRC error if the archive is malformed.
+    pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Archive, R7zError> {
         let file = std::fs::File::open(path)?;
         // SAFETY: The file is opened read-only and we do not mutate the mapping.
         // A concurrent truncation of the file could cause SIGBUS; callers that
         // need to guard against this should use `from_reader` instead.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_bytes(Bytes::from_owner(mmap))
+        Self::from_bytes_with_password(Bytes::from_owner(mmap), password)
     }
 
     /// Fully read a [`Read`] source and decode it as a 7z archive.
@@ -107,10 +122,20 @@ impl Archive {
     ///
     /// Returns [`R7zError::Io`] if reading fails, or a parse/CRC error if the
     /// archive is malformed.
-    pub fn from_reader(mut reader: impl Read) -> Result<Archive, R7zError> {
+    pub fn from_reader(reader: impl Read) -> Result<Archive, R7zError> {
+        Self::from_reader_with_password(reader, None)
+    }
+
+    /// Fully read a [`Read`] source and decode it as a 7z archive, with a password.
+    ///
+    /// See [`Archive::from_reader`] and [`Archive::open_with_password`] for details.
+    pub fn from_reader_with_password(
+        mut reader: impl Read,
+        password: Option<&str>,
+    ) -> Result<Archive, R7zError> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
-        Self::from_bytes(Bytes::from(buf))
+        Self::from_bytes_with_password(Bytes::from(buf), password)
     }
 
     /// Parse a 7z archive from in-memory bytes.
@@ -120,6 +145,17 @@ impl Archive {
     /// Returns [`R7zError::Parse`] if the bytes are not a valid 7z archive, or
     /// [`R7zError::Crc`] if any CRC check fails.
     pub fn from_bytes(data: Bytes) -> Result<Archive, R7zError> {
+        Self::from_bytes_with_password(data, None)
+    }
+
+    /// Parse a 7z archive from in-memory bytes, with an optional password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the bytes are not a valid 7z archive,
+    /// [`R7zError::Crc`] if any CRC check fails, or [`R7zError::PasswordRequired`]
+    /// if the header is encrypted and no password is supplied.
+    pub fn from_bytes_with_password(data: Bytes, password: Option<&str>) -> Result<Archive, R7zError> {
         if data.len() < 32 {
             return Err(R7zError::Parse);
         }
@@ -158,11 +194,36 @@ impl Archive {
                     data_start + usize::try_from(pi.pack_size[0]).map_err(|_| R7zError::Parse)?;
                 let packed = &data[data_start..data_end];
                 let folder = ui.parse_folder(0)?;
-                let unpack_size = ui.unpack_sizes.first().copied().ok_or(R7zError::Parse)?;
+
+                // Find the final output stream's unpack size.
+                // For a single coder it's just unpack_sizes[0].
+                // For multi-coder (e.g. AES+LZMA2) we need the stream that
+                // is NOT bound as an output in any bind pair.
+                let unpack_size = {
+                    let num_out = folder.total_out_streams();
+                    if num_out <= 1 {
+                        ui.unpack_sizes.first().copied().ok_or(R7zError::Parse)?
+                    } else {
+                        let mut final_idx = num_out - 1;
+                        for out_idx in 0..num_out {
+                            let is_bound = folder
+                                .bind_pairs
+                                .iter()
+                                .any(|&(_, bound_out)| bound_out == out_idx as u64);
+                            if !is_bound {
+                                final_idx = out_idx;
+                                break;
+                            }
+                        }
+                        ui.unpack_sizes.get(final_idx).copied().ok_or(R7zError::Parse)?
+                    }
+                };
                 if unpack_size > MAX_HEADER_UNPACK_BYTES {
                     return Err(R7zError::Parse);
                 }
-                let decompressed = codec::decompress_folder(&folder, packed, unpack_size)?;
+                let decompressed = codec::decompress_folder_with_password(
+                    &folder, packed, unpack_size, password,
+                )?;
                 let decompressed = Bytes::from(decompressed);
 
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;

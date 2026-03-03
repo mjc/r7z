@@ -266,3 +266,39 @@ fn p7zip_aes_round_trip() {
         .expect("round-trip decryption failed");
     assert_eq!(extracted, original.as_slice());
 }
+
+/// Decrypt a file from a large real-world AES-encrypted archive.
+/// Requires /mnt/emulation/Nintendo64Archive.7z to be present.
+#[test]
+#[ignore]
+fn aes_decrypt_n64_archive() {
+    let path = std::path::Path::new("/mnt/emulation/Nintendo64Archive.7z");
+    if !path.exists() {
+        eprintln!("skipping: {path:?} not found");
+        return;
+    }
+
+    let archive = r7z::Archive::open_with_password(path, Some("snahp.it"))
+        .expect("failed to open N64 archive");
+    let num = archive.num_files();
+    eprintln!("N64 archive: {num} files");
+    assert!(num > 600, "expected 600+ files, got {num}");
+
+    let fi = archive.files_info().unwrap();
+    for i in 0..5.min(num) {
+        eprintln!("  [{i}] {:?}", fi.name(i));
+    }
+
+    // Verify specific known file names from this archive
+    assert_eq!(
+        fi.name(0).unwrap(),
+        "Betas, Unreleased ROMS, and Protos/Tower&Shaft.eep"
+    );
+    assert_eq!(
+        fi.name(1).unwrap(),
+        "Full Retail NTSC ROM Set/007 - GoldenEye (USA).n64"
+    );
+
+    // NOTE: Extracting files from this 6GB solid archive is too slow for a test.
+    // The important thing is that the encrypted header was decrypted and parsed.
+}
