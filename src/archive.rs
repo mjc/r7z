@@ -27,11 +27,18 @@ impl ArchiveMetadata {
     /// Returns [`R7zError::Parse`] if the bytes are not a valid `EncodedHeader` archive,
     /// or [`R7zError::Crc`] if the start-header CRC does not match.
     pub fn parse(data: &[u8]) -> Result<ArchiveMetadata, R7zError> {
+        if data.len() < 32 {
+            return Err(R7zError::Parse);
+        }
+        // Validate start_header_crc on raw bytes before trusting any parsed fields.
+        // input[8..12] = start_header_crc, input[12..32] = the covered region.
+        let start_crc = u32::from_le_bytes(data[8..12].try_into().map_err(|_| R7zError::Parse)?);
+        if crc32fast::hash(&data[12..32]) != start_crc {
+            return Err(R7zError::Crc);
+        }
         let backing = Bytes::copy_from_slice(data);
         let (input, signature) =
             SignatureHeader::parse(&backing).map_err(|_| R7zError::Parse)?;
-
-        signature.validate_start_header_crc()?;
 
         let offset = signature.next_header_offset.to_usize();
         let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
@@ -80,9 +87,16 @@ impl Archive {
     /// Returns [`R7zError::Parse`] if the bytes are not a valid 7z archive, or
     /// [`R7zError::Crc`] if any CRC check fails.
     pub fn from_bytes(data: Bytes) -> Result<Archive, R7zError> {
+        if data.len() < 32 {
+            return Err(R7zError::Parse);
+        }
+        // Validate start_header_crc on raw bytes before trusting any parsed fields.
+        // data[8..12] = start_header_crc, data[12..32] = the covered region.
+        let start_crc = u32::from_le_bytes(data[8..12].try_into().map_err(|_| R7zError::Parse)?);
+        if crc32fast::hash(&data[12..32]) != start_crc {
+            return Err(R7zError::Crc);
+        }
         let (input, signature) = SignatureHeader::parse(&data).map_err(|_| R7zError::Parse)?;
-
-        signature.validate_start_header_crc()?;
 
         let offset = signature.next_header_offset.to_usize();
         let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
