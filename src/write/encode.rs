@@ -20,7 +20,7 @@ pub(crate) fn build_archive(
     if entries.is_empty() {
         return Err(R7zError::Parse);
     }
-    validate_options(options)?;
+    validate_archive_options(options)?;
 
     let mut packed_data = Vec::new();
     let mut folders = Vec::new();
@@ -74,7 +74,7 @@ pub(crate) fn build_archive(
     Ok(archive)
 }
 
-fn validate_options(options: &ArchiveOptions) -> Result<(), R7zError> {
+pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R7zError> {
     let Some(enc) = &options.encryption else {
         return Ok(());
     };

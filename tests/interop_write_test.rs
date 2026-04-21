@@ -1247,15 +1247,23 @@ fn archive_builder_rejects_invalid_aes_options() {
 
     let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
     enc.encrypt_header = true;
+    let invalid_options = r7z::ArchiveOptions {
+        header_mode: r7z::HeaderMode::Plain,
+        encryption: Some(enc),
+        ..Default::default()
+    };
     let err = r7z::ArchiveBuilder::new()
-        .options(r7z::ArchiveOptions {
-            header_mode: r7z::HeaderMode::Plain,
-            encryption: Some(enc),
-            ..Default::default()
-        })
+        .options(invalid_options.clone())
         .add_file("secret.txt", b"classified")
         .build()
         .unwrap_err();
+    assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let err = match r7z::ArchiveWriter::new(&mut buf, invalid_options) {
+        Ok(_) => panic!("ArchiveWriter accepted invalid encrypted header options"),
+        Err(err) => err,
+    };
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 }
 

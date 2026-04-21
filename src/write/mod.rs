@@ -166,6 +166,7 @@ pub struct ArchiveWriter<W: Write + Seek> {
 
 impl<W: Write + Seek> ArchiveWriter<W> {
     pub fn new(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
+        encode::validate_archive_options(&options)?;
         Ok(Self {
             out,
             entries: Vec::new(),
