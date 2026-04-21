@@ -7,11 +7,11 @@
 //!
 //! | Byte | Bits   | Meaning                                        |
 //! |------|--------|------------------------------------------------|
-//! | 0    | [5:0]  | NumCyclesPower (0–62, or 0x3F for raw key)     |
-//! | 0    | [6]    | IV present flag                                |
-//! | 0    | [7]    | Salt present flag                              |
-//! | 1*   | [7:4]  | Extra salt bytes (if salt flag set)            |
-//! | 1*   | [3:0]  | Extra IV bytes (if IV flag set)                |
+//! | 0    | \[5:0\]  | NumCyclesPower (0–62, or 0x3F for raw key)   |
+//! | 0    | \[6\]    | IV present flag                              |
+//! | 0    | \[7\]    | Salt present flag                            |
+//! | 1*   | \[7:4\]  | Extra salt bytes (if salt flag set)          |
+//! | 1*   | \[3:0\]  | Extra IV bytes (if IV flag set)              |
 //! | 2+   |        | Salt bytes, then IV bytes                      |
 //!
 //! \* Byte 1 is only present if either the salt or IV flag is set.
