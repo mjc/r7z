@@ -15,11 +15,23 @@ pub fn run_7z(args: &[&str], dir: &std::path::Path) -> std::process::Output {
         return out;
     }
     let mut nix_args = vec!["-p", "p7zip", "--run"];
-    let cmd = format!("7z {}", args.join(" "));
+    let quoted: Vec<String> = args.iter().map(|arg| shell_quote(arg)).collect();
+    let cmd = format!("7z {}", quoted.join(" "));
     nix_args.push(&cmd);
     Command::new("nix-shell")
         .args(&nix_args)
         .current_dir(dir)
         .output()
         .expect("nix-shell not available; install p7zip or enter a nix shell with p7zip")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if arg
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-_./:=+".contains(&b))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }

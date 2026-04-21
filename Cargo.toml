@@ -29,6 +29,7 @@ hex = "0.4"
 tempfile = "3.26.0"
 pprof = { version = "0.15", features = ["flamegraph"] }
 xz2 = "0.1.7"
+walkdir = "2.5.0"
 
 [[bench]]
 name = "parse_bench"

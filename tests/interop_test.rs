@@ -98,6 +98,79 @@ fn p7zip_read_interop_multi_file_lzma2() {
 }
 
 #[test]
+fn p7zip_read_interop_multi_file_lzma2_non_solid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let files = [
+        ("one.txt", b"one" as &[u8]),
+        ("two.txt", b"two two"),
+        ("three.txt", b"three three three"),
+    ];
+    for (name, data) in &files {
+        std::fs::write(dir.join(name), data).unwrap();
+    }
+
+    let archive_path = dir.join("non_solid.7z");
+    let out = run_7z(
+        &[
+            "a",
+            archive_path.to_str().unwrap(),
+            "one.txt",
+            "two.txt",
+            "three.txt",
+            "-m0=lzma2",
+            "-ms=off",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let fi = archive.files_info().unwrap();
+    let names: Vec<String> = fi.names().collect();
+    for (name, original) in &files {
+        let idx = names.iter().position(|n| n == name).unwrap();
+        assert_eq!(
+            archive.extract_to_memory(idx).unwrap().as_slice(),
+            *original
+        );
+    }
+}
+
+#[test]
+fn p7zip_read_interop_copy_codec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let original = b"stored without compression";
+    std::fs::write(dir.join("stored.bin"), original).unwrap();
+
+    let archive_path = dir.join("copy.7z");
+    let out = run_7z(
+        &[
+            "a",
+            archive_path.to_str().unwrap(),
+            "stored.bin",
+            "-m0=Copy",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), original);
+}
+
+#[test]
 fn p7zip_read_interop_extract_all() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -135,6 +208,71 @@ fn p7zip_read_interop_extract_all() {
         std::fs::read(out_dir.join("file_b.txt")).unwrap(),
         b"content B long long long"
     );
+}
+
+#[test]
+fn p7zip_extract_all_preserves_directories_and_zero_byte_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let input = dir.join("input");
+    std::fs::create_dir_all(input.join("nested/empty_dir")).unwrap();
+    std::fs::write(input.join("nested/file.txt"), b"nested content").unwrap();
+    std::fs::write(input.join("empty.txt"), b"").unwrap();
+
+    let archive_path = dir.join("tree.7z");
+    let out = run_7z(&["a", archive_path.to_str().unwrap(), "input"], dir);
+    assert!(
+        out.status.success(),
+        "7z a failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let out_dir = dir.join("out");
+    archive.extract_all(&out_dir).unwrap();
+
+    assert!(out_dir.join("input/nested/empty_dir").is_dir());
+    assert_eq!(
+        std::fs::read(out_dir.join("input/nested/file.txt")).unwrap(),
+        b"nested content"
+    );
+    assert_eq!(std::fs::read(out_dir.join("input/empty.txt")).unwrap(), b"");
+}
+
+#[test]
+fn p7zip_read_interop_names_with_spaces_unicode_and_nested_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("nested dir")).unwrap();
+    std::fs::write(dir.join("space name.txt"), b"space").unwrap();
+    std::fs::write(dir.join("nested dir/unicode-\u{2603}.txt"), b"unicode").unwrap();
+
+    let archive_path = dir.join("names.7z");
+    let out = run_7z(
+        &[
+            "a",
+            archive_path.to_str().unwrap(),
+            "space name.txt",
+            "nested dir/unicode-\u{2603}.txt",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z a failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let fi = archive.files_info().unwrap();
+    let names: Vec<String> = fi.names().collect();
+    let space_idx = names.iter().position(|n| n == "space name.txt").unwrap();
+    let unicode_idx = names
+        .iter()
+        .position(|n| n == "nested dir/unicode-\u{2603}.txt")
+        .unwrap();
+    assert_eq!(archive.extract_to_memory(space_idx).unwrap(), b"space");
+    assert_eq!(archive.extract_to_memory(unicode_idx).unwrap(), b"unicode");
 }
 /// p7zip creates a BCJ+LZMA2 archive; r7z extracts it correctly.
 #[test]
@@ -202,8 +340,7 @@ fn aes_decrypt_fixture_correct_password() {
         .extract_to_memory_with_password(0, Some("test123"))
         .expect("decryption should succeed");
     assert_eq!(
-        extracted,
-        b"Hello from an encrypted 7z archive!\n",
+        extracted, b"Hello from an encrypted 7z archive!\n",
         "decrypted content mismatch"
     );
 }
@@ -261,10 +398,93 @@ fn p7zip_aes_round_trip() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
+    let err = archive.extract_to_memory(0).unwrap_err();
+    assert!(matches!(err, r7z::R7zError::PasswordRequired));
+    let err = archive
+        .extract_to_memory_with_password(0, Some("wrong"))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        r7z::R7zError::Decompression | r7z::R7zError::Crc
+    ));
     let extracted = archive
         .extract_to_memory_with_password(0, Some("MyS3cret!"))
         .expect("round-trip decryption failed");
     assert_eq!(extracted, original.as_slice());
+}
+
+#[test]
+fn p7zip_aes_encrypted_headers_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    std::fs::write(dir.join("header_secret.txt"), b"header encrypted").unwrap();
+
+    let archive_path = dir.join("encrypted_headers.7z");
+    let out = run_7z(
+        &[
+            "a",
+            archive_path.to_str().unwrap(),
+            "header_secret.txt",
+            "-pHeaderPass!",
+            "-mhe=on",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z a failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let err = match r7z::Archive::open(&archive_path) {
+        Ok(_) => panic!("encrypted headers opened without a password"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, r7z::R7zError::PasswordRequired));
+
+    let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderPass!")).unwrap();
+    let fi = archive.files_info().unwrap();
+    assert_eq!(fi.name(0).unwrap(), "header_secret.txt");
+    let extracted = archive
+        .extract_to_memory_with_password(0, Some("HeaderPass!"))
+        .unwrap();
+    assert_eq!(extracted, b"header encrypted");
+}
+
+#[test]
+fn p7zip_unsupported_codecs_return_unsupported_codec() {
+    for method in ["BZip2", "PPMd", "Deflate"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("payload.txt"), b"unsupported codec payload").unwrap();
+
+        let archive_path = dir.join(format!("{method}.7z"));
+        let method_arg = format!("-m0={method}");
+        let out = run_7z(
+            &[
+                "a",
+                archive_path.to_str().unwrap(),
+                "payload.txt",
+                method_arg.as_str(),
+            ],
+            dir,
+        );
+        if !out.status.success() {
+            eprintln!(
+                "skipping unsupported-codec interop for {method}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            continue;
+        }
+
+        let archive = r7z::Archive::open(&archive_path).unwrap();
+        let err = archive.extract_to_memory(0).unwrap_err();
+        assert!(
+            matches!(err, r7z::R7zError::UnsupportedCodec(_)),
+            "expected UnsupportedCodec for {method}, got {err:?}"
+        );
+    }
 }
 
 /// Decrypt a file from a large real-world AES-encrypted archive.
@@ -299,6 +519,46 @@ fn aes_decrypt_n64_archive() {
         "Full Retail NTSC ROM Set/007 - GoldenEye (USA).n64"
     );
 
-    // NOTE: Extracting files from this 6GB solid archive is too slow for a test.
-    // The important thing is that the encrypted header was decrypted and parsed.
+    // Extract ALL files from the encrypted archive
+    let tmp = tempfile::tempdir().unwrap();
+    let t0 = std::time::Instant::now();
+    archive
+        .extract_all_with_password(tmp.path(), Some("snahp.it"))
+        .expect("extract_all failed");
+    let elapsed = t0.elapsed();
+
+    // Count extracted files
+    let mut count = 0u64;
+    let mut total_bytes = 0u64;
+    for entry in walkdir::WalkDir::new(tmp.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            total_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            count += 1;
+        }
+    }
+    eprintln!(
+        "Extracted {count} files, {:.2} GB total in {elapsed:.2?}",
+        total_bytes as f64 / 1_073_741_824.0
+    );
+
+    // Spot-check: verify Tower&Shaft.eep
+    let eep = std::fs::read(
+        tmp.path()
+            .join("Betas, Unreleased ROMS, and Protos/Tower&Shaft.eep"),
+    )
+    .unwrap();
+    assert_eq!(eep.len(), 512);
+    assert_eq!(crc32fast::hash(&eep), 0xEDDBB2AD);
+
+    // Spot-check: verify GoldenEye
+    let ge = std::fs::read(
+        tmp.path()
+            .join("Full Retail NTSC ROM Set/007 - GoldenEye (USA).n64"),
+    )
+    .unwrap();
+    assert_eq!(ge.len(), 12_582_912, "GoldenEye should be 12MB");
+    assert_eq!(crc32fast::hash(&ge), 0x8B70CB5B, "GoldenEye CRC mismatch");
 }
