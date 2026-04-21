@@ -722,6 +722,39 @@ fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
 }
 
 #[test]
+fn archive_builder_header_modes_are_honored() {
+    let single_default = r7z::ArchiveBuilder::new()
+        .add_file("single.txt", b"one")
+        .build()
+        .expect("build failed");
+    let archive = r7z::Archive::from_bytes(single_default.into()).expect("from_bytes failed");
+    assert!(archive.encoded_header.is_none());
+
+    let encoded = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            header_mode: r7z::HeaderMode::Encoded,
+            ..Default::default()
+        })
+        .add_file("single.txt", b"one")
+        .build()
+        .expect("build failed");
+    let archive = r7z::Archive::from_bytes(encoded.into()).expect("from_bytes failed");
+    assert!(archive.encoded_header.is_some());
+
+    let plain = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            header_mode: r7z::HeaderMode::Plain,
+            ..Default::default()
+        })
+        .add_file("a.txt", b"alpha")
+        .add_file("b.txt", b"bravo")
+        .build()
+        .expect("build failed");
+    let archive = r7z::Archive::from_bytes(plain.into()).expect("from_bytes failed");
+    assert!(archive.encoded_header.is_none());
+}
+
+#[test]
 fn archive_builder_copy_p7zip_extracts_and_lists_method() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -730,6 +763,72 @@ fn archive_builder_copy_p7zip_extracts_and_lists_method() {
 
     write_builder_archive(&archive_path, r7z::Codec::Copy, &files);
     assert_p7zip_extracts_archive(dir, &archive_path, &files, &["Copy"]);
+}
+
+#[test]
+fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("writer_mixed.7z");
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file).expect("new failed");
+    writer
+        .append_file("a.txt", b"alpha".as_slice(), r7z::EntryMeta::archive_file())
+        .expect("append file failed");
+    writer.new_folder().expect("new_folder failed");
+    writer
+        .append_directory("nested", r7z::EntryMeta::directory_unix_mode(0o040_755))
+        .expect("append directory failed");
+    writer
+        .append_empty_file("nested/empty.txt", r7z::EntryMeta::archive_file())
+        .expect("append empty file failed");
+    writer
+        .append_anti_item("removed.txt", r7z::EntryMeta::default())
+        .expect("append anti failed");
+    writer.new_folder().expect("new_folder failed");
+    writer
+        .append_file(
+            "nested/b.txt",
+            b"bravo".as_slice(),
+            r7z::EntryMeta::archive_file(),
+        )
+        .expect("append file failed");
+    writer.finish().expect("finish failed");
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let fi = archive.files_info().unwrap();
+    assert_eq!(archive.num_files(), 5);
+    assert_eq!(fi.name(0).unwrap(), "a.txt");
+    assert_eq!(fi.name(1).unwrap(), "nested");
+    assert_eq!(fi.name(2).unwrap(), "nested/empty.txt");
+    assert_eq!(fi.name(3).unwrap(), "removed.txt");
+    assert_eq!(fi.name(4).unwrap(), "nested/b.txt");
+    assert!(fi.is_directory(1));
+    assert!(fi.is_empty_file(2));
+    assert!(fi.is_anti(3));
+    let unpack_info = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap();
+    assert_eq!(unpack_info.num_folders, 2);
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"alpha");
+    assert_eq!(archive.extract_to_memory(2).unwrap(), b"");
+    assert_eq!(archive.extract_to_memory(4).unwrap(), b"bravo");
+
+    let out_dir = dir.join("out");
+    extract_with_p7zip(dir, &archive_path, &out_dir);
+    assert_eq!(std::fs::read(out_dir.join("a.txt")).unwrap(), b"alpha");
+    assert!(out_dir.join("nested").is_dir());
+    assert_eq!(
+        std::fs::read(out_dir.join("nested/empty.txt")).unwrap(),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("nested/b.txt")).unwrap(),
+        b"bravo"
+    );
 }
 
 #[test]
