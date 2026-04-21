@@ -737,6 +737,26 @@ fn build_streaming_with_options_copy_p7zip_extracts_and_lists_method() {
 }
 
 #[test]
+fn build_streaming_with_options_lzma_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("streaming_lzma.7z");
+    let output = std::fs::File::create(&archive_path).unwrap();
+    let entries = files
+        .iter()
+        .map(|(name, data)| (name.to_string_lossy().into_owned(), data.as_slice()));
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Lzma,
+        ..Default::default()
+    };
+
+    r7z::build_streaming_with_options(entries, output, options)
+        .expect("build_streaming_with_options failed");
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA"]);
+}
+
+#[test]
 fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
     let bytes = r7z::ArchiveBuilder::new()
         .add_file("a.txt", b"alpha")
