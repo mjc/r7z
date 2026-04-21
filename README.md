@@ -280,6 +280,14 @@ These are public but primarily used for building advanced tooling:
 
 Archives written by r7z use format version 0.4 (standard), are in uncompressed-Header format, and are fully readable by 7-Zip ≥ 9.x and p7zip.
 
+Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
+LZMA2, and BCJ+x86+LZMA2 archives. The parity target is matching archive
+listing/extraction behavior: file names, file contents, nested paths,
+directories, zero-byte files, and exposed metadata where r7z supports it.
+r7z does not guarantee byte-identical output to p7zip.
+
+LZHAM and Fast LZMA2 variants from p7zip-zstd are not supported.
+
 ## Development
 
 ### Setup (NixOS / Nix Flakes)
