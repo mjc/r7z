@@ -76,7 +76,7 @@ let archive = Archive::open_with_password(Path::new("secret.7z"), Some("passphra
 let data = archive.extract_to_memory_with_password(0, Some("passphrase"))?;
 ```
 
-### Building a single-file LZMA archive
+### Building a single-file LZMA2 archive
 
 ```rust
 use r7z::ArchiveBuilder;
@@ -87,15 +87,16 @@ let bytes = ArchiveBuilder::new()
 std::fs::write("out.7z", &bytes)?;
 ```
 
-### Building a multi-file LZMA2 archive
+### Building a multi-file archive with explicit entries
 
 ```rust
-use r7z::{ArchiveBuilder, Codec};
+use r7z::{ArchiveBuilder, EntryMeta};
 
 let bytes = ArchiveBuilder::new()
     .add_file("alpha.txt", b"AAAA")
+    .add_empty_file("empty.txt", EntryMeta::default())
+    .add_directory("beta", EntryMeta::default())
     .add_file("beta/beta.txt", b"BBBBBBBB")
-    .compression(Codec::Lzma2)
     .build()?;
 ```
 
@@ -110,7 +111,28 @@ let bytes = ArchiveBuilder::new()
     .build()?;
 ```
 
-### Streaming builder — process large archives without loading all data into memory
+### Building Copy or AES-encrypted archives
+
+```rust
+use r7z::{ArchiveBuilder, ArchiveOptions, Codec, EncryptionOptions};
+
+let copy_bytes = ArchiveBuilder::new()
+    .compression(Codec::Copy)
+    .add_file("stored.bin", b"stored without compression")
+    .build()?;
+
+let mut options = ArchiveOptions::default();
+options.encryption = Some(EncryptionOptions::default_for_password("secret"));
+
+let encrypted_bytes = ArchiveBuilder::new()
+    .options(options)
+    .add_file("secret.txt", b"encrypted content")
+    .build()?;
+```
+
+Set `EncryptionOptions::encrypt_header = true` to hide filenames and metadata until the password is supplied.
+
+### Writer API — file-backed archive creation
 
 ```rust
 use r7z::build_streaming;
@@ -123,7 +145,7 @@ let entries = vec![
     ("file2.bin".to_string(), File::open("file2.bin")?),
 ].into_iter();
 
-build_streaming(entries, out_file)?;  // Pipes files through compressor directly to disk
+build_streaming(entries, out_file)?;
 ```
 
 ### Parsing from an in-memory buffer
@@ -172,14 +194,16 @@ Builder pattern — all methods consume `self` and return `Self` for chaining:
 
 | Method | Description |
 |--------|-------------|
-| `ArchiveBuilder::new()` | Create an empty builder (LZMA compression default) |
+| `ArchiveBuilder::new()` | Create an empty builder (LZMA2 compression default) |
 | `.add_file(name: &str, data: &[u8])` | Queue a file with its content |
-| `.compression(codec: Codec)` | Set compression (`Codec::Lzma` or `Codec::Lzma2`) |
+| `.add_empty_file(name, meta)` / `.add_directory(name, meta)` / `.add_anti_item(name, meta)` | Queue empty-stream entries |
+| `.compression(codec: Codec)` | Set compression (`Codec::Copy`, `Codec::Lzma`, `Codec::Lzma2`, or `Codec::Lzma2Bcj`) |
+| `.options(options: ArchiveOptions)` | Set codec, header mode, and encryption options |
 | `.build()` | Produce the final `.7z` bytes as `Result<Vec<u8>, R7zError>` |
 
-The builder uses **solid compression**: all files are concatenated into one stream before compressing, which gives better ratios for many small files.
+The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It uses **solid compression** for non-empty files: file data is concatenated into one stream before compression, while directories, anti-items, and zero-byte files are represented with 7z empty-stream metadata.
 
-### `ArchiveWriter` and `build_streaming` — Streaming builders for large archives
+### `ArchiveWriter` and `build_streaming` — file-backed builders
 
 `ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata:
 
@@ -189,13 +213,14 @@ use std::fs::File;
 
 let file = File::create("out.7z")?;
 let mut writer = ArchiveWriter::new(file)?.compression(Codec::Lzma2);
-writer.append("a.txt", &mut b"hello".as_ref())?;
+writer.append_file("a.txt", &mut b"hello".as_ref(), EntryMeta::default())?;
+writer.append_empty_file("empty.txt", EntryMeta::default())?;
 writer.new_folder()?;
 writer.append_entry("b.txt", &mut b"world".as_ref(), EntryMeta::default())?;
 writer.finish()?;
 ```
 
-For archives too large to fit in memory, use the streaming builder:
+For file-backed output, use the convenience builder:
 
 ```rust
 pub fn build_streaming<W, I, R>(entries: I, out: W) -> Result<(), R7zError>
@@ -205,19 +230,20 @@ where
     R: Read,
 ```
 
-Each `entry` (filename, `impl Read`) is piped through the LZMA2 compressor directly to the output file. Neither all input data nor all compressed output is held in memory simultaneously — only one file at a time.
+Each `entry` is provided as a filename and `impl Read`; the builder writes the final `.7z` archive to any `Write + Seek` output.
 
 ### `Codec` — Compression algorithms
 
 ```rust
 pub enum Codec {
-    Lzma,      // Classic LZMA  — codec ID [0x03, 0x01, 0x01]
-    Lzma2,     // Modern LZMA2  — codec ID [0x21]
+    Copy,      // No compression — codec ID [0x00]
+    Lzma,      // Classic LZMA — codec ID [0x03, 0x01, 0x01]
+    Lzma2,     // Default — codec ID [0x21]
     Lzma2Bcj,  // x86 BCJ filter followed by LZMA2
 }
 ```
 
-`Lzma2` is the p7zip default and generally gives slightly better compression ratios.
+`Lzma2` is the default and generally gives slightly better compression ratios.
 
 ### `R7zError` — Error variants
 
@@ -270,23 +296,23 @@ These are public but primarily used for building advanced tooling:
 | Feature | Status |
 |---------|--------|
 | LZMA compression | Read + Write |
-| LZMA2 compression | Read + Write |
-| Copy codec | Read |
+| LZMA2 compression | Read + Write (default) |
+| Copy codec | Read + Write |
 | BCJ x86 filter + LZMA2 | Read + Write |
-| Uncompressed Copy codec | Read |
-| EncodedHeader archives (p7zip default) | Read |
+| EncodedHeader archives (p7zip default) | Read + Write |
 | Uncompressed Header archives | Read + Write |
 | Solid archives | Read + Write |
 | Multi-file archives | Read + Write |
 | Multi-folder / non-solid archives | Read + Write via `ArchiveWriter` |
-| AES-256-SHA-256 encrypted content | Read |
-| AES encrypted headers (`-mhe=on`) | Read with password |
+| Directories / zero-byte files / anti-items | Read + Write |
+| AES-256-SHA-256 encrypted content | Read + Write |
+| AES encrypted headers (`-mhe=on`) | Read + Write with password |
+| Update existing archives | Not supported |
 | Deflate / BZip2 / PPMd | Not supported |
-| AES writing | Not supported |
 
 **7z specification:** [7zFormat.txt](https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt)
 
-Archives written by r7z use format version 0.4 (standard), are in uncompressed-Header format, and are fully readable by 7-Zip ≥ 9.x and p7zip.
+Archives written by r7z use format version 0.4 (standard). Multi-entry archives use EncodedHeader by default, matching p7zip behavior, and are fully readable by 7-Zip ≥ 9.x and p7zip.
 
 Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
 LZMA2, and BCJ+x86+LZMA2 archives. The parity target is matching archive

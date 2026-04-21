@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 /// Head-to-head comparison: lzma_rust2 (pure Rust) vs C liblzma (via xz2).
 ///
 /// Uses LZMA-alone format for both so the underlying algorithm is identical
