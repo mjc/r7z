@@ -1,5 +1,5 @@
 use crate::pack_info::{scan_pack_info, scan_unpack_info};
-use crate::parsers::scan_digests;
+use crate::parsers::{bitmap_is_set, scan_digests};
 use crate::{sevenzip_varuint64_decode, PackInfo, Property, UnpackInfo};
 use bytes::Bytes;
 use nom::{number::complete::le_u8, IResult, ToUsize};
@@ -120,7 +120,7 @@ fn parse_stream_digests(input: &[u8], num: usize) -> IResult<&[u8], Vec<Option<u
         (&[][..], input)
     };
 
-    let is_defined = |i: usize| -> bool { all_defined != 0 || (bitmap[i / 8] >> (i % 8)) & 1 == 1 };
+    let is_defined = |i: usize| -> bool { all_defined != 0 || bitmap_is_set(bitmap, i) };
 
     (0..num).try_fold(
         (input, Vec::with_capacity(num.min(input.len()))),

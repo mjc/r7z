@@ -91,11 +91,15 @@ pub(crate) fn scan_digests(input: &[u8], num: usize) -> IResult<&[u8], ()> {
     }
     let num_bytes = num.div_ceil(8);
     let (input, bitmap) = take(num_bytes)(input)?;
-    let num_defined = (0..num)
-        .filter(|&i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
-        .count();
+    let num_defined = (0..num).filter(|&i| bitmap_is_set(bitmap, i)).count();
     let (input, _) = take(num_defined * 4)(input)?;
     Ok((input, ()))
+}
+
+pub(crate) fn bitmap_is_set(bitmap: &[u8], index: usize) -> bool {
+    bitmap
+        .get(index / 8)
+        .is_some_and(|b| (b >> (7 - (index % 8))) & 1 == 1)
 }
 
 #[cfg(test)]
@@ -110,18 +114,18 @@ mod tests {
         assert_eq!(rem, &[0xFF]);
     }
 
-    /// `all_defined=0`, `bitmap=0x03` (both bits set for 2 entries) → reads 2 CRCs.
+    /// `all_defined=0`, high bits set for 2 entries → reads 2 CRCs.
     #[test]
     fn scan_digests_bitmap_all_set() {
-        let input = [0x00u8, 0x03, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let input = [0x00u8, 0xC0, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
         let (rem, ()) = scan_digests(&input, 2).unwrap();
         assert!(rem.is_empty());
     }
 
-    /// `all_defined=0`, `bitmap=0x04` (only bit 2 set) for 3 entries → 1 CRC read.
+    /// `all_defined=0`, only entry 2 set for 3 entries → 1 CRC read.
     #[test]
     fn scan_digests_bitmap_sparse() {
-        let input = [0x00u8, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+        let input = [0x00u8, 0x20, 0xDE, 0xAD, 0xBE, 0xEF];
         let (rem, ()) = scan_digests(&input, 3).unwrap();
         assert!(rem.is_empty());
     }

@@ -1,9 +1,10 @@
 use bytes::Bytes;
-use nom::{number::complete::le_u8, IResult, ToUsize};
+use nom::number::complete::le_u8;
+use nom::IResult;
 use smallvec::SmallVec;
 
 use crate::folder::scan_folder;
-use crate::parsers::scan_digests;
+use crate::parsers::{bitmap_is_set, scan_digests};
 use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
 
 /// Describes where the packed (compressed) data streams live in the archive file.
@@ -38,8 +39,13 @@ impl PackInfo {
         let (input, pack_pos) = sevenzip_varuint64_decode(input)?;
         let (input, num_pack_streams) = sevenzip_varuint64_decode(input)?;
 
-        // Property::Size tag
-        let (mut input, _size_marker) = le_u8(input)?;
+        let (mut input, size_marker) = Property::parse(input)?;
+        if size_marker != Property::Size {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Satisfy,
+            )));
+        }
 
         let mut pack_size: SmallVec<[u64; 4]> =
             SmallVec::with_capacity(usize_cap(num_pack_streams, input.len()));
@@ -49,8 +55,13 @@ impl PackInfo {
             input = sliced;
         }
 
-        // Property::END tag
-        let (input, _end_marker) = le_u8(input)?;
+        let (input, end_marker) = Property::parse(input)?;
+        if end_marker != Property::END {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Satisfy,
+            )));
+        }
 
         Ok((
             input,
@@ -102,12 +113,15 @@ impl UnpackInfo {
     /// Returns [`R7zError`](crate::R7zError) if the stored bytes are malformed
     /// (should not happen — bytes are validated during [`parse`](UnpackInfo::parse)).
     ///
-    /// # Panics
-    ///
-    /// Panics if `idx >= num_folders`.
     pub fn parse_folder(&self, idx: usize) -> Result<Folder, crate::R7zError> {
-        let start = self.folder_offsets[idx] as usize;
-        let end = self.folder_offsets[idx + 1] as usize;
+        let start = *self.folder_offsets.get(idx).ok_or(crate::R7zError::Parse)? as usize;
+        let end = *self
+            .folder_offsets
+            .get(idx + 1)
+            .ok_or(crate::R7zError::Parse)? as usize;
+        if start > end || end > self.folder_data.len() {
+            return Err(crate::R7zError::Parse);
+        }
         let (_, folder) =
             Folder::parse(&self.folder_data[start..end]).map_err(|_| crate::R7zError::Parse)?;
         Ok(folder)
@@ -133,8 +147,13 @@ impl UnpackInfo {
             )));
         }
 
-        // Folder tag
-        let (input, _folder_marker) = le_u8(input)?;
+        let (input, folder_marker) = Property::parse(input)?;
+        if folder_marker != Property::Folder {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Satisfy,
+            )));
+        }
         let (input, num_folders) = sevenzip_varuint64_decode(input)?;
         let (input, is_external) = le_u8(input)?;
 
@@ -192,7 +211,13 @@ impl UnpackInfo {
                     }
                 }
                 Property::CRC => {
-                    let (i, crcs) = parse_digests(input, num_folders.to_usize())?;
+                    let num_folders = usize::try_from(num_folders).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, crcs) = parse_digests(input, num_folders)?;
                     digests = crcs;
                     input = i;
                 }
@@ -244,12 +269,24 @@ pub(crate) fn scan_pack_info(input: &[u8]) -> IResult<&[u8], ()> {
     }
     let (input, _pack_pos) = sevenzip_varuint64_decode(input)?;
     let (input, num_pack_streams) = sevenzip_varuint64_decode(input)?;
-    let (mut input, _size_marker) = le_u8(input)?;
+    let (mut input, size_marker) = Property::parse(input)?;
+    if size_marker != Property::Size {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
     for _ in 0..num_pack_streams {
         let (i, _) = sevenzip_varuint64_decode(input)?;
         input = i;
     }
-    let (input, _end) = le_u8(input)?;
+    let (input, end_marker) = Property::parse(input)?;
+    if end_marker != Property::END {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
     Ok((input, ()))
 }
 
@@ -272,7 +309,13 @@ pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
         )));
     }
 
-    let (input, _folder_marker) = le_u8(input)?;
+    let (input, folder_marker) = Property::parse(input)?;
+    if folder_marker != Property::Folder {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Satisfy,
+        )));
+    }
     let (input, num_folders) = sevenzip_varuint64_decode(input)?;
     let (input, is_external) = le_u8(input)?;
 
@@ -333,6 +376,7 @@ pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
 /// Parse CRC digests for `num_streams` streams using `AllAreDefined` + optional bitmap.
 fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[Option<u32>; 4]>> {
     use nom::number::complete::le_u32;
+    use nom::number::complete::le_u8;
 
     let (input, all_defined) = le_u8(input)?;
 
@@ -344,7 +388,7 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
         (&[][..], input)
     };
 
-    let is_defined = |i: usize| -> bool { all_defined != 0 || (bitmap[i / 8] >> (i % 8)) & 1 == 1 };
+    let is_defined = |i: usize| -> bool { all_defined != 0 || bitmap_is_set(bitmap, i) };
 
     (0..num_streams).try_fold(
         (input, SmallVec::with_capacity(num_streams.min(input.len()))),

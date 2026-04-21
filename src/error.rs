@@ -34,4 +34,12 @@ pub enum R7zError {
     /// The supplied password was incorrect (decryption produced garbage).
     #[error("wrong password")]
     WrongPassword,
+
+    /// The archive entry name cannot be extracted safely under the destination directory.
+    #[error("unsafe archive path: {0}")]
+    UnsafePath(String),
+
+    /// The requested entry is a directory or anti-item, not a regular file.
+    #[error("entry is a directory")]
+    Directory,
 }

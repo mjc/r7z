@@ -205,7 +205,7 @@ pub fn decompress_folder_with_password(
     //
     // We build a topological order by figuring out which coder receives the
     // packed stream (starts first) and following the bind pairs.
-    let order = coder_execution_order(folder);
+    let order = coder_execution_order(folder)?;
 
     let mut data = packed_data.to_vec();
     for (i, &coder_idx) in order.iter().enumerate() {
@@ -221,10 +221,22 @@ pub fn decompress_folder_with_password(
 ///
 /// The packed (compressed) stream enters one coder first, its output feeds the
 /// next via bind pairs, and so on.  We return coder indices in execution order.
-fn coder_execution_order(folder: &crate::Folder) -> SmallVec<[usize; 4]> {
+fn coder_execution_order(folder: &crate::Folder) -> Result<SmallVec<[usize; 4]>, R7zError> {
     let n = folder.coders.len();
     if n <= 1 {
-        return (0..n).collect();
+        return Ok((0..n).collect());
+    }
+
+    if folder
+        .coders
+        .iter()
+        .any(|coder| coder.num_in_streams != 1 || coder.num_out_streams != 1)
+    {
+        return Err(R7zError::Parse);
+    }
+
+    if folder.bind_pairs.len() != n - 1 {
+        return Err(R7zError::Parse);
     }
 
     // Find which coder's input stream is NOT bound to any other coder's output.
@@ -241,12 +253,36 @@ fn coder_execution_order(folder: &crate::Folder) -> SmallVec<[usize; 4]> {
     //   The packed data goes to the stream NOT appearing as any bind_pair's in_index.
     //   Stream 0 (coder 0) is not bound as input → coder 0 runs first.
 
-    // Build a set of bound input streams
+    // Build a set of bound input streams.
     let bound_in: SmallVec<[u64; 4]> = folder
         .bind_pairs
         .iter()
         .map(|&(in_idx, _)| in_idx)
         .collect();
+
+    for &(in_idx, out_idx) in &folder.bind_pairs {
+        if in_idx >= n as u64 || out_idx >= n as u64 {
+            return Err(R7zError::Parse);
+        }
+    }
+
+    let start_stream = if folder.packed_indices.is_empty() {
+        let starts: SmallVec<[u64; 2]> = (0..n as u64)
+            .filter(|stream| !bound_in.contains(stream))
+            .collect();
+        if starts.len() != 1 {
+            return Err(R7zError::Parse);
+        }
+        starts[0]
+    } else if folder.packed_indices.len() == 1 {
+        let start = folder.packed_indices[0];
+        if start >= n as u64 || bound_in.contains(&start) {
+            return Err(R7zError::Parse);
+        }
+        start
+    } else {
+        return Err(R7zError::Parse);
+    };
 
     // Map global stream index → coder index
     // For simple 1-in/1-out coders: stream i belongs to coder i.
@@ -254,39 +290,29 @@ fn coder_execution_order(folder: &crate::Folder) -> SmallVec<[usize; 4]> {
     let mut order = SmallVec::with_capacity(n);
 
     // Find the first coder (the one whose input stream is not bound)
-    let mut current_stream: u64 = 0;
-    for i in 0..n {
-        let stream = i as u64;
-        if !bound_in.contains(&stream) {
-            current_stream = stream;
-            order.push(i);
-            break;
-        }
-    }
+    let mut current_stream = start_stream;
+    order.push(usize::try_from(start_stream).map_err(|_| R7zError::Parse)?);
 
     // Follow the chain: find bind pair where out_index == current_stream,
     // then the coder that owns in_index is next.
     while order.len() < n {
-        let mut found = false;
-        for &(in_idx, out_idx) in &folder.bind_pairs {
-            if out_idx == current_stream {
-                let coder_idx = in_idx as usize; // stream i → coder i (simple case)
-                order.push(coder_idx);
-                current_stream = in_idx;
-                found = true;
-                break;
-            }
+        let matches: SmallVec<[(u64, u64); 2]> = folder
+            .bind_pairs
+            .iter()
+            .copied()
+            .filter(|&(_, out_idx)| out_idx == current_stream)
+            .collect();
+        if matches.len() != 1 {
+            return Err(R7zError::Parse);
         }
-        if !found {
-            // No more bind pairs; add remaining coders in order
-            for i in 0..n {
-                if !order.contains(&i) {
-                    order.push(i);
-                }
-            }
-            break;
+        let (in_idx, _) = matches[0];
+        let coder_idx = usize::try_from(in_idx).map_err(|_| R7zError::Parse)?;
+        if order.contains(&coder_idx) {
+            return Err(R7zError::Parse);
         }
+        order.push(coder_idx);
+        current_stream = in_idx;
     }
 
-    order
+    Ok(order)
 }

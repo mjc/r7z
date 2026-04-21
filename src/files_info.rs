@@ -17,6 +17,8 @@ pub struct FilesInfo {
     pub empty_streams: Bytes,
     /// Raw bitmap of empty-file flags (empty = all false). Bit `i` = entry `i` is a zero-byte file.
     pub empty_files: Bytes,
+    /// Raw bitmap of anti-item flags (empty = all false). Bit `i` = entry `i` is an anti-item.
+    pub anti_items: Bytes,
 }
 
 impl FilesInfo {
@@ -69,16 +71,35 @@ impl FilesInfo {
 
     /// Returns `true` if entry `i` has no data stream (directory or zero-byte file).
     pub fn is_empty_stream(&self, i: usize) -> bool {
-        self.empty_streams
-            .get(i / 8)
-            .is_some_and(|b| (b >> (i % 8)) & 1 == 1)
+        bitmap_is_set(&self.empty_streams, i)
     }
 
     /// Returns `true` if entry `i` is a genuine zero-byte file.
     pub fn is_empty_file(&self, i: usize) -> bool {
-        self.empty_files
-            .get(i / 8)
-            .is_some_and(|b| (b >> (i % 8)) & 1 == 1)
+        let Some(empty_idx) = self.empty_stream_ordinal(i) else {
+            return false;
+        };
+        bitmap_is_set(&self.empty_files, empty_idx)
+    }
+
+    /// Returns `true` if entry `i` is a directory.
+    pub fn is_directory(&self, i: usize) -> bool {
+        self.is_empty_stream(i) && !self.is_empty_file(i)
+    }
+
+    /// Returns `true` if entry `i` is an anti-item.
+    pub fn is_anti(&self, i: usize) -> bool {
+        let Some(empty_idx) = self.empty_stream_ordinal(i) else {
+            return false;
+        };
+        bitmap_is_set(&self.anti_items, empty_idx)
+    }
+
+    fn empty_stream_ordinal(&self, i: usize) -> Option<usize> {
+        if !self.is_empty_stream(i) {
+            return None;
+        }
+        Some((0..i).filter(|&idx| self.is_empty_stream(idx)).count())
     }
 
     /// Parse a `FilesInfo` block from the header stream.
@@ -117,6 +138,7 @@ impl FilesInfo {
         let mut attributes: Vec<Option<u32>> = Vec::new();
         let mut empty_streams = Bytes::new();
         let mut empty_files = Bytes::new();
+        let mut anti_items = Bytes::new();
         let mut input = input;
 
         loop {
@@ -133,6 +155,12 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
+                    if block.is_empty() {
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::Eof,
+                        )));
+                    }
                     // block[0] is the external flag; block[1..] is the raw UTF-16LE name data.
                     name_data = backing.slice_ref(&block[1..]);
                     input = i;
@@ -146,6 +174,12 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
+                    if block.is_empty() {
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::Eof,
+                        )));
+                    }
                     let all_defined = block[0];
                     // Layout: all_defined [bitmap if !all_defined] external [data...]
                     // external byte position: 1 (all_defined) or 1+nb (all_defined + bitmap)
@@ -163,7 +197,7 @@ impl FilesInfo {
                     mtimes = Vec::with_capacity(n.min(block.len() / 8));
                     let mut pos = data_start;
                     for j in 0..n {
-                        let is_def = all_defined != 0 || (bitmap[j / 8] >> (j % 8)) & 1 == 1;
+                        let is_def = all_defined != 0 || bitmap_is_set(bitmap, j);
                         if is_def && pos + 8 <= block.len() {
                             let val = u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap());
                             mtimes.push(Some(val));
@@ -183,6 +217,12 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
+                    if block.is_empty() {
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::Eof,
+                        )));
+                    }
                     let all_defined = block[0];
                     // Layout: all_defined [bitmap if !all_defined] external [data...]
                     let (data_start, num_bytes) = if all_defined != 0 {
@@ -199,7 +239,7 @@ impl FilesInfo {
                     attributes = Vec::with_capacity(n.min(block.len() / 4));
                     let mut pos = data_start;
                     for j in 0..n {
-                        let is_def = all_defined != 0 || (bitmap[j / 8] >> (j % 8)) & 1 == 1;
+                        let is_def = all_defined != 0 || bitmap_is_set(bitmap, j);
                         if is_def && pos + 4 <= block.len() {
                             let val = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap());
                             attributes.push(Some(val));
@@ -234,6 +274,18 @@ impl FilesInfo {
                     empty_files = backing.slice_ref(block);
                     input = i;
                 }
+                Property::Anti => {
+                    let (i, size) = sevenzip_varuint64_decode(input)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, block) = take(sz)(i)?;
+                    anti_items = backing.slice_ref(block);
+                    input = i;
+                }
                 _ => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
                     let sz = usize::try_from(size).map_err(|_| {
@@ -257,9 +309,16 @@ impl FilesInfo {
                 attributes,
                 empty_streams,
                 empty_files,
+                anti_items,
             },
         ))
     }
+}
+
+fn bitmap_is_set(bitmap: &[u8], index: usize) -> bool {
+    bitmap
+        .get(index / 8)
+        .is_some_and(|b| (b >> (7 - (index % 8))) & 1 == 1)
 }
 
 /// Walk a `FilesInfo` block without allocating.  Returns `num_files`.
@@ -307,7 +366,8 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_files_info;
+    use super::{scan_files_info, FilesInfo};
+    use bytes::Bytes;
 
     /// Minimal: 3 files, no sub-properties.
     #[test]
@@ -351,5 +411,28 @@ mod tests {
     #[test]
     fn scan_files_info_wrong_tag() {
         assert!(scan_files_info(&[0x06u8]).is_err());
+    }
+
+    #[test]
+    fn files_info_classifies_directory_zero_file_and_anti_items() {
+        let fi = FilesInfo {
+            num_files: 4,
+            name_data: Bytes::new(),
+            mtimes: Vec::new(),
+            attributes: Vec::new(),
+            empty_streams: Bytes::from_static(&[0b1110_0000]),
+            empty_files: Bytes::from_static(&[0b0100_0000]),
+            anti_items: Bytes::from_static(&[0b0010_0000]),
+        };
+
+        assert!(fi.is_directory(0));
+        assert!(!fi.is_empty_file(0));
+        assert!(!fi.is_directory(1));
+        assert!(fi.is_empty_file(1));
+        assert!(fi.is_anti(2));
+        assert!(!fi.is_empty_stream(9));
+        assert!(!fi.is_empty_file(9));
+        assert!(!fi.is_directory(9));
+        assert!(!fi.is_anti(9));
     }
 }
