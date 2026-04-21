@@ -221,7 +221,7 @@ writer.append_entry("b.txt", &mut b"world".as_ref(), EntryMeta::default())?;
 writer.finish()?;
 ```
 
-When configured with `Codec::Copy` and no encryption, `ArchiveWriter` writes non-empty file payloads directly to the output as they are appended. With default `Codec::Lzma2` and no encryption, it streams into the compressed folder and writes those bytes when the folder is sealed by `new_folder()` or `finish()`. Other writer codecs still collect input before final archive assembly.
+When configured with `Codec::Copy` and no encryption, `ArchiveWriter` writes non-empty file payloads directly to the output as they are appended. With `Codec::Lzma` or default `Codec::Lzma2` and no encryption, it streams into the compressed folder and writes those bytes when the folder is sealed by `new_folder()` or `finish()`. Encrypted and BCJ-filtered writer paths still collect input before final archive assembly.
 
 For file-backed output, use the convenience builder:
 

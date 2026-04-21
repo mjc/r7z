@@ -865,6 +865,43 @@ fn archive_writer_lzma2_streams_payload_before_finish() {
 }
 
 #[test]
+fn archive_writer_lzma_streams_payload_before_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("writer_lzma_streamed.7z");
+    let payload = (0u8..=255)
+        .rev()
+        .cycle()
+        .take(1024 * 1024)
+        .collect::<Vec<_>>();
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
+        .expect("new failed")
+        .compression(r7z::Codec::Lzma);
+
+    writer
+        .append_file(
+            "streamed.bin",
+            payload.as_slice(),
+            r7z::EntryMeta::archive_file(),
+        )
+        .expect("append failed");
+    writer.new_folder().expect("new_folder failed");
+    assert!(
+        std::fs::metadata(&archive_path).unwrap().len() > 32,
+        "LZMA writer should emit compressed payload bytes after sealing a folder"
+    );
+
+    writer.finish().expect("finish failed");
+    assert_p7zip_extracts_archive(
+        dir,
+        &archive_path,
+        &[(PathBuf::from("streamed.bin"), payload)],
+        &["LZMA"],
+    );
+}
+
+#[test]
 fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
