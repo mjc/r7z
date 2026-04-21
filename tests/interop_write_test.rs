@@ -751,6 +751,7 @@ fn archive_builder_empty_directory_and_anti_items_round_trip_and_p7zip_lists() {
     assert!(fi.is_directory(0));
     assert!(fi.is_empty_file(1));
     assert!(fi.is_anti(3));
+    assert!(!fi.is_directory(3));
     assert_eq!(archive.extract_to_memory(2).unwrap(), b"payload");
 
     let listing = list_with_p7zip(dir, &archive_path);
@@ -793,6 +794,7 @@ fn archive_builder_empty_only_p7zip_extracts_and_r7z_reads() {
     assert!(fi.is_directory(0));
     assert!(fi.is_empty_file(1));
     assert!(fi.is_anti(2));
+    assert!(!fi.is_directory(2));
     assert_eq!(archive.extract_to_memory(1).unwrap(), b"");
 
     let listing = list_with_p7zip(dir, &archive_path);

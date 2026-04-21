@@ -92,7 +92,7 @@ impl FilesInfo {
 
     /// Returns `true` if entry `i` is a directory.
     pub fn is_directory(&self, i: usize) -> bool {
-        self.is_empty_stream(i) && !self.is_empty_file(i)
+        self.is_empty_stream(i) && !self.is_empty_file(i) && !self.is_anti(i)
     }
 
     /// Returns `true` if entry `i` is an anti-item.
@@ -496,6 +496,7 @@ mod tests {
         assert!(!fi.is_directory(1));
         assert!(fi.is_empty_file(1));
         assert!(fi.is_anti(2));
+        assert!(!fi.is_directory(2));
         assert!(!fi.is_empty_stream(9));
         assert!(!fi.is_empty_file(9));
         assert!(!fi.is_directory(9));
