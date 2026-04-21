@@ -20,6 +20,7 @@ pub(crate) fn build_archive(
     if entries.is_empty() {
         return Err(R7zError::Parse);
     }
+    validate_options(options)?;
 
     let mut packed_data = Vec::new();
     let mut folders = Vec::new();
@@ -71,6 +72,29 @@ pub(crate) fn build_archive(
     archive.extend_from_slice(&next_header);
     write_signature(&mut archive, next_header_offset, &next_header);
     Ok(archive)
+}
+
+fn validate_options(options: &ArchiveOptions) -> Result<(), R7zError> {
+    let Some(enc) = &options.encryption else {
+        return Ok(());
+    };
+    if enc.num_cycles_power > 0x3F {
+        return Err(R7zError::InvalidOptions(
+            "AES num_cycles_power must be <= 63",
+        ));
+    }
+    if enc.salt_len > 16 {
+        return Err(R7zError::InvalidOptions("AES salt_len must be <= 16"));
+    }
+    if enc.iv_len > 16 {
+        return Err(R7zError::InvalidOptions("AES iv_len must be <= 16"));
+    }
+    if enc.encrypt_header && options.header_mode == HeaderMode::Plain {
+        return Err(R7zError::InvalidOptions(
+            "encrypt_header requires encoded headers",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn finish_streamed_copy_archive<W: Write + Seek>(

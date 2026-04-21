@@ -1108,6 +1108,19 @@ fn archive_builder_rejects_invalid_aes_options() {
         .build()
         .unwrap_err();
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
+
+    let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
+    enc.encrypt_header = true;
+    let err = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            header_mode: r7z::HeaderMode::Plain,
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("secret.txt", b"classified")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 }
 
 #[test]
