@@ -338,7 +338,7 @@ This loads the dev shell with:
 - **Profiling**: `perf`, `cargo-flamegraph`, `valgrind`
 - **Build**: `cargo-nextest`, `gnuplot`, `hyperfine`
 
-Running `cargo flamegraph --bin build_n64 -- /mnt/emulation/n64 /tmp/n64_build.7z` will build a streaming 7z archive from a directory tree and profile the codepath.
+Running `cargo flamegraph --bin build_n64 -- /mnt/emulation/n64 /tmp/n64_build.7z` will build a 7z archive from a directory tree and profile the codepath.
 
 ### Without Nix
 
