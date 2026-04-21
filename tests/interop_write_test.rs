@@ -1358,6 +1358,67 @@ fn archive_builder_salted_aes_content_p7zip_and_r7z_extract() {
 }
 
 #[test]
+fn archive_builder_salted_aes_encrypted_header_p7zip_and_r7z_extract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("aes_salted_header.7z");
+    let mut enc = r7z::EncryptionOptions::default_for_password("HeaderSecret");
+    enc.encrypt_header = true;
+    enc.salt_len = 8;
+    enc.iv_len = 8;
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("hidden.txt", b"salted header")
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let err = match r7z::Archive::open(&archive_path) {
+        Ok(_) => panic!("encrypted salted header opened without password"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, r7z::R7zError::PasswordRequired));
+    let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
+    let encoded_header = archive.encoded_header.as_ref().unwrap();
+    let folder = encoded_header.unpack_info.parse_folder(0).unwrap();
+    let aes_coder = &folder.coders[0];
+    assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
+    assert_salted_aes_properties(aes_coder.properties.as_deref().unwrap());
+    assert_eq!(
+        archive
+            .extract_to_memory_with_password(0, Some("HeaderSecret"))
+            .unwrap(),
+        b"salted header"
+    );
+
+    let out_dir = dir.join("out");
+    let out_arg = format!("-o{}", out_dir.to_str().unwrap());
+    let out = run_7z(
+        &[
+            "x",
+            "-y",
+            "-pHeaderSecret",
+            archive_path.to_str().unwrap(),
+            &out_arg,
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z x failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("hidden.txt")).unwrap(),
+        b"salted header"
+    );
+}
+
+#[test]
 fn archive_builder_aes_content_copy_and_bcj_p7zip_and_r7z_extract() {
     let cases = [
         (
