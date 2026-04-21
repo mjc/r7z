@@ -5,7 +5,105 @@
 
 mod support;
 
-use support::run_7z;
+use std::path::{Path, PathBuf};
+
+use support::{assert_extracted_files, create_p7zip_archive, run_7z, write_fixture_tree};
+
+fn fixture_args(files: &[(PathBuf, Vec<u8>)]) -> Vec<String> {
+    files
+        .iter()
+        .map(|(name, _)| name.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+fn assert_names_include(archive: &r7z::Archive, expected: &[String]) {
+    let fi = archive.files_info().unwrap();
+    let names: Vec<String> = fi.names().collect();
+    for name in expected {
+        assert!(
+            names.contains(name),
+            "archive names missing {name}: {names:?}"
+        );
+    }
+}
+
+fn assert_archive_files_read_and_extract_all(
+    archive_path: &Path,
+    out_dir: &Path,
+    expected: &[(PathBuf, Vec<u8>)],
+) -> r7z::Archive {
+    let archive =
+        r7z::Archive::open(archive_path).expect("r7z failed to open p7zip-created archive");
+    let expected_names = fixture_args(expected);
+    assert_names_include(&archive, &expected_names);
+
+    let fi = archive.files_info().unwrap();
+    let names: Vec<String> = fi.names().collect();
+    for (name, original) in expected {
+        if original.is_empty() {
+            continue;
+        }
+        let archive_name = name.to_string_lossy().replace('\\', "/");
+        let idx = names
+            .iter()
+            .position(|n| n == &archive_name)
+            .unwrap_or_else(|| panic!("{archive_name} not found in archive"));
+        let extracted = archive.extract_to_memory(idx).unwrap();
+        assert_eq!(extracted, *original, "mismatch for {archive_name}");
+    }
+
+    std::fs::create_dir_all(out_dir).unwrap();
+    archive.extract_all(out_dir).unwrap();
+    assert_extracted_files(out_dir, expected);
+    archive
+}
+
+fn assert_every_folder_uses(archive: &r7z::Archive, codec_id: &[u8]) {
+    let si = archive.streams_info().unwrap();
+    let ui = si.unpack_info.as_ref().unwrap();
+    assert!(ui.num_folders_usize() > 0, "expected at least one folder");
+    for folder_idx in 0..ui.num_folders_usize() {
+        let folder = ui.parse_folder(folder_idx).unwrap();
+        assert_eq!(
+            folder.coders.len(),
+            1,
+            "folder {folder_idx} should contain exactly one coder"
+        );
+        assert_eq!(folder.coders[0].codec_id.as_slice(), codec_id);
+    }
+}
+
+fn assert_every_folder_includes_bcj_lzma2(archive: &r7z::Archive) {
+    let si = archive.streams_info().unwrap();
+    let ui = si.unpack_info.as_ref().unwrap();
+    assert!(ui.num_folders_usize() > 0, "expected at least one folder");
+    for folder_idx in 0..ui.num_folders_usize() {
+        let folder = ui.parse_folder(folder_idx).unwrap();
+        let codec_ids: Vec<&[u8]> = folder
+            .coders
+            .iter()
+            .map(|coder| coder.codec_id.as_slice())
+            .collect();
+        assert!(
+            codec_ids.contains(&r7z::CODEC_LZMA2),
+            "folder {folder_idx} missing LZMA2 coder: {codec_ids:?}"
+        );
+        assert!(
+            codec_ids.contains(&r7z::CODEC_BCJ_X86),
+            "folder {folder_idx} missing BCJ x86 coder: {codec_ids:?}"
+        );
+    }
+}
+
+fn executable_payload(size: usize) -> Vec<u8> {
+    let mut data = vec![0x90u8; size];
+    for pos in (16..size.saturating_sub(5)).step_by(97) {
+        let target = (pos as u32).wrapping_mul(13);
+        data[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
+        data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
+    }
+    data
+}
 
 #[test]
 fn p7zip_read_interop_single_lzma() {
@@ -321,6 +419,321 @@ fn p7zip_read_interop_bcj_lzma2() {
 
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted, data, "extracted data should match original");
+}
+
+#[test]
+fn p7zip_interop_lzma_single_file_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = vec![(
+        PathBuf::from("hello.txt"),
+        b"classic LZMA single-file payload".to_vec(),
+    )];
+    std::fs::write(input.join("hello.txt"), &expected[0].1).unwrap();
+
+    let archive_path = tmp.path().join("lzma_single.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["hello.txt"],
+        &["-m0=lzma", "-mx=1"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA);
+}
+
+#[test]
+fn p7zip_interop_lzma_multi_file_solid_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = write_fixture_tree(&input);
+    let file_args = fixture_args(&expected);
+    let file_refs: Vec<&str> = file_args.iter().map(String::as_str).collect();
+
+    let archive_path = tmp.path().join("lzma_solid.7z");
+    create_p7zip_archive(&input, &archive_path, &file_refs, &["-m0=lzma", "-mx=1"]);
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA);
+}
+
+#[test]
+fn p7zip_interop_lzma_multi_file_non_solid_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = write_fixture_tree(&input);
+    let file_args = fixture_args(&expected);
+    let file_refs: Vec<&str> = file_args.iter().map(String::as_str).collect();
+
+    let archive_path = tmp.path().join("lzma_non_solid.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &file_refs,
+        &["-m0=lzma", "-mx=1", "-ms=off"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA);
+}
+
+#[test]
+fn p7zip_interop_lzma2_single_file_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = vec![(
+        PathBuf::from("hello-lzma2.txt"),
+        b"LZMA2 single-file payload".to_vec(),
+    )];
+    std::fs::write(input.join("hello-lzma2.txt"), &expected[0].1).unwrap();
+
+    let archive_path = tmp.path().join("lzma2_single.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["hello-lzma2.txt"],
+        &["-m0=lzma2", "-mx=1"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA2);
+}
+
+#[test]
+fn p7zip_interop_lzma2_multi_file_solid_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = write_fixture_tree(&input);
+    let file_args = fixture_args(&expected);
+    let file_refs: Vec<&str> = file_args.iter().map(String::as_str).collect();
+
+    let archive_path = tmp.path().join("lzma2_solid.7z");
+    create_p7zip_archive(&input, &archive_path, &file_refs, &["-m0=lzma2", "-mx=1"]);
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA2);
+}
+
+#[test]
+fn p7zip_interop_lzma2_multi_file_non_solid_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = write_fixture_tree(&input);
+    let file_args = fixture_args(&expected);
+    let file_refs: Vec<&str> = file_args.iter().map(String::as_str).collect();
+
+    let archive_path = tmp.path().join("lzma2_non_solid.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &file_refs,
+        &["-m0=lzma2", "-mx=1", "-ms=off"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA2);
+}
+
+#[test]
+fn p7zip_interop_bcj_lzma2_single_file_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    let expected = vec![(PathBuf::from("code.bin"), executable_payload(4096))];
+    std::fs::write(input.join("code.bin"), &expected[0].1).unwrap();
+
+    let archive_path = tmp.path().join("bcj_lzma2_single.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["code.bin"],
+        &["-m0=lzma2", "-mf=BCJ", "-mx=7"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_includes_bcj_lzma2(&archive);
+}
+
+#[test]
+fn p7zip_interop_bcj_lzma2_multi_file_non_solid_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("bin")).unwrap();
+    let expected = vec![
+        (PathBuf::from("bin/app.exe"), executable_payload(4096)),
+        (PathBuf::from("bin/helper.dll"), executable_payload(2048)),
+    ];
+    for (name, data) in &expected {
+        std::fs::write(input.join(name), data).unwrap();
+    }
+
+    let archive_path = tmp.path().join("bcj_lzma2_non_solid.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["bin/app.exe", "bin/helper.dll"],
+        &["-m0=lzma2", "-mf=BCJ", "-mx=7", "-ms=off"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_includes_bcj_lzma2(&archive);
+}
+
+#[test]
+fn p7zip_interop_lzma_empty_file_and_nested_directory_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("nested/empty_dir")).unwrap();
+    std::fs::write(input.join("empty.txt"), b"").unwrap();
+    std::fs::write(input.join("nested/payload.txt"), b"nested lzma payload").unwrap();
+    let expected = vec![
+        (PathBuf::from("empty.txt"), Vec::new()),
+        (
+            PathBuf::from("nested/payload.txt"),
+            b"nested lzma payload".to_vec(),
+        ),
+    ];
+
+    let archive_path = tmp.path().join("lzma_empty_dir.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["empty.txt", "nested/empty_dir", "nested/payload.txt"],
+        &["-m0=lzma", "-mx=1"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA);
+    assert!(tmp.path().join("out/nested/empty_dir").is_dir());
+    assert_names_include(&archive, &[String::from("nested/empty_dir")]);
+}
+
+#[test]
+fn p7zip_interop_lzma2_empty_file_and_nested_directory_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("nested/empty_dir")).unwrap();
+    std::fs::write(input.join("empty.txt"), b"").unwrap();
+    std::fs::write(input.join("nested/payload.txt"), b"nested lzma2 payload").unwrap();
+    let expected = vec![
+        (PathBuf::from("empty.txt"), Vec::new()),
+        (
+            PathBuf::from("nested/payload.txt"),
+            b"nested lzma2 payload".to_vec(),
+        ),
+    ];
+
+    let archive_path = tmp.path().join("lzma2_empty_dir.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["empty.txt", "nested/empty_dir", "nested/payload.txt"],
+        &["-m0=lzma2", "-mx=1"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA2);
+    assert!(tmp.path().join("out/nested/empty_dir").is_dir());
+    assert_names_include(&archive, &[String::from("nested/empty_dir")]);
+}
+
+#[test]
+fn p7zip_interop_lzma_spaces_nested_unicode_names_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("nested dir")).unwrap();
+    let expected = vec![
+        (PathBuf::from("space name.txt"), b"space lzma".to_vec()),
+        (
+            PathBuf::from("nested dir/unicode-\u{2603}.txt"),
+            b"unicode lzma".to_vec(),
+        ),
+    ];
+    for (name, data) in &expected {
+        std::fs::write(input.join(name), data).unwrap();
+    }
+
+    let archive_path = tmp.path().join("lzma_names.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["space name.txt", "nested dir/unicode-\u{2603}.txt"],
+        &["-m0=lzma", "-mx=1"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA);
+}
+
+#[test]
+fn p7zip_interop_lzma2_spaces_nested_unicode_names_r7z_read_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("nested dir")).unwrap();
+    let expected = vec![
+        (PathBuf::from("space name.txt"), b"space lzma2".to_vec()),
+        (
+            PathBuf::from("nested dir/unicode-\u{2603}.txt"),
+            b"unicode lzma2".to_vec(),
+        ),
+    ];
+    for (name, data) in &expected {
+        std::fs::write(input.join(name), data).unwrap();
+    }
+
+    let archive_path = tmp.path().join("lzma2_names.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["space name.txt", "nested dir/unicode-\u{2603}.txt"],
+        &["-m0=lzma2", "-mx=1"],
+    );
+    let archive = assert_archive_files_read_and_extract_all(
+        &archive_path,
+        &tmp.path().join("out"),
+        &expected,
+    );
+    assert_every_folder_uses(&archive, r7z::CODEC_LZMA2);
 }
 
 // ── AES-256-SHA-256 encrypted archive tests ──────────────────────────────────
