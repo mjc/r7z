@@ -1,0 +1,37 @@
+{
+  "wing": "r7z",
+  "captured_at": "2026-04-17T00:00:00-06:00",
+  "phase": "fallback_poisoned_legacy_state",
+  "status_snapshot": {
+    "total_drawers": 1854,
+    "reported_wing_count": 2626,
+    "reported_room_counts_sample": {
+      "archive_core": 2358,
+      "codecs_and_formats": 42,
+      "cli_and_tools": 60,
+      "testing": 5853,
+      "benchmarks": 777
+    }
+  },
+  "enumeration_snapshot": {
+    "list_drawers": {
+      "wing": "r7z",
+      "count": 0
+    },
+    "search": {
+      "wing": "r7z",
+      "query": "7z format",
+      "total_before_filter": 0,
+      "result_count": 0
+    }
+  },
+  "assessment": {
+    "trust_level": "poisoned",
+    "summary": "MemPalace reported nonzero drawer counts for r7z while direct list/search remained empty after reconnect. Existing r7z drawers were treated as inaccessible legacy state and excluded from operational use.",
+    "recovery_path": "logical replacement in the same r7z wing with fresh canonical drawers, registry, and validation"
+  },
+  "notes": [
+    "No enumerable legacy drawers were available to snapshot verbatim.",
+    "Physical deletion is deferred unless legacy drawers become addressable in the future."
+  ]
+}

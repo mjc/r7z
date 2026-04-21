@@ -1,0 +1,185 @@
+{
+  "wing": "r7z",
+  "rooms": [
+    {
+      "name": "spec_ledger",
+      "canonical_id": "room-spec-ledger"
+    },
+    {
+      "name": "archive_model",
+      "canonical_id": "room-archive-model"
+    },
+    {
+      "name": "codec_backends",
+      "canonical_id": "room-codec-backends"
+    },
+    {
+      "name": "fixtures_and_interop",
+      "canonical_id": "room-fixtures-and-interop"
+    },
+    {
+      "name": "test_matrix",
+      "canonical_id": "room-test-matrix"
+    },
+    {
+      "name": "decisions_and_risks",
+      "canonical_id": "room-decisions-and-risks"
+    },
+    {
+      "name": "benchmarks",
+      "canonical_id": "room-benchmarks"
+    }
+  ],
+  "canonical_drawers": [
+    {
+      "room": "spec_ledger",
+      "canonical_id": "registry"
+    },
+    {
+      "room": "spec_ledger",
+      "canonical_id": "room-spec-ledger"
+    },
+    {
+      "room": "archive_model",
+      "canonical_id": "room-archive-model"
+    },
+    {
+      "room": "codec_backends",
+      "canonical_id": "room-codec-backends"
+    },
+    {
+      "room": "fixtures_and_interop",
+      "canonical_id": "room-fixtures-and-interop"
+    },
+    {
+      "room": "test_matrix",
+      "canonical_id": "room-test-matrix"
+    },
+    {
+      "room": "decisions_and_risks",
+      "canonical_id": "room-decisions-and-risks"
+    },
+    {
+      "room": "benchmarks",
+      "canonical_id": "room-benchmarks"
+    },
+    {
+      "room": "decisions_and_risks",
+      "canonical_id": "legacy-poisoned-state-incident"
+    },
+    {
+      "room": "spec_ledger",
+      "canonical_id": "spec-feature-checklist"
+    },
+    {
+      "room": "spec_ledger",
+      "canonical_id": "method-id-ledger"
+    },
+    {
+      "room": "test_matrix",
+      "canonical_id": "repo-coverage-manifest"
+    },
+    {
+      "room": "archive_model",
+      "canonical_id": "parser-writer-architecture-skeleton"
+    },
+    {
+      "room": "codec_backends",
+      "canonical_id": "codec-support-matrix"
+    },
+    {
+      "room": "fixtures_and_interop",
+      "canonical_id": "fixture-provenance-registry"
+    },
+    {
+      "room": "test_matrix",
+      "canonical_id": "feature-to-test-mapping-ledger"
+    },
+    {
+      "room": "decisions_and_risks",
+      "canonical_id": "rewrite-adr-index"
+    },
+    {
+      "room": "benchmarks",
+      "canonical_id": "benchmark-baseline-index"
+    },
+    {
+      "room": "test_matrix",
+      "canonical_id": "read-parity-acceptance-2026-04-21"
+    }
+  ],
+  "search_checks": [
+    {
+      "query": "7z format",
+      "expected_room": "spec_ledger",
+      "expected_canonical_id": "spec-feature-checklist"
+    },
+    {
+      "query": "header",
+      "expected_room": "spec_ledger",
+      "expected_canonical_id": "spec-feature-checklist"
+    },
+    {
+      "query": "folder graph",
+      "expected_room": "archive_model",
+      "expected_canonical_id": "parser-writer-architecture-skeleton"
+    },
+    {
+      "query": "codec matrix",
+      "expected_room": "codec_backends",
+      "expected_canonical_id": "codec-support-matrix"
+    },
+    {
+      "query": "fixture provenance",
+      "expected_room": "fixtures_and_interop",
+      "expected_canonical_id": "fixture-provenance-registry"
+    },
+    {
+      "query": "test coverage",
+      "expected_room": "test_matrix",
+      "expected_canonical_id": "feature-to-test-mapping-ledger"
+    },
+    {
+      "query": "read parity acceptance",
+      "expected_room": "test_matrix",
+      "expected_canonical_id": "read-parity-acceptance-2026-04-21"
+    }
+  ],
+  "required_tunnels": [
+    {
+      "source_room": "spec_ledger",
+      "target_room": "archive_model",
+      "label": "spec->parser"
+    },
+    {
+      "source_room": "spec_ledger",
+      "target_room": "codec_backends",
+      "label": "spec->codec"
+    },
+    {
+      "source_room": "archive_model",
+      "target_room": "test_matrix",
+      "label": "adr->coverage"
+    },
+    {
+      "source_room": "codec_backends",
+      "target_room": "test_matrix",
+      "label": "adr->coverage"
+    },
+    {
+      "source_room": "fixtures_and_interop",
+      "target_room": "test_matrix",
+      "label": "fixture->test"
+    },
+    {
+      "source_room": "benchmarks",
+      "target_room": "archive_model",
+      "label": "perf->owner"
+    },
+    {
+      "source_room": "benchmarks",
+      "target_room": "codec_backends",
+      "label": "perf->owner"
+    }
+  ]
+}

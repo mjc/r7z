@@ -1,0 +1,63 @@
+wing: r7z
+rooms:
+- name: spec_ledger
+  description: Official 7z format facts, method IDs, property IDs, and non-negotiable invariants.
+  keywords:
+  - 7z
+  - spec
+  - header
+  - method-id
+  - property-id
+- name: archive_model
+  description: Parser and writer architecture, IR design, folder graph rules, and API shape.
+  keywords:
+  - parser
+  - writer
+  - folder-graph
+  - architecture
+  - api
+  - safe-extraction
+- name: codec_backends
+  description: Codec support, backend choices, method-property behavior, and encryption notes.
+  keywords:
+  - codec
+  - backend
+  - lzma
+  - lzma2
+  - aes
+  - bcj
+  - copy
+- name: fixtures_and_interop
+  description: Fixture provenance, generation commands, interoperability notes, and external-tool quirks.
+  keywords:
+  - fixtures
+  - interop
+  - p7zip
+  - provenance
+  - commands
+  - read-parity
+- name: test_matrix
+  description: Feature-to-test mapping, malformed corpus coverage, CI expectations, and acceptance reports.
+  keywords:
+  - tests
+  - coverage
+  - ci
+  - malformed
+  - acceptance
+  - read-parity
+- name: decisions_and_risks
+  description: ADRs, tradeoffs, compatibility notes, incidents, and unresolved blockers.
+  keywords:
+  - decisions
+  - risks
+  - adr
+  - compatibility
+  - blockers
+- name: benchmarks
+  description: Parse, extract, and build baselines with hotspot ownership and regression thresholds.
+  keywords:
+  - benchmark
+  - perf
+  - flamegraph
+  - threshold
+  - hotspot
