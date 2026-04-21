@@ -7,15 +7,14 @@
 //!
 //! The algorithm matches p7zip / LZMA SDK `Bra86.c` exactly.
 
+use std::io::{self, Read};
+
 /// Test whether the most-significant byte of a 4-byte displacement indicates
 /// a near address (0x00 or 0xFF after biased addition).
 #[inline]
 fn test86_msb(b: u8) -> bool {
     (b.wrapping_add(1)) & 0xFE == 0
 }
-
-/// Lookup: prevMask value → number of relevant high bits to check.
-const MASK_TO_BIT_NUMBER: [u32; 8] = [0, 1, 2, 2, 3, 3, 3, 3];
 
 /// Apply the x86 BCJ filter in-place (matches LZMA SDK `Bra86.c`).
 ///
@@ -29,91 +28,158 @@ const MASK_TO_BIT_NUMBER: [u32; 8] = [0, 1, 2, 2, 3, 3, 3, 3];
 /// (fewer than 5) are left untouched and should be prepended to the next call.
 pub fn bcj_x86_convert(data: &mut [u8], ip: u32, state: &mut u32, encoding: bool) -> usize {
     let size = data.len();
+    let mut pos: usize = 0;
+    let mut mask: u32 = *state & 7;
     if size < 5 {
         return 0;
     }
 
     let limit = size - 4;
     let ip = ip.wrapping_add(5); // p7zip pre-adds 5
-    let mut buf_pos: usize = 0;
-    let mut prev_pos_t: usize = usize::MAX; // (SizeT)0 - 1
-    let mut prev_mask: u32 = *state & 0x7;
 
     loop {
-        if buf_pos >= limit {
-            break;
+        let start = pos;
+        while pos < limit && (data[pos] & 0xFE) != 0xE8 {
+            pos += 1;
         }
 
-        // Scan for E8 (CALL) or E9 (JMP) starting at buf_pos
-        let found = data[buf_pos..limit]
-            .iter()
-            .position(|&b| (b & 0xFE) == 0xE8);
-        buf_pos = match found {
-            Some(offset) => buf_pos + offset,
-            None => break,
-        };
+        let distance = pos - start;
+        if pos >= limit {
+            *state = if distance > 2 {
+                0
+            } else {
+                mask >> u32::try_from(distance).unwrap_or(0)
+            };
+            return pos;
+        }
 
-        // Distance since last candidate
-        let prev_pos_t_new = buf_pos.wrapping_sub(prev_pos_t);
-        prev_pos_t = prev_pos_t_new;
-        if prev_pos_t > 3 {
-            prev_mask = 0;
+        if distance > 2 {
+            mask = 0;
         } else {
-            prev_mask = (prev_mask << (prev_pos_t.wrapping_sub(1) as u32)) & 0x7;
-            if prev_mask != 0 {
-                let check_byte_idx = buf_pos + 4 - MASK_TO_BIT_NUMBER[prev_mask as usize] as usize;
-                if !test86_msb(data[check_byte_idx]) {
-                    prev_pos_t = buf_pos;
-                    prev_mask = ((prev_mask << 1) & 0x7) | 1;
-                    buf_pos += 1;
+            mask >>= u32::try_from(distance).unwrap_or(0);
+            if mask != 0 {
+                let test_idx = pos + usize::try_from(mask >> 1).unwrap_or(0) + 1;
+                if mask > 4 || mask == 3 || test86_msb(data[test_idx]) {
+                    mask = (mask >> 1) | 4;
+                    pos += 1;
                     continue;
                 }
             }
         }
-        prev_pos_t = buf_pos;
 
-        if test86_msb(data[buf_pos + 4]) {
-            // Read 4-byte displacement (LE) from p[1..5]
-            let p = buf_pos;
-            let mut src = u32::from(data[p + 1])
-                | (u32::from(data[p + 2]) << 8)
-                | (u32::from(data[p + 3]) << 16)
-                | (u32::from(data[p + 4]) << 24);
+        if test86_msb(data[pos + 4]) {
+            let p = pos;
+            let mut value = u32::from(data[p + 4]) << 24
+                | u32::from(data[p + 3]) << 16
+                | u32::from(data[p + 2]) << 8
+                | u32::from(data[p + 1]);
+            let current = ip.wrapping_add(pos as u32);
+            pos += 5;
 
-            let dest;
-            loop {
-                let d = if encoding {
-                    ip.wrapping_add(buf_pos as u32).wrapping_add(src)
-                } else {
-                    src.wrapping_sub(ip.wrapping_add(buf_pos as u32))
-                };
-                if prev_mask == 0 {
-                    dest = d;
-                    break;
-                }
-                let index = MASK_TO_BIT_NUMBER[prev_mask as usize] * 8;
-                let b = (d >> (24 - index)) as u8;
-                if !test86_msb(b) {
-                    dest = d;
-                    break;
-                }
-                src = d ^ ((1u32 << (32 - index)).wrapping_sub(1));
+            if encoding {
+                value = value.wrapping_add(current);
+            } else {
+                value = value.wrapping_sub(current);
             }
 
-            // Write back: MSB byte becomes 0x00 or 0xFF
-            data[p + 4] = (!(((dest >> 24) & 1).wrapping_sub(1))) as u8;
-            data[p + 3] = (dest >> 16) as u8;
-            data[p + 2] = (dest >> 8) as u8;
-            data[p + 1] = dest as u8;
-            buf_pos += 5;
+            if mask != 0 {
+                let shift = (mask & 6) << 2;
+                if test86_msb((value >> shift) as u8) {
+                    let adjust_mask = ((0x100u64 << shift) - 1) as u32;
+                    value ^= adjust_mask;
+                    if encoding {
+                        value = value.wrapping_add(current);
+                    } else {
+                        value = value.wrapping_sub(current);
+                    }
+                }
+                mask = 0;
+            }
+
+            data[p + 1] = value as u8;
+            data[p + 2] = (value >> 8) as u8;
+            data[p + 3] = (value >> 16) as u8;
+            data[p + 4] = (0u8).wrapping_sub(((value >> 24) & 1) as u8);
         } else {
-            prev_mask = ((prev_mask << 1) & 0x7) | 1;
-            buf_pos += 1;
+            mask = (mask >> 1) | 4;
+            pos += 1;
+        }
+    }
+}
+
+pub(crate) struct BcjX86Reader<R> {
+    inner: R,
+    tail: Vec<u8>,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    state: u32,
+    input_offset: u64,
+    eof: bool,
+}
+
+impl<R: Read> BcjX86Reader<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            inner,
+            tail: Vec::with_capacity(4),
+            pending: Vec::new(),
+            pending_pos: 0,
+            state: 0,
+            input_offset: 0,
+            eof: false,
         }
     }
 
-    *state = prev_mask;
-    buf_pos
+    fn fill_pending(&mut self) -> io::Result<()> {
+        self.pending.clear();
+        self.pending_pos = 0;
+
+        while self.pending.is_empty() && !self.eof {
+            let mut chunk = [0u8; 8192];
+            let n = self.inner.read(&mut chunk)?;
+
+            if n == 0 {
+                self.eof = true;
+                self.pending.extend_from_slice(&self.tail);
+                self.tail.clear();
+                break;
+            }
+
+            let mut data = Vec::with_capacity(self.tail.len() + n);
+            data.extend_from_slice(&self.tail);
+            data.extend_from_slice(&chunk[..n]);
+
+            let processed =
+                bcj_x86_convert(&mut data, self.input_offset as u32, &mut self.state, false);
+            self.pending.extend_from_slice(&data[..processed]);
+            self.tail.clear();
+            self.tail.extend_from_slice(&data[processed..]);
+            self.input_offset = self.input_offset.wrapping_add(processed as u64);
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for BcjX86Reader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        if self.pending_pos == self.pending.len() {
+            self.fill_pending()?;
+        }
+
+        let available = &self.pending[self.pending_pos..];
+        if available.is_empty() {
+            return Ok(0);
+        }
+
+        let n = available.len().min(out.len());
+        out[..n].copy_from_slice(&available[..n]);
+        self.pending_pos += n;
+        Ok(n)
+    }
 }
 
 /// Decode (post-decompress) x86 BCJ filter.
@@ -254,5 +320,65 @@ mod tests {
         let disp = u32::from_le_bytes([data[1], data[2], data[3], 0]);
         // The MSB byte (data[4]) gets special treatment
         assert_eq!(disp, 0x0105);
+    }
+
+    #[test]
+    fn streaming_decode_matches_batch_for_chunk_sizes() {
+        let mut original = vec![0x90u8; 4096];
+        for &pos in &[3usize, 10, 63, 127, 512, 1021, 2048, 3070] {
+            original[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
+            original[pos + 1] = (pos * 5) as u8;
+            original[pos + 2] = ((pos * 5) >> 8) as u8;
+            original[pos + 3] = 0;
+            original[pos + 4] = 0;
+        }
+
+        let mut encoded = original.clone();
+        bcj_x86_encode(&mut encoded);
+
+        let mut expected = encoded.clone();
+        bcj_x86_decode(&mut expected);
+
+        for chunk_size in [1usize, 2, 3, 4, 5, 7, 16, 64] {
+            let cursor = std::io::Cursor::new(encoded.clone());
+            let mut reader = BcjX86Reader::new(cursor);
+            let mut actual = Vec::new();
+            let mut buf = vec![0u8; chunk_size];
+            loop {
+                let n = reader.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(actual, expected, "chunk_size={chunk_size}");
+        }
+    }
+
+    #[test]
+    fn streaming_decode_handles_split_instruction() {
+        let mut original = vec![0x90u8; 32];
+        original[4] = 0xE8;
+        original[5] = 0x40;
+        original[6] = 0x00;
+        original[7] = 0x00;
+        original[8] = 0x00;
+
+        let mut encoded = original.clone();
+        bcj_x86_encode(&mut encoded);
+
+        let cursor = std::io::Cursor::new(encoded);
+        let mut reader = BcjX86Reader::new(cursor);
+        let mut actual = Vec::new();
+        let mut buf = [0u8; 2];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            actual.extend_from_slice(&buf[..n]);
+        }
+
+        assert_eq!(actual, original);
     }
 }

@@ -4,7 +4,7 @@ use crate::{
 };
 use bytes::Bytes;
 use memmap2::Mmap;
-use std::io::Read;
+use std::io::{BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
@@ -307,6 +307,49 @@ impl Archive {
         file_index: usize,
         password: Option<&str>,
     ) -> Result<Vec<u8>, R7zError> {
+        let mut bytes = Vec::new();
+        self.extract_to_writer_with_password(file_index, &mut bytes, password)?;
+        Ok(bytes)
+    }
+
+    /// Extract a single file by index into a writer.
+    ///
+    /// This streams the decoded folder into `writer` instead of materializing
+    /// the whole folder in memory. The returned value is the number of file
+    /// bytes written.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same archive, codec, and CRC errors as
+    /// [`extract_to_memory`](Self::extract_to_memory), plus [`R7zError::Io`] for
+    /// writer failures.
+    pub fn extract_to_writer<W: Write + ?Sized>(
+        &self,
+        file_index: usize,
+        writer: &mut W,
+    ) -> Result<u64, R7zError> {
+        self.extract_to_writer_with_password(file_index, writer, None)
+    }
+
+    /// Extract a single file by index into a writer, supplying a password for
+    /// encrypted archives.
+    ///
+    /// The decoder stream is drained after the target file has been written
+    /// whenever a folder CRC is present, so corruption later in the same solid
+    /// block is still detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::PasswordRequired`] if the file is encrypted and no
+    /// password is supplied, [`R7zError::Crc`] for digest mismatches,
+    /// [`R7zError::Decompression`] for codec failures, or [`R7zError::Io`] for
+    /// writer failures.
+    pub fn extract_to_writer_with_password<W: Write + ?Sized>(
+        &self,
+        file_index: usize,
+        writer: &mut W,
+        password: Option<&str>,
+    ) -> Result<u64, R7zError> {
         if file_index >= self.num_files() {
             return Err(R7zError::Parse);
         }
@@ -316,9 +359,88 @@ impl Archive {
             return Err(R7zError::Directory);
         }
         if fi.is_some_and(|f| f.is_empty_stream(file_index) && f.is_empty_file(file_index)) {
-            return Ok(Vec::new());
+            return Ok(0);
         }
 
+        let location = self.extraction_location(file_index)?;
+        let packed = &self.data[location.packed_range.clone()];
+        let mut reader = codec::folder_reader(
+            &location.folder,
+            packed,
+            location.folder_unpack_size,
+            password,
+        )?;
+
+        let mut folder_hasher = location.folder_digest.map(|_| crc32fast::Hasher::new());
+        let mut stream_hasher = location.substream_digest.map(|_| crc32fast::Hasher::new());
+        let mut decoded_len = 0u64;
+        let mut remaining_skip = location.stream_start;
+        let mut remaining_take = location.stream_size;
+        let mut written = 0u64;
+        let mut buf = [0u8; 8192];
+
+        loop {
+            let n = reader.read(&mut buf).map_err(|_| R7zError::Decompression)?;
+            if n == 0 {
+                break;
+            }
+
+            decoded_len = decoded_len.checked_add(n as u64).ok_or(R7zError::Parse)?;
+
+            if let Some(hasher) = folder_hasher.as_mut() {
+                hasher.update(&buf[..n]);
+            }
+
+            let mut offset = 0usize;
+            if remaining_skip > 0 {
+                let skip = remaining_skip.min(n);
+                remaining_skip -= skip;
+                offset += skip;
+            }
+
+            if remaining_skip == 0 && remaining_take > 0 && offset < n {
+                let take = remaining_take.min(n - offset);
+                let bytes = &buf[offset..offset + take];
+                writer.write_all(bytes)?;
+                if let Some(hasher) = stream_hasher.as_mut() {
+                    hasher.update(bytes);
+                }
+                remaining_take -= take;
+                written = written.checked_add(take as u64).ok_or(R7zError::Parse)?;
+            }
+
+            if remaining_skip == 0 && remaining_take == 0 && location.folder_digest.is_none() {
+                break;
+            }
+        }
+
+        if remaining_skip > 0 || remaining_take > 0 {
+            return Err(R7zError::Decompression);
+        }
+
+        if let Some(expected) = location.folder_digest {
+            let actual = folder_hasher.ok_or(R7zError::Parse)?.finalize();
+            if actual != expected {
+                return Err(R7zError::Crc);
+            }
+        }
+
+        if let Some(expected) = location.substream_digest {
+            let actual = stream_hasher.ok_or(R7zError::Parse)?.finalize();
+            if actual != expected {
+                return Err(R7zError::Crc);
+            }
+        }
+
+        if decoded_len < location.stream_end_u64()? {
+            return Err(R7zError::Decompression);
+        }
+
+        Ok(written)
+    }
+
+    fn extraction_location(&self, file_index: usize) -> Result<ExtractionLocation, R7zError> {
+        let fi = self.header.files_info();
         let streams = self.streams_info().ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
@@ -336,7 +458,7 @@ impl Archive {
         )
         .ok_or(R7zError::Parse)?;
 
-        // Decompress the folder
+        // Locate the packed bytes for the folder that contains this file stream.
         let folder = unpack_info.parse_folder(folder_idx)?;
         let prior_pack_sizes = pack_info
             .pack_size
@@ -350,30 +472,29 @@ impl Archive {
         let pack_pos = usize::try_from(pack_info.pack_pos).map_err(|_| R7zError::Parse)?;
         let data_start = checked_add_usize(checked_add_usize(32, pack_pos)?, pack_offset)?;
         let packed_range = checked_range(self.data.len(), data_start, pack_size)?;
-        let packed = &self.data[packed_range];
 
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
-        let decompressed =
-            codec::decompress_folder_with_password(&folder, packed, folder_unpack_size, password)?;
-        validate_digest(
-            unpack_info.digests.get(folder_idx).copied().flatten(),
-            &decompressed,
-        )?;
-
-        // Slice the target stream out of the decompressed folder data
         let stream_start =
             stream_offset_in_folder(folder_idx, stream_in_folder, substream_info, unpack_info)?;
         let stream_size =
             stream_size_at(folder_idx, stream_in_folder, substream_info, unpack_info)?;
-        let stream_range = checked_range(decompressed.len(), stream_start, stream_size as u64)?;
-        let extracted = decompressed[stream_range].to_vec();
-
-        if let Some(si) = substream_info {
+        let folder_digest = unpack_info.digests.get(folder_idx).copied().flatten();
+        let substream_digest = if let Some(si) = substream_info {
             let crc_idx = substream_global_index(folder_idx, stream_in_folder, si)?;
-            validate_digest(si.digests.get(crc_idx).copied().flatten(), &extracted)?;
-        }
+            si.digests.get(crc_idx).copied().flatten()
+        } else {
+            None
+        };
 
-        Ok(extracted)
+        Ok(ExtractionLocation {
+            folder,
+            packed_range,
+            folder_unpack_size,
+            stream_start,
+            stream_size,
+            folder_digest,
+            substream_digest,
+        })
     }
 
     /// Extract all files to a directory.
@@ -422,11 +543,13 @@ impl Archive {
                 }
                 std::fs::File::create(&dest_path)?;
             } else {
-                let bytes = self.extract_to_memory_with_password(i, password)?;
                 if let Some(parent) = dest_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&dest_path, &bytes)?;
+                let file = std::fs::File::create(&dest_path)?;
+                let mut writer = BufWriter::new(file);
+                self.extract_to_writer_with_password(i, &mut writer, password)?;
+                writer.flush()?;
             }
         }
         Ok(())
@@ -434,6 +557,26 @@ impl Archive {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+struct ExtractionLocation {
+    folder: crate::Folder,
+    packed_range: Range<usize>,
+    folder_unpack_size: u64,
+    stream_start: usize,
+    stream_size: usize,
+    folder_digest: Option<u32>,
+    substream_digest: Option<u32>,
+}
+
+impl ExtractionLocation {
+    fn stream_end_u64(&self) -> Result<u64, R7zError> {
+        let end = self
+            .stream_start
+            .checked_add(self.stream_size)
+            .ok_or(R7zError::Parse)?;
+        u64::try_from(end).map_err(|_| R7zError::Parse)
+    }
+}
 
 fn checked_add_usize(lhs: usize, rhs: usize) -> Result<usize, R7zError> {
     lhs.checked_add(rhs).ok_or(R7zError::Parse)
@@ -446,14 +589,6 @@ fn checked_range(total_len: usize, start: usize, len: u64) -> Result<Range<usize
         Ok(start..end)
     } else {
         Err(R7zError::Parse)
-    }
-}
-
-fn validate_digest(expected: Option<u32>, bytes: &[u8]) -> Result<(), R7zError> {
-    if expected.is_some_and(|crc| crc32fast::hash(bytes) != crc) {
-        Err(R7zError::Crc)
-    } else {
-        Ok(())
     }
 }
 

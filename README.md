@@ -50,6 +50,11 @@ if let Some(fi) = archive.files_info() {
 // Directories are reported as R7zError::Directory; zero-byte files return an empty Vec.
 let data = archive.extract_to_memory(0)?;
 println!("{} bytes", data.len());
+
+// Stream a file directly to any writer.
+let mut out = std::fs::File::create("/tmp/first-file.bin")?;
+let written = archive.extract_to_writer(0, &mut out)?;
+println!("{written} bytes written");
 ```
 
 ### Reading — extract all to disk safely
@@ -58,7 +63,8 @@ println!("{} bytes", data.len());
 archive.extract_all(Path::new("/tmp/output"))?;
 ```
 
-`extract_all` creates directories and zero-byte files correctly and rejects unsafe archive paths.
+`extract_all` creates directories and zero-byte files correctly, rejects unsafe archive paths,
+and streams decoded file data to disk instead of buffering full decoded folders in memory.
 
 ### Reading — encrypted archives
 
@@ -144,6 +150,8 @@ let archive = Archive::from_bytes(raw.into())?;
 | `archive.streams_info()` | `Option<&StreamInfo>` | Raw stream/pack metadata |
 | `archive.extract_to_memory(index: usize)` | `Result<Vec<u8>, R7zError>` | Decompress file at `index` (0-based) |
 | `archive.extract_to_memory_with_password(index, password)` | `Result<Vec<u8>, R7zError>` | Decrypt/decompress file at `index` |
+| `archive.extract_to_writer(index, writer)` | `Result<u64, R7zError>` | Stream file at `index` into a writer |
+| `archive.extract_to_writer_with_password(index, writer, password)` | `Result<u64, R7zError>` | Stream encrypted file data into a writer |
 | `archive.extract_all(dest: &Path)` | `Result<(), R7zError>` | Extract all files; creates subdirectories as needed |
 | `archive.extract_all_with_password(dest, password)` | `Result<(), R7zError>` | Extract all files from an encrypted archive |
 
@@ -284,7 +292,8 @@ Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
 LZMA2, and BCJ+x86+LZMA2 archives. The parity target is matching archive
 listing/extraction behavior: file names, file contents, nested paths,
 directories, zero-byte files, and exposed metadata where r7z supports it.
-r7z does not guarantee byte-identical output to p7zip.
+r7z does not guarantee byte-identical archive output, matching compression ratios,
+or matching compressed stream bytes.
 
 LZHAM and Fast LZMA2 variants from p7zip-zstd are not supported.
 
