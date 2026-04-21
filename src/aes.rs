@@ -26,6 +26,9 @@ use sha2::{Digest, Sha256};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
+/// Bound p7zip's default AES KDF cost while rejecting maliciously huge values.
+pub(crate) const MAX_AES_NUM_CYCLES_POWER: u8 = 24;
+
 /// Parsed AES-256-SHA-256 properties from a 7z coder.
 #[derive(Debug)]
 pub(crate) struct AesProperties {
@@ -82,7 +85,11 @@ impl AesProperties {
 ///
 /// The password is first encoded as UTF-16LE. Then for `2^num_cycles_power`
 /// iterations, we feed `salt || password_utf16le || counter_le_8bytes` into SHA-256.
-pub(crate) fn derive_key(password: &str, salt: &[u8], num_cycles_power: u8) -> [u8; 32] {
+pub(crate) fn derive_key(
+    password: &str,
+    salt: &[u8],
+    num_cycles_power: u8,
+) -> Result<[u8; 32], R7zError> {
     // Special case: 0x3F means raw key = salt || password, zero-padded
     if num_cycles_power == 0x3F {
         let pwd_utf16: Vec<u8> = password
@@ -93,7 +100,11 @@ pub(crate) fn derive_key(password: &str, salt: &[u8], num_cycles_power: u8) -> [
         let total: Vec<u8> = salt.iter().chain(pwd_utf16.iter()).copied().collect();
         let len = total.len().min(32);
         key[..len].copy_from_slice(&total[..len]);
-        return key;
+        return Ok(key);
+    }
+
+    if num_cycles_power > MAX_AES_NUM_CYCLES_POWER {
+        return Err(R7zError::Decompression);
     }
 
     let pwd_utf16: Vec<u8> = password
@@ -120,7 +131,7 @@ pub(crate) fn derive_key(password: &str, salt: &[u8], num_cycles_power: u8) -> [
     let result = hasher.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&result);
-    key
+    Ok(key)
 }
 
 /// Decrypt `data` using AES-256-CBC with the given key and IV.
@@ -185,13 +196,21 @@ mod tests {
     fn derive_key_known_value() {
         // With 0 cycles (2^0 = 1 iteration), no salt, we can verify manually.
         // SHA256(password_utf16le || 0x0000000000000000)
-        let key = derive_key("a", &[], 0);
+        let key = derive_key("a", &[], 0).unwrap();
         // "a" in UTF-16LE = [0x61, 0x00]
         // One round: SHA256([0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
         let mut hasher = Sha256::new();
         hasher.update([0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn derive_key_rejects_excessive_cycle_power() {
+        assert!(matches!(
+            derive_key("a", &[], MAX_AES_NUM_CYCLES_POWER + 1),
+            Err(R7zError::Decompression)
+        ));
     }
 
     #[test]

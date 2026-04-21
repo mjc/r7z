@@ -1,4 +1,4 @@
-use crate::{sevenzip_varuint64_decode, Property};
+use crate::{parsers::bitmap_is_set, sevenzip_varuint64_decode, Property};
 use bytes::Bytes;
 use nom::{bytes::complete::take, IResult};
 
@@ -19,6 +19,8 @@ pub struct FilesInfo {
     pub empty_files: Bytes,
     /// Raw bitmap of anti-item flags (empty = all false). Bit `i` = entry `i` is an anti-item.
     pub anti_items: Bytes,
+    /// Mapping from file index to ordinal within the empty-stream bitmap payloads.
+    empty_stream_ordinals: Vec<Option<usize>>,
 }
 
 impl FilesInfo {
@@ -96,10 +98,7 @@ impl FilesInfo {
     }
 
     fn empty_stream_ordinal(&self, i: usize) -> Option<usize> {
-        if !self.is_empty_stream(i) {
-            return None;
-        }
-        Some((0..i).filter(|&idx| self.is_empty_stream(idx)).count())
+        self.empty_stream_ordinals.get(i).copied().flatten()
     }
 
     /// Parse a `FilesInfo` block from the header stream.
@@ -300,6 +299,8 @@ impl FilesInfo {
             }
         }
 
+        let empty_stream_ordinals = empty_stream_ordinals(&empty_streams, n);
+
         Ok((
             input,
             FilesInfo {
@@ -310,15 +311,25 @@ impl FilesInfo {
                 empty_streams,
                 empty_files,
                 anti_items,
+                empty_stream_ordinals,
             },
         ))
     }
 }
 
-fn bitmap_is_set(bitmap: &[u8], index: usize) -> bool {
-    bitmap
-        .get(index / 8)
-        .is_some_and(|b| (b >> (7 - (index % 8))) & 1 == 1)
+fn empty_stream_ordinals(empty_streams: &[u8], num_files: usize) -> Vec<Option<usize>> {
+    let mut next_empty = 0usize;
+    (0..num_files)
+        .map(|i| {
+            if bitmap_is_set(empty_streams, i) {
+                let ordinal = next_empty;
+                next_empty += 1;
+                Some(ordinal)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Walk a `FilesInfo` block without allocating.  Returns `num_files`.
@@ -423,6 +434,7 @@ mod tests {
             empty_streams: Bytes::from_static(&[0b1110_0000]),
             empty_files: Bytes::from_static(&[0b0100_0000]),
             anti_items: Bytes::from_static(&[0b0010_0000]),
+            empty_stream_ordinals: vec![Some(0), Some(1), Some(2), None],
         };
 
         assert!(fi.is_directory(0));

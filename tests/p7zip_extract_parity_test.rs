@@ -101,22 +101,35 @@ fn streaming_extract_reports_corrupt_lzma_and_lzma2_payloads() {
 }
 
 #[test]
-fn streaming_extract_drains_solid_folder_for_late_corruption() {
+fn streaming_extract_stops_after_target_when_folder_crc_is_absent() {
     let mut bytes = r7z::ArchiveBuilder::new()
         .compression(r7z::Codec::Lzma2)
         .add_file("first.txt", b"first")
         .add_file("second.bin", &vec![0xA5u8; 128 * 1024])
         .build()
         .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.clone().into()).unwrap();
+    let folder_digest = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .digests
+        .first()
+        .copied()
+        .flatten();
+    assert!(
+        folder_digest.is_none(),
+        "fixture should not carry a folder CRC"
+    );
     corrupt_late_in_pack_stream(&mut bytes);
 
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let mut out = Vec::new();
-    let err = archive.extract_to_writer(0, &mut out).unwrap_err();
-    assert!(matches!(
-        err,
-        r7z::R7zError::Crc | r7z::R7zError::Decompression
-    ));
+    let written = archive.extract_to_writer(0, &mut out).unwrap();
+    assert_eq!(written, 5);
+    assert_eq!(out, b"first");
 }
 
 fn assert_archive_file_apis_match_source(archive_path: &Path, source_root: &Path, prefix: &str) {

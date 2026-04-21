@@ -408,6 +408,10 @@ impl Archive {
                 remaining_take -= take;
                 written = written.checked_add(take as u64).ok_or(R7zError::Parse)?;
             }
+
+            if remaining_skip == 0 && remaining_take == 0 && location.folder_digest.is_none() {
+                break;
+            }
         }
 
         if remaining_skip > 0 || remaining_take > 0 {

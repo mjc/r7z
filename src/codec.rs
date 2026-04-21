@@ -3,6 +3,8 @@ use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
+const MAX_BUFFERED_AES_BYTES: usize = 256 * 1024 * 1024;
+
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
 ///
 /// `properties` is the 5-byte LZMA properties block to store in `CoderInfo`.
@@ -73,6 +75,17 @@ fn lzma2_dict_size(props: Option<&[u8]>) -> Result<u32, R7zError> {
     } else {
         Ok((2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11))
     }
+}
+
+#[cfg(test)]
+fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, R7zError> {
+    let dict_size = lzma2_dict_size(properties)?;
+    let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
+    let mut output = Vec::new();
+    reader
+        .read_to_end(&mut output)
+        .map_err(|_| R7zError::Decompression)?;
+    Ok(output)
 }
 
 /// Decompress all folders in a Folder chain and return the concatenated output.
@@ -175,16 +188,33 @@ fn coder_reader<'a>(
         let pwd = password.ok_or(R7zError::PasswordRequired)?;
         let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
         let props = crate::aes::AesProperties::parse(props_bytes)?;
-        let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power);
+        let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power)?;
         let mut encrypted = Vec::new();
-        input
-            .read_to_end(&mut encrypted)
-            .map_err(|_| R7zError::Decompression)?;
+        read_to_end_bounded(&mut input, &mut encrypted, MAX_BUFFERED_AES_BYTES)?;
         let decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
         return Ok(Box::new(Cursor::new(decrypted)));
     }
 
     Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
+}
+
+fn read_to_end_bounded(
+    input: &mut dyn Read,
+    output: &mut Vec<u8>,
+    max_len: usize,
+) -> Result<(), R7zError> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = input.read(&mut buf).map_err(|_| R7zError::Decompression)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let new_len = output.len().checked_add(n).ok_or(R7zError::Decompression)?;
+        if new_len > max_len {
+            return Err(R7zError::Decompression);
+        }
+        output.extend_from_slice(&buf[..n]);
+    }
 }
 
 /// Determine the order in which coders should be executed for decompression.

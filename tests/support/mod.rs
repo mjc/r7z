@@ -141,6 +141,18 @@ pub fn assert_trees_equal(expected: &Path, actual: &Path) {
     for entry in expected_entries {
         let expected_path = expected.join(&entry);
         let actual_path = actual.join(&entry);
+        assert_eq!(
+            actual_path.is_dir(),
+            expected_path.is_dir(),
+            "directory type mismatch for {}",
+            entry.display()
+        );
+        assert_eq!(
+            actual_path.is_file(),
+            expected_path.is_file(),
+            "file type mismatch for {}",
+            entry.display()
+        );
         if expected_path.is_file() {
             assert_eq!(
                 fs::read(&actual_path).unwrap(),

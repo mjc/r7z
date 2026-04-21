@@ -40,6 +40,6 @@ pub enum R7zError {
     UnsafePath(String),
 
     /// The requested entry is a directory or anti-item, not a regular file.
-    #[error("entry is a directory")]
+    #[error("entry is a directory or anti-item")]
     Directory,
 }
