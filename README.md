@@ -100,6 +100,29 @@ let bytes = ArchiveBuilder::new()
     .build()?;
 ```
 
+### Writing metadata and encoded headers
+
+```rust
+use r7z::{ArchiveBuilder, ArchiveOptions, EntryMeta, HeaderMode};
+use std::time::{Duration, UNIX_EPOCH};
+
+let meta = EntryMeta {
+    mtime: Some(UNIX_EPOCH + Duration::from_secs(1_710_504_000)),
+    start_pos: Some(0),
+    ..EntryMeta::from_unix_mode(0o100_644)
+};
+
+let bytes = ArchiveBuilder::new()
+    .options(ArchiveOptions {
+        header_mode: HeaderMode::Encoded,
+        ..ArchiveOptions::default()
+    })
+    .add_file_entry("metadata.txt", b"with metadata", meta)
+    .build()?;
+```
+
+`EntryMeta::attributes` stores raw 7z `WinAttrib` values. `EntryMeta::from_unix_mode(mode)` sets `(mode << 16) | 0x20`, `EntryMeta::directory_unix_mode(mode)` sets `(mode << 16) | 0x10`, and `EntryMeta::archive_file()` sets `0x20`.
+
 ### Building a BCJ+x86+LZMA2 archive
 
 ```rust
@@ -131,6 +154,7 @@ let encrypted_bytes = ArchiveBuilder::new()
 ```
 
 Set `EncryptionOptions::encrypt_header = true` to hide filenames and metadata until the password is supplied.
+`EncryptionOptions::default_for_password(password)` uses p7zip-compatible writer defaults: cycle power 19, no salt, and a random 16-byte IV. Non-default salt and IV lengths up to 16 bytes are also supported.
 
 ### Writer API — file-backed archive creation
 
