@@ -1244,3 +1244,85 @@ fn archive_builder_aes_encrypted_header_p7zip_and_r7z_require_password() {
         b"hidden payload"
     );
 }
+
+#[test]
+fn archive_builder_empty_only_encrypted_header_p7zip_and_r7z_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("empty_aes_header.7z");
+    let mut enc = r7z::EncryptionOptions::default_for_password("HeaderSecret");
+    enc.encrypt_header = true;
+    let options = r7z::ArchiveOptions {
+        encryption: Some(enc),
+        ..Default::default()
+    };
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(options)
+        .add_directory("emptydir", r7z::EntryMeta::directory_unix_mode(0o040_755))
+        .add_empty_file("emptydir/empty.txt", r7z::EntryMeta::archive_file())
+        .add_anti_item("removed.txt", r7z::EntryMeta::default())
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let err = match r7z::Archive::open(&archive_path) {
+        Ok(_) => panic!("encrypted empty header opened without password"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, r7z::R7zError::PasswordRequired));
+
+    let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
+    assert!(archive.streams_info().is_none());
+    let fi = archive.files_info().unwrap();
+    assert_eq!(archive.num_files(), 3);
+    assert!(fi.is_directory(0));
+    assert!(fi.is_empty_file(1));
+    assert!(fi.is_anti(2));
+    assert_eq!(
+        archive
+            .extract_to_memory_with_password(1, Some("HeaderSecret"))
+            .unwrap(),
+        b""
+    );
+
+    let no_password = run_7z(&["l", archive_path.to_str().unwrap()], dir);
+    assert!(!no_password.status.success());
+
+    let listing = run_7z(
+        &["l", "-pHeaderSecret", archive_path.to_str().unwrap()],
+        dir,
+    );
+    assert!(
+        listing.status.success(),
+        "7z l failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&listing.stdout),
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing_stdout = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing_stdout.contains("emptydir/empty.txt"));
+    assert!(listing_stdout.contains("removed.txt"));
+
+    let out_dir = dir.join("out");
+    let out_arg = format!("-o{}", out_dir.to_str().unwrap());
+    let out = run_7z(
+        &[
+            "x",
+            "-y",
+            "-pHeaderSecret",
+            archive_path.to_str().unwrap(),
+            &out_arg,
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z x failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_dir.join("emptydir").is_dir());
+    assert_eq!(
+        std::fs::read(out_dir.join("emptydir/empty.txt")).unwrap(),
+        b""
+    );
+}
