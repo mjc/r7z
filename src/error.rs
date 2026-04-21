@@ -42,4 +42,8 @@ pub enum R7zError {
     /// The requested entry is a directory or anti-item, not a regular file.
     #[error("entry is a directory or anti-item")]
     Directory,
+
+    /// A writer option is outside the range supported by the 7z format.
+    #[error("invalid archive option: {0}")]
+    InvalidOptions(&'static str),
 }

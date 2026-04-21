@@ -183,6 +183,18 @@ struct AesMaterial {
 }
 
 fn make_aes_material(options: &EncryptionOptions) -> Result<AesMaterial, R7zError> {
+    if options.num_cycles_power > 0x3F {
+        return Err(R7zError::InvalidOptions(
+            "AES num_cycles_power must be <= 63",
+        ));
+    }
+    if options.salt_len > 16 {
+        return Err(R7zError::InvalidOptions("AES salt_len must be <= 16"));
+    }
+    if options.iv_len > 16 {
+        return Err(R7zError::InvalidOptions("AES iv_len must be <= 16"));
+    }
+
     let mut salt = vec![0u8; usize::from(options.salt_len)];
     let mut iv_bytes = vec![0u8; usize::from(options.iv_len)];
     if !salt.is_empty() {

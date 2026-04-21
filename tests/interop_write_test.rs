@@ -864,6 +864,46 @@ fn archive_builder_aes_content_p7zip_and_r7z_extract_with_password() {
 }
 
 #[test]
+fn archive_builder_rejects_invalid_aes_options() {
+    let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
+    enc.salt_len = 17;
+    let err = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("secret.txt", b"classified")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
+
+    let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
+    enc.iv_len = 17;
+    let err = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("secret.txt", b"classified")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
+
+    let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
+    enc.num_cycles_power = 64;
+    enc.encrypt_header = true;
+    let err = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("secret.txt", b"classified")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
+}
+
+#[test]
 fn archive_builder_aes_encrypted_header_p7zip_and_r7z_require_password() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
