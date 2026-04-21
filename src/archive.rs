@@ -124,9 +124,8 @@ impl Read for ArchiveRangeReader<'_> {
             return Ok(0);
         }
         let remaining = self.end - self.pos;
-        let n = usize::try_from(remaining.min(buf.len() as u64)).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "range too large")
-        })?;
+        let n = usize::try_from(remaining.min(buf.len() as u64))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "range too large"))?;
         self.source
             .read_exact_at(self.pos, &mut buf[..n])
             .map_err(std::io::Error::other)?;
@@ -663,7 +662,8 @@ impl Archive {
             acc.checked_add(size).ok_or(R7zError::Parse)
         })?;
         let pack_size = *pack_info.pack_size.get(folder_idx).ok_or(R7zError::Parse)?;
-        let data_start = checked_add_u64(checked_add_u64(32, pack_info.pack_pos)?, pack_offset_u64)?;
+        let data_start =
+            checked_add_u64(checked_add_u64(32, pack_info.pack_pos)?, pack_offset_u64)?;
         let packed_range = checked_range_u64(self.source.len()?, data_start, pack_size)?;
 
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;

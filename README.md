@@ -57,6 +57,11 @@ let written = archive.extract_to_writer(0, &mut out)?;
 println!("{written} bytes written");
 ```
 
+`Archive::open` is file-backed and uses `mmap` by default, so opening a large
+archive does not allocate a heap buffer for the full file. Use
+`ArchiveOpenOptions { storage_mode: ArchiveStorageMode::Seek, ..Default::default() }`
+when mmap is undesirable.
+
 ### Reading — extract all to disk safely
 
 ```rust
@@ -172,7 +177,33 @@ let entries = vec![
 build_streaming(entries, out_file)?;
 ```
 
-### Parsing from an in-memory buffer
+### Parsing from a seekable reader or in-memory buffer
+
+7z archives require random access. `Archive::from_reader` accepts `Read + Seek`
+sources such as `std::io::Cursor<Vec<u8>>` or `std::fs::File`; non-seekable
+streams should be spooled by the caller before opening.
+
+```rust
+let file = std::fs::File::open("example.7z")?;
+let archive = Archive::from_reader(file)?;
+```
+
+`ArchiveOpenOptions` controls file-backed storage mode and metadata limits:
+
+```rust
+use r7z::{Archive, ArchiveOpenOptions, ArchiveStorageMode};
+use std::path::Path;
+
+let archive = Archive::open_with_options(
+    Path::new("example.7z"),
+    ArchiveOpenOptions {
+        storage_mode: ArchiveStorageMode::Seek,
+        max_metadata_bytes: 64 * 1024 * 1024,
+    },
+)?;
+```
+
+For explicitly in-memory archives, use `Archive::from_bytes`:
 
 ```rust
 let raw: Vec<u8> = std::fs::read("example.7z")?;
@@ -185,10 +216,11 @@ let archive = Archive::from_bytes(raw.into())?;
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `Archive::open(path: &Path)` | `Result<Archive, R7zError>` | Read and fully decode a `.7z` file from disk |
+| `Archive::open(path: &Path)` | `Result<Archive, R7zError>` | File-backed open using mmap by default |
 | `Archive::open_with_password(path, password)` | `Result<Archive, R7zError>` | Open an archive with encrypted headers |
-| `Archive::from_reader(reader)` | `Result<Archive, R7zError>` | Buffer and decode any `Read` source |
-| `Archive::from_reader_with_password(reader, password)` | `Result<Archive, R7zError>` | Buffer and decode a password-protected `Read` source |
+| `Archive::open_with_options(path, options)` | `Result<Archive, R7zError>` | Open with mmap/seek storage and metadata limits |
+| `Archive::from_reader(reader)` | `Result<Archive, R7zError>` | Decode a seekable `Read + Seek` source |
+| `Archive::from_reader_with_password(reader, password)` | `Result<Archive, R7zError>` | Decode a password-protected seekable source |
 | `Archive::from_bytes(data: bytes::Bytes)` | `Result<Archive, R7zError>` | Decode a `.7z` from an in-memory buffer |
 | `Archive::from_bytes_with_password(data, password)` | `Result<Archive, R7zError>` | Decode password-protected bytes |
 | `archive.num_files()` | `usize` | Number of entries (files and directories) |
@@ -296,6 +328,7 @@ pub enum Codec {
 | `R7zError::WrongPassword` | Reserved for password-specific failures |
 | `R7zError::UnsafePath(String)` | Extracted path would escape the destination |
 | `R7zError::Directory` | Requested entry is a directory or anti-item |
+| `R7zError::LimitExceeded(&'static str)` | Configured metadata or safety limit was exceeded |
 
 **Error handling example:**
 
@@ -350,6 +383,12 @@ These are public but primarily used for building advanced tooling:
 **7z specification:** [7zFormat.txt](https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt)
 
 Archives written by r7z use format version 0.4 (standard). Multi-entry archives use EncodedHeader by default, matching p7zip behavior, and are fully readable by 7-Zip ≥ 9.x and p7zip.
+
+`extract_to_writer` streams decoded file data into the supplied writer and is
+the preferred low-allocation extraction API. `extract_to_memory` intentionally
+allocates the requested file contents. AES-encrypted extraction still buffers
+the encrypted pack stream internally before AES-CBC decryption; streaming AES is
+a planned hardening follow-up.
 
 Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
 LZMA2, and BCJ+x86+LZMA2 archives. The parity target is matching archive

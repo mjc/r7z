@@ -19,6 +19,22 @@
 //! let bytes = archive.extract_to_memory_with_password(0, Some("pass")).unwrap();
 //! ```
 //!
+//! `Archive::open` is file-backed by default. Generic reader input must be
+//! seekable because 7z stores stream data and authoritative metadata in
+//! different file regions:
+//!
+//! ```compile_fail
+//! struct NetworkStream;
+//!
+//! impl std::io::Read for NetworkStream {
+//!     fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+//!         Ok(0)
+//!     }
+//! }
+//!
+//! let _archive = r7z::Archive::from_reader(NetworkStream).unwrap();
+//! ```
+//!
 //! `Archive::extract_all` rejects unsafe paths such as absolute names, parent
 //! directory traversal, and Windows-prefixed paths. Directory entries and zero-byte
 //! files are handled distinctly.
