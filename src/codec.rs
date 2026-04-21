@@ -139,7 +139,7 @@ fn decompress_lzma(
 }
 
 fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, R7zError> {
-    let dict_size = lzma2_dict_size(properties);
+    let dict_size = lzma2_dict_size(properties)?;
     let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
     let mut output = Vec::new();
     reader
@@ -152,12 +152,21 @@ fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, 
 ///
 /// The 7z spec encodes: `dict_size = (2 | (p & 1)) << ((p >> 1) + 11)` for p < 40,
 /// and `u32::MAX` for p == 40 (meaning "as large as needed").
-fn lzma2_dict_size(props: Option<&[u8]>) -> u32 {
-    let p = props.and_then(|b| b.first().copied()).unwrap_or(40);
-    if p >= 40 {
-        u32::MAX
+fn lzma2_dict_size(props: Option<&[u8]>) -> Result<u32, R7zError> {
+    let Some(props) = props else {
+        return Ok(u32::MAX);
+    };
+    if props.len() != 1 {
+        return Err(R7zError::Decompression);
+    }
+
+    let p = props[0];
+    if p > 40 {
+        Err(R7zError::Decompression)
+    } else if p == 40 {
+        Ok(u32::MAX)
     } else {
-        (2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11)
+        Ok((2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11))
     }
 }
 
@@ -315,4 +324,44 @@ fn coder_execution_order(folder: &crate::Folder) -> Result<SmallVec<[usize; 4]>,
     }
 
     Ok(order)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compress_lzma, decompress_lzma2, lzma2_dict_size};
+    use crate::R7zError;
+
+    #[test]
+    fn lzma_property_block_is_exactly_five_bytes() {
+        let (props, _) = compress_lzma(b"property block").unwrap();
+        assert_eq!(props.len(), 5);
+    }
+
+    #[test]
+    fn lzma2_dict_size_decodes_p7zip_property_values() {
+        assert_eq!(lzma2_dict_size(Some(&[8])).unwrap(), 64 * 1024);
+        assert_eq!(lzma2_dict_size(Some(&[16])).unwrap(), 1024 * 1024);
+        assert_eq!(lzma2_dict_size(Some(&[24])).unwrap(), 16 * 1024 * 1024);
+        assert_eq!(lzma2_dict_size(Some(&[28])).unwrap(), 64 * 1024 * 1024);
+        assert_eq!(lzma2_dict_size(Some(&[40])).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn lzma2_property_values_zero_through_forty_decode_empty_stream() {
+        for prop in 0u8..=40 {
+            let decoded = decompress_lzma2(Some(&[prop]), &[0x00]).unwrap();
+            assert!(decoded.is_empty(), "property {prop} decoded non-empty data");
+        }
+    }
+
+    #[test]
+    fn unsupported_lzma2_property_shapes_return_decompression_errors() {
+        for props in [&[][..], &[0x1c, 0x00][..], &[41][..]] {
+            let err = lzma2_dict_size(Some(props)).unwrap_err();
+            assert!(matches!(err, R7zError::Decompression));
+
+            let err = decompress_lzma2(Some(props), &[0x00]).unwrap_err();
+            assert!(matches!(err, R7zError::Decompression));
+        }
+    }
 }

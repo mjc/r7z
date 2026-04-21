@@ -40,6 +40,10 @@ pub fn bcj_x86_convert(data: &mut [u8], ip: u32, state: &mut u32, encoding: bool
     let mut prev_mask: u32 = *state & 0x7;
 
     loop {
+        if buf_pos >= limit {
+            break;
+        }
+
         // Scan for E8 (CALL) or E9 (JMP) starting at buf_pos
         let found = data[buf_pos..limit]
             .iter()
