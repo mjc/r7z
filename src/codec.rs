@@ -3,6 +3,10 @@ use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
+// Cap how much encrypted data we buffer before AES-CBC decryption to avoid
+// unbounded memory growth on malicious or unexpectedly large inputs. Encrypted
+// pack streams larger than this fail to decode; if that becomes a compatibility
+// issue, this should become configurable or derived from validated metadata.
 const MAX_BUFFERED_AES_BYTES: usize = 256 * 1024 * 1024;
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
@@ -90,8 +94,9 @@ fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, 
 
 /// Decompress all folders in a Folder chain and return the concatenated output.
 ///
-/// For simple single-coder folders this just calls `decompress` once.
-/// BCJ+LZMA chaining (bind pairs) is resolved in order.
+/// This is the compatibility wrapper around the internal folder reader: it
+/// builds the reader chain for the folder, drains it, and returns the decoded
+/// bytes.
 ///
 /// # Errors
 ///
