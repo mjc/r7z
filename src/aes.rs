@@ -7,7 +7,7 @@
 //!
 //! | Byte | Bits   | Meaning                                        |
 //! |------|--------|------------------------------------------------|
-//! | 0    | \[5:0\]  | NumCyclesPower (0–62, or 0x3F for raw key)   |
+//! | 0    | \[5:0\]  | `NumCyclesPower` (0–62, or 0x3F for raw key) |
 //! | 0    | \[6\]    | IV present flag                              |
 //! | 0    | \[7\]    | Salt present flag                            |
 //! | 1*   | \[7:4\]  | Extra salt bytes (if salt flag set)          |
@@ -16,15 +16,16 @@
 //!
 //! \* Byte 1 is only present if either the salt or IV flag is set.
 //!
-//! Salt size = ((byte0 >> 7) & 1) + (byte1 >> 4)  
+//! Salt size = ((byte0 >> 7) & 1) + (byte1 >> 4)\
 //! IV size   = ((byte0 >> 6) & 1) + (byte1 & 0x0F)
 
 use crate::R7zError;
 use aes::Aes256;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use sha2::{Digest, Sha256};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
+type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
 /// Bound p7zip's default AES KDF cost while rejecting maliciously huge values.
 pub(crate) const MAX_AES_NUM_CYCLES_POWER: u8 = 24;
@@ -32,7 +33,7 @@ pub(crate) const MAX_AES_NUM_CYCLES_POWER: u8 = 24;
 /// Parsed AES-256-SHA-256 properties from a 7z coder.
 #[derive(Debug)]
 pub(crate) struct AesProperties {
-    /// Number of SHA-256 iterations = 2^num_cycles_power.
+    /// Number of SHA-256 iterations = `2^num_cycles_power`.
     pub num_cycles_power: u8,
     /// Salt (0..16 bytes).
     pub salt: Vec<u8>,
@@ -92,10 +93,7 @@ pub(crate) fn derive_key(
 ) -> Result<[u8; 32], R7zError> {
     // Special case: 0x3F means raw key = salt || password, zero-padded
     if num_cycles_power == 0x3F {
-        let pwd_utf16: Vec<u8> = password
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect();
+        let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let mut key = [0u8; 32];
         let total: Vec<u8> = salt.iter().chain(pwd_utf16.iter()).copied().collect();
         let len = total.len().min(32);
@@ -107,10 +105,7 @@ pub(crate) fn derive_key(
         return Err(R7zError::Decompression);
     }
 
-    let pwd_utf16: Vec<u8> = password
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
+    let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
 
     let num_rounds: u64 = 1u64 << num_cycles_power;
 
@@ -156,6 +151,43 @@ pub(crate) fn decrypt_aes256_cbc(
         .map_err(|_| R7zError::Decompression)?;
 
     Ok(buf)
+}
+
+pub(crate) fn encode_aes_properties(num_cycles_power: u8, salt: &[u8], iv: &[u8]) -> Vec<u8> {
+    assert!(salt.len() <= 16, "7z AES salt must be at most 16 bytes");
+    assert!(iv.len() <= 16, "7z AES IV must be at most 16 bytes");
+    let mut props = Vec::with_capacity(2 + salt.len() + iv.len());
+    let has_salt = !salt.is_empty();
+    let has_iv = !iv.is_empty();
+    props.push(
+        (num_cycles_power & 0x3F) | if has_salt { 0x80 } else { 0 } | if has_iv { 0x40 } else { 0 },
+    );
+    if has_salt || has_iv {
+        let salt_extra = salt.len().saturating_sub(usize::from(has_salt));
+        let iv_extra = iv.len().saturating_sub(usize::from(has_iv));
+        let salt_extra = u8::try_from(salt_extra).expect("salt length checked");
+        let iv_extra = u8::try_from(iv_extra).expect("IV length checked");
+        props.push((salt_extra << 4) | iv_extra);
+        props.extend_from_slice(salt);
+        props.extend_from_slice(iv);
+    }
+    props
+}
+
+pub(crate) fn encrypt_aes256_cbc_zero_pad(
+    data: &[u8],
+    key: &[u8; 32],
+    iv: &[u8; 16],
+) -> Result<Vec<u8>, R7zError> {
+    let padded_len = data.len().next_multiple_of(16);
+    let padded_len = padded_len.max(16);
+    let mut buf = vec![0u8; padded_len];
+    buf[..data.len()].copy_from_slice(data);
+    let encryptor = Aes256CbcEnc::new(key.into(), iv.into());
+    let out = encryptor
+        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, padded_len)
+        .map_err(|_| R7zError::Decompression)?;
+    Ok(out.to_vec())
 }
 
 #[cfg(test)]
@@ -232,5 +264,29 @@ mod tests {
 
         let decrypted = decrypt_aes256_cbc(&ciphertext, &key, &iv).unwrap();
         assert_eq!(&decrypted, plaintext);
+    }
+
+    #[test]
+    fn encode_aes_properties_parse_roundtrip() {
+        let salt = [0xAA, 0xBB, 0xCC, 0xDD];
+        let iv = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let props = encode_aes_properties(19, &salt, &iv);
+        let parsed = AesProperties::parse(&props).unwrap();
+        assert_eq!(parsed.num_cycles_power, 19);
+        assert_eq!(parsed.salt, salt);
+        assert_eq!(parsed.iv, iv);
+    }
+
+    #[test]
+    fn encrypt_zero_pad_decrypt_truncates_to_original() {
+        let key = [0x33u8; 32];
+        let iv = [0x44u8; 16];
+        let plaintext = b"not a block multiple";
+        let encrypted = encrypt_aes256_cbc_zero_pad(plaintext, &key, &iv).unwrap();
+        assert!(encrypted.len().is_multiple_of(16));
+
+        let mut decrypted = decrypt_aes256_cbc(&encrypted, &key, &iv).unwrap();
+        decrypted.truncate(plaintext.len());
+        assert_eq!(decrypted, plaintext);
     }
 }

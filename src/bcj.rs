@@ -26,6 +26,7 @@ fn test86_msb(b: u8) -> bool {
 ///
 /// Returns the number of bytes that were fully processed.  Trailing bytes
 /// (fewer than 5) are left untouched and should be prepended to the next call.
+#[allow(clippy::cast_possible_truncation)]
 pub fn bcj_x86_convert(data: &mut [u8], ip: u32, state: &mut u32, encoding: bool) -> usize {
     let size = data.len();
     let mut pos: usize = 0;
@@ -201,6 +202,7 @@ pub fn bcj_x86_encode(data: &mut [u8]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::pedantic)]
 mod tests {
     use super::*;
 

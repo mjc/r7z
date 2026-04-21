@@ -131,6 +131,11 @@ impl Archive {
     /// Fully read a [`Read`] source and decode it as a 7z archive, with a password.
     ///
     /// See [`Archive::from_reader`] and [`Archive::open_with_password`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Io`] if reading fails, [`R7zError::PasswordRequired`]
+    /// if encrypted headers need a password, or a parse/CRC error if malformed.
     pub fn from_reader_with_password(
         mut reader: impl Read,
         password: Option<&str>,
@@ -229,8 +234,13 @@ impl Archive {
                 if unpack_size > MAX_HEADER_UNPACK_BYTES {
                     return Err(R7zError::Parse);
                 }
-                let decompressed =
-                    codec::decompress_folder_with_password(&folder, packed, unpack_size, password)?;
+                let decompressed = codec::decompress_folder_with_password_and_sizes(
+                    &folder,
+                    packed,
+                    unpack_size,
+                    &ui.unpack_sizes,
+                    password,
+                )?;
                 let decompressed = Bytes::from(decompressed);
 
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
@@ -364,10 +374,11 @@ impl Archive {
 
         let location = self.extraction_location(file_index)?;
         let packed = &self.data[location.packed_range.clone()];
-        let mut reader = codec::folder_reader(
+        let mut reader = codec::folder_reader_with_sizes(
             &location.folder,
             packed,
             location.folder_unpack_size,
+            &location.coder_unpack_sizes,
             password,
         )?;
 
@@ -474,6 +485,7 @@ impl Archive {
         let packed_range = checked_range(self.data.len(), data_start, pack_size)?;
 
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
+        let coder_unpack_sizes = folder_coder_unpack_sizes(folder_idx, unpack_info)?;
         let stream_start =
             stream_offset_in_folder(folder_idx, stream_in_folder, substream_info, unpack_info)?;
         let stream_size =
@@ -490,6 +502,7 @@ impl Archive {
             folder,
             packed_range,
             folder_unpack_size,
+            coder_unpack_sizes,
             stream_start,
             stream_size,
             folder_digest,
@@ -562,6 +575,7 @@ struct ExtractionLocation {
     folder: crate::Folder,
     packed_range: Range<usize>,
     folder_unpack_size: u64,
+    coder_unpack_sizes: Vec<u64>,
     stream_start: usize,
     stream_size: usize,
     folder_digest: Option<u32>,
@@ -590,6 +604,23 @@ fn checked_range(total_len: usize, start: usize, len: u64) -> Result<Range<usize
     } else {
         Err(R7zError::Parse)
     }
+}
+
+fn folder_coder_unpack_sizes(
+    folder_idx: usize,
+    unpack_info: &crate::UnpackInfo,
+) -> Result<Vec<u64>, R7zError> {
+    let mut global_base = 0usize;
+    for i in 0..folder_idx {
+        global_base += unpack_info.parse_folder(i)?.total_out_streams();
+    }
+    let folder = unpack_info.parse_folder(folder_idx)?;
+    let num = folder.total_out_streams();
+    unpack_info
+        .unpack_sizes
+        .get(global_base..global_base + num)
+        .map(<[u64]>::to_vec)
+        .ok_or(R7zError::Parse)
 }
 
 fn safe_archive_path(dest: &Path, name: &str) -> Result<Option<PathBuf>, R7zError> {
@@ -701,29 +732,28 @@ fn folder_total_unpack_size(
                 .get(global_base)
                 .copied()
                 .ok_or(R7zError::Parse);
-        } else {
-            // Multi-coder: find the out-stream NOT bound as an output in any bind pair
-            // (the one that produces the final decompressed data).
-            for out_idx in 0..num_out {
-                let is_bound = folder
-                    .bind_pairs
-                    .iter()
-                    .any(|&(_, bound_out)| bound_out == out_idx as u64);
-                if !is_bound {
-                    return unpack_info
-                        .unpack_sizes
-                        .get(global_base + out_idx)
-                        .copied()
-                        .ok_or(R7zError::Parse);
-                }
-            }
-            // Fallback: last out-stream
-            return unpack_info
-                .unpack_sizes
-                .get(global_base + num_out - 1)
-                .copied()
-                .ok_or(R7zError::Parse);
         }
+        // Multi-coder: find the out-stream NOT bound as an output in any bind pair
+        // (the one that produces the final decompressed data).
+        for out_idx in 0..num_out {
+            let is_bound = folder
+                .bind_pairs
+                .iter()
+                .any(|&(_, bound_out)| bound_out == out_idx as u64);
+            if !is_bound {
+                return unpack_info
+                    .unpack_sizes
+                    .get(global_base + out_idx)
+                    .copied()
+                    .ok_or(R7zError::Parse);
+            }
+        }
+        // Fallback: last out-stream
+        return unpack_info
+            .unpack_sizes
+            .get(global_base + num_out - 1)
+            .copied()
+            .ok_or(R7zError::Parse);
     }
 
     // Legacy fallback: try direct index

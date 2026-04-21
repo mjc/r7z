@@ -9,8 +9,14 @@ pub struct FilesInfo {
     pub num_files: u64,
     /// Raw UTF-16LE null-terminated name block (empty = no Name property present).
     name_data: Bytes,
+    /// Creation timestamps as Windows FILETIME values (100ns intervals since 1601-01-01).
+    pub ctimes: Vec<Option<u64>>,
+    /// Last-access timestamps as Windows FILETIME values (100ns intervals since 1601-01-01).
+    pub atimes: Vec<Option<u64>>,
     /// Last-modified timestamps as Windows FILETIME values (100ns intervals since 1601-01-01).
     pub mtimes: Vec<Option<u64>>,
+    /// Per-entry start positions.
+    pub start_positions: Vec<Option<u64>>,
     /// Windows file attributes per entry.
     pub attributes: Vec<Option<u32>>,
     /// Raw bitmap of empty-stream flags (empty = all false). Bit `i` = entry `i` has no data stream.
@@ -133,7 +139,10 @@ impl FilesInfo {
 
         // Lazy init: no allocations until the relevant property is seen.
         let mut name_data = Bytes::new();
+        let mut ctimes: Vec<Option<u64>> = Vec::new();
+        let mut atimes: Vec<Option<u64>> = Vec::new();
         let mut mtimes: Vec<Option<u64>> = Vec::new();
+        let mut start_positions: Vec<Option<u64>> = Vec::new();
         let mut attributes: Vec<Option<u32>> = Vec::new();
         let mut empty_streams = Bytes::new();
         let mut empty_files = Bytes::new();
@@ -164,7 +173,7 @@ impl FilesInfo {
                     name_data = backing.slice_ref(&block[1..]);
                     input = i;
                 }
-                Property::MTime => {
+                Property::CTime | Property::ATime | Property::MTime | Property::StartPos => {
                     let (i, size) = sevenzip_varuint64_decode(input)?;
                     let sz = usize::try_from(size).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(
@@ -173,37 +182,13 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    if block.is_empty() {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::Eof,
-                        )));
-                    }
-                    let all_defined = block[0];
-                    // Layout: all_defined [bitmap if !all_defined] external [data...]
-                    // external byte position: 1 (all_defined) or 1+nb (all_defined + bitmap)
-                    let (data_start, num_bytes) = if all_defined != 0 {
-                        (2usize, 0usize) // skip all_defined + external
-                    } else {
-                        let nb = n.div_ceil(8);
-                        (2 + nb, nb) // skip all_defined + bitmap + external
-                    };
-                    let bitmap = if all_defined != 0 {
-                        &[][..]
-                    } else {
-                        &block[1..=num_bytes]
-                    };
-                    mtimes = Vec::with_capacity(n.min(block.len() / 8));
-                    let mut pos = data_start;
-                    for j in 0..n {
-                        let is_def = all_defined != 0 || bitmap_is_set(bitmap, j);
-                        if is_def && pos + 8 <= block.len() {
-                            let val = u64::from_le_bytes(block[pos..pos + 8].try_into().unwrap());
-                            mtimes.push(Some(val));
-                            pos += 8;
-                        } else {
-                            mtimes.push(None);
-                        }
+                    let values = parse_defined_u64_property(input, block, n)?;
+                    match tag {
+                        Property::CTime => ctimes = values,
+                        Property::ATime => atimes = values,
+                        Property::MTime => mtimes = values,
+                        Property::StartPos => start_positions = values,
+                        _ => unreachable!(),
                     }
                     input = i;
                 }
@@ -216,37 +201,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    if block.is_empty() {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::Eof,
-                        )));
-                    }
-                    let all_defined = block[0];
-                    // Layout: all_defined [bitmap if !all_defined] external [data...]
-                    let (data_start, num_bytes) = if all_defined != 0 {
-                        (2usize, 0usize) // skip all_defined + external
-                    } else {
-                        let nb = n.div_ceil(8);
-                        (2 + nb, nb) // skip all_defined + bitmap + external
-                    };
-                    let bitmap = if all_defined != 0 {
-                        &[][..]
-                    } else {
-                        &block[1..=num_bytes]
-                    };
-                    attributes = Vec::with_capacity(n.min(block.len() / 4));
-                    let mut pos = data_start;
-                    for j in 0..n {
-                        let is_def = all_defined != 0 || bitmap_is_set(bitmap, j);
-                        if is_def && pos + 4 <= block.len() {
-                            let val = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap());
-                            attributes.push(Some(val));
-                            pos += 4;
-                        } else {
-                            attributes.push(None);
-                        }
-                    }
+                    attributes = parse_defined_u32_property(input, block, n)?;
                     input = i;
                 }
                 Property::EmptyStream => {
@@ -306,7 +261,10 @@ impl FilesInfo {
             FilesInfo {
                 num_files,
                 name_data,
+                ctimes,
+                atimes,
                 mtimes,
+                start_positions,
                 attributes,
                 empty_streams,
                 empty_files,
@@ -330,6 +288,99 @@ fn empty_stream_ordinals(empty_streams: &[u8], num_files: usize) -> Vec<Option<u
             }
         })
         .collect()
+}
+
+type ParseError<'a> = nom::Err<nom::error::Error<&'a [u8]>>;
+type DefinedPropertyLayout<'b> = (u8, &'b [u8], usize);
+
+fn defined_property_layout<'a, 'b>(
+    error_input: &'a [u8],
+    block: &'b [u8],
+    num_values: usize,
+) -> Result<DefinedPropertyLayout<'b>, ParseError<'a>> {
+    if block.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Eof,
+        )));
+    }
+
+    let all_defined = block[0];
+    if all_defined != 0 {
+        if block.len() < 2 {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                error_input,
+                nom::error::ErrorKind::Eof,
+            )));
+        }
+        return Ok((all_defined, &[], 2));
+    }
+
+    let bitmap_len = num_values.div_ceil(8);
+    let data_start = 2 + bitmap_len;
+    if block.len() < data_start {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Eof,
+        )));
+    }
+
+    let bitmap_end = 1 + bitmap_len;
+    Ok((all_defined, &block[1..bitmap_end], data_start))
+}
+
+fn parse_defined_u64_property<'a>(
+    error_input: &'a [u8],
+    block: &[u8],
+    num_values: usize,
+) -> Result<Vec<Option<u64>>, ParseError<'a>> {
+    let (all_defined, bitmap, mut pos) = defined_property_layout(error_input, block, num_values)?;
+    let mut values = Vec::with_capacity(num_values);
+    for index in 0..num_values {
+        let is_defined = all_defined != 0 || bitmap_is_set(bitmap, index);
+        if is_defined {
+            if pos + 8 > block.len() {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    error_input,
+                    nom::error::ErrorKind::Eof,
+                )));
+            }
+            values.push(Some(u64::from_le_bytes(
+                block[pos..pos + 8].try_into().unwrap(),
+            )));
+            pos += 8;
+        } else {
+            values.push(None);
+        }
+    }
+    Ok(values)
+}
+
+fn parse_defined_u32_property<'a>(
+    error_input: &'a [u8],
+    block: &[u8],
+    num_values: usize,
+) -> Result<Vec<Option<u32>>, ParseError<'a>> {
+    let (all_defined, bitmap, mut pos) = defined_property_layout(error_input, block, num_values)?;
+    let mut values = Vec::with_capacity(num_values);
+    for index in 0..num_values {
+        let is_defined = all_defined != 0 || bitmap_is_set(bitmap, index);
+        if is_defined {
+            if pos + 4 > block.len() {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    error_input,
+                    nom::error::ErrorKind::Eof,
+                )));
+            }
+            values.push(Some(u32::from_le_bytes(
+                block[pos..pos + 4].try_into().unwrap(),
+            )));
+            pos += 4;
+        } else {
+            values.push(None);
+        }
+    }
+    Ok(values)
 }
 
 /// Walk a `FilesInfo` block without allocating.  Returns `num_files`.
@@ -429,7 +480,10 @@ mod tests {
         let fi = FilesInfo {
             num_files: 4,
             name_data: Bytes::new(),
+            ctimes: Vec::new(),
+            atimes: Vec::new(),
             mtimes: Vec::new(),
+            start_positions: Vec::new(),
             attributes: Vec::new(),
             empty_streams: Bytes::from_static(&[0b1110_0000]),
             empty_files: Bytes::from_static(&[0b0100_0000]),

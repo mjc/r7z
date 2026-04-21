@@ -394,6 +394,7 @@ fn archive_writer_mtime_r7z_reads() {
     let meta = r7z::EntryMeta {
         mtime: Some(ts),
         unix_mode: None,
+        ..Default::default()
     };
 
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -419,6 +420,7 @@ fn archive_writer_unix_mode_r7z_reads() {
     let meta = r7z::EntryMeta {
         mtime: None,
         unix_mode: Some(mode),
+        ..Default::default()
     };
 
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -448,6 +450,7 @@ fn archive_writer_mtime_p7zip_reads() {
     let meta = r7z::EntryMeta {
         mtime: Some(ts),
         unix_mode: None,
+        ..Default::default()
     };
 
     let archive_path = dir.join("ts.7z");

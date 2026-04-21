@@ -33,8 +33,8 @@
 //! std::fs::write("out.7z", bytes).unwrap();
 //! ```
 //!
-//! For streaming or multi-folder writes, use [`ArchiveWriter`]. [`EntryMeta`] can
-//! store optional modification times and Unix mode bits. [`Codec::Lzma2Bcj`] applies
+//! For file-backed or multi-folder writes, use [`ArchiveWriter`]. [`EntryMeta`] can
+//! store optional timestamps and attributes. [`Codec::Lzma2Bcj`] applies
 //! the x86 BCJ filter before LZMA2 compression for executable-like payloads.
 
 extern crate num;
@@ -44,7 +44,6 @@ extern crate num_derive;
 mod aes;
 mod archive;
 pub mod bcj;
-mod builder;
 mod codec;
 mod coder_info;
 mod error;
@@ -55,9 +54,9 @@ mod pack_info;
 mod parsers;
 mod property;
 mod stream_info;
+mod write;
 
 pub use archive::{Archive, ArchiveMetadata};
-pub use builder::{build_streaming, ArchiveBuilder, ArchiveWriter, Codec, EntryMeta};
 pub use codec::{
     decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ_X86,
     CODEC_COPY, CODEC_LZMA, CODEC_LZMA2,
@@ -71,6 +70,10 @@ pub use pack_info::{PackInfo, UnpackInfo};
 pub use parsers::*;
 pub use property::{find_next_property_id, Property};
 pub use stream_info::{StreamInfo, SubstreamInfo};
+pub use write::{
+    build_streaming, ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec,
+    EncryptionOptions, EntryKind, EntryMeta, HeaderMode,
+};
 
 // Re-export nom's IResult for convenience in integration tests
 pub use nom::IResult;
