@@ -97,7 +97,7 @@ pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R
     Ok(())
 }
 
-pub(crate) fn finish_streamed_copy_archive<W: Write + Seek>(
+pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     mut out: W,
     entries: &[WriteEntry],
     folders: &[CompletedFolder],

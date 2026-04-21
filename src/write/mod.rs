@@ -5,7 +5,8 @@ mod header;
 mod model;
 
 use crate::R7zError;
-use header::encode_coder_info_copy;
+use header::{encode_coder_info_copy, encode_coder_info_lzma2};
+use lzma_rust2::{Lzma2Options, Lzma2Writer};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub use model::{
@@ -30,6 +31,33 @@ impl StreamingCopyFolder {
             file_crcs: Vec::new(),
         }
     }
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count = self.count.checked_add(n as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "archive stream too large")
+        })?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct StreamingLzma2Folder<W: Write> {
+    writer: Lzma2Writer<CountingWriter<W>>,
+    file_indices: Vec<usize>,
+    unpack_size: u64,
+    file_sizes: Vec<u64>,
+    file_crcs: Vec<u32>,
 }
 
 pub struct ArchiveBuilder {
@@ -155,26 +183,32 @@ impl ArchiveBuilder {
 }
 
 pub struct ArchiveWriter<W: Write + Seek> {
-    out: W,
+    out: Option<W>,
     entries: Vec<WriteEntry>,
     options: ArchiveOptions,
     current_folder: usize,
     copy_started: bool,
     copy_current: StreamingCopyFolder,
     copy_completed: Vec<StreamingCopyFolder>,
+    lzma2_started: bool,
+    lzma2_current: Option<StreamingLzma2Folder<W>>,
+    lzma2_completed: Vec<model::CompletedFolder>,
 }
 
 impl<W: Write + Seek> ArchiveWriter<W> {
     pub fn new(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
         encode::validate_archive_options(&options)?;
         Ok(Self {
-            out,
+            out: Some(out),
             entries: Vec::new(),
             options,
             current_folder: 0,
             copy_started: false,
             copy_current: StreamingCopyFolder::new(),
             copy_completed: Vec::new(),
+            lzma2_started: false,
+            lzma2_current: None,
+            lzma2_completed: Vec::new(),
         })
     }
 
@@ -232,6 +266,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         if self.should_stream_copy() {
             return self.append_copy_streaming(name, reader, meta);
         }
+        if self.should_stream_lzma2() {
+            return self.append_lzma2_streaming(name, reader, meta);
+        }
 
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
@@ -285,6 +322,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
         if self.should_stream_copy() {
             self.seal_copy_folder();
+        } else if self.should_stream_lzma2() {
+            self.seal_lzma2_folder()?;
         } else if self
             .entries
             .iter()
@@ -303,23 +342,37 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 .into_iter()
                 .map(model::CompletedFolder::from)
                 .collect();
-            return encode::finish_streamed_copy_archive(
-                self.out,
+            return encode::finish_streamed_archive(
+                self.out.take().ok_or(R7zError::Parse)?,
                 &self.entries,
                 &folders,
                 &self.options,
             );
         }
+        if self.lzma2_started {
+            self.seal_lzma2_folder()?;
+            return encode::finish_streamed_archive(
+                self.out.take().ok_or(R7zError::Parse)?,
+                &self.entries,
+                &self.lzma2_completed,
+                &self.options,
+            );
+        }
 
         let bytes = encode::build_archive(&self.entries, &self.options)?;
-        self.out.seek(SeekFrom::Start(0))?;
-        self.out.write_all(&bytes)?;
-        self.out.flush()?;
-        Ok(self.out)
+        let out = self.out.as_mut().ok_or(R7zError::Parse)?;
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(&bytes)?;
+        out.flush()?;
+        self.out.take().ok_or(R7zError::Parse)
     }
 
     fn should_stream_copy(&self) -> bool {
         self.options.codec == Codec::Copy && self.options.encryption.is_none()
+    }
+
+    fn should_stream_lzma2(&self) -> bool {
+        self.options.codec == Codec::Lzma2 && self.options.encryption.is_none()
     }
 
     fn append_copy_streaming(
@@ -329,8 +382,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
         if !self.copy_started {
-            self.out.seek(SeekFrom::Start(0))?;
-            self.out.write_all(&[0u8; 32])?;
+            let out = self.out.as_mut().ok_or(R7zError::Parse)?;
+            out.seek(SeekFrom::Start(0))?;
+            out.write_all(&[0u8; 32])?;
             self.copy_started = true;
         }
 
@@ -342,7 +396,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             if n == 0 {
                 break;
             }
-            self.out.write_all(&buf[..n])?;
+            self.out
+                .as_mut()
+                .ok_or(R7zError::Parse)?
+                .write_all(&buf[..n])?;
             hasher.update(&buf[..n]);
             size = size.checked_add(n as u64).ok_or(R7zError::Parse)?;
         }
@@ -379,6 +436,130 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             ));
             self.current_folder += 1;
         }
+    }
+
+    fn append_lzma2_streaming(
+        &mut self,
+        name: &str,
+        mut reader: impl Read,
+        meta: EntryMeta,
+    ) -> Result<(), R7zError> {
+        let mut buf = [0u8; 8192];
+        let first = reader.read(&mut buf)?;
+        if first == 0 {
+            self.entries.push(WriteEntry {
+                name: name.to_string(),
+                kind: EntryKind::File,
+                meta,
+                has_stream: false,
+                data: None,
+                folder_id: self.current_folder,
+            });
+            return Ok(());
+        }
+
+        self.ensure_lzma2_folder()?;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut size = 0u64;
+        self.write_lzma2_file_chunk(&buf[..first], &mut hasher, &mut size)?;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            self.write_lzma2_file_chunk(&buf[..n], &mut hasher, &mut size)?;
+        }
+
+        let index = self.entries.len();
+        self.entries.push(WriteEntry {
+            name: name.to_string(),
+            kind: EntryKind::File,
+            meta,
+            has_stream: true,
+            data: None,
+            folder_id: self.current_folder,
+        });
+        let folder = self.lzma2_current.as_mut().ok_or(R7zError::Parse)?;
+        folder.file_indices.push(index);
+        folder.unpack_size = folder
+            .unpack_size
+            .checked_add(size)
+            .ok_or(R7zError::Parse)?;
+        folder.file_sizes.push(size);
+        folder.file_crcs.push(hasher.finalize());
+        Ok(())
+    }
+
+    fn write_lzma2_file_chunk(
+        &mut self,
+        chunk: &[u8],
+        hasher: &mut crc32fast::Hasher,
+        size: &mut u64,
+    ) -> Result<(), R7zError> {
+        let folder = self.lzma2_current.as_mut().ok_or(R7zError::Parse)?;
+        folder
+            .writer
+            .write_all(chunk)
+            .map_err(|_| R7zError::Decompression)?;
+        hasher.update(chunk);
+        *size = size
+            .checked_add(chunk.len() as u64)
+            .ok_or(R7zError::Parse)?;
+        Ok(())
+    }
+
+    fn ensure_lzma2_folder(&mut self) -> Result<(), R7zError> {
+        if self.lzma2_current.is_some() {
+            return Ok(());
+        }
+        if !self.lzma2_started {
+            let out = self.out.as_mut().ok_or(R7zError::Parse)?;
+            out.seek(SeekFrom::Start(0))?;
+            out.write_all(&[0u8; 32])?;
+            self.lzma2_started = true;
+        }
+        let out = self.out.take().ok_or(R7zError::Parse)?;
+        let writer = Lzma2Writer::new(
+            CountingWriter {
+                inner: out,
+                count: 0,
+            },
+            Lzma2Options::default(),
+        );
+        self.lzma2_current = Some(StreamingLzma2Folder {
+            writer,
+            file_indices: Vec::new(),
+            unpack_size: 0,
+            file_sizes: Vec::new(),
+            file_crcs: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn seal_lzma2_folder(&mut self) -> Result<(), R7zError> {
+        let Some(folder) = self.lzma2_current.take() else {
+            return Ok(());
+        };
+        let StreamingLzma2Folder {
+            writer,
+            file_indices,
+            unpack_size,
+            file_sizes,
+            file_crcs,
+        } = folder;
+        let count_writer = writer.finish().map_err(|_| R7zError::Decompression)?;
+        let pack_size = count_writer.count;
+        self.out = Some(count_writer.inner);
+        self.lzma2_completed.push(model::CompletedFolder {
+            file_indices,
+            pack_size,
+            coder_info: encode_coder_info_lzma2(0x1c),
+            coder_unpack_sizes: vec![unpack_size],
+            file_sizes,
+            file_crcs,
+        });
+        self.current_folder += 1;
+        Ok(())
     }
 }
 
