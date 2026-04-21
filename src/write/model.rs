@@ -103,6 +103,7 @@ pub(crate) struct WriteEntry {
     pub name: String,
     pub kind: EntryKind,
     pub meta: EntryMeta,
+    pub has_stream: bool,
     pub data: Option<Vec<u8>>,
     pub folder_id: usize,
 }

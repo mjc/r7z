@@ -766,6 +766,38 @@ fn archive_builder_copy_p7zip_extracts_and_lists_method() {
 }
 
 #[test]
+fn archive_writer_copy_streams_payload_before_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("writer_copy_streamed.7z");
+    let payload = vec![0xA7; 128 * 1024];
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file)
+        .expect("new failed")
+        .compression(r7z::Codec::Copy);
+
+    writer
+        .append_file(
+            "streamed.bin",
+            payload.as_slice(),
+            r7z::EntryMeta::archive_file(),
+        )
+        .expect("append failed");
+    assert!(
+        std::fs::metadata(&archive_path).unwrap().len() > payload.len() as u64,
+        "Copy writer should write payload bytes before finish"
+    );
+
+    writer.finish().expect("finish failed");
+    assert_p7zip_extracts_archive(
+        dir,
+        &archive_path,
+        &[(PathBuf::from("streamed.bin"), payload)],
+        &["Copy"],
+    );
+}
+
+#[test]
 fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

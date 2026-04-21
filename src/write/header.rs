@@ -210,7 +210,7 @@ fn write_files_info(h: &mut Vec<u8>, entries: &[WriteEntry]) {
 }
 
 fn write_empty_properties(h: &mut Vec<u8>, entries: &[WriteEntry]) {
-    let empty: Vec<bool> = entries.iter().map(|entry| entry.data.is_none()).collect();
+    let empty: Vec<bool> = entries.iter().map(|entry| !entry.has_stream).collect();
     if !empty.iter().any(|&v| v) {
         return;
     }
@@ -221,7 +221,7 @@ fn write_empty_properties(h: &mut Vec<u8>, entries: &[WriteEntry]) {
 
     let mut empty_files = Vec::new();
     let mut anti = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.data.is_none()) {
+    for entry in entries.iter().filter(|entry| !entry.has_stream) {
         empty_files.push(entry.kind == EntryKind::File);
         anti.push(entry.kind == EntryKind::Anti);
     }

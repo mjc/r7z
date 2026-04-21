@@ -8,6 +8,7 @@ use super::model::{
 };
 use crate::{aes, bcj, codec, R7zError};
 use std::collections::BTreeMap;
+use std::io::{Seek, SeekFrom, Write};
 
 type PayloadEncoding = (Vec<u8>, Vec<u8>, Vec<u64>, Vec<CoderSpec>);
 type HeaderEncoding = (Vec<u8>, Vec<u8>, Vec<u64>);
@@ -24,7 +25,7 @@ pub(crate) fn build_archive(
     let mut folders = Vec::new();
     let mut by_folder: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, entry) in entries.iter().enumerate() {
-        if entry.data.is_some() {
+        if entry.has_stream {
             by_folder.entry(entry.folder_id).or_default().push(idx);
         }
     }
@@ -70,6 +71,50 @@ pub(crate) fn build_archive(
     archive.extend_from_slice(&next_header);
     write_signature(&mut archive, next_header_offset, &next_header);
     Ok(archive)
+}
+
+pub(crate) fn finish_streamed_copy_archive<W: Write + Seek>(
+    mut out: W,
+    entries: &[WriteEntry],
+    folders: &[CompletedFolder],
+    options: &ArchiveOptions,
+) -> Result<W, R7zError> {
+    if entries.is_empty() {
+        return Err(R7zError::Parse);
+    }
+
+    let packed_size = folders.iter().try_fold(0u64, |acc, folder| {
+        acc.checked_add(folder.pack_size).ok_or(R7zError::Parse)
+    })?;
+    let raw_header = build_header(entries, folders);
+    let should_encode = match options.header_mode {
+        HeaderMode::Plain => false,
+        HeaderMode::Encoded => true,
+        HeaderMode::P7zipDefault => entries.len() > 1,
+    };
+
+    let (next_header, next_header_offset) = if should_encode {
+        let (pack, coder_info, coder_unpack_sizes) = encode_header_stream(&raw_header, None)?;
+        out.seek(SeekFrom::Start(32 + packed_size))?;
+        out.write_all(&pack)?;
+        let descriptor = build_encoded_header_descriptor(
+            packed_size,
+            pack.len() as u64,
+            &coder_info,
+            &coder_unpack_sizes,
+        );
+        (descriptor, packed_size + pack.len() as u64)
+    } else {
+        (raw_header, packed_size)
+    };
+
+    out.seek(SeekFrom::Start(32 + next_header_offset))?;
+    out.write_all(&next_header)?;
+    let signature = signature_bytes(next_header_offset, &next_header);
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&signature)?;
+    out.flush()?;
+    Ok(out)
 }
 
 fn encode_folder(
@@ -212,6 +257,10 @@ fn make_aes_material(options: &EncryptionOptions) -> Result<AesMaterial, R7zErro
 }
 
 fn write_signature(archive: &mut [u8], next_header_offset: u64, next_header: &[u8]) {
+    archive[..32].copy_from_slice(&signature_bytes(next_header_offset, next_header));
+}
+
+fn signature_bytes(next_header_offset: u64, next_header: &[u8]) -> [u8; 32] {
     let next_header_size = next_header.len() as u64;
     let next_header_crc = crc32fast::hash(next_header);
     let mut start_header = [0u8; 20];
@@ -220,11 +269,13 @@ fn write_signature(archive: &mut [u8], next_header_offset: u64, next_header: &[u
     start_header[16..].copy_from_slice(&next_header_crc.to_le_bytes());
     let start_header_crc = crc32fast::hash(&start_header);
 
-    archive[..6].copy_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
-    archive[6] = 0x00;
-    archive[7] = 0x04;
-    archive[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
-    archive[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
-    archive[20..28].copy_from_slice(&next_header_size.to_le_bytes());
-    archive[28..32].copy_from_slice(&next_header_crc.to_le_bytes());
+    let mut signature = [0u8; 32];
+    signature[..6].copy_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+    signature[6] = 0x00;
+    signature[7] = 0x04;
+    signature[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
+    signature[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
+    signature[20..28].copy_from_slice(&next_header_size.to_le_bytes());
+    signature[28..32].copy_from_slice(&next_header_crc.to_le_bytes());
+    signature
 }

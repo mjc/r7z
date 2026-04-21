@@ -220,6 +220,8 @@ writer.append_entry("b.txt", &mut b"world".as_ref(), EntryMeta::default())?;
 writer.finish()?;
 ```
 
+When configured with `Codec::Copy` and no encryption, `ArchiveWriter` writes non-empty file payloads directly to the output as they are appended. Other writer codecs still collect input before final archive assembly.
+
 For file-backed output, use the convenience builder:
 
 ```rust
