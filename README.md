@@ -231,9 +231,19 @@ where
     W: Write + Seek,
     I: IntoIterator<Item = (String, R)>,
     R: Read,
+
+pub fn build_streaming_with_options<W, I, R>(
+    entries: I,
+    out: W,
+    options: ArchiveOptions
+) -> Result<(), R7zError>
+where
+    W: Write + Seek,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
 ```
 
-Each `entry` is provided as a filename and `impl Read`; the builder writes the final `.7z` archive to any `Write + Seek` output.
+Each `entry` is provided as a filename and `impl Read`; the builder writes the final `.7z` archive to any `Write + Seek` output. Use `build_streaming_with_options` for Copy, explicit header mode, or encryption settings.
 
 ### `Codec` — Compression algorithms
 

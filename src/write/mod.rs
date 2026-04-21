@@ -415,21 +415,29 @@ fn write_entry_from_archive_entry(
     })
 }
 
-pub fn build_streaming<W, I, R>(entries: I, mut out: W) -> Result<(), R7zError>
+pub fn build_streaming<W, I, R>(entries: I, out: W) -> Result<(), R7zError>
 where
     W: Write + Seek,
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    let mut builder = ArchiveBuilder::new();
-    for (name, mut reader) in entries {
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        builder = builder.add_file(&name, &data);
+    build_streaming_with_options(entries, out, ArchiveOptions::default())
+}
+
+pub fn build_streaming_with_options<W, I, R>(
+    entries: I,
+    out: W,
+    options: ArchiveOptions,
+) -> Result<(), R7zError>
+where
+    W: Write + Seek,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+{
+    let mut writer = ArchiveWriter::new(out, options)?;
+    for (name, reader) in entries {
+        writer.append(&name, reader)?;
     }
-    let bytes = builder.build()?;
-    out.seek(SeekFrom::Start(0))?;
-    out.write_all(&bytes)?;
-    out.flush()?;
+    writer.finish()?;
     Ok(())
 }

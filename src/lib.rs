@@ -71,8 +71,8 @@ pub use parsers::*;
 pub use property::{find_next_property_id, Property};
 pub use stream_info::{StreamInfo, SubstreamInfo};
 pub use write::{
-    build_streaming, ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec,
-    EncryptionOptions, EntryKind, EntryMeta, HeaderMode,
+    build_streaming, build_streaming_with_options, ArchiveBuilder, ArchiveEntry, ArchiveOptions,
+    ArchiveWriter, Codec, EncryptionOptions, EntryKind, EntryMeta, HeaderMode,
 };
 
 // Re-export nom's IResult for convenience in integration tests
