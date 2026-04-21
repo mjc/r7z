@@ -10,6 +10,19 @@
 //! let bytes = archive.extract_to_memory(0).unwrap();
 //! ```
 //!
+//! Password-protected archives can be opened and extracted with the password-aware
+//! APIs:
+//!
+//! ```rust,no_run
+//! let archive =
+//!     r7z::Archive::open_with_password(std::path::Path::new("secret.7z"), Some("pass")).unwrap();
+//! let bytes = archive.extract_to_memory_with_password(0, Some("pass")).unwrap();
+//! ```
+//!
+//! `Archive::extract_all` rejects unsafe paths such as absolute names, parent
+//! directory traversal, and Windows-prefixed paths. Directory entries and zero-byte
+//! files are handled distinctly.
+//!
 //! ## Writing
 //!
 //! ```rust,no_run
@@ -19,6 +32,10 @@
 //!     .unwrap();
 //! std::fs::write("out.7z", bytes).unwrap();
 //! ```
+//!
+//! For streaming or multi-folder writes, use [`ArchiveWriter`]. [`EntryMeta`] can
+//! store optional modification times and Unix mode bits. [`Codec::Lzma2Bcj`] applies
+//! the x86 BCJ filter before LZMA2 compression for executable-like payloads.
 
 extern crate num;
 #[macro_use]
