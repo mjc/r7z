@@ -208,11 +208,11 @@ The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It us
 `ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata:
 
 ```rust
-use r7z::{ArchiveWriter, Codec, EntryMeta};
+use r7z::{ArchiveOptions, ArchiveWriter, Codec, EntryMeta};
 use std::fs::File;
 
 let file = File::create("out.7z")?;
-let mut writer = ArchiveWriter::new(file)?.compression(Codec::Lzma2);
+let mut writer = ArchiveWriter::new(file, ArchiveOptions::default())?.compression(Codec::Lzma2);
 writer.append_file("a.txt", &mut b"hello".as_ref(), EntryMeta::default())?;
 writer.append_empty_file("empty.txt", EntryMeta::default())?;
 writer.new_folder()?;

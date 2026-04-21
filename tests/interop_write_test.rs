@@ -57,7 +57,7 @@ fn write_builder_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathB
 
 fn write_writer_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBuf, Vec<u8>)]) {
     let file = std::fs::File::create(archive_path).unwrap();
-    let mut writer = r7z::ArchiveWriter::new(file)
+    let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("ArchiveWriter::new failed")
         .compression(codec);
     for (idx, (name, data)) in files.iter().enumerate() {
@@ -276,7 +276,8 @@ fn archive_writer_single_folder_r7z_reads() {
     ];
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    let mut w = r7z::ArchiveWriter::new(&mut buf).expect("new failed");
+    let mut w =
+        r7z::ArchiveWriter::new(&mut buf, r7z::ArchiveOptions::default()).expect("new failed");
     for (name, data) in &files {
         w.append(name, *data).expect("append failed");
     }
@@ -305,7 +306,8 @@ fn archive_writer_multi_folder_r7z_reads() {
     ];
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    let mut w = r7z::ArchiveWriter::new(&mut buf).expect("new failed");
+    let mut w =
+        r7z::ArchiveWriter::new(&mut buf, r7z::ArchiveOptions::default()).expect("new failed");
     for (name, data) in &folder0 {
         w.append(name, *data).expect("append failed");
     }
@@ -341,7 +343,7 @@ fn archive_writer_multi_folder_p7zip_reads() {
 
     let archive_path = dir.join("writer_multi.7z");
     let file = std::fs::File::create(&archive_path).unwrap();
-    let mut w = r7z::ArchiveWriter::new(file).expect("new failed");
+    let mut w = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default()).expect("new failed");
     for (name, data) in &folder0 {
         w.append(name, *data).expect("append failed");
     }
@@ -404,7 +406,7 @@ fn archive_writer_mtime_r7z_reads() {
     };
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    let mut w = r7z::ArchiveWriter::new(&mut buf).unwrap();
+    let mut w = r7z::ArchiveWriter::new(&mut buf, r7z::ArchiveOptions::default()).unwrap();
     w.append_entry("ts.txt", b"timestamp test".as_ref(), meta)
         .unwrap();
     w.finish().unwrap();
@@ -430,7 +432,7 @@ fn archive_writer_unix_mode_r7z_reads() {
     };
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    let mut w = r7z::ArchiveWriter::new(&mut buf).unwrap();
+    let mut w = r7z::ArchiveWriter::new(&mut buf, r7z::ArchiveOptions::default()).unwrap();
     w.append_entry("perms.txt", b"permissions test".as_ref(), meta)
         .unwrap();
     w.finish().unwrap();
@@ -498,7 +500,7 @@ fn archive_writer_mtime_p7zip_reads() {
 
     let archive_path = dir.join("ts.7z");
     let file = std::fs::File::create(&archive_path).unwrap();
-    let mut w = r7z::ArchiveWriter::new(file).unwrap();
+    let mut w = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default()).unwrap();
     w.append_entry("ts.txt", b"timestamp data".as_ref(), meta)
         .unwrap();
     w.finish().unwrap();
@@ -603,7 +605,7 @@ fn archive_writer_bcj_lzma2_p7zip_reads() {
 
     let archive_path = dir.join("bcj_writer.7z");
     let file = std::fs::File::create(&archive_path).unwrap();
-    let mut w = r7z::ArchiveWriter::new(file)
+    let mut w = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .unwrap()
         .compression(r7z::Codec::Lzma2Bcj);
     w.append("code.bin", &mut data.as_slice()).unwrap();
@@ -772,7 +774,7 @@ fn archive_writer_copy_streams_payload_before_finish() {
     let archive_path = dir.join("writer_copy_streamed.7z");
     let payload = vec![0xA7; 128 * 1024];
     let file = std::fs::File::create(&archive_path).unwrap();
-    let mut writer = r7z::ArchiveWriter::new(file)
+    let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("new failed")
         .compression(r7z::Codec::Copy);
 
@@ -803,7 +805,8 @@ fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     let dir = tmp.path();
     let archive_path = dir.join("writer_mixed.7z");
     let file = std::fs::File::create(&archive_path).unwrap();
-    let mut writer = r7z::ArchiveWriter::new(file).expect("new failed");
+    let mut writer =
+        r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default()).expect("new failed");
     writer
         .append_file("a.txt", b"alpha".as_slice(), r7z::EntryMeta::archive_file())
         .expect("append file failed");

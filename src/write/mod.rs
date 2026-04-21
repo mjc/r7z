@@ -156,11 +156,7 @@ pub struct ArchiveWriter<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> ArchiveWriter<W> {
-    pub fn new(out: W) -> Result<Self, R7zError> {
-        Self::new_with_options(out, ArchiveOptions::default())
-    }
-
-    pub fn new_with_options(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
+    pub fn new(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
         Ok(Self {
             out,
             entries: Vec::new(),
@@ -170,6 +166,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             copy_current: StreamingCopyFolder::new(),
             copy_completed: Vec::new(),
         })
+    }
+
+    pub fn new_default(out: W) -> Result<Self, R7zError> {
+        Self::new(out, ArchiveOptions::default())
     }
 
     #[must_use]
