@@ -98,6 +98,35 @@ pub struct ArchiveEntry {
     pub meta: EntryMeta,
 }
 
+impl ArchiveEntry {
+    #[must_use]
+    pub fn file(name: impl Into<String>, meta: EntryMeta) -> Self {
+        Self {
+            name: name.into(),
+            kind: EntryKind::File,
+            meta,
+        }
+    }
+
+    #[must_use]
+    pub fn directory(name: impl Into<String>, meta: EntryMeta) -> Self {
+        Self {
+            name: name.into(),
+            kind: EntryKind::Directory,
+            meta,
+        }
+    }
+
+    #[must_use]
+    pub fn anti(name: impl Into<String>, meta: EntryMeta) -> Self {
+        Self {
+            name: name.into(),
+            kind: EntryKind::Anti,
+            meta,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct WriteEntry {
     pub name: String,

@@ -196,6 +196,7 @@ Builder pattern — all methods consume `self` and return `Self` for chaining:
 |--------|-------------|
 | `ArchiveBuilder::new()` | Create an empty builder (LZMA2 compression default) |
 | `.add_file(name: &str, data: &[u8])` | Queue a file with its content |
+| `.add_entry(entry, data)` | Queue an explicit `ArchiveEntry`; non-file entries must not provide stream data |
 | `.add_empty_file(name, meta)` / `.add_directory(name, meta)` / `.add_anti_item(name, meta)` | Queue empty-stream entries |
 | `.compression(codec: Codec)` | Set compression (`Codec::Copy`, `Codec::Lzma`, `Codec::Lzma2`, or `Codec::Lzma2Bcj`) |
 | `.options(options: ArchiveOptions)` | Set codec, header mode, and encryption options |
@@ -205,7 +206,7 @@ The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It us
 
 ### `ArchiveWriter` and `build_streaming` — file-backed builders
 
-`ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata:
+`ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata. It also accepts explicit `ArchiveEntry` values through `.append_archive_entry(...)` and `.append_empty_entry(...)`:
 
 ```rust
 use r7z::{ArchiveOptions, ArchiveWriter, Codec, EntryMeta};

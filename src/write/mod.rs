@@ -101,6 +101,15 @@ impl ArchiveBuilder {
         self
     }
 
+    pub fn add_entry(mut self, entry: ArchiveEntry, data: Option<&[u8]>) -> Result<Self, R7zError> {
+        self.entries.push(write_entry_from_archive_entry(
+            entry,
+            data.map(<[u8]>::to_vec),
+            0,
+        )?);
+        Ok(self)
+    }
+
     #[must_use]
     pub fn add_empty_file(mut self, name: &str, meta: EntryMeta) -> Self {
         self.entries.push(WriteEntry {
@@ -189,6 +198,28 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
         self.append_file(name, reader, meta)
+    }
+
+    pub fn append_archive_entry(
+        &mut self,
+        entry: ArchiveEntry,
+        reader: impl Read,
+    ) -> Result<(), R7zError> {
+        let ArchiveEntry { name, kind, meta } = entry;
+        if kind != EntryKind::File {
+            return Err(R7zError::InvalidOptions(
+                "only file entries can have stream data",
+            ));
+        }
+        self.append_file(&name, reader, meta)
+    }
+
+    pub fn append_empty_entry(&mut self, entry: ArchiveEntry) -> Result<(), R7zError> {
+        match entry.kind {
+            EntryKind::File => self.append_empty_file(&entry.name, entry.meta),
+            EntryKind::Directory => self.append_directory(&entry.name, entry.meta),
+            EntryKind::Anti => self.append_anti_item(&entry.name, entry.meta),
+        }
     }
 
     pub fn append_file(
@@ -361,6 +392,27 @@ impl From<StreamingCopyFolder> for model::CompletedFolder {
             file_crcs: folder.file_crcs,
         }
     }
+}
+
+fn write_entry_from_archive_entry(
+    entry: ArchiveEntry,
+    data: Option<Vec<u8>>,
+    folder_id: usize,
+) -> Result<WriteEntry, R7zError> {
+    let has_stream = entry.kind == EntryKind::File && data.as_ref().is_some_and(|d| !d.is_empty());
+    if entry.kind != EntryKind::File && data.as_ref().is_some_and(|d| !d.is_empty()) {
+        return Err(R7zError::InvalidOptions(
+            "only file entries can have stream data",
+        ));
+    }
+    Ok(WriteEntry {
+        name: entry.name,
+        kind: entry.kind,
+        meta: entry.meta,
+        has_stream,
+        data: has_stream.then_some(data).flatten(),
+        folder_id,
+    })
 }
 
 pub fn build_streaming<W, I, R>(entries: I, mut out: W) -> Result<(), R7zError>

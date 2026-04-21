@@ -867,6 +867,79 @@ fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
 }
 
 #[test]
+fn archive_entry_helpers_round_trip_and_validate_stream_kind() {
+    let builder = r7z::ArchiveBuilder::new()
+        .add_entry(
+            r7z::ArchiveEntry::directory("dir", r7z::EntryMeta::default()),
+            None,
+        )
+        .unwrap()
+        .add_entry(
+            r7z::ArchiveEntry::file("dir/data.txt", r7z::EntryMeta::archive_file()),
+            Some(b"hello"),
+        )
+        .unwrap()
+        .add_entry(
+            r7z::ArchiveEntry::file("dir/empty.txt", r7z::EntryMeta::default()),
+            None,
+        )
+        .unwrap()
+        .add_entry(
+            r7z::ArchiveEntry::anti("removed.txt", r7z::EntryMeta::default()),
+            None,
+        )
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(builder.build().unwrap().into()).unwrap();
+    let fi = archive.files_info().unwrap();
+    assert!(fi.is_directory(0));
+    assert_eq!(archive.extract_to_memory(1).unwrap(), b"hello");
+    assert!(fi.is_empty_file(2));
+    assert!(fi.is_anti(3));
+
+    let invalid = r7z::ArchiveBuilder::new().add_entry(
+        r7z::ArchiveEntry::directory("bad", r7z::EntryMeta::default()),
+        Some(b"not allowed"),
+    );
+    assert!(matches!(invalid, Err(r7z::R7zError::InvalidOptions(_))));
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut writer =
+        r7z::ArchiveWriter::new(&mut buf, r7z::ArchiveOptions::default()).expect("new failed");
+    writer
+        .append_empty_entry(r7z::ArchiveEntry::directory(
+            "dir",
+            r7z::EntryMeta::default(),
+        ))
+        .unwrap();
+    writer
+        .append_archive_entry(
+            r7z::ArchiveEntry::file("dir/data.txt", r7z::EntryMeta::archive_file()),
+            b"hello".as_slice(),
+        )
+        .unwrap();
+    writer
+        .append_empty_entry(r7z::ArchiveEntry::file(
+            "dir/empty.txt",
+            r7z::EntryMeta::default(),
+        ))
+        .unwrap();
+    writer
+        .append_empty_entry(r7z::ArchiveEntry::anti(
+            "removed.txt",
+            r7z::EntryMeta::default(),
+        ))
+        .unwrap();
+    writer.finish().unwrap();
+
+    let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
+    let fi = archive.files_info().unwrap();
+    assert!(fi.is_directory(0));
+    assert_eq!(archive.extract_to_memory(1).unwrap(), b"hello");
+    assert!(fi.is_empty_file(2));
+    assert!(fi.is_anti(3));
+}
+
+#[test]
 fn archive_builder_empty_directory_and_anti_items_round_trip_and_p7zip_lists() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
