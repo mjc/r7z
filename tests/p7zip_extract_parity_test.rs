@@ -103,6 +103,10 @@ fn streaming_extract_reports_corrupt_lzma_and_lzma2_payloads() {
 #[test]
 fn streaming_extract_stops_after_target_when_folder_crc_is_absent() {
     let mut bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            header_mode: r7z::HeaderMode::Plain,
+            ..Default::default()
+        })
         .compression(r7z::Codec::Lzma2)
         .add_file("first.txt", b"first")
         .add_file("second.bin", &vec![0xA5u8; 128 * 1024])
