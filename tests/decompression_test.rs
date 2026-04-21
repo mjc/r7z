@@ -92,11 +92,8 @@ fn decompress_bcj_lzma2_fixture() {
     // Verify bind pairs exist
     assert_eq!(folder.bind_pairs.len(), 1, "expected 1 bind pair");
 
-    // Extract the file and compare with the original
+    // Extract the file and validate against fixture-local invariants.
     let extracted = archive.extract_to_memory(0).unwrap();
     assert_eq!(extracted.len(), 4096, "expected 4096 bytes");
-
-    // Compare with original file
-    let original = std::fs::read("/tmp/bcj_original.bin").unwrap();
-    assert_eq!(extracted, original, "extracted data should match original");
+    assert_eq!(crc32fast::hash(&extracted), 0x5723_650d);
 }
