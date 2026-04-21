@@ -202,9 +202,16 @@ fn write_files_info(h: &mut Vec<u8>, entries: &[WriteEntry]) {
     write_time_property(h, 0x14, entries, |e| e.meta.mtime);
     write_u64_property(h, 0x18, entries, |e| e.meta.start_pos);
     write_u32_property(h, 0x15, entries, |e| {
-        e.meta
-            .attributes
-            .or_else(|| e.meta.unix_mode.map(|mode| (mode << 16) | 0x20))
+        e.meta.attributes.or_else(|| {
+            e.meta.unix_mode.map(|mode| {
+                let file_attribute = if e.kind == EntryKind::Directory {
+                    0x10
+                } else {
+                    0x20
+                };
+                (mode << 16) | file_attribute
+            })
+        })
     });
     h.push(0x00);
 }
@@ -450,5 +457,40 @@ mod tests {
         );
         assert_eq!(fi.start_positions, vec![None, None, Some(77)]);
         assert_eq!(fi.attributes, vec![None, Some(0x20), None]);
+    }
+
+    #[test]
+    fn files_info_writer_derives_unix_mode_attributes_from_entry_kind() {
+        let entries = vec![
+            entry(
+                "dir",
+                EntryKind::Directory,
+                false,
+                EntryMeta {
+                    unix_mode: Some(0o040_755),
+                    ..EntryMeta::default()
+                },
+            ),
+            entry(
+                "file.txt",
+                EntryKind::File,
+                true,
+                EntryMeta {
+                    unix_mode: Some(0o100_644),
+                    ..EntryMeta::default()
+                },
+            ),
+        ];
+
+        let header = parse_header(build_header(&entries, &[]));
+        let fi = header.files_info().unwrap();
+
+        assert_eq!(
+            fi.attributes,
+            vec![
+                Some((0o040_755 << 16) | 0x10),
+                Some((0o100_644 << 16) | 0x20)
+            ]
+        );
     }
 }
