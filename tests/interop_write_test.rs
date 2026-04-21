@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 //! Write-interop tests: create archives with r7z, extract with p7zip, byte-compare.
 
 mod support;
@@ -37,6 +39,10 @@ fn executable_payload(size: usize) -> Vec<u8> {
         data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
     }
     data
+}
+
+fn filetime_from_unix_secs(secs: u64) -> u64 {
+    (secs + 11_644_473_600) * 10_000_000
 }
 
 fn write_builder_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBuf, Vec<u8>)]) {
@@ -438,6 +444,43 @@ fn archive_writer_unix_mode_r7z_reads() {
     assert_eq!(attrs & 0xFFFF, 0x20);
 }
 
+#[test]
+fn archive_builder_full_metadata_r7z_reads() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let ctime_secs = 1_577_836_800; // 2020-01-01T00:00:00Z
+    let atime_secs = 1_609_459_200; // 2021-01-01T00:00:00Z
+    let mtime_secs = 1_640_995_200; // 2022-01-01T00:00:00Z
+    let data_meta = r7z::EntryMeta {
+        ctime: Some(UNIX_EPOCH + Duration::from_secs(ctime_secs)),
+        atime: Some(UNIX_EPOCH + Duration::from_secs(atime_secs)),
+        mtime: Some(UNIX_EPOCH + Duration::from_secs(mtime_secs)),
+        start_pos: Some(123),
+        ..r7z::EntryMeta::from_unix_mode(0o100_640)
+    };
+    let plain_meta = r7z::EntryMeta::archive_file();
+
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file_entry("meta.txt", b"metadata", data_meta)
+        .add_file_entry("plain.txt", b"plain", plain_meta)
+        .build()
+        .expect("build failed");
+
+    let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
+    let fi = archive.files_info().unwrap();
+
+    assert_eq!(fi.ctimes[0], Some(filetime_from_unix_secs(ctime_secs)));
+    assert_eq!(fi.ctimes[1], None);
+    assert_eq!(fi.atimes[0], Some(filetime_from_unix_secs(atime_secs)));
+    assert_eq!(fi.atimes[1], None);
+    assert_eq!(fi.mtimes[0], Some(filetime_from_unix_secs(mtime_secs)));
+    assert_eq!(fi.mtimes[1], None);
+    assert_eq!(fi.start_positions[0], Some(123));
+    assert_eq!(fi.start_positions[1], None);
+    assert_eq!(fi.attributes[0], Some((0o100_640 << 16) | 0x20));
+    assert_eq!(fi.attributes[1], Some(0x20));
+}
+
 /// p7zip lists a non-epoch timestamp for an archive written with mtime via [`ArchiveWriter`].
 #[test]
 fn archive_writer_mtime_p7zip_reads() {
@@ -656,4 +699,222 @@ fn build_streaming_lzma2_p7zip_extracts_and_lists_method() {
 
     r7z::build_streaming(entries, output).expect("build_streaming failed");
     assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA2"]);
+}
+
+#[test]
+fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("a.txt", b"alpha")
+        .add_file("b.txt", b"bravo")
+        .build()
+        .expect("build failed");
+
+    let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
+    assert!(archive.encoded_header.is_some());
+    let ui = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap();
+    let folder = ui.parse_folder(0).unwrap();
+    assert_eq!(folder.coders[0].codec_id.as_slice(), r7z::CODEC_LZMA2);
+}
+
+#[test]
+fn archive_builder_copy_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("copy.7z");
+
+    write_builder_archive(&archive_path, r7z::Codec::Copy, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["Copy"]);
+}
+
+#[test]
+fn archive_builder_empty_directory_and_anti_items_round_trip_and_p7zip_lists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("specials.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_directory("nested", r7z::EntryMeta::default())
+        .add_empty_file("nested/empty.txt", r7z::EntryMeta::default())
+        .add_file("nested/data.txt", b"payload")
+        .add_anti_item("deleted.txt", r7z::EntryMeta::default())
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let fi = archive.files_info().unwrap();
+    assert!(fi.is_directory(0));
+    assert!(fi.is_empty_file(1));
+    assert!(fi.is_anti(3));
+    assert_eq!(archive.extract_to_memory(2).unwrap(), b"payload");
+
+    let listing = list_with_p7zip(dir, &archive_path);
+    assert!(listing.contains("nested/empty.txt"));
+    assert!(listing.contains("deleted.txt"));
+
+    let out_dir = dir.join("out");
+    extract_with_p7zip(dir, &archive_path, &out_dir);
+    assert!(out_dir.join("nested").is_dir());
+    assert_eq!(
+        std::fs::read(out_dir.join("nested/empty.txt")).unwrap(),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("nested/data.txt")).unwrap(),
+        b"payload"
+    );
+}
+
+#[test]
+fn archive_builder_empty_only_p7zip_extracts_and_r7z_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("empty_only.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_directory("emptydir", r7z::EntryMeta::directory_unix_mode(0o040_755))
+        .add_empty_file("emptydir/empty.txt", r7z::EntryMeta::archive_file())
+        .add_anti_item("removed.txt", r7z::EntryMeta::default())
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    assert!(archive.streams_info().is_none());
+    let fi = archive.files_info().unwrap();
+    assert_eq!(archive.num_files(), 3);
+    assert_eq!(fi.name(0).unwrap(), "emptydir");
+    assert_eq!(fi.name(1).unwrap(), "emptydir/empty.txt");
+    assert_eq!(fi.name(2).unwrap(), "removed.txt");
+    assert!(fi.is_directory(0));
+    assert!(fi.is_empty_file(1));
+    assert!(fi.is_anti(2));
+    assert_eq!(archive.extract_to_memory(1).unwrap(), b"");
+
+    let listing = list_with_p7zip(dir, &archive_path);
+    assert!(listing.contains("emptydir"));
+    assert!(listing.contains("emptydir/empty.txt"));
+    assert!(listing.contains("removed.txt"));
+
+    let out_dir = dir.join("out");
+    extract_with_p7zip(dir, &archive_path, &out_dir);
+    assert!(out_dir.join("emptydir").is_dir());
+    assert_eq!(
+        std::fs::read(out_dir.join("emptydir/empty.txt")).unwrap(),
+        b""
+    );
+}
+
+#[test]
+fn archive_builder_aes_content_p7zip_and_r7z_extract_with_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("aes_content.7z");
+    let options = r7z::ArchiveOptions {
+        encryption: Some(r7z::EncryptionOptions::default_for_password("Secret123")),
+        ..Default::default()
+    };
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(options)
+        .add_file("secret.txt", b"classified")
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    assert!(matches!(
+        archive.extract_to_memory(0).unwrap_err(),
+        r7z::R7zError::PasswordRequired
+    ));
+    assert_eq!(
+        archive
+            .extract_to_memory_with_password(0, Some("Secret123"))
+            .unwrap(),
+        b"classified"
+    );
+
+    let out_dir = dir.join("out");
+    let out_arg = format!("-o{}", out_dir.to_str().unwrap());
+    let out = run_7z(
+        &[
+            "x",
+            "-y",
+            "-pSecret123",
+            archive_path.to_str().unwrap(),
+            &out_arg,
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z x failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("secret.txt")).unwrap(),
+        b"classified"
+    );
+}
+
+#[test]
+fn archive_builder_aes_encrypted_header_p7zip_and_r7z_require_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("aes_header.7z");
+    let mut enc = r7z::EncryptionOptions::default_for_password("HeaderSecret");
+    enc.encrypt_header = true;
+    let options = r7z::ArchiveOptions {
+        encryption: Some(enc),
+        ..Default::default()
+    };
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(options)
+        .add_file("hidden.txt", b"hidden payload")
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let err = match r7z::Archive::open(&archive_path) {
+        Ok(_) => panic!("encrypted header opened without password"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, r7z::R7zError::PasswordRequired));
+    let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
+    assert_eq!(
+        archive
+            .extract_to_memory_with_password(0, Some("HeaderSecret"))
+            .unwrap(),
+        b"hidden payload"
+    );
+
+    let no_password = run_7z(&["l", archive_path.to_str().unwrap()], dir);
+    assert!(!no_password.status.success());
+
+    let out_dir = dir.join("out");
+    let out_arg = format!("-o{}", out_dir.to_str().unwrap());
+    let out = run_7z(
+        &[
+            "x",
+            "-y",
+            "-pHeaderSecret",
+            archive_path.to_str().unwrap(),
+            &out_arg,
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z x failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("hidden.txt")).unwrap(),
+        b"hidden payload"
+    );
 }
