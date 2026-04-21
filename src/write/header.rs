@@ -341,3 +341,114 @@ fn system_time_to_filetime(t: SystemTime) -> u64 {
         Err(_) => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_header;
+    use crate::write::model::{EntryKind, EntryMeta, WriteEntry};
+    use bytes::Bytes;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn entry(name: &str, kind: EntryKind, has_stream: bool, meta: EntryMeta) -> WriteEntry {
+        WriteEntry {
+            name: name.to_string(),
+            kind,
+            meta,
+            has_stream,
+            data: has_stream.then(|| vec![0xAA]),
+            folder_id: 0,
+        }
+    }
+
+    fn filetime_from_unix_secs(secs: u64) -> u64 {
+        (secs + 11_644_473_600) * 10_000_000
+    }
+
+    fn parse_header(header: Vec<u8>) -> crate::Header {
+        let backing = Bytes::from(header);
+        let (_, parsed) = crate::Header::parse(&backing).unwrap();
+        parsed
+    }
+
+    #[test]
+    fn files_info_writer_emits_empty_stream_empty_file_and_anti_bitmaps() {
+        let entries = vec![
+            entry("dir", EntryKind::Directory, false, EntryMeta::default()),
+            entry("empty.txt", EntryKind::File, false, EntryMeta::default()),
+            entry("deleted.txt", EntryKind::Anti, false, EntryMeta::default()),
+            entry("data.txt", EntryKind::File, true, EntryMeta::default()),
+        ];
+
+        let header = parse_header(build_header(&entries, &[]));
+        let fi = header.files_info().unwrap();
+
+        assert_eq!(fi.empty_streams.as_ref(), &[0b1110_0000]);
+        assert_eq!(fi.empty_files.as_ref(), &[0b0100_0000]);
+        assert_eq!(fi.anti_items.as_ref(), &[0b0010_0000]);
+        assert!(fi.is_directory(0));
+        assert!(fi.is_empty_file(1));
+        assert!(fi.is_anti(2));
+        assert!(!fi.is_empty_stream(3));
+    }
+
+    #[test]
+    fn files_info_writer_emits_partial_metadata_definition_bitmaps() {
+        let ctime_secs = 1_577_836_800;
+        let atime_secs = 1_609_459_200;
+        let mtime_secs = 1_640_995_200;
+        let entries = vec![
+            entry(
+                "ctime-mtime.txt",
+                EntryKind::File,
+                true,
+                EntryMeta {
+                    ctime: Some(UNIX_EPOCH + Duration::from_secs(ctime_secs)),
+                    mtime: Some(UNIX_EPOCH + Duration::from_secs(mtime_secs)),
+                    ..EntryMeta::default()
+                },
+            ),
+            entry(
+                "atime-attrs.txt",
+                EntryKind::File,
+                true,
+                EntryMeta {
+                    atime: Some(UNIX_EPOCH + Duration::from_secs(atime_secs)),
+                    attributes: Some(0x20),
+                    ..EntryMeta::default()
+                },
+            ),
+            entry(
+                "start-pos.txt",
+                EntryKind::File,
+                true,
+                EntryMeta {
+                    mtime: Some(UNIX_EPOCH + Duration::from_secs(mtime_secs + 60)),
+                    start_pos: Some(77),
+                    ..EntryMeta::default()
+                },
+            ),
+        ];
+
+        let header = parse_header(build_header(&entries, &[]));
+        let fi = header.files_info().unwrap();
+
+        assert_eq!(
+            fi.ctimes,
+            vec![Some(filetime_from_unix_secs(ctime_secs)), None, None]
+        );
+        assert_eq!(
+            fi.atimes,
+            vec![None, Some(filetime_from_unix_secs(atime_secs)), None]
+        );
+        assert_eq!(
+            fi.mtimes,
+            vec![
+                Some(filetime_from_unix_secs(mtime_secs)),
+                None,
+                Some(filetime_from_unix_secs(mtime_secs + 60)),
+            ]
+        );
+        assert_eq!(fi.start_positions, vec![None, None, Some(77)]);
+        assert_eq!(fi.attributes, vec![None, Some(0x20), None]);
+    }
+}
