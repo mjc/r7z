@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::{
+    collections::BTreeSet,
     env,
     fs::{self, File},
     io::Read,
@@ -31,29 +32,44 @@ pub fn run_7z(args: &[&str], dir: &std::path::Path) -> std::process::Output {
         .expect("nix-shell not available; install p7zip or enter a nix shell with p7zip")
 }
 
-pub fn write_fixture_tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let files = vec![
-        (
-            PathBuf::from("alpha.txt"),
-            b"alpha payload repeated repeated repeated".to_vec(),
-        ),
-        (
-            PathBuf::from("nested/beta.bin"),
-            (0u8..=127).cycle().take(4096).collect(),
-        ),
-        (
-            PathBuf::from("nested/deep/gamma.txt"),
-            b"gamma\nwith\nmultiple\nlines\n".to_vec(),
-        ),
-    ];
+pub fn run_7z_checked(args: &[&str], dir: &Path) -> std::process::Output {
+    let out = run_7z(args, dir);
+    assert!(
+        out.status.success(),
+        "7z failed in {} with args {:?}\nstdout:\n{}\nstderr:\n{}",
+        dir.display(),
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
 
-    for (name, data) in &files {
-        if let Some(parent) = name.parent() {
-            fs::create_dir_all(dir.join(parent)).unwrap();
+pub fn write_fixture_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let files = fixture_files();
+    fs::create_dir_all(root.join("nested dir/empty_dir")).unwrap();
+    fs::create_dir_all(root.join("deep/path")).unwrap();
+
+    for (path, data) in &files {
+        let full = root.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
         }
-        fs::write(dir.join(name), data).unwrap();
+        fs::write(full, data).unwrap();
     }
 
+    files
+}
+
+pub fn write_fixture_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let files = fixture_files();
+    for (path, data) in &files {
+        let full = root.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(full, data).unwrap();
+    }
     files
 }
 
@@ -100,6 +116,12 @@ pub fn extract_with_p7zip(dir: &Path, archive_path: &Path, out_dir: &Path) {
     );
 }
 
+pub fn extract_with_r7z(archive: &Path, out_dir: &Path) {
+    fs::create_dir_all(out_dir).unwrap();
+    let archive = r7z::Archive::open(archive).unwrap();
+    archive.extract_all(out_dir).unwrap();
+}
+
 pub fn list_with_p7zip(dir: &Path, archive_path: &Path) -> String {
     let out = run_7z(&["l", archive_path.to_str().unwrap()], dir);
     assert!(
@@ -111,6 +133,25 @@ pub fn list_with_p7zip(dir: &Path, archive_path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+pub fn assert_trees_equal(expected: &Path, actual: &Path) {
+    let expected_entries = tree_entries(expected);
+    let actual_entries = tree_entries(actual);
+    assert_eq!(actual_entries, expected_entries, "tree entry mismatch");
+
+    for entry in expected_entries {
+        let expected_path = expected.join(&entry);
+        let actual_path = actual.join(&entry);
+        if expected_path.is_file() {
+            assert_eq!(
+                fs::read(&actual_path).unwrap(),
+                fs::read(&expected_path).unwrap(),
+                "file content mismatch for {}",
+                entry.display()
+            );
+        }
+    }
+}
+
 fn shell_quote(arg: &str) -> String {
     if arg
         .bytes()
@@ -120,4 +161,44 @@ fn shell_quote(arg: &str) -> String {
     } else {
         format!("'{}'", arg.replace('\'', "'\\''"))
     }
+}
+
+fn fixture_files() -> Vec<(PathBuf, Vec<u8>)> {
+    let mut binary = Vec::with_capacity(1024 * 1024);
+    for i in 0..1024 * 1024 {
+        binary.push(((i * 31 + i / 7) & 0xff) as u8);
+    }
+
+    let mut code = vec![0x90u8; 16 * 1024];
+    for &pos in &[8usize, 64, 255, 1024, 4096, 8191, 12000, 15000] {
+        code[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
+        code[pos + 1] = (pos * 3) as u8;
+        code[pos + 2] = ((pos * 3) >> 8) as u8;
+        code[pos + 3] = 0;
+        code[pos + 4] = 0;
+    }
+
+    vec![
+        (PathBuf::from("alpha.txt"), b"alpha text\n".to_vec()),
+        (
+            PathBuf::from("nested dir/beta.txt"),
+            b"beta text with spaces in the path\n".to_vec(),
+        ),
+        (
+            PathBuf::from("nested dir/unicode-\u{2603}.txt"),
+            "snowman payload\n".as_bytes().to_vec(),
+        ),
+        (PathBuf::from("deep/path/empty.txt"), Vec::new()),
+        (PathBuf::from("binary/payload.bin"), binary),
+        (PathBuf::from("bin/code.bin"), code),
+    ]
+}
+
+fn tree_entries(root: &Path) -> BTreeSet<PathBuf> {
+    walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .into_iter()
+        .map(|entry| entry.unwrap())
+        .map(|entry| entry.path().strip_prefix(root).unwrap().to_path_buf())
+        .collect()
 }

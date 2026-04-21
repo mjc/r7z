@@ -1,4 +1,4 @@
-use crate::R7zError;
+use crate::{Folder, R7zError};
 use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
@@ -53,101 +53,6 @@ pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
     Ok((0x1c, compressed))
 }
 
-/// Decompress `input` using the given codec, returning the decompressed bytes.
-///
-/// * `codec_id`   — codec identifier bytes from `CoderInfo`
-/// * `properties` — optional codec properties from `CoderInfo`
-/// * `input`      — compressed data (not including any `LZMA_ALONE` header)
-/// * `unpack_size`— expected output size (used to build LZMA header)
-pub fn decompress(
-    codec_id: &[u8],
-    properties: Option<&[u8]>,
-    input: &[u8],
-    unpack_size: u64,
-) -> Result<Vec<u8>, R7zError> {
-    if codec_id == CODEC_COPY {
-        return Ok(input.to_vec());
-    }
-
-    if codec_id == CODEC_LZMA {
-        return decompress_lzma(properties, input, unpack_size);
-    }
-
-    if codec_id == CODEC_LZMA2 {
-        return decompress_lzma2(properties, input);
-    }
-
-    if codec_id == CODEC_BCJ_X86 {
-        // BCJ is applied in-place as a post-processing step after a prior
-        // decompressor.  When called standalone, clone the input and decode.
-        let mut buf = input.to_vec();
-        crate::bcj::bcj_x86_decode(&mut buf);
-        return Ok(buf);
-    }
-
-    if codec_id == CODEC_AES_256_SHA_256 {
-        // AES requires a password — when called through the simple decompress
-        // path without one, signal that a password is needed.
-        return Err(R7zError::PasswordRequired);
-    }
-
-    Err(R7zError::UnsupportedCodec(codec_id.to_vec()))
-}
-
-/// Decompress or decrypt a single coder, with optional password for AES.
-fn decompress_coder(
-    coder: &crate::CoderInfo,
-    input: &[u8],
-    unpack_size: u64,
-    password: Option<&str>,
-) -> Result<Vec<u8>, R7zError> {
-    if *coder.codec_id == *CODEC_AES_256_SHA_256 {
-        let pwd = password.ok_or(R7zError::PasswordRequired)?;
-        let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        let props = crate::aes::AesProperties::parse(props_bytes)?;
-        let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power);
-        return crate::aes::decrypt_aes256_cbc(input, &key, &props.iv);
-    }
-    decompress(
-        &coder.codec_id,
-        coder.properties.as_deref(),
-        input,
-        unpack_size,
-    )
-}
-
-fn decompress_lzma(
-    properties: Option<&[u8]>,
-    input: &[u8],
-    unpack_size: u64,
-) -> Result<Vec<u8>, R7zError> {
-    let props = properties.ok_or(R7zError::Decompression)?;
-    if props.len() != 5 {
-        return Err(R7zError::Decompression);
-    }
-    let props_byte = props[0];
-    let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-
-    let mut reader =
-        LzmaReader::new_with_props(Cursor::new(input), unpack_size, props_byte, dict_size, None)
-            .map_err(|_| R7zError::Decompression)?;
-    let mut output = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
-    reader
-        .read_to_end(&mut output)
-        .map_err(|_| R7zError::Decompression)?;
-    Ok(output)
-}
-
-fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, R7zError> {
-    let dict_size = lzma2_dict_size(properties)?;
-    let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
-    let mut output = Vec::new();
-    reader
-        .read_to_end(&mut output)
-        .map_err(|_| R7zError::Decompression)?;
-    Ok(output)
-}
-
 /// Decode the LZMA2 dictionary size from the 7z properties byte.
 ///
 /// The 7z spec encodes: `dict_size = (2 | (p & 1)) << ((p >> 1) + 11)` for p < 40,
@@ -195,15 +100,27 @@ pub fn decompress_folder(
 /// was supplied, or [`R7zError::Decompression`] / [`R7zError::UnsupportedCodec`]
 /// for other failures.
 pub fn decompress_folder_with_password(
-    folder: &crate::Folder,
+    folder: &Folder,
     packed_data: &[u8],
     unpack_size: u64,
     password: Option<&str>,
 ) -> Result<Vec<u8>, R7zError> {
-    if folder.coders.len() == 1 {
-        let coder = &folder.coders[0];
-        return decompress_coder(coder, packed_data, unpack_size, password);
-    }
+    let mut reader = folder_reader(folder, packed_data, unpack_size, password)?;
+    let mut data = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
+    reader
+        .read_to_end(&mut data)
+        .map_err(|_| R7zError::Decompression)?;
+    Ok(data)
+}
+
+pub(crate) fn folder_reader<'a>(
+    folder: &Folder,
+    packed_data: &'a [u8],
+    unpack_size: u64,
+    password: Option<&str>,
+) -> Result<Box<dyn Read + 'a>, R7zError> {
+    let order = coder_execution_order(folder)?;
+    let mut reader: Box<dyn Read + 'a> = Box::new(Cursor::new(packed_data));
 
     // Multi-coder chain: resolve bind-pair ordering so that each coder's
     // output feeds the next one's input.
@@ -214,16 +131,60 @@ pub fn decompress_folder_with_password(
     //
     // We build a topological order by figuring out which coder receives the
     // packed stream (starts first) and following the bind pairs.
-    let order = coder_execution_order(folder)?;
-
-    let mut data = packed_data.to_vec();
     for (i, &coder_idx) in order.iter().enumerate() {
         let coder = &folder.coders[coder_idx];
         // For chained coders we don't know intermediate sizes; use 0 to signal "unknown".
         let size = if i == order.len() - 1 { unpack_size } else { 0 };
-        data = decompress_coder(coder, &data, size, password)?;
+        reader = coder_reader(coder, reader, size, password)?;
     }
-    Ok(data)
+    Ok(reader)
+}
+
+fn coder_reader<'a>(
+    coder: &crate::CoderInfo,
+    mut input: Box<dyn Read + 'a>,
+    unpack_size: u64,
+    password: Option<&str>,
+) -> Result<Box<dyn Read + 'a>, R7zError> {
+    if *coder.codec_id == *CODEC_COPY {
+        return Ok(input);
+    }
+
+    if *coder.codec_id == *CODEC_LZMA {
+        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        if props.len() != 5 {
+            return Err(R7zError::Decompression);
+        }
+        let props_byte = props[0];
+        let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+        let reader = LzmaReader::new_with_props(input, unpack_size, props_byte, dict_size, None)
+            .map_err(|_| R7zError::Decompression)?;
+        return Ok(Box::new(reader));
+    }
+
+    if *coder.codec_id == *CODEC_LZMA2 {
+        let dict_size = lzma2_dict_size(coder.properties.as_deref())?;
+        return Ok(Box::new(Lzma2Reader::new(input, dict_size, None)));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_X86 {
+        return Ok(Box::new(crate::bcj::BcjX86Reader::new(input)));
+    }
+
+    if *coder.codec_id == *CODEC_AES_256_SHA_256 {
+        let pwd = password.ok_or(R7zError::PasswordRequired)?;
+        let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        let props = crate::aes::AesProperties::parse(props_bytes)?;
+        let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power);
+        let mut encrypted = Vec::new();
+        input
+            .read_to_end(&mut encrypted)
+            .map_err(|_| R7zError::Decompression)?;
+        let decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
+        return Ok(Box::new(Cursor::new(decrypted)));
+    }
+
+    Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
 }
 
 /// Determine the order in which coders should be executed for decompression.
