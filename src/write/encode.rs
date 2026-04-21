@@ -78,9 +78,9 @@ pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R
     let Some(enc) = &options.encryption else {
         return Ok(());
     };
-    if enc.num_cycles_power > 0x3F {
+    if enc.num_cycles_power > aes::MAX_AES_NUM_CYCLES_POWER {
         return Err(R7zError::InvalidOptions(
-            "AES num_cycles_power must be <= 63",
+            "AES num_cycles_power must be <= 24",
         ));
     }
     if enc.salt_len > 16 {
@@ -252,9 +252,9 @@ struct AesMaterial {
 }
 
 fn make_aes_material(options: &EncryptionOptions) -> Result<AesMaterial, R7zError> {
-    if options.num_cycles_power > 0x3F {
+    if options.num_cycles_power > aes::MAX_AES_NUM_CYCLES_POWER {
         return Err(R7zError::InvalidOptions(
-            "AES num_cycles_power must be <= 63",
+            "AES num_cycles_power must be <= 24",
         ));
     }
     if options.salt_len > 16 {

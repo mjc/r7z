@@ -58,6 +58,23 @@ fn assert_default_aes_properties(props: &[u8]) {
     );
 }
 
+fn assert_salted_aes_properties(props: &[u8]) {
+    assert_eq!(props.len(), 18);
+    assert_eq!(props[0] & 0x3F, 19);
+    assert_eq!(props[0] & 0x80, 0x80, "AES salt should be present");
+    assert_eq!(props[0] & 0x40, 0x40, "AES IV should be present");
+    assert_eq!(props[1] >> 4, 7, "AES salt length should be 8");
+    assert_eq!(props[1] & 0x0F, 7, "AES IV length should be 8");
+    assert!(
+        props[2..10].iter().any(|&b| b != 0),
+        "generated AES salt should not be all zero"
+    );
+    assert!(
+        props[10..].iter().any(|&b| b != 0),
+        "generated AES IV should not be all zero"
+    );
+}
+
 fn write_builder_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBuf, Vec<u8>)]) {
     let mut builder = r7z::ArchiveBuilder::new().compression(codec);
     for (name, data) in files {
@@ -1285,6 +1302,62 @@ fn archive_builder_default_aes_properties_match_p7zip_settings() {
 }
 
 #[test]
+fn archive_builder_salted_aes_content_p7zip_and_r7z_extract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("aes_salted.7z");
+    let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
+    enc.salt_len = 8;
+    enc.iv_len = 8;
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("secret.txt", b"salted secret")
+        .build()
+        .expect("build failed");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let streams = archive.streams_info().unwrap();
+    let unpack_info = streams.unpack_info.as_ref().unwrap();
+    let folder = unpack_info.parse_folder(0).unwrap();
+    let aes_coder = &folder.coders[0];
+    assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
+    assert_salted_aes_properties(aes_coder.properties.as_deref().unwrap());
+    assert_eq!(
+        archive
+            .extract_to_memory_with_password(0, Some("Secret123"))
+            .unwrap(),
+        b"salted secret"
+    );
+
+    let out_dir = dir.join("out");
+    let out_arg = format!("-o{}", out_dir.to_str().unwrap());
+    let out = run_7z(
+        &[
+            "x",
+            "-y",
+            "-pSecret123",
+            archive_path.to_str().unwrap(),
+            &out_arg,
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z x failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("secret.txt")).unwrap(),
+        b"salted secret"
+    );
+}
+
+#[test]
 fn archive_builder_aes_content_copy_and_bcj_p7zip_and_r7z_extract() {
     let cases = [
         (
@@ -1375,7 +1448,7 @@ fn archive_builder_rejects_invalid_aes_options() {
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 
     let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
-    enc.num_cycles_power = 64;
+    enc.num_cycles_power = 25;
     enc.encrypt_header = true;
     let err = r7z::ArchiveBuilder::new()
         .options(r7z::ArchiveOptions {
@@ -1385,6 +1458,21 @@ fn archive_builder_rejects_invalid_aes_options() {
         .add_file("secret.txt", b"classified")
         .build()
         .unwrap_err();
+    assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
+
+    let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
+    enc.num_cycles_power = 25;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let err = match r7z::ArchiveWriter::new(
+        &mut buf,
+        r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        },
+    ) {
+        Ok(_) => panic!("ArchiveWriter accepted unsupported AES cycle power"),
+        Err(err) => err,
+    };
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 
     let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
