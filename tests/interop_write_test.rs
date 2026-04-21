@@ -431,7 +431,6 @@ fn archive_writer_mtime_r7z_reads() {
     let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000);
     let meta = r7z::EntryMeta {
         mtime: Some(ts),
-        unix_mode: None,
         ..Default::default()
     };
 
@@ -450,16 +449,12 @@ fn archive_writer_mtime_r7z_reads() {
     assert_eq!(fi.mtimes.first().copied().flatten(), Some(expected_ft));
 }
 
-/// [`ArchiveWriter::append_entry`] with unix_mode: attributes survive write → read.
+/// [`ArchiveWriter::append_entry`] with Unix-mode attributes survives write -> read.
 #[test]
 fn archive_writer_unix_mode_r7z_reads() {
     // Regular file, rw-r--r-- = 0o100644
     let mode: u32 = 0o100_644;
-    let meta = r7z::EntryMeta {
-        mtime: None,
-        unix_mode: Some(mode),
-        ..Default::default()
-    };
+    let meta = r7z::EntryMeta::from_unix_mode(mode);
 
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut w = r7z::ArchiveWriter::new(&mut buf, r7z::ArchiveOptions::default()).unwrap();
@@ -524,7 +519,6 @@ fn archive_writer_mtime_p7zip_reads() {
     let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000); // 2024-03-15T12:00:00Z
     let meta = r7z::EntryMeta {
         mtime: Some(ts),
-        unix_mode: None,
         ..Default::default()
     };
 

@@ -59,7 +59,6 @@ pub struct EntryMeta {
     pub atime: Option<SystemTime>,
     pub mtime: Option<SystemTime>,
     pub attributes: Option<u32>,
-    pub unix_mode: Option<u32>,
     pub start_pos: Option<u64>,
 }
 
@@ -68,7 +67,6 @@ impl EntryMeta {
     pub fn from_unix_mode(mode: u32) -> Self {
         Self {
             attributes: Some((mode << 16) | 0x20),
-            unix_mode: Some(mode),
             ..Self::default()
         }
     }
@@ -77,7 +75,6 @@ impl EntryMeta {
     pub fn directory_unix_mode(mode: u32) -> Self {
         Self {
             attributes: Some((mode << 16) | 0x10),
-            unix_mode: Some(mode),
             ..Self::default()
         }
     }
