@@ -757,6 +757,26 @@ fn build_streaming_with_options_lzma_p7zip_extracts_and_lists_method() {
 }
 
 #[test]
+fn build_streaming_with_options_bcj_lzma2_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = executable_files();
+    let archive_path = dir.join("streaming_bcj_lzma2.7z");
+    let output = std::fs::File::create(&archive_path).unwrap();
+    let entries = files
+        .iter()
+        .map(|(name, data)| (name.to_string_lossy().into_owned(), data.as_slice()));
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Lzma2Bcj,
+        ..Default::default()
+    };
+
+    r7z::build_streaming_with_options(entries, output, options)
+        .expect("build_streaming_with_options failed");
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["BCJ", "LZMA2"]);
+}
+
+#[test]
 fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
     let bytes = r7z::ArchiveBuilder::new()
         .add_file("a.txt", b"alpha")
@@ -918,6 +938,39 @@ fn archive_writer_lzma_streams_payload_before_finish() {
         &archive_path,
         &[(PathBuf::from("streamed.bin"), payload)],
         &["LZMA"],
+    );
+}
+
+#[test]
+fn archive_writer_bcj_lzma2_streams_payload_before_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("writer_bcj_lzma2_streamed.7z");
+    let payload = executable_payload(1024 * 1024);
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
+        .expect("new failed")
+        .compression(r7z::Codec::Lzma2Bcj);
+
+    writer
+        .append_file(
+            "streamed.exe",
+            payload.as_slice(),
+            r7z::EntryMeta::archive_file(),
+        )
+        .expect("append failed");
+    writer.new_folder().expect("new_folder failed");
+    assert!(
+        std::fs::metadata(&archive_path).unwrap().len() > 32,
+        "BCJ+LZMA2 writer should emit compressed payload bytes after sealing a folder"
+    );
+
+    writer.finish().expect("finish failed");
+    assert_p7zip_extracts_archive(
+        dir,
+        &archive_path,
+        &[(PathBuf::from("streamed.exe"), payload)],
+        &["BCJ", "LZMA2"],
     );
 }
 
