@@ -45,6 +45,19 @@ fn filetime_from_unix_secs(secs: u64) -> u64 {
     (secs + 11_644_473_600) * 10_000_000
 }
 
+fn assert_default_aes_properties(props: &[u8]) {
+    assert_eq!(props.len(), 18);
+    assert_eq!(props[0] & 0x3F, 19);
+    assert_eq!(props[0] & 0x80, 0, "default AES salt should be absent");
+    assert_eq!(props[0] & 0x40, 0x40, "default AES IV should be present");
+    assert_eq!(props[1] >> 4, 0, "default AES salt length should be zero");
+    assert_eq!(props[1] & 0x0F, 15, "default AES IV length should be 16");
+    assert!(
+        props[2..].iter().any(|&b| b != 0),
+        "generated AES IV should not be all zero"
+    );
+}
+
 fn write_builder_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBuf, Vec<u8>)]) {
     let mut builder = r7z::ArchiveBuilder::new().compression(codec);
     for (name, data) in files {
@@ -1068,6 +1081,45 @@ fn archive_builder_aes_content_p7zip_and_r7z_extract_with_password() {
         std::fs::read(out_dir.join("secret.txt")).unwrap(),
         b"classified"
     );
+}
+
+#[test]
+fn archive_builder_default_aes_properties_match_p7zip_settings() {
+    let options = r7z::ArchiveOptions {
+        encryption: Some(r7z::EncryptionOptions::default_for_password("Secret123")),
+        ..Default::default()
+    };
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(options)
+        .add_file("secret.txt", b"classified")
+        .build()
+        .expect("build failed");
+
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let streams = archive.streams_info().unwrap();
+    let unpack_info = streams.unpack_info.as_ref().unwrap();
+    let folder = unpack_info.parse_folder(0).unwrap();
+    let aes_coder = &folder.coders[0];
+    assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
+    assert_default_aes_properties(aes_coder.properties.as_deref().unwrap());
+
+    let mut enc = r7z::EncryptionOptions::default_for_password("HeaderSecret");
+    enc.encrypt_header = true;
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            encryption: Some(enc),
+            ..Default::default()
+        })
+        .add_file("hidden.txt", b"hidden payload")
+        .build()
+        .expect("build failed");
+    let archive = r7z::Archive::from_bytes_with_password(bytes.into(), Some("HeaderSecret"))
+        .expect("from_bytes_with_password failed");
+    let encoded_header = archive.encoded_header.as_ref().unwrap();
+    let folder = encoded_header.unpack_info.parse_folder(0).unwrap();
+    let aes_coder = &folder.coders[0];
+    assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
+    assert_default_aes_properties(aes_coder.properties.as_deref().unwrap());
 }
 
 #[test]
