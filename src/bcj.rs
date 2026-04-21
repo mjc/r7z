@@ -150,6 +150,7 @@ impl<R: Read> BcjX86Reader<R> {
             data.extend_from_slice(&self.tail);
             data.extend_from_slice(&chunk[..n]);
 
+            #[allow(clippy::cast_possible_truncation)]
             let processed =
                 bcj_x86_convert(&mut data, self.input_offset as u32, &mut self.state, false);
             self.pending.extend_from_slice(&data[..processed]);
