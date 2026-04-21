@@ -1,7 +1,89 @@
 //! Write-interop tests: create archives with r7z, extract with p7zip, byte-compare.
 
 mod support;
-use support::run_7z;
+use std::path::{Path, PathBuf};
+
+use support::{assert_extracted_files, extract_with_p7zip, list_with_p7zip, run_7z};
+
+fn parity_files() -> Vec<(PathBuf, Vec<u8>)> {
+    vec![
+        (
+            PathBuf::from("alpha.txt"),
+            b"alpha data from r7z".repeat(16),
+        ),
+        (
+            PathBuf::from("nested/beta.bin"),
+            (0u8..=255).cycle().take(8192).collect(),
+        ),
+        (
+            PathBuf::from("nested/deep/gamma.txt"),
+            b"gamma line one\ngamma line two\n".repeat(12),
+        ),
+    ]
+}
+
+fn executable_files() -> Vec<(PathBuf, Vec<u8>)> {
+    vec![
+        (PathBuf::from("bin/app.exe"), executable_payload(4096)),
+        (PathBuf::from("bin/helper.dll"), executable_payload(3072)),
+    ]
+}
+
+fn executable_payload(size: usize) -> Vec<u8> {
+    let mut data = vec![0xCCu8; size];
+    for pos in (16..size.saturating_sub(5)).step_by(89) {
+        let target = (pos as u32).wrapping_mul(17);
+        data[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
+        data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
+    }
+    data
+}
+
+fn write_builder_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBuf, Vec<u8>)]) {
+    let mut builder = r7z::ArchiveBuilder::new().compression(codec);
+    for (name, data) in files {
+        let archive_name = name.to_string_lossy();
+        builder = builder.add_file(archive_name.as_ref(), data);
+    }
+    let bytes = builder.build().expect("ArchiveBuilder build failed");
+    std::fs::write(archive_path, bytes).unwrap();
+}
+
+fn write_writer_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBuf, Vec<u8>)]) {
+    let file = std::fs::File::create(archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file)
+        .expect("ArchiveWriter::new failed")
+        .compression(codec);
+    for (idx, (name, data)) in files.iter().enumerate() {
+        if idx == 1 {
+            writer.new_folder().expect("new_folder failed");
+        }
+        let archive_name = name.to_string_lossy();
+        writer
+            .append(archive_name.as_ref(), data.as_slice())
+            .expect("append failed");
+    }
+    writer.finish().expect("finish failed");
+}
+
+fn assert_p7zip_extracts_archive(
+    dir: &Path,
+    archive_path: &Path,
+    expected: &[(PathBuf, Vec<u8>)],
+    labels: &[&str],
+) {
+    let out_dir = dir.join("extracted");
+    extract_with_p7zip(dir, archive_path, &out_dir);
+    assert_extracted_files(&out_dir, expected);
+
+    let listing = list_with_p7zip(dir, archive_path);
+    for label in labels {
+        assert!(
+            listing.contains(label),
+            "expected p7zip listing to contain {label:?}:\n{listing}"
+        );
+    }
+}
 
 /// r7z round-trip: build → `from_bytes` → `extract_to_memory`.
 #[test]
@@ -490,4 +572,85 @@ fn archive_writer_bcj_lzma2_p7zip_reads() {
 
     let extracted = std::fs::read(dir.join("code.bin")).unwrap();
     assert_eq!(extracted, data);
+}
+
+#[test]
+fn archive_builder_lzma_multi_file_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("builder_lzma.7z");
+
+    write_builder_archive(&archive_path, r7z::Codec::Lzma, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA"]);
+}
+
+#[test]
+fn archive_builder_lzma2_multi_file_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("builder_lzma2.7z");
+
+    write_builder_archive(&archive_path, r7z::Codec::Lzma2, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA2"]);
+}
+
+#[test]
+fn archive_builder_bcj_lzma2_multi_file_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = executable_files();
+    let archive_path = dir.join("builder_bcj_lzma2.7z");
+
+    write_builder_archive(&archive_path, r7z::Codec::Lzma2Bcj, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["BCJ", "LZMA2"]);
+}
+
+#[test]
+fn archive_writer_lzma_multi_folder_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("writer_lzma.7z");
+
+    write_writer_archive(&archive_path, r7z::Codec::Lzma, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA"]);
+}
+
+#[test]
+fn archive_writer_lzma2_multi_folder_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("writer_lzma2.7z");
+
+    write_writer_archive(&archive_path, r7z::Codec::Lzma2, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA2"]);
+}
+
+#[test]
+fn archive_writer_bcj_lzma2_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = executable_files();
+    let archive_path = dir.join("writer_bcj_lzma2.7z");
+
+    write_writer_archive(&archive_path, r7z::Codec::Lzma2Bcj, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["BCJ", "LZMA2"]);
+}
+
+#[test]
+fn build_streaming_lzma2_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("streaming_lzma2.7z");
+    let output = std::fs::File::create(&archive_path).unwrap();
+    let entries = files
+        .iter()
+        .map(|(name, data)| (name.to_string_lossy().into_owned(), data.as_slice()));
+
+    r7z::build_streaming(entries, output).expect("build_streaming failed");
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA2"]);
 }
