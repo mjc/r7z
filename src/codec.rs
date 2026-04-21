@@ -152,8 +152,24 @@ pub(crate) fn folder_reader_with_sizes<'a>(
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
+    folder_reader_with_sizes_from_reader(
+        folder,
+        Box::new(Cursor::new(packed_data)),
+        unpack_size,
+        coder_unpack_sizes,
+        password,
+    )
+}
+
+pub(crate) fn folder_reader_with_sizes_from_reader<'a>(
+    folder: &Folder,
+    input: Box<dyn Read + 'a>,
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Box<dyn Read + 'a>, R7zError> {
     let order = coder_execution_order(folder)?;
-    let mut reader: Box<dyn Read + 'a> = Box::new(Cursor::new(packed_data));
+    let mut reader = input;
 
     // Multi-coder chain: resolve bind-pair ordering so that each coder's
     // output feeds the next one's input.

@@ -4,15 +4,136 @@ use crate::{
 };
 use bytes::Bytes;
 use memmap2::Mmap;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 /// Maximum decompressed size accepted for the compressed archive header (metadata only).
 /// A malicious archive could declare an enormous `unpack_size` to cause OOM during header
 /// decompression; this cap bounds the allocation to a sane limit. File data extracted
 /// via [`Archive::extract_to_memory`] is not subject to this limit.
-const MAX_HEADER_UNPACK_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveStorageMode {
+    Mmap,
+    Seek,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveOpenOptions {
+    pub max_metadata_bytes: u64,
+    pub storage_mode: ArchiveStorageMode,
+}
+
+impl Default for ArchiveOpenOptions {
+    fn default() -> Self {
+        Self {
+            max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
+            storage_mode: ArchiveStorageMode::Mmap,
+        }
+    }
+}
+
+trait ReadSeek: Read + Seek {}
+
+impl<T: Read + Seek> ReadSeek for T {}
+
+enum ArchiveSource {
+    Bytes(Bytes),
+    Seekable(Mutex<Box<dyn ReadSeek + Send>>),
+}
+
+impl ArchiveSource {
+    fn from_reader<R>(reader: R) -> Self
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::Seekable(Mutex::new(Box::new(reader)))
+    }
+
+    fn len(&self) -> Result<u64, R7zError> {
+        match self {
+            Self::Bytes(bytes) => u64::try_from(bytes.len()).map_err(|_| R7zError::Parse),
+            Self::Seekable(reader) => {
+                let mut reader = reader.lock().map_err(|_| R7zError::Parse)?;
+                reader.seek(SeekFrom::End(0)).map_err(R7zError::Io)
+            }
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), R7zError> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(u64::try_from(dst.len()).map_err(|_| R7zError::Parse)?)
+            .ok_or(R7zError::Parse)?;
+        if end > self.len()? {
+            return Err(R7zError::Parse);
+        }
+        match self {
+            Self::Bytes(bytes) => {
+                let start = usize::try_from(offset).map_err(|_| R7zError::Parse)?;
+                let end = usize::try_from(end).map_err(|_| R7zError::Parse)?;
+                dst.copy_from_slice(bytes.get(start..end).ok_or(R7zError::Parse)?);
+                Ok(())
+            }
+            Self::Seekable(reader) => {
+                let mut reader = reader.lock().map_err(|_| R7zError::Parse)?;
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read_exact(dst)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn read_range_to_vec(&self, range: Range<u64>, limit: u64) -> Result<Vec<u8>, R7zError> {
+        let len = checked_sub_u64(range.end, range.start)?;
+        if len > limit {
+            return Err(R7zError::LimitExceeded("metadata"));
+        }
+        let len = usize::try_from(len).map_err(|_| R7zError::Parse)?;
+        let mut out = vec![0u8; len];
+        self.read_exact_at(range.start, &mut out)?;
+        Ok(out)
+    }
+
+    fn range_reader(&self, range: Range<u64>) -> Result<ArchiveRangeReader<'_>, R7zError> {
+        if range.start > range.end || range.end > self.len()? {
+            return Err(R7zError::Parse);
+        }
+        Ok(ArchiveRangeReader {
+            source: self,
+            pos: range.start,
+            end: range.end,
+        })
+    }
+}
+
+struct ArchiveRangeReader<'a> {
+    source: &'a ArchiveSource,
+    pos: u64,
+    end: u64,
+}
+
+impl Read for ArchiveRangeReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.end - self.pos;
+        let n = usize::try_from(remaining.min(buf.len() as u64)).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "range too large")
+        })?;
+        self.source
+            .read_exact_at(self.pos, &mut buf[..n])
+            .map_err(std::io::Error::other)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
 
 /// Metadata extracted from the outer 7z header (`EncodedHeader` only).
 #[derive(Debug)]
@@ -62,8 +183,7 @@ impl ArchiveMetadata {
 
 /// Fully decoded archive with file listing and extraction support.
 pub struct Archive {
-    /// Raw archive bytes (O(1) clone via reference counting).
-    data: Bytes,
+    source: ArchiveSource,
     pub signature: SignatureHeader,
     /// Present for `EncodedHeader` archives; None for uncompressed-header archives.
     pub encoded_header: Option<EncodedHeader>,
@@ -89,7 +209,7 @@ impl Archive {
     /// this is rarely an issue for archive files, but callers that need
     /// stronger guarantees should use [`Archive::from_reader`] instead.
     pub fn open(path: &Path) -> Result<Archive, R7zError> {
-        Self::open_with_password(path, None)
+        Self::open_with_options(path, ArchiveOpenOptions::default())
     }
 
     /// Open a 7z archive from a file path, supplying a password for encrypted archives.
@@ -104,31 +224,53 @@ impl Archive {
     /// [`R7zError::PasswordRequired`] if the headers are encrypted and no password
     /// is supplied, or a parse/CRC error if the archive is malformed.
     pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Archive, R7zError> {
-        let file = std::fs::File::open(path)?;
-        // SAFETY: The file is opened read-only and we do not mutate the mapping.
-        // A concurrent truncation of the file could cause SIGBUS; callers that
-        // need to guard against this should use `from_reader` instead.
-        let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_bytes_with_password(Bytes::from_owner(mmap), password)
+        Self::open_with_password_and_options(path, password, ArchiveOpenOptions::default())
     }
 
-    /// Fully read a [`Read`] source and decode it as a 7z archive.
+    pub fn open_with_options(
+        path: &Path,
+        options: ArchiveOpenOptions,
+    ) -> Result<Archive, R7zError> {
+        Self::open_with_password_and_options(path, None, options)
+    }
+
+    pub fn open_with_password_and_options(
+        path: &Path,
+        password: Option<&str>,
+        options: ArchiveOpenOptions,
+    ) -> Result<Archive, R7zError> {
+        let file = std::fs::File::open(path)?;
+        let source = match options.storage_mode {
+            ArchiveStorageMode::Mmap => {
+                // SAFETY: The file is opened read-only and we do not mutate the
+                // mapping. A concurrent truncation could cause SIGBUS; callers
+                // that need stronger guarantees can select Seek mode.
+                let mmap = unsafe { Mmap::map(&file)? };
+                ArchiveSource::Bytes(Bytes::from_owner(mmap))
+            }
+            ArchiveStorageMode::Seek => ArchiveSource::from_reader(file),
+        };
+        Self::from_source_with_password(source, password, options)
+    }
+
+    /// Decode a seekable [`Read`] source as a 7z archive.
     ///
-    /// Because the 7z format requires random access (the header lives at the
-    /// end of the file while the data blocks are near the start), the entire
-    /// source is buffered into memory before parsing begins.  For local files
-    /// prefer [`Archive::open`], which uses `mmap` to avoid an upfront
-    /// allocation.
+    /// The 7z format needs random access: packed streams are near the start,
+    /// while the authoritative header is usually near the end. Non-seekable
+    /// sources must be spooled by the caller before constructing an [`Archive`].
     ///
     /// # Errors
     ///
     /// Returns [`R7zError::Io`] if reading fails, or a parse/CRC error if the
     /// archive is malformed.
-    pub fn from_reader(reader: impl Read) -> Result<Archive, R7zError> {
+    pub fn from_reader<R>(reader: R) -> Result<Archive, R7zError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         Self::from_reader_with_password(reader, None)
     }
 
-    /// Fully read a [`Read`] source and decode it as a 7z archive, with a password.
+    /// Decode a seekable [`Read`] source as a 7z archive, with a password.
     ///
     /// See [`Archive::from_reader`] and [`Archive::open_with_password`] for details.
     ///
@@ -136,13 +278,42 @@ impl Archive {
     ///
     /// Returns [`R7zError::Io`] if reading fails, [`R7zError::PasswordRequired`]
     /// if encrypted headers need a password, or a parse/CRC error if malformed.
-    pub fn from_reader_with_password(
-        mut reader: impl Read,
+    pub fn from_reader_with_password<R>(
+        reader: R,
         password: Option<&str>,
-    ) -> Result<Archive, R7zError> {
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
-        Self::from_bytes_with_password(Bytes::from(buf), password)
+    ) -> Result<Archive, R7zError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::from_reader_with_password_and_options(
+            reader,
+            password,
+            ArchiveOpenOptions {
+                storage_mode: ArchiveStorageMode::Seek,
+                ..ArchiveOpenOptions::default()
+            },
+        )
+    }
+
+    pub fn from_reader_with_options<R>(
+        reader: R,
+        options: ArchiveOpenOptions,
+    ) -> Result<Archive, R7zError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::from_reader_with_password_and_options(reader, None, options)
+    }
+
+    pub fn from_reader_with_password_and_options<R>(
+        reader: R,
+        password: Option<&str>,
+        options: ArchiveOpenOptions,
+    ) -> Result<Archive, R7zError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::from_source_with_password(ArchiveSource::from_reader(reader), password, options)
     }
 
     /// Parse a 7z archive from in-memory bytes.
@@ -166,43 +337,57 @@ impl Archive {
         data: Bytes,
         password: Option<&str>,
     ) -> Result<Archive, R7zError> {
-        if data.len() < 32 {
+        Self::from_source_with_password(
+            ArchiveSource::Bytes(data),
+            password,
+            ArchiveOpenOptions::default(),
+        )
+    }
+
+    fn from_source_with_password(
+        source: ArchiveSource,
+        password: Option<&str>,
+        options: ArchiveOpenOptions,
+    ) -> Result<Archive, R7zError> {
+        let source_len = source.len()?;
+        if source_len < 32 {
             return Err(R7zError::Parse);
         }
-        // Validate start_header_crc on raw bytes before trusting any parsed fields.
-        // data[8..12] = start_header_crc, data[12..32] = the covered region.
-        let start_crc = u32::from_le_bytes(data[8..12].try_into().map_err(|_| R7zError::Parse)?);
-        if crc32fast::hash(&data[12..32]) != start_crc {
+        let mut signature_bytes = [0u8; 32];
+        source.read_exact_at(0, &mut signature_bytes)?;
+        let (_, signature) =
+            SignatureHeader::parse(&signature_bytes).map_err(|_| R7zError::Parse)?;
+        signature.validate_start_header_crc()?;
+
+        if signature.next_header_size > options.max_metadata_bytes {
+            return Err(R7zError::LimitExceeded("metadata"));
+        }
+
+        let header_start = checked_add_u64(32, signature.next_header_offset)?;
+        let header_range = checked_range_u64(source_len, header_start, signature.next_header_size)?;
+        let next_header =
+            Bytes::from(source.read_range_to_vec(header_range, options.max_metadata_bytes)?);
+        if crc32fast::hash(&next_header) != signature.next_header_crc {
             return Err(R7zError::Crc);
         }
-        let (input, signature) = SignatureHeader::parse(&data).map_err(|_| R7zError::Parse)?;
-
-        let offset = usize::try_from(signature.next_header_offset).map_err(|_| R7zError::Parse)?;
-        let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
-
-        // Validate next_header_crc over the raw encoded/header bytes
-        let header_start = checked_add_usize(32, offset)?;
-        let header_range = checked_range(data.len(), header_start, signature.next_header_size)?;
-        let header_raw = &data[header_range.clone()];
-        let computed_crc = crc32fast::hash(header_raw);
-        if computed_crc != signature.next_header_crc {
-            return Err(R7zError::Crc);
-        }
+        let (prop_input, prop) = Property::parse(&next_header).map_err(|_| R7zError::Parse)?;
 
         match prop {
             Property::EncodedHeader => {
                 // Parse the EncodedHeader (describes how the full header is compressed)
                 let (_, encoded_header) =
-                    EncodedHeader::parse(input, &data).map_err(|_| R7zError::Parse)?;
+                    EncodedHeader::parse(prop_input, &next_header).map_err(|_| R7zError::Parse)?;
 
                 // Decompress the packed header stream
                 let pi = &encoded_header.pack_info;
                 let ui = &encoded_header.unpack_info;
-                let pack_pos = usize::try_from(pi.pack_pos).map_err(|_| R7zError::Parse)?;
-                let data_start = checked_add_usize(32, pack_pos)?;
+                let data_start = checked_add_u64(32, pi.pack_pos)?;
                 let pack_size = *pi.pack_size.first().ok_or(R7zError::Parse)?;
-                let data_range = checked_range(data.len(), data_start, pack_size)?;
-                let packed = &data[data_range];
+                if pack_size > options.max_metadata_bytes {
+                    return Err(R7zError::LimitExceeded("metadata"));
+                }
+                let data_range = checked_range_u64(source_len, data_start, pack_size)?;
+                let packed = source.read_range_to_vec(data_range, options.max_metadata_bytes)?;
                 let folder = ui.parse_folder(0)?;
 
                 // Find the final output stream's unpack size.
@@ -231,12 +416,12 @@ impl Archive {
                             .ok_or(R7zError::Parse)?
                     }
                 };
-                if unpack_size > MAX_HEADER_UNPACK_BYTES {
-                    return Err(R7zError::Parse);
+                if unpack_size > options.max_metadata_bytes {
+                    return Err(R7zError::LimitExceeded("metadata"));
                 }
                 let decompressed = codec::decompress_folder_with_password_and_sizes(
                     &folder,
-                    packed,
+                    &packed,
                     unpack_size,
                     &ui.unpack_sizes,
                     password,
@@ -246,7 +431,7 @@ impl Archive {
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
 
                 Ok(Archive {
-                    data,
+                    source,
                     signature,
                     encoded_header: Some(encoded_header),
                     header,
@@ -255,11 +440,10 @@ impl Archive {
             Property::Header => {
                 // Header is stored uncompressed at next_header_offset (the raw bytes
                 // include the 0x01 tag, so we slice from header_start, not header_start+1)
-                let header_bytes = data.slice(header_range);
-                let (_, header) = Header::parse(&header_bytes).map_err(|_| R7zError::Parse)?;
+                let (_, header) = Header::parse(&next_header).map_err(|_| R7zError::Parse)?;
 
                 Ok(Archive {
-                    data,
+                    source,
                     signature,
                     encoded_header: None,
                     header,
@@ -373,10 +557,10 @@ impl Archive {
         }
 
         let location = self.extraction_location(file_index)?;
-        let packed = &self.data[location.packed_range.clone()];
-        let mut reader = codec::folder_reader_with_sizes(
+        let packed = self.source.range_reader(location.packed_range.clone())?;
+        let mut reader = codec::folder_reader_with_sizes_from_reader(
             &location.folder,
-            packed,
+            Box::new(packed),
             location.folder_unpack_size,
             &location.coder_unpack_sizes,
             password,
@@ -478,11 +662,9 @@ impl Archive {
         let pack_offset_u64 = prior_pack_sizes.iter().try_fold(0u64, |acc, &size| {
             acc.checked_add(size).ok_or(R7zError::Parse)
         })?;
-        let pack_offset = usize::try_from(pack_offset_u64).map_err(|_| R7zError::Parse)?;
         let pack_size = *pack_info.pack_size.get(folder_idx).ok_or(R7zError::Parse)?;
-        let pack_pos = usize::try_from(pack_info.pack_pos).map_err(|_| R7zError::Parse)?;
-        let data_start = checked_add_usize(checked_add_usize(32, pack_pos)?, pack_offset)?;
-        let packed_range = checked_range(self.data.len(), data_start, pack_size)?;
+        let data_start = checked_add_u64(checked_add_u64(32, pack_info.pack_pos)?, pack_offset_u64)?;
+        let packed_range = checked_range_u64(self.source.len()?, data_start, pack_size)?;
 
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
         let coder_unpack_sizes = folder_coder_unpack_sizes(folder_idx, unpack_info)?;
@@ -573,7 +755,7 @@ impl Archive {
 
 struct ExtractionLocation {
     folder: crate::Folder,
-    packed_range: Range<usize>,
+    packed_range: Range<u64>,
     folder_unpack_size: u64,
     coder_unpack_sizes: Vec<u64>,
     stream_start: usize,
@@ -596,8 +778,25 @@ fn checked_add_usize(lhs: usize, rhs: usize) -> Result<usize, R7zError> {
     lhs.checked_add(rhs).ok_or(R7zError::Parse)
 }
 
+fn checked_add_u64(lhs: u64, rhs: u64) -> Result<u64, R7zError> {
+    lhs.checked_add(rhs).ok_or(R7zError::Parse)
+}
+
+fn checked_sub_u64(lhs: u64, rhs: u64) -> Result<u64, R7zError> {
+    lhs.checked_sub(rhs).ok_or(R7zError::Parse)
+}
+
 fn checked_range(total_len: usize, start: usize, len: u64) -> Result<Range<usize>, R7zError> {
     let len = usize::try_from(len).map_err(|_| R7zError::Parse)?;
+    let end = start.checked_add(len).ok_or(R7zError::Parse)?;
+    if end <= total_len {
+        Ok(start..end)
+    } else {
+        Err(R7zError::Parse)
+    }
+}
+
+fn checked_range_u64(total_len: u64, start: u64, len: u64) -> Result<Range<u64>, R7zError> {
     let end = start.checked_add(len).ok_or(R7zError::Parse)?;
     if end <= total_len {
         Ok(start..end)

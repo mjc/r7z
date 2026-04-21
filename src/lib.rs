@@ -56,7 +56,7 @@ mod property;
 mod stream_info;
 mod write;
 
-pub use archive::{Archive, ArchiveMetadata};
+pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMode};
 pub use codec::{
     decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ_X86,
     CODEC_COPY, CODEC_LZMA, CODEC_LZMA2,
