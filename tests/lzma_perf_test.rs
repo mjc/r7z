@@ -30,7 +30,13 @@ fn pseudo_random_payload(size: usize) -> Vec<u8> {
 /// Text-like data — repeating English-ish words. Moderate compressibility.
 fn text_like_payload(size: usize) -> Vec<u8> {
     let words = "the quick brown fox jumps over the lazy dog and then runs back again to fetch a bone from the yard where the old tree stands quietly in the breeze ";
-    words.as_bytes().iter().copied().cycle().take(size).collect()
+    words
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(size)
+        .collect()
 }
 
 // ── lzma_rust2 (pure Rust) ─────────────────────────────────────────────────
@@ -58,9 +64,14 @@ fn rust_decompress(alone: &[u8]) -> Vec<u8> {
     let unpack_size = u64::from_le_bytes(alone[5..13].try_into().unwrap());
     let stream = &alone[13..];
 
-    let mut r =
-        lzma_rust2::LzmaReader::new_with_props(Cursor::new(stream), unpack_size, props_byte, dict_size, None)
-            .unwrap();
+    let mut r = lzma_rust2::LzmaReader::new_with_props(
+        Cursor::new(stream),
+        unpack_size,
+        props_byte,
+        dict_size,
+        None,
+    )
+    .unwrap();
     let mut out = Vec::with_capacity(unpack_size as usize);
     r.read_to_end(&mut out).unwrap();
     out
@@ -106,7 +117,10 @@ fn bench<F: Fn() -> R, R>(label: &str, iters: u32, f: F) -> std::time::Duration 
 #[ignore] // run explicitly with --ignored
 fn lzma_rust_vs_c_performance() {
     let data = payload();
-    println!("\n=== LZMA Rust-vs-C comparison ({} bytes payload) ===\n", data.len());
+    println!(
+        "\n=== LZMA Rust-vs-C comparison ({} bytes payload) ===\n",
+        data.len()
+    );
 
     // ── Compress ───────────────────────────────────────────────────────────
     println!("Compression (preset 6):");
@@ -155,7 +169,9 @@ fn lzma_rust_vs_c_performance() {
     );
 
     println!("Decompression:");
-    let rust_dec_time2 = bench("lzma_rust2", ITERS, || rust_decompress(&rust_rand_compressed));
+    let rust_dec_time2 = bench("lzma_rust2", ITERS, || {
+        rust_decompress(&rust_rand_compressed)
+    });
     let c_dec_time2 = bench("C liblzma ", ITERS, || c_decompress(&c_rand_compressed));
     let dec_ratio2 = rust_dec_time2.as_nanos() as f64 / c_dec_time2.as_nanos() as f64;
     println!("  → Rust/C ratio: {dec_ratio2:.2}x\n");
@@ -183,7 +199,9 @@ fn lzma_rust_vs_c_performance() {
     );
 
     println!("Decompression:");
-    let rust_dec_time3 = bench("lzma_rust2", ITERS, || rust_decompress(&rust_text_compressed));
+    let rust_dec_time3 = bench("lzma_rust2", ITERS, || {
+        rust_decompress(&rust_text_compressed)
+    });
     let c_dec_time3 = bench("C liblzma ", ITERS, || c_decompress(&c_text_compressed));
     let dec_ratio3 = rust_dec_time3.as_nanos() as f64 / c_dec_time3.as_nanos() as f64;
     println!("  → Rust/C ratio: {dec_ratio3:.2}x\n");
