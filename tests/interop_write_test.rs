@@ -1071,6 +1071,70 @@ fn archive_builder_aes_content_p7zip_and_r7z_extract_with_password() {
 }
 
 #[test]
+fn archive_builder_aes_content_copy_and_bcj_p7zip_and_r7z_extract() {
+    let cases = [
+        (
+            r7z::Codec::Copy,
+            "aes_copy.7z",
+            "raw.bin",
+            (0u8..=255).cycle().take(4097).collect::<Vec<_>>(),
+        ),
+        (
+            r7z::Codec::Lzma2Bcj,
+            "aes_bcj.7z",
+            "bin/app.exe",
+            executable_payload(4096),
+        ),
+    ];
+
+    for (codec, archive_name, entry_name, payload) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let archive_path = dir.join(archive_name);
+        let options = r7z::ArchiveOptions {
+            codec,
+            encryption: Some(r7z::EncryptionOptions::default_for_password("Secret123")),
+            ..Default::default()
+        };
+        let bytes = r7z::ArchiveBuilder::new()
+            .options(options)
+            .add_file(entry_name, &payload)
+            .build()
+            .expect("build failed");
+        std::fs::write(&archive_path, bytes).unwrap();
+
+        let archive = r7z::Archive::open(&archive_path).unwrap();
+        assert_eq!(
+            archive
+                .extract_to_memory_with_password(0, Some("Secret123"))
+                .unwrap(),
+            payload
+        );
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let out_arg = format!("-o{}", out_dir.to_str().unwrap());
+        let out = run_7z(
+            &[
+                "x",
+                "-y",
+                "-pSecret123",
+                archive_path.to_str().unwrap(),
+                &out_arg,
+            ],
+            dir,
+        );
+        assert!(
+            out.status.success(),
+            "7z x failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(out_dir.join(entry_name)).unwrap(), payload);
+    }
+}
+
+#[test]
 fn archive_builder_rejects_invalid_aes_options() {
     let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
     enc.salt_len = 17;
