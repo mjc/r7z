@@ -1,4 +1,4 @@
-use std::{fs, process::Command};
+use std::{fs, io::Cursor, process::Command};
 
 use tempfile::tempdir;
 
@@ -172,6 +172,39 @@ fn cli_list_accepts_wildcard_entry_patterns() {
 
     assert!(listing.contains("Path = a.txt"));
     assert!(!listing.contains("Path = b.log"));
+}
+
+#[test]
+fn cli_test_accepts_wildcard_entry_patterns() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("test-wildcards.7z");
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = r7z::ArchiveWriter::new(&mut cursor, r7z::ArchiveOptions::default())
+            .unwrap()
+            .compression(r7z::Codec::Copy);
+        writer.append("good.txt", &b"good-payload"[..]).unwrap();
+        writer.new_folder().unwrap();
+        writer
+            .append("bad.log", &b"bad-payload-unique"[..])
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let mut bytes = cursor.into_inner();
+    let bad_offset = bytes
+        .windows(b"bad-payload-unique".len())
+        .position(|window| window == b"bad-payload-unique")
+        .unwrap();
+    bytes[bad_offset] ^= 0x55;
+    fs::write(&archive, bytes).unwrap();
+
+    let all = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["t", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(all.status.code(), Some(1));
+
+    run_r7z(&["t".into(), archive.display().to_string(), "*.txt".into()]);
 }
 
 #[test]

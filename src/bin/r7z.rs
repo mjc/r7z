@@ -467,10 +467,17 @@ fn archive_methods(archive: &Archive) -> Vec<String> {
 
 fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
+    let selected = selected_patterns(&cli.operands);
     let mut sink = io::sink();
     let mut warnings = 0u8;
     for i in 0..archive.num_files() {
         let fi = archive.files_info();
+        let name = fi
+            .and_then(|files| files.name(i))
+            .unwrap_or_else(|| format!("unknown-{i}"));
+        if !entry_is_selected(&name, &selected) {
+            continue;
+        }
         if fi.is_some_and(|files| {
             files.is_directory(i) || files.is_anti(i) || files.is_empty_file(i)
         }) {
