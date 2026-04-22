@@ -220,6 +220,24 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.options.compression.level = parse_level(switch)?;
         return Ok(());
     }
+    if lower.starts_with("md") {
+        let value = parse_attached_value(switch, "md")?;
+        let size = parse_size(value)?;
+        state.options.compression.dictionary_size = Some(
+            u32::try_from(size)
+                .map_err(|_| CliError::Usage(format!("dictionary size is too large: {value}")))?,
+        );
+        return Ok(());
+    }
+    if lower.starts_with("mfb") {
+        let value = parse_attached_value(switch, "mfb")?;
+        state.options.compression.fast_bytes = Some(
+            value
+                .parse::<u32>()
+                .map_err(|_| CliError::Usage(format!("invalid fast bytes: {value}")))?,
+        );
+        return Ok(());
+    }
     if lower.starts_with("ms") {
         state.options.compression.solid = parse_solid(switch)?;
         return Ok(());
@@ -369,6 +387,18 @@ fn parse_size(text: &str) -> Result<u64, CliError> {
         .checked_mul(multiplier)
         .filter(|&value| value > 0)
         .ok_or_else(|| CliError::Usage(format!("invalid volume size: {text}")))
+}
+
+fn parse_attached_value<'a>(switch: &'a str, name: &str) -> Result<&'a str, CliError> {
+    let value = switch
+        .get(name.len()..)
+        .ok_or_else(|| CliError::Usage(format!("-{name} requires a value")))?;
+    let value = value.strip_prefix('=').unwrap_or(value);
+    if value.is_empty() {
+        Err(CliError::Usage(format!("-{name} requires a value")))
+    } else {
+        Ok(value)
+    }
 }
 
 fn list_archive(cli: &Cli) -> Result<(), CliError> {

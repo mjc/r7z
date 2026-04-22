@@ -15,7 +15,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
   `-aoa`, and `-aos`.
-- CLI method grammar: `-m0=METHOD:d=SIZE:fb=N` for supported codecs.
+- CLI method grammar: `-m0=METHOD:d=SIZE:fb=N`, `-md=SIZE`, and `-mfb=N`
+  for supported codecs.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
 - CLI warnings: test/extract return warning status when explicit operands match
@@ -33,7 +34,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - Decoder extensions: ZSTD, Brotli, LZ4, LZ5, Lizard, LZHAM. `FLZMA2` is tracked
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
 - Encoder: all missing decoder methods above, plus exact p7zip method-chain
-  switch grammar beyond the currently supported `d`/`fb` subset.
+  switch grammar beyond the currently supported dictionary/fast-bytes subset.
 - CLI: interactive overwrite prompts, remaining warning paths, and byte-for-byte
   listing text are still incomplete.
 - Metadata: p7zip-like unsafe link materialization is intentionally not default;
