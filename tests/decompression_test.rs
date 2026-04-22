@@ -30,6 +30,16 @@ fn decompress_lzma_packed_header() {
 }
 
 #[test]
+fn archive_metadata_parse_accepts_prepended_bytes() {
+    let mut buf = b"stub bytes before the 7z signature".to_vec();
+    buf.extend_from_slice(&support::valid_7z_string());
+
+    let meta = r7z::ArchiveMetadata::parse(&buf).unwrap();
+
+    assert_eq!(meta.signature.signature, *b"7z\xbc\xaf'\x1c");
+}
+
+#[test]
 fn archive_open_and_decompress_header_stream() {
     use std::env;
     let path = env::current_dir().unwrap().join("tests/fixtures/test_1.7z");

@@ -113,6 +113,25 @@ fn open_split_archive_first_volume_reads_siblings() {
 }
 
 #[test]
+fn open_prepended_archive_finds_embedded_signature() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut bytes = b"MZ fake sfx stub\nnot a real executable\n".to_vec();
+    bytes.extend_from_slice(
+        &r7z::ArchiveBuilder::new()
+            .add_file("payload.txt", b"embedded")
+            .build()
+            .unwrap(),
+    );
+    let archive_path = tmp.path().join("payload.exe");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+
+    assert_eq!(archive.num_files(), 1);
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"embedded");
+}
+
+#[test]
 fn sparse_large_seek_open_does_not_read_whole_file() {
     let tmp = tempfile::tempdir().unwrap();
     let archive_path = tmp.path().join("sparse.7z");

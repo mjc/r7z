@@ -8,7 +8,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 
 ## Implemented
 
-- Parser: core 7z headers, encoded headers, stream info, files info.
+- Parser: core 7z headers, encoded headers, stream info, files info,
+  SFX/prepended-byte signature scan.
 - Decoder: Copy, LZMA, LZMA2, x86 BCJ filter, 7zAES in folder chains.
 - Encoder: Copy, LZMA, LZMA2, BCJ+LZMA2, 7zAES content/header encryption.
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
@@ -20,7 +21,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 
 ## Gaps By Category
 
-- Parser: SFX/prepended-byte signature scan.
+- Parser: no known p7zip parity gaps in the currently tracked subset.
 - Decoder: BCJ2 multi-packed-stream graph, BZip2, PPMd, Deflate, Deflate64,
   Delta, ARM, ARMT, IA64, PPC, SPARC, Swap2, Swap4.
 - Decoder extensions: ZSTD, Brotli, LZ4, LZ5, Lizard, LZHAM. `FLZMA2` is tracked

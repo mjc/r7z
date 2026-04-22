@@ -14,6 +14,8 @@ use std::sync::Mutex;
 /// decompression; this cap bounds the allocation to a sane limit. File data extracted
 /// via [`Archive::extract_to_memory`] is not subject to this limit.
 const DEFAULT_MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const SEVEN_Z_MAGIC: &[u8; 6] = b"7z\xbc\xaf'\x1c";
+const SIGNATURE_SCAN_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArchiveStorageMode {
@@ -176,6 +178,76 @@ impl ArchiveSource {
             end: range.end,
         })
     }
+
+    fn find_signature_offset(&self, limit: u64) -> Result<u64, R7zError> {
+        let source_len = self.len()?;
+        let scan_len = source_len.min(limit);
+        let mut offset = 0u64;
+        let mut carry = Vec::new();
+        let mut saw_bad_signature = false;
+
+        while offset < scan_len {
+            let remaining = scan_len - offset;
+            let chunk_len = usize::try_from(remaining.min(SIGNATURE_SCAN_CHUNK as u64))
+                .map_err(|_| R7zError::Parse)?;
+            let mut chunk = vec![0u8; chunk_len];
+            self.read_exact_at(offset, &mut chunk)?;
+
+            let carry_len = carry.len();
+            carry.extend_from_slice(&chunk);
+            let search_start = carry_len.saturating_sub(SEVEN_Z_MAGIC.len() - 1);
+            let base = offset
+                .checked_sub(carry_len as u64)
+                .ok_or(R7zError::Parse)?;
+
+            for pos in find_magic_offsets(&carry[search_start..]) {
+                let pos = search_start.checked_add(pos).ok_or(R7zError::Parse)?;
+                let candidate = base.checked_add(pos as u64).ok_or(R7zError::Parse)?;
+                match self.signature_at(candidate)? {
+                    SignatureCandidate::Valid => return Ok(candidate),
+                    SignatureCandidate::BadCrc => saw_bad_signature = true,
+                    SignatureCandidate::Incomplete => {}
+                }
+            }
+
+            if carry.len() >= SEVEN_Z_MAGIC.len() - 1 {
+                carry = carry[carry.len() - (SEVEN_Z_MAGIC.len() - 1)..].to_vec();
+            }
+            offset = offset
+                .checked_add(chunk_len as u64)
+                .ok_or(R7zError::Parse)?;
+        }
+
+        if saw_bad_signature {
+            Err(R7zError::Crc)
+        } else {
+            Err(R7zError::Parse)
+        }
+    }
+
+    fn signature_at(&self, offset: u64) -> Result<SignatureCandidate, R7zError> {
+        if offset.checked_add(32).ok_or(R7zError::Parse)? > self.len()? {
+            return Ok(SignatureCandidate::Incomplete);
+        }
+        let mut signature_bytes = [0u8; 32];
+        self.read_exact_at(offset, &mut signature_bytes)?;
+        let (_, signature) =
+            SignatureHeader::parse(&signature_bytes).map_err(|_| R7zError::Parse)?;
+        if signature.signature != *SEVEN_Z_MAGIC {
+            return Ok(SignatureCandidate::Incomplete);
+        }
+        match signature.validate_start_header_crc() {
+            Ok(()) => Ok(SignatureCandidate::Valid),
+            Err(R7zError::Crc) => Ok(SignatureCandidate::BadCrc),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+enum SignatureCandidate {
+    Valid,
+    BadCrc,
+    Incomplete,
 }
 
 struct VolumeReader {
@@ -221,21 +293,15 @@ impl ArchiveMetadata {
     /// Returns [`R7zError::Parse`] if the bytes are not a valid `EncodedHeader` archive,
     /// or [`R7zError::Crc`] if the start-header CRC does not match.
     pub fn parse(data: &[u8]) -> Result<ArchiveMetadata, R7zError> {
-        if data.len() < 32 {
-            return Err(R7zError::Parse);
-        }
-        // Validate start_header_crc on raw bytes before trusting any parsed fields.
-        // input[8..12] = start_header_crc, input[12..32] = the covered region.
-        let start_crc = u32::from_le_bytes(data[8..12].try_into().map_err(|_| R7zError::Parse)?);
-        if crc32fast::hash(&data[12..32]) != start_crc {
-            return Err(R7zError::Crc);
-        }
-        let backing = Bytes::copy_from_slice(data);
+        let signature_offset = find_signature_in_slice(data)?;
+        let archive_data = data.get(signature_offset..).ok_or(R7zError::Parse)?;
+        let backing = Bytes::copy_from_slice(archive_data);
         let (input, signature) = SignatureHeader::parse(&backing).map_err(|_| R7zError::Parse)?;
+        signature.validate_start_header_crc()?;
 
         let offset = usize::try_from(signature.next_header_offset).map_err(|_| R7zError::Parse)?;
         let header_start = checked_add_usize(32, offset)?;
-        checked_range(data.len(), header_start, signature.next_header_size)?;
+        checked_range(archive_data.len(), header_start, signature.next_header_size)?;
         let (input, prop) = find_next_property_id(input, offset).map_err(|_| R7zError::Parse)?;
 
         match prop {
@@ -255,6 +321,7 @@ impl ArchiveMetadata {
 /// Fully decoded archive with file listing and extraction support.
 pub struct Archive {
     source: ArchiveSource,
+    base_offset: u64,
     pub signature: SignatureHeader,
     /// Present for `EncodedHeader` archives; None for uncompressed-header archives.
     pub encoded_header: Option<EncodedHeader>,
@@ -428,8 +495,9 @@ impl Archive {
         if source_len < 32 {
             return Err(R7zError::Parse);
         }
+        let base_offset = source.find_signature_offset(DEFAULT_MAX_METADATA_BYTES)?;
         let mut signature_bytes = [0u8; 32];
-        source.read_exact_at(0, &mut signature_bytes)?;
+        source.read_exact_at(base_offset, &mut signature_bytes)?;
         let (_, signature) =
             SignatureHeader::parse(&signature_bytes).map_err(|_| R7zError::Parse)?;
         signature.validate_start_header_crc()?;
@@ -438,7 +506,10 @@ impl Archive {
             return Err(R7zError::LimitExceeded("metadata"));
         }
 
-        let header_start = checked_add_u64(32, signature.next_header_offset)?;
+        let header_start = checked_add_u64(
+            checked_add_u64(base_offset, 32)?,
+            signature.next_header_offset,
+        )?;
         let header_range = checked_range_u64(source_len, header_start, signature.next_header_size)?;
         let next_header =
             Bytes::from(source.read_range_to_vec(header_range, options.max_metadata_bytes)?);
@@ -456,7 +527,7 @@ impl Archive {
                 // Decompress the packed header stream
                 let pi = &encoded_header.pack_info;
                 let ui = &encoded_header.unpack_info;
-                let data_start = checked_add_u64(32, pi.pack_pos)?;
+                let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pi.pack_pos)?;
                 let pack_size = *pi.pack_size.first().ok_or(R7zError::Parse)?;
                 if pack_size > options.max_metadata_bytes {
                     return Err(R7zError::LimitExceeded("metadata"));
@@ -507,6 +578,7 @@ impl Archive {
 
                 Ok(Archive {
                     source,
+                    base_offset,
                     signature,
                     encoded_header: Some(encoded_header),
                     header,
@@ -519,6 +591,7 @@ impl Archive {
 
                 Ok(Archive {
                     source,
+                    base_offset,
                     signature,
                     encoded_header: None,
                     header,
@@ -751,8 +824,10 @@ impl Archive {
             acc.checked_add(size).ok_or(R7zError::Parse)
         })?;
         let pack_size = *pack_info.pack_size.get(folder_idx).ok_or(R7zError::Parse)?;
-        let data_start =
-            checked_add_u64(checked_add_u64(32, pack_info.pack_pos)?, pack_offset_u64)?;
+        let data_start = checked_add_u64(
+            checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?,
+            pack_offset_u64,
+        )?;
         let packed_range = checked_range_u64(self.source.len()?, data_start, pack_size)?;
 
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
@@ -892,6 +967,38 @@ fn checked_range_u64(total_len: u64, start: u64, len: u64) -> Result<Range<u64>,
     } else {
         Err(R7zError::Parse)
     }
+}
+
+fn find_signature_in_slice(data: &[u8]) -> Result<usize, R7zError> {
+    let mut saw_bad_signature = false;
+    for offset in find_magic_offsets(data) {
+        let Some(signature_bytes) = data.get(offset..offset.saturating_add(32)) else {
+            continue;
+        };
+        if signature_bytes.len() < 32 {
+            continue;
+        }
+        let (_, signature) =
+            SignatureHeader::parse(signature_bytes).map_err(|_| R7zError::Parse)?;
+        match signature.validate_start_header_crc() {
+            Ok(()) => return Ok(offset),
+            Err(R7zError::Crc) => saw_bad_signature = true,
+            Err(err) => return Err(err),
+        }
+    }
+
+    if saw_bad_signature {
+        Err(R7zError::Crc)
+    } else {
+        Err(R7zError::Parse)
+    }
+}
+
+fn find_magic_offsets(haystack: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    haystack
+        .windows(SEVEN_Z_MAGIC.len())
+        .enumerate()
+        .filter_map(|(idx, bytes)| (bytes == SEVEN_Z_MAGIC).then_some(idx))
 }
 
 fn is_split_first_volume(path: &Path) -> bool {
