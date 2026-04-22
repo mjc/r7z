@@ -39,14 +39,8 @@ fn run(args: Vec<String>) -> Result<u8, CliError> {
             Ok(EXIT_OK)
         }
         Command::Test => test_archive(&cli),
-        Command::ExtractFull => {
-            extract_archive(&cli, false)?;
-            Ok(EXIT_OK)
-        }
-        Command::ExtractFlat => {
-            extract_archive(&cli, true)?;
-            Ok(EXIT_OK)
-        }
+        Command::ExtractFull => extract_archive(&cli, false),
+        Command::ExtractFlat => extract_archive(&cli, true),
         Command::Add => {
             create_archive(&cli, true)?;
             Ok(EXIT_OK)
@@ -518,10 +512,11 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     Ok(warnings)
 }
 
-fn extract_archive(cli: &Cli, flat: bool) -> Result<(), CliError> {
+fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     fs::create_dir_all(&cli.output_dir)?;
     let selected = selected_patterns(&cli.operands);
+    let mut matched = 0usize;
 
     for i in 0..archive.num_files() {
         let fi = archive.files_info();
@@ -531,6 +526,7 @@ fn extract_archive(cli: &Cli, flat: bool) -> Result<(), CliError> {
         if !entry_is_selected(&name, &selected) {
             continue;
         }
+        matched += 1;
         let Some(files) = fi else {
             continue;
         };
@@ -567,7 +563,12 @@ fn extract_archive(cli: &Cli, flat: bool) -> Result<(), CliError> {
             archive.extract_to_writer_with_password(i, &mut file, cli.password.as_deref())?;
         }
     }
-    Ok(())
+    if !selected.is_empty() && matched == 0 {
+        eprintln!("No files to process");
+        Ok(EXIT_WARNING)
+    } else {
+        Ok(EXIT_OK)
+    }
 }
 
 fn create_archive(cli: &Cli, allow_existing_merge: bool) -> Result<(), CliError> {
