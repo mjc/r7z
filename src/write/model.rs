@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{num::NonZeroU64, path::PathBuf, time::SystemTime};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Codec {
@@ -17,11 +17,103 @@ pub enum HeaderMode {
     Encoded,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveOptions {
     pub codec: Codec,
     pub header_mode: HeaderMode,
     pub encryption: Option<EncryptionOptions>,
+    pub compression: CompressionOptions,
+    pub streaming: StreamingOptions,
+}
+
+impl Default for ArchiveOptions {
+    fn default() -> Self {
+        Self {
+            codec: Codec::default(),
+            header_mode: HeaderMode::default(),
+            encryption: None,
+            compression: CompressionOptions::default(),
+            streaming: StreamingOptions::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompressionOptions {
+    pub level: CompressionLevel,
+    pub dictionary_size: Option<u32>,
+    pub fast_bytes: Option<u32>,
+    pub solid: SolidMode,
+    pub lzma2_chunk_size: Option<NonZeroU64>,
+}
+
+impl Default for CompressionOptions {
+    fn default() -> Self {
+        Self {
+            level: CompressionLevel::Normal,
+            dictionary_size: None,
+            fast_bytes: None,
+            solid: SolidMode::Solid,
+            lzma2_chunk_size: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompressionLevel {
+    Store,
+    Fastest,
+    Fast,
+    #[default]
+    Normal,
+    Maximum,
+    Ultra,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SolidMode {
+    #[default]
+    Solid,
+    NonSolid,
+    Limit {
+        max_files: Option<NonZeroU64>,
+        max_bytes: Option<NonZeroU64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingOptions {
+    pub buffer_size: usize,
+    pub spool: SpoolMode,
+}
+
+impl Default for StreamingOptions {
+    fn default() -> Self {
+        Self {
+            buffer_size: 8192,
+            spool: SpoolMode::Auto {
+                memory_threshold: 16 * 1024 * 1024,
+                dir: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpoolMode {
+    Memory,
+    TempFile {
+        dir: Option<PathBuf>,
+    },
+    Auto {
+        memory_threshold: u64,
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeOptions {
+    pub sizes: Vec<NonZeroU64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +177,21 @@ impl EntryMeta {
             attributes: Some(0x20),
             ..Self::default()
         }
+    }
+
+    #[must_use]
+    pub fn symlink() -> Self {
+        Self {
+            attributes: Some((0o120_777 << 16) | 0x20),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_symlink_default(mut self) -> Self {
+        if self.attributes.is_none() {
+            self.attributes = Some((0o120_777 << 16) | 0x20);
+        }
+        self
     }
 }
 

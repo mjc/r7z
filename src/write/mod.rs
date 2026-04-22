@@ -9,11 +9,16 @@ use header::{
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
     encode_coder_info_lzma2,
 };
-use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
-use std::io::{Read, Seek, SeekFrom, Write};
+use lzma_rust2::{Lzma2Writer, LzmaWriter};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
 pub use model::{
-    ArchiveEntry, ArchiveOptions, Codec, EncryptionOptions, EntryKind, EntryMeta, HeaderMode,
+    ArchiveEntry, ArchiveOptions, Codec, CompressionLevel, CompressionOptions, EncryptionOptions,
+    EntryKind, EntryMeta, HeaderMode, SolidMode, SpoolMode, StreamingOptions, VolumeOptions,
 };
 
 use model::WriteEntry;
@@ -149,6 +154,19 @@ impl ArchiveBuilder {
         self
     }
 
+    #[must_use]
+    pub fn add_symlink(mut self, name: &str, target: &str, meta: EntryMeta) -> Self {
+        self.entries.push(WriteEntry {
+            name: name.to_string(),
+            kind: EntryKind::File,
+            meta: meta.with_symlink_default(),
+            has_stream: true,
+            data: Some(target.as_bytes().to_vec()),
+            folder_id: 0,
+        });
+        self
+    }
+
     pub fn add_entry(mut self, entry: ArchiveEntry, data: Option<&[u8]>) -> Result<Self, R7zError> {
         self.entries.push(write_entry_from_archive_entry(
             entry,
@@ -198,7 +216,8 @@ impl ArchiveBuilder {
     }
 
     pub fn build(self) -> Result<Vec<u8>, R7zError> {
-        encode::build_archive(&self.entries, &self.options)
+        let entries = entries_with_solid_folders(self.entries, &self.options.compression.solid)?;
+        encode::build_archive(&entries, &self.options)
     }
 }
 
@@ -207,6 +226,8 @@ pub struct ArchiveWriter<W: Write + Seek> {
     entries: Vec<WriteEntry>,
     options: ArchiveOptions,
     current_folder: usize,
+    current_folder_files: u64,
+    current_folder_bytes: u64,
     copy_current: StreamingCopyFolder,
     copy_completed: Vec<StreamingCopyFolder>,
     lzma2_current: Option<StreamingLzma2Folder<W>>,
@@ -225,6 +246,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             entries: Vec::new(),
             options,
             current_folder: 0,
+            current_folder_files: 0,
+            current_folder_bytes: 0,
             copy_current: StreamingCopyFolder::new(),
             copy_completed: Vec::new(),
             lzma2_current: None,
@@ -302,6 +325,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
+        let size = data.len() as u64;
         self.entries.push(WriteEntry {
             name: name.to_string(),
             kind: EntryKind::File,
@@ -310,7 +334,17 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             data: (!data.is_empty()).then_some(data),
             folder_id: self.current_folder,
         });
+        self.finish_entry_folder_accounting(size)?;
         Ok(())
+    }
+
+    pub fn append_symlink(
+        &mut self,
+        name: &str,
+        target: &str,
+        meta: EntryMeta,
+    ) -> Result<(), R7zError> {
+        self.append_file(name, target.as_bytes(), meta.with_symlink_default())
     }
 
     pub fn append_empty_file(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
@@ -365,7 +399,39 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         {
             self.current_folder += 1;
         }
+        self.current_folder_files = 0;
+        self.current_folder_bytes = 0;
         Ok(())
+    }
+
+    fn finish_entry_folder_accounting(&mut self, size: u64) -> Result<(), R7zError> {
+        if size == 0 {
+            return Ok(());
+        }
+        self.current_folder_files = self
+            .current_folder_files
+            .checked_add(1)
+            .ok_or(R7zError::Parse)?;
+        self.current_folder_bytes = self
+            .current_folder_bytes
+            .checked_add(size)
+            .ok_or(R7zError::Parse)?;
+        match &self.options.compression.solid {
+            SolidMode::Solid => Ok(()),
+            SolidMode::NonSolid => self.new_folder(),
+            SolidMode::Limit {
+                max_files,
+                max_bytes,
+            } => {
+                let files_hit = max_files.is_some_and(|n| self.current_folder_files >= n.get());
+                let bytes_hit = max_bytes.is_some_and(|n| self.current_folder_bytes >= n.get());
+                if files_hit || bytes_hit {
+                    self.new_folder()
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     pub fn finish(mut self) -> Result<W, R7zError> {
@@ -443,7 +509,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     ) -> Result<(), R7zError> {
         let mut hasher = crc32fast::Hasher::new();
         let mut size = 0u64;
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; self.options.streaming.buffer_size];
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
@@ -495,6 +561,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.copy_current.file_sizes.push(size);
         self.copy_current.file_crcs.push(hasher.finalize());
 
+        self.finish_entry_folder_accounting(size)?;
         Ok(())
     }
 
@@ -524,7 +591,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         mut reader: impl Read,
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; self.options.streaming.buffer_size];
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
@@ -567,6 +634,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .ok_or(R7zError::Parse)?;
         folder.file_sizes.push(size);
         folder.file_crcs.push(hasher.finalize());
+        self.finish_entry_folder_accounting(size)?;
         Ok(())
     }
 
@@ -603,7 +671,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 inner: out,
                 count: 0,
             },
-            Lzma2Options::default(),
+            encode::lzma2_options(&self.options.compression),
         );
         self.lzma2_current = Some(StreamingLzma2Folder {
             writer,
@@ -632,7 +700,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.lzma2_completed.push(model::CompletedFolder {
             file_indices,
             pack_size,
-            coder_info: encode_coder_info_lzma2(0x1c),
+            coder_info: encode_coder_info_lzma2(encode::lzma2_property_byte(
+                &self.options.compression,
+            )?),
             coder_unpack_sizes: vec![unpack_size],
             file_sizes,
             file_crcs,
@@ -647,7 +717,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         mut reader: impl Read,
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; self.options.streaming.buffer_size];
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
@@ -690,6 +760,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .ok_or(R7zError::Parse)?;
         folder.file_sizes.push(size);
         folder.file_crcs.push(hasher.finalize());
+        self.finish_entry_folder_accounting(size)?;
         Ok(())
     }
 
@@ -721,7 +792,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             out.write_all(&[0u8; 32])?;
         }
         let out = self.out.take().ok_or(R7zError::Parse)?;
-        let options = LzmaOptions::with_preset(6);
+        let options = encode::lzma_options(&self.options.compression);
         let dict_size = options.dict_size;
         let writer = LzmaWriter::new_no_header(
             CountingWriter {
@@ -779,7 +850,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         mut reader: impl Read,
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; self.options.streaming.buffer_size];
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
@@ -822,6 +893,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .ok_or(R7zError::Parse)?;
         folder.file_sizes.push(size);
         folder.file_crcs.push(hasher.finalize());
+        self.finish_entry_folder_accounting(size)?;
         Ok(())
     }
 
@@ -858,7 +930,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 inner: out,
                 count: 0,
             },
-            Lzma2Options::default(),
+            encode::lzma2_options(&self.options.compression),
         );
         self.bcj_lzma2_current = Some(StreamingBcjLzma2Folder {
             writer: BcjX86Writer::new(lzma2),
@@ -888,7 +960,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.bcj_lzma2_completed.push(model::CompletedFolder {
             file_indices,
             pack_size,
-            coder_info: encode_coder_info_bcj_lzma2(0x1c),
+            coder_info: encode_coder_info_bcj_lzma2(encode::lzma2_property_byte(
+                &self.options.compression,
+            )?),
             coder_unpack_sizes: vec![unpack_size, unpack_size],
             file_sizes,
             file_crcs,
@@ -909,6 +983,58 @@ impl From<StreamingCopyFolder> for model::CompletedFolder {
             file_crcs: folder.file_crcs,
         }
     }
+}
+
+fn entries_with_solid_folders(
+    mut entries: Vec<WriteEntry>,
+    solid: &SolidMode,
+) -> Result<Vec<WriteEntry>, R7zError> {
+    let mut folder_id = 0usize;
+    let mut folder_files = 0u64;
+    let mut folder_bytes = 0u64;
+
+    for entry in &mut entries {
+        if !entry.has_stream {
+            entry.folder_id = folder_id;
+            continue;
+        }
+        let size = entry
+            .data
+            .as_ref()
+            .map(|data| data.len() as u64)
+            .ok_or(R7zError::Parse)?;
+
+        let would_exceed = match solid {
+            SolidMode::Solid | SolidMode::NonSolid => false,
+            SolidMode::Limit {
+                max_files,
+                max_bytes,
+            } => {
+                let next_files = folder_files.checked_add(1).ok_or(R7zError::Parse)?;
+                let next_bytes = folder_bytes.checked_add(size).ok_or(R7zError::Parse)?;
+                let files_hit = max_files.is_some_and(|n| folder_files > 0 && next_files > n.get());
+                let bytes_hit = max_bytes.is_some_and(|n| folder_files > 0 && next_bytes > n.get());
+                files_hit || bytes_hit
+            }
+        };
+        if would_exceed {
+            folder_id = folder_id.checked_add(1).ok_or(R7zError::Parse)?;
+            folder_files = 0;
+            folder_bytes = 0;
+        }
+
+        entry.folder_id = folder_id;
+        folder_files = folder_files.checked_add(1).ok_or(R7zError::Parse)?;
+        folder_bytes = folder_bytes.checked_add(size).ok_or(R7zError::Parse)?;
+
+        if matches!(solid, SolidMode::NonSolid) {
+            folder_id = folder_id.checked_add(1).ok_or(R7zError::Parse)?;
+            folder_files = 0;
+            folder_bytes = 0;
+        }
+    }
+
+    Ok(entries)
 }
 
 fn write_entry_from_archive_entry(
@@ -957,4 +1083,225 @@ where
     }
     writer.finish()?;
     Ok(())
+}
+
+pub fn build_streaming_to_writer<W, I, R>(
+    entries: I,
+    mut out: W,
+    options: ArchiveOptions,
+) -> Result<(), R7zError>
+where
+    W: Write,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+{
+    encode::validate_archive_options(&options)?;
+    match options.streaming.spool.clone() {
+        SpoolMode::Memory => {
+            let mut spool = Cursor::new(Vec::new());
+            build_streaming_with_options(entries, &mut spool, options)?;
+            out.write_all(spool.get_ref())?;
+            out.flush()?;
+            Ok(())
+        }
+        SpoolMode::Auto {
+            memory_threshold,
+            dir,
+        } => {
+            let mut spool = AutoSpool::new(memory_threshold, dir)?;
+            let result = (|| {
+                build_streaming_with_options(entries, &mut spool, options)?;
+                spool.seek(SeekFrom::Start(0))?;
+                io::copy(&mut spool, &mut out)?;
+                out.flush()?;
+                Ok(())
+            })();
+            let remove_result = spool.cleanup();
+            match (result, remove_result) {
+                (Err(err), _) => Err(err),
+                (Ok(()), Err(err)) => Err(err.into()),
+                (Ok(()), Ok(())) => Ok(()),
+            }
+        }
+        SpoolMode::TempFile { dir } => {
+            let (mut spool, path) = create_temp_spool(dir.as_deref())?;
+            let result = (|| {
+                build_streaming_with_options(entries, &mut spool, options)?;
+                spool.seek(SeekFrom::Start(0))?;
+                io::copy(&mut spool, &mut out)?;
+                out.flush()?;
+                Ok(())
+            })();
+            let remove_result = std::fs::remove_file(&path);
+            match (result, remove_result) {
+                (Err(err), _) => Err(err),
+                (Ok(()), Err(err)) => Err(err.into()),
+                (Ok(()), Ok(())) => Ok(()),
+            }
+        }
+    }
+}
+
+pub fn build_streaming_volumes<P, I, R>(
+    entries: I,
+    base_path: P,
+    archive_options: ArchiveOptions,
+    volume_options: VolumeOptions,
+) -> Result<Vec<PathBuf>, R7zError>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+{
+    if volume_options.sizes.is_empty() {
+        return Err(R7zError::InvalidOptions(
+            "volume options require at least one size",
+        ));
+    }
+
+    let mut archive = Vec::new();
+    build_streaming_to_writer(entries, &mut archive, archive_options)?;
+
+    let base = base_path.as_ref();
+    let mut paths = Vec::new();
+    let mut offset = 0usize;
+    let mut volume_idx = 0usize;
+    while offset < archive.len() || (archive.is_empty() && volume_idx == 0) {
+        let size_idx = volume_idx.min(volume_options.sizes.len() - 1);
+        let size = usize::try_from(volume_options.sizes[size_idx].get())
+            .map_err(|_| R7zError::InvalidOptions("volume size is too large"))?;
+        let end = offset.saturating_add(size).min(archive.len());
+        let path = PathBuf::from(format!("{}.{:03}", base.display(), volume_idx + 1));
+        let mut file = File::create(&path)?;
+        file.write_all(&archive[offset..end])?;
+        file.flush()?;
+        paths.push(path);
+        offset = end;
+        volume_idx += 1;
+        if size == 0 {
+            return Err(R7zError::InvalidOptions(
+                "volume size must be greater than zero",
+            ));
+        }
+    }
+
+    Ok(paths)
+}
+
+fn create_temp_spool(dir: Option<&Path>) -> Result<(File, PathBuf), R7zError> {
+    let dir = dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir)?;
+    for attempt in 0..100u32 {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(|_| R7zError::Parse)?;
+        let name = format!(
+            "r7z-spool-{}-{attempt}-{:016x}.tmp",
+            std::process::id(),
+            u64::from_le_bytes(random)
+        );
+        let path = dir.join(name);
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(R7zError::InvalidOptions("could not create temp spool file"))
+}
+
+enum AutoSpoolInner {
+    Memory(Cursor<Vec<u8>>),
+    TempFile { file: File, path: PathBuf },
+}
+
+struct AutoSpool {
+    memory_threshold: u64,
+    dir: Option<PathBuf>,
+    inner: AutoSpoolInner,
+}
+
+impl AutoSpool {
+    fn new(memory_threshold: u64, dir: Option<PathBuf>) -> Result<Self, R7zError> {
+        let inner = if memory_threshold == 0 {
+            let (file, path) = create_temp_spool(dir.as_deref())?;
+            AutoSpoolInner::TempFile { file, path }
+        } else {
+            AutoSpoolInner::Memory(Cursor::new(Vec::new()))
+        };
+        Ok(Self {
+            memory_threshold,
+            dir,
+            inner,
+        })
+    }
+
+    fn maybe_roll_to_file(&mut self, write_len: usize) -> io::Result<()> {
+        let AutoSpoolInner::Memory(cursor) = &mut self.inner else {
+            return Ok(());
+        };
+
+        let projected_len = cursor
+            .position()
+            .saturating_add(write_len as u64)
+            .max(cursor.get_ref().len() as u64);
+        if projected_len <= self.memory_threshold {
+            return Ok(());
+        }
+
+        let current_pos = cursor.position();
+        let (mut file, path) = create_temp_spool(self.dir.as_deref()).map_err(io::Error::other)?;
+        file.write_all(cursor.get_ref())?;
+        file.seek(SeekFrom::Start(current_pos))?;
+        self.inner = AutoSpoolInner::TempFile { file, path };
+        Ok(())
+    }
+
+    fn cleanup(self) -> io::Result<()> {
+        match self.inner {
+            AutoSpoolInner::Memory(_) => Ok(()),
+            AutoSpoolInner::TempFile { path, .. } => std::fs::remove_file(path),
+        }
+    }
+}
+
+impl Write for AutoSpool {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.maybe_roll_to_file(buf.len())?;
+        match &mut self.inner {
+            AutoSpoolInner::Memory(cursor) => cursor.write(buf),
+            AutoSpoolInner::TempFile { file, .. } => file.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            AutoSpoolInner::Memory(cursor) => cursor.flush(),
+            AutoSpoolInner::TempFile { file, .. } => file.flush(),
+        }
+    }
+}
+
+impl Read for AutoSpool {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            AutoSpoolInner::Memory(cursor) => cursor.read(buf),
+            AutoSpoolInner::TempFile { file, .. } => file.read(buf),
+        }
+    }
+}
+
+impl Seek for AutoSpool {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match &mut self.inner {
+            AutoSpoolInner::Memory(cursor) => cursor.seek(pos),
+            AutoSpoolInner::TempFile { file, .. } => file.seek(pos),
+        }
+    }
 }

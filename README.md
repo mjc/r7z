@@ -252,13 +252,19 @@ Builder pattern — all methods consume `self` and return `Self` for chaining:
 |--------|-------------|
 | `ArchiveBuilder::new()` | Create an empty builder (LZMA2 compression default) |
 | `.add_file(name: &str, data: &[u8])` | Queue a file with its content |
+| `.add_symlink(name, target, meta)` | Queue a symlink-like entry; target bytes are stored as file data and Unix symlink mode bits are set |
 | `.add_entry(entry, data)` | Queue an explicit `ArchiveEntry`; non-file entries must not provide stream data |
 | `.add_empty_file(name, meta)` / `.add_directory(name, meta)` / `.add_anti_item(name, meta)` | Queue empty-stream entries |
 | `.compression(codec: Codec)` | Set compression (`Codec::Copy`, `Codec::Lzma`, `Codec::Lzma2`, or `Codec::Lzma2Bcj`) |
-| `.options(options: ArchiveOptions)` | Set codec, header mode, and encryption options |
+| `.options(options: ArchiveOptions)` | Set codec, header mode, encryption, compression tuning, and streaming options |
 | `.build()` | Produce the final `.7z` bytes as `Result<Vec<u8>, R7zError>` |
 
 The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It uses **solid compression** for non-empty files: file data is concatenated into one stream before compression, while directories, anti-items, and zero-byte files are represented with 7z empty-stream metadata.
+
+`ArchiveOptions::compression` exposes p7zip-like tuning through `CompressionOptions`:
+`CompressionLevel`, optional dictionary size, optional fast bytes, `SolidMode`
+(`Solid`, `NonSolid`, or `Limit`), and optional LZMA2 chunk size. The existing
+`Codec` still selects the algorithm.
 
 ### `ArchiveWriter` and `build_streaming` — file-backed builders
 
@@ -297,9 +303,43 @@ where
     W: Write + Seek,
     I: IntoIterator<Item = (String, R)>,
     R: Read,
+
+pub fn build_streaming_to_writer<W, I, R>(
+    entries: I,
+    out: W,
+    options: ArchiveOptions
+) -> Result<(), R7zError>
+where
+    W: Write,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+
+pub fn build_streaming_volumes<P, I, R>(
+    entries: I,
+    base_path: P,
+    archive_options: ArchiveOptions,
+    volume_options: VolumeOptions
+) -> Result<Vec<PathBuf>, R7zError>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
 ```
 
 Each `entry` is provided as a filename and `impl Read`; the builder writes the final `.7z` archive to any `Write + Seek` output. Use `build_streaming_with_options` for Copy, explicit header mode, or encryption settings.
+`build_streaming_to_writer` accepts plain `Write` sinks by assembling through an
+internal spool first. `build_streaming_volumes` writes p7zip-style split output
+such as `archive.7z.001`, `archive.7z.002`, and returns the created paths.
+
+### Link metadata
+
+`FilesInfo::entry_type(index)` classifies entries as `File`, `Directory`,
+`EmptyFile`, `Anti`, or `Symlink`. `Archive::symlink_target(index)` returns the
+stored symlink target for entries marked with Unix symlink mode bits. `extract_all`
+does not create filesystem symlinks; symlink entries extract as regular files
+containing the target path bytes. Hard-link preservation is not supported for
+`.7z` because p7zip does not reliably emit a standard hard-link representation
+for this format.
 
 ### `Codec` — Compression algorithms
 
@@ -379,6 +419,8 @@ These are public but primarily used for building advanced tooling:
 | AES encrypted headers (`-mhe=on`) | Read + Write with password |
 | Update existing archives | Not supported |
 | Deflate / BZip2 / PPMd | Not supported |
+| Read split volumes | Not supported |
+| Hard-link preservation | Not supported |
 
 **7z specification:** [7zFormat.txt](https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt)
 

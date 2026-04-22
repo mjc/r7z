@@ -633,6 +633,19 @@ impl Archive {
         Ok(written)
     }
 
+    pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
+        let Some(fi) = self.files_info() else {
+            return Ok(None);
+        };
+        if !fi.is_symlink(file_index) {
+            return Ok(None);
+        }
+        let target = self.extract_to_memory(file_index)?;
+        String::from_utf8(target)
+            .map(Some)
+            .map_err(|_| R7zError::Parse)
+    }
+
     fn extraction_location(&self, file_index: usize) -> Result<ExtractionLocation, R7zError> {
         let fi = self.header.files_info();
         let streams = self.streams_info().ok_or(R7zError::Parse)?;

@@ -48,6 +48,7 @@ pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 /// The properties byte encodes the maximum dictionary size needed for decompression.
 /// We advertise 32 MB (0x1c), which matches the default preset dictionary.
 /// p7zip uses this only for memory estimation — the LZMA2 stream is self-describing.
+#[allow(dead_code)]
 pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
     let buf = Vec::new();
     let mut writer = Lzma2Writer::new(buf, lzma_rust2::Lzma2Options::default());

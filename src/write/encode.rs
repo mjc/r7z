@@ -4,9 +4,11 @@ use super::header::{
     encode_coder_info_lzma2, CoderSpec,
 };
 use super::model::{
-    ArchiveOptions, Codec, CompletedFolder, EncryptionOptions, HeaderMode, WriteEntry,
+    ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
+    EncryptionOptions, HeaderMode, SolidMode, WriteEntry,
 };
 use crate::{aes, bcj, codec, R7zError};
+use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 
@@ -75,6 +77,7 @@ pub(crate) fn build_archive(
 }
 
 pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R7zError> {
+    validate_compression_options(options)?;
     let Some(enc) = &options.encryption else {
         return Ok(());
     };
@@ -97,6 +100,53 @@ pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R
     Ok(())
 }
 
+fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError> {
+    if options.streaming.buffer_size == 0 {
+        return Err(R7zError::InvalidOptions(
+            "streaming buffer_size must be greater than zero",
+        ));
+    }
+    if options.codec == Codec::Copy
+        && (options.compression.dictionary_size.is_some()
+            || options.compression.fast_bytes.is_some()
+            || options.compression.lzma2_chunk_size.is_some())
+    {
+        return Err(R7zError::InvalidOptions(
+            "Copy codec does not support compression tuning",
+        ));
+    }
+    if let Some(dict) = options.compression.dictionary_size {
+        if dict < 4096 {
+            return Err(R7zError::InvalidOptions(
+                "dictionary_size must be at least 4096 bytes",
+            ));
+        }
+    }
+    if let Some(fast_bytes) = options.compression.fast_bytes {
+        if !(8..=273).contains(&fast_bytes) {
+            return Err(R7zError::InvalidOptions("fast_bytes must be in 8..=273"));
+        }
+    }
+    if let Some(chunk_size) = options.compression.lzma2_chunk_size {
+        let dict = lzma_options(&options.compression).dict_size;
+        if chunk_size.get() < u64::from(dict) {
+            return Err(R7zError::InvalidOptions(
+                "lzma2_chunk_size must be at least dictionary_size",
+            ));
+        }
+    }
+    if let SolidMode::Limit {
+        max_files: None,
+        max_bytes: None,
+    } = options.compression.solid
+    {
+        return Err(R7zError::InvalidOptions(
+            "solid limit requires max_files or max_bytes",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     mut out: W,
     entries: &[WriteEntry],
@@ -106,6 +156,7 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     if entries.is_empty() {
         return Err(R7zError::Parse);
     }
+    validate_archive_options(options)?;
 
     let packed_size = folders.iter().try_fold(0u64, |acc, folder| {
         acc.checked_add(folder.pack_size).ok_or(R7zError::Parse)
@@ -157,7 +208,7 @@ fn encode_folder(
     }
 
     let (mut pack, mut coder_info, mut coder_unpack_sizes, specs) =
-        encode_payload(&data, options.codec)?;
+        encode_payload_with_options(&data, options.codec, &options.compression)?;
 
     if let Some(enc) = &options.encryption {
         let aes = make_aes_material(enc)?;
@@ -182,7 +233,11 @@ fn encode_folder(
     ))
 }
 
-fn encode_payload(data: &[u8], method: Codec) -> Result<PayloadEncoding, R7zError> {
+fn encode_payload_with_options(
+    data: &[u8],
+    method: Codec,
+    compression: &CompressionOptions,
+) -> Result<PayloadEncoding, R7zError> {
     match method {
         Codec::Copy => Ok((
             data.to_vec(),
@@ -191,7 +246,7 @@ fn encode_payload(data: &[u8], method: Codec) -> Result<PayloadEncoding, R7zErro
             vec![CoderSpec::Copy],
         )),
         Codec::Lzma => {
-            let (props, compressed) = codec::compress_lzma(data)?;
+            let (props, compressed) = compress_lzma(data, compression)?;
             Ok((
                 compressed,
                 encode_coder_info_lzma(&props),
@@ -200,7 +255,7 @@ fn encode_payload(data: &[u8], method: Codec) -> Result<PayloadEncoding, R7zErro
             ))
         }
         Codec::Lzma2 => {
-            let (prop, compressed) = codec::compress_lzma2(data)?;
+            let (prop, compressed) = compress_lzma2(data, compression)?;
             Ok((
                 compressed,
                 encode_coder_info_lzma2(prop),
@@ -211,7 +266,7 @@ fn encode_payload(data: &[u8], method: Codec) -> Result<PayloadEncoding, R7zErro
         Codec::Lzma2Bcj => {
             let mut filtered = data.to_vec();
             bcj::bcj_x86_encode(&mut filtered);
-            let (prop, compressed) = codec::compress_lzma2(&filtered)?;
+            let (prop, compressed) = compress_lzma2(&filtered, compression)?;
             Ok((
                 compressed,
                 encode_coder_info_bcj_lzma2(prop),
@@ -243,6 +298,95 @@ fn encode_header_stream(
         coder_info,
         vec![before_padding, raw_header.len() as u64],
     ))
+}
+
+pub(crate) fn lzma_options(compression: &CompressionOptions) -> LzmaOptions {
+    let mut options = LzmaOptions::with_preset(compression_level_preset(compression.level));
+    if let Some(dict_size) = compression.dictionary_size {
+        options.dict_size = dict_size;
+    }
+    if let Some(fast_bytes) = compression.fast_bytes {
+        options.nice_len = fast_bytes;
+    }
+    options
+}
+
+pub(crate) fn lzma2_options(compression: &CompressionOptions) -> Lzma2Options {
+    let mut options = Lzma2Options {
+        lzma_options: lzma_options(compression),
+        chunk_size: None,
+    };
+    options.set_chunk_size(compression.lzma2_chunk_size);
+    options
+}
+
+pub(crate) fn lzma2_property_byte(compression: &CompressionOptions) -> Result<u8, R7zError> {
+    encode_lzma2_dict_size(lzma_options(compression).dict_size)
+}
+
+fn compression_level_preset(level: CompressionLevel) -> u32 {
+    match level {
+        CompressionLevel::Store => 0,
+        CompressionLevel::Fastest => 1,
+        CompressionLevel::Fast => 3,
+        CompressionLevel::Normal => 6,
+        CompressionLevel::Maximum => 7,
+        CompressionLevel::Ultra => 9,
+    }
+}
+
+fn compress_lzma(
+    data: &[u8],
+    compression: &CompressionOptions,
+) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
+    let options = lzma_options(compression);
+    let dict_size = options.dict_size;
+    let mut writer = LzmaWriter::new_no_header(Vec::new(), &options, false)
+        .map_err(|_| R7zError::Decompression)?;
+    writer
+        .write_all(data)
+        .map_err(|_| R7zError::Decompression)?;
+    let props_byte = writer.props();
+    let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
+    let mut props = Vec::with_capacity(5);
+    props.push(props_byte);
+    props.extend_from_slice(&dict_size.to_le_bytes());
+    Ok((props, compressed))
+}
+
+fn compress_lzma2(
+    data: &[u8],
+    compression: &CompressionOptions,
+) -> Result<(u8, Vec<u8>), R7zError> {
+    let options = lzma2_options(compression);
+    let prop = encode_lzma2_dict_size(options.lzma_options.dict_size)?;
+    let mut writer = Lzma2Writer::new(Vec::new(), options);
+    writer
+        .write_all(data)
+        .map_err(|_| R7zError::Decompression)?;
+    let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
+    Ok((prop, compressed))
+}
+
+fn encode_lzma2_dict_size(dict_size: u32) -> Result<u8, R7zError> {
+    if dict_size < 4096 {
+        return Err(R7zError::InvalidOptions(
+            "dictionary_size must be at least 4096 bytes",
+        ));
+    }
+    if dict_size == u32::MAX {
+        return Ok(40);
+    }
+    for prop in 0u8..40 {
+        let base = 2u32 | (u32::from(prop) & 1);
+        let size = base
+            .checked_shl((u32::from(prop) >> 1) + 11)
+            .ok_or(R7zError::InvalidOptions("dictionary_size is too large"))?;
+        if size >= dict_size {
+            return Ok(prop);
+        }
+    }
+    Err(R7zError::InvalidOptions("dictionary_size is too large"))
 }
 
 struct AesMaterial {

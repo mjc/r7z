@@ -3,6 +3,7 @@
 //! Write-interop tests: create archives with r7z, extract with p7zip, byte-compare.
 
 mod support;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use support::{assert_extracted_files, extract_with_p7zip, list_with_p7zip, run_7z};
@@ -1690,4 +1691,163 @@ fn archive_builder_empty_only_encrypted_header_p7zip_and_r7z_read() {
         std::fs::read(out_dir.join("emptydir/empty.txt")).unwrap(),
         b""
     );
+}
+
+#[test]
+fn compression_options_control_lzma2_properties_and_solid_blocks() {
+    let options = r7z::ArchiveOptions {
+        compression: r7z::CompressionOptions {
+            dictionary_size: Some(1 << 20),
+            solid: r7z::SolidMode::NonSolid,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(options)
+        .add_file("a.txt", b"alpha")
+        .add_file("b.txt", b"bravo")
+        .build()
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let unpack_info = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap();
+    assert_eq!(unpack_info.num_folders, 2);
+    let folder = unpack_info.parse_folder(0).unwrap();
+    assert_eq!(folder.coders[0].properties.as_deref(), Some(&[16][..]));
+}
+
+#[test]
+fn build_streaming_to_writer_matches_seek_backed_output() {
+    let files = vec![
+        ("a.txt".to_string(), b"alpha".as_slice()),
+        ("b.txt".to_string(), b"bravo".as_slice()),
+    ];
+    let mut seek_backed = std::io::Cursor::new(Vec::new());
+    r7z::build_streaming_with_options(
+        files.clone(),
+        &mut seek_backed,
+        r7z::ArchiveOptions::default(),
+    )
+    .unwrap();
+
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut write_only = WriteOnly(Vec::new());
+    r7z::build_streaming_to_writer(files, &mut write_only, r7z::ArchiveOptions::default()).unwrap();
+    assert_eq!(write_only.0, seek_backed.into_inner());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut temp_spooled = WriteOnly(Vec::new());
+    r7z::build_streaming_to_writer(
+        vec![
+            ("a.txt".to_string(), b"alpha".as_slice()),
+            ("b.txt".to_string(), b"bravo".as_slice()),
+        ],
+        &mut temp_spooled,
+        r7z::ArchiveOptions {
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::TempFile {
+                    dir: Some(tmp.path().to_path_buf()),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let archive = r7z::Archive::from_bytes(temp_spooled.0.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(1).unwrap(), b"bravo");
+
+    let mut auto_spooled = WriteOnly(Vec::new());
+    r7z::build_streaming_to_writer(
+        vec![
+            ("a.txt".to_string(), b"alpha".as_slice()),
+            ("b.txt".to_string(), b"bravo".as_slice()),
+        ],
+        &mut auto_spooled,
+        r7z::ArchiveOptions {
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::Auto {
+                    memory_threshold: 1,
+                    dir: Some(tmp.path().to_path_buf()),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let archive = r7z::Archive::from_bytes(auto_spooled.0.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"alpha");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn build_streaming_volumes_splits_final_archive_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("split.7z");
+    let payload = (0u8..=255).cycle().take(16 * 1024).collect::<Vec<_>>();
+    let entries = vec![("payload.bin".to_string(), payload.as_slice())];
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Copy,
+        ..Default::default()
+    };
+    let paths = r7z::build_streaming_volumes(
+        entries,
+        &base,
+        options,
+        r7z::VolumeOptions {
+            sizes: vec![NonZeroU64::new(2048).unwrap()],
+        },
+    )
+    .unwrap();
+    assert!(paths.len() > 1);
+    assert_eq!(paths[0], tmp.path().join("split.7z.001"));
+
+    let mut joined = Vec::new();
+    for path in &paths {
+        joined.extend_from_slice(&std::fs::read(path).unwrap());
+    }
+    let archive = r7z::Archive::from_bytes(joined.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), payload);
+}
+
+#[test]
+fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_symlink("link.txt", "target.txt", r7z::EntryMeta::default())
+        .build()
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let fi = archive.files_info().unwrap();
+    assert!(fi.is_symlink(0));
+    assert_eq!(fi.entry_type(0), r7z::EntryType::Symlink);
+    assert_eq!(
+        archive.symlink_target(0).unwrap().as_deref(),
+        Some("target.txt")
+    );
+
+    archive.extract_all(&out).unwrap();
+    assert_eq!(std::fs::read(out.join("link.txt")).unwrap(), b"target.txt");
+    assert!(!std::fs::symlink_metadata(out.join("link.txt"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }

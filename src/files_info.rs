@@ -29,6 +29,15 @@ pub struct FilesInfo {
     empty_stream_ordinals: Vec<Option<usize>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryType {
+    File,
+    Directory,
+    EmptyFile,
+    Anti,
+    Symlink,
+}
+
 impl FilesInfo {
     /// Decode the name of entry `i` on demand (UTF-16LE, null-terminated).
     pub fn name(&self, i: usize) -> Option<String> {
@@ -101,6 +110,28 @@ impl FilesInfo {
             return false;
         };
         bitmap_is_set(&self.anti_items, empty_idx)
+    }
+
+    pub fn is_symlink(&self, i: usize) -> bool {
+        self.attributes
+            .get(i)
+            .copied()
+            .flatten()
+            .is_some_and(|attrs| ((attrs >> 16) & 0o170_000) == 0o120_000)
+    }
+
+    pub fn entry_type(&self, i: usize) -> EntryType {
+        if self.is_anti(i) {
+            EntryType::Anti
+        } else if self.is_symlink(i) {
+            EntryType::Symlink
+        } else if self.is_directory(i) {
+            EntryType::Directory
+        } else if self.is_empty_file(i) {
+            EntryType::EmptyFile
+        } else {
+            EntryType::File
+        }
     }
 
     fn empty_stream_ordinal(&self, i: usize) -> Option<usize> {
