@@ -160,6 +160,39 @@ fn cli_update_expands_wildcard_input_paths() {
 }
 
 #[test]
+fn cli_create_accepts_p7zip_method_chain_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), vec![0x5Au8; 4096]).unwrap();
+    let archive = tmp.path().join("method-chain.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA2:d=1m:fb=32".into(),
+        archive.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    let folder = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .parse_folder(0)
+        .unwrap();
+    let lzma2 = folder
+        .coders
+        .iter()
+        .find(|coder| coder.codec_id.as_slice() == r7z::CODEC_LZMA2)
+        .unwrap();
+    assert_eq!(lzma2.properties.as_deref(), Some(&[16][..]));
+    assert_eq!(archive.extract_to_memory(0).unwrap(), vec![0x5Au8; 4096]);
+}
+
+#[test]
 fn cli_extract_aos_skips_existing_files() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

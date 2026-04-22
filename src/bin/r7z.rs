@@ -212,8 +212,7 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         return Ok(());
     }
     if lower.starts_with("m0=") {
-        let method = &switch[3..];
-        state.options.codec = codec_from_method_name(method)?;
+        apply_method_spec(&switch[3..], &mut state.options)?;
         state.method_was_explicit = true;
         return Ok(());
     }
@@ -264,6 +263,34 @@ fn codec_from_method_name(name: &str) -> Result<Codec, CliError> {
             other.name()
         ))),
     }
+}
+
+fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), CliError> {
+    let mut parts = spec.split(':');
+    let method = parts.next().unwrap_or("");
+    options.codec = codec_from_method_name(method)?;
+    for param in parts {
+        let (key, value) = param
+            .split_once('=')
+            .ok_or_else(|| CliError::Usage(format!("invalid method option: {param}")))?;
+        match key.to_ascii_lowercase().as_str() {
+            "d" => {
+                let size = parse_size(value)?;
+                options.compression.dictionary_size = Some(u32::try_from(size).map_err(|_| {
+                    CliError::Usage(format!("dictionary size is too large: {value}"))
+                })?);
+            }
+            "fb" => {
+                options.compression.fast_bytes = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| CliError::Usage(format!("invalid fast bytes: {value}")))?,
+                );
+            }
+            _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
+        }
+    }
+    Ok(())
 }
 
 fn parse_filter(switch: &str, options: &mut ArchiveOptions) -> Result<(), CliError> {
