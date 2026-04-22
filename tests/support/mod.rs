@@ -134,6 +134,32 @@ pub fn list_with_p7zip(dir: &Path, archive_path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+pub fn list_with_p7zip_technical(dir: &Path, archive_path: &Path) -> String {
+    let out = run_7z(&["l", "-slt", archive_path.to_str().unwrap()], dir);
+    assert!(
+        out.status.success(),
+        "7z l -slt failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+pub fn list_with_r7z(args: &[&str], dir: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("r7z binary should run");
+    assert!(
+        out.status.success(),
+        "r7z list failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 pub fn assert_trees_equal(expected: &Path, actual: &Path) {
     let expected_entries = tree_entries(expected);
     let actual_entries = tree_entries(actual);

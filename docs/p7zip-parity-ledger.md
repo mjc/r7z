@@ -20,6 +20,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   for supported codecs.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
+- CLI listing: `l` and `l -slt` report p7zip-like stable fields for paths,
+  sizes, entry kinds, and method names.
 - CLI warnings: test/extract return warning status when explicit operands match
   no archive entries; create/update return warning status for missing literal
   disk inputs while unmatched disk wildcards are ignored.
@@ -37,8 +39,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
 - Encoder: all missing decoder methods above, plus exact p7zip method-chain
   switch grammar beyond the currently supported dictionary/fast-bytes subset.
-- CLI: interactive overwrite prompts, remaining warning paths, and byte-for-byte
-  listing text are still incomplete.
+- CLI: interactive overwrite prompts and byte-for-byte listing text are still
+  incomplete.
 - Metadata: p7zip-like unsafe link materialization is intentionally not default;
   add explicit API/CLI knobs before enabling it.
 - Update: current `a`/`u`/`d` rewrite archives atomically for supported codecs,

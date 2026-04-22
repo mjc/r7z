@@ -459,8 +459,8 @@ fn print_listing(
     }
     println!("Method = {}", archive_methods(archive).join(" "));
     println!();
-    println!("{:>12}  Name", "Size");
-    println!("{:-<12}  {:-<40}", "", "");
+    println!("   Date      Time    Attr         Size   Compressed  Name");
+    println!("------------------- ----- ------------ ------------  ------------------------");
     for i in 0..archive.num_files() {
         let Some(entry) = listed_entry(archive, i)? else {
             continue;
@@ -468,8 +468,16 @@ fn print_listing(
         if !entry_is_selected(&entry.name, selected) {
             continue;
         }
-        println!("{:>12}  {}", entry.size_text, entry.name);
+        println!(
+            "{:19} {:5} {:>12} {:>12}  {}",
+            "",
+            entry.kind.attribute_text(),
+            entry.size_text(),
+            "",
+            entry.name
+        );
     }
+    println!("------------------- ----- ------------ ------------  ------------------------");
     println!();
     Ok(())
 }
@@ -477,6 +485,8 @@ fn print_listing(
 fn print_technical_listing(archive: &Archive, selected: &[String]) -> Result<(), CliError> {
     println!("Type = 7z");
     println!("Method = {}", archive_methods(archive).join(" "));
+    println!();
+    println!("----------");
     for i in 0..archive.num_files() {
         let Some(entry) = listed_entry(archive, i)? else {
             continue;
@@ -486,24 +496,63 @@ fn print_technical_listing(archive: &Archive, selected: &[String]) -> Result<(),
         }
         println!();
         println!("Path = {}", entry.name);
-        println!("Size = {}", entry.size_text);
-        println!("Folder = {}", entry.kind);
+        println!("Size = {}", entry.size_text());
+        println!("Packed Size = ");
         if let Some(mtime) = entry.mtime {
             println!("Modified = {mtime}");
         }
         if let Some(attrs) = entry.attributes {
-            println!("Attributes = {attrs:08X}");
+            println!("Attributes = {} {attrs:08X}", entry.kind.attribute_class());
+        } else {
+            println!("Attributes = {}", entry.kind.attribute_class());
         }
+        println!("CRC = ");
+        println!("Encrypted = -");
+        println!("Method = {}", entry.method_text);
+        println!("Block = ");
     }
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListedKind {
+    File,
+    Directory,
+    Symlink,
+    Anti,
+}
+
+impl ListedKind {
+    fn attribute_class(self) -> &'static str {
+        match self {
+            Self::Directory => "D",
+            Self::File | Self::Symlink => "A",
+            Self::Anti => "",
+        }
+    }
+
+    fn attribute_text(self) -> &'static str {
+        match self {
+            Self::Directory => "D....",
+            Self::File | Self::Symlink => "....A",
+            Self::Anti => ".....",
+        }
+    }
+}
+
 struct ListedEntry {
     name: String,
-    size_text: String,
-    kind: &'static str,
+    size: Option<u64>,
+    kind: ListedKind,
     mtime: Option<u64>,
     attributes: Option<u32>,
+    method_text: String,
+}
+
+impl ListedEntry {
+    fn size_text(&self) -> String {
+        self.size.map_or_else(String::new, |size| size.to_string())
+    }
 }
 
 fn listed_entry(archive: &Archive, index: usize) -> Result<Option<ListedEntry>, CliError> {
@@ -514,37 +563,46 @@ fn listed_entry(archive: &Archive, index: usize) -> Result<Option<ListedEntry>, 
     let Some(files) = fi else {
         return Ok(Some(ListedEntry {
             name,
-            size_text: "?".to_string(),
-            kind: "File",
+            size: None,
+            kind: ListedKind::File,
             mtime: None,
             attributes: None,
+            method_text: archive_methods(archive).join(" "),
         }));
     };
     let kind = if files.is_anti(index) {
-        "Anti"
+        ListedKind::Anti
     } else if files.is_directory(index) {
-        "Directory"
+        ListedKind::Directory
     } else if files.is_symlink(index) {
-        "Symlink"
+        ListedKind::Symlink
     } else {
-        "File"
+        ListedKind::File
     };
-    let size_text = if files.is_directory(index) || files.is_anti(index) {
-        String::new()
+    let size = if files.is_directory(index) {
+        Some(0)
+    } else if files.is_anti(index) {
+        None
     } else if files.is_empty_file(index) {
-        "0".to_string()
+        Some(0)
     } else {
         archive
             .extract_to_memory(index)
-            .map(|bytes| bytes.len().to_string())
-            .unwrap_or_else(|_| "?".to_string())
+            .map(|bytes| bytes.len() as u64)
+            .ok()
+    };
+    let method_text = if matches!(kind, ListedKind::File | ListedKind::Symlink) {
+        archive_methods(archive).join(" ")
+    } else {
+        String::new()
     };
     Ok(Some(ListedEntry {
         name,
-        size_text,
+        size,
         kind,
         mtime: files.mtimes.get(index).copied().flatten(),
         attributes: files.attributes.get(index).copied().flatten(),
+        method_text,
     }))
 }
 
