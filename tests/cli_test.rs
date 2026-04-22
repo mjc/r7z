@@ -108,6 +108,58 @@ fn cli_extract_accepts_wildcard_entry_patterns() {
 }
 
 #[test]
+fn cli_create_expands_wildcard_input_paths() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.log"), b"bravo").unwrap();
+    let archive = tmp.path().join("create-wildcards.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("*.txt").display().to_string(),
+    ]);
+
+    let listing = run_r7z(&["l".into(), "-slt".into(), archive.display().to_string()]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("Path = a.txt"));
+    assert!(!listing.contains("Path = b.log"));
+}
+
+#[test]
+fn cli_update_expands_wildcard_input_paths() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("base.txt"), b"base").unwrap();
+    fs::write(input.join("new.txt"), b"new").unwrap();
+    fs::write(input.join("skip.log"), b"skip").unwrap();
+    let archive = tmp.path().join("update-wildcards.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("base.txt").display().to_string(),
+    ]);
+    run_r7z(&[
+        "u".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("new.*").display().to_string(),
+    ]);
+
+    let listing = run_r7z(&["l".into(), "-slt".into(), archive.display().to_string()]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("Path = base.txt"));
+    assert!(listing.contains("Path = new.txt"));
+    assert!(!listing.contains("Path = skip.log"));
+}
+
+#[test]
 fn cli_delete_accepts_wildcard_entry_patterns() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

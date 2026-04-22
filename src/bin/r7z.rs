@@ -552,7 +552,8 @@ fn create_archive(cli: &Cli, allow_existing_merge: bool) -> Result<(), CliError>
     if allow_existing_merge && cli.archive.exists() {
         return update_archive(cli);
     }
-    let entries = collect_disk_entries(&cli.operands)?;
+    let paths = expand_disk_patterns(&cli.operands)?;
+    let entries = collect_disk_entries(&paths)?;
     write_archive_entries(&cli.archive, entries, &cli.options, &cli.volume_sizes)
 }
 
@@ -563,7 +564,8 @@ fn update_archive(cli: &Cli) -> Result<(), CliError> {
     if !cli.archive.exists() {
         return create_archive(cli, false);
     }
-    let new_entries = collect_disk_entries(&cli.operands)?;
+    let paths = expand_disk_patterns(&cli.operands)?;
+    let new_entries = collect_disk_entries(&paths)?;
     let new_names: BTreeSet<String> = new_entries.iter().map(|entry| entry.name.clone()).collect();
     let archive = open_archive(cli)?;
     let mut entries = archive_entries(&archive, cli.password.as_deref())?
@@ -622,6 +624,52 @@ fn collect_disk_entries(paths: &[PathBuf]) -> Result<Vec<PendingEntry>, CliError
         collect_path(path, Path::new(&base_name), &mut entries)?;
     }
     Ok(entries)
+}
+
+fn expand_disk_patterns(paths: &[PathBuf]) -> Result<Vec<PathBuf>, CliError> {
+    let mut expanded = Vec::new();
+    for path in paths {
+        let text = path.to_string_lossy();
+        if !has_wildcard(&text) {
+            expanded.push(path.clone());
+            continue;
+        }
+
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if parent.is_some_and(|parent| has_wildcard(&parent.to_string_lossy())) {
+            return Err(CliError::Usage(format!(
+                "wildcards are only supported in the final path component: {}",
+                path.display()
+            )));
+        }
+        let parent = parent.unwrap_or_else(|| Path::new("."));
+        let pattern = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| CliError::Usage(format!("invalid wildcard path: {}", path.display())))?;
+
+        let mut matches = fs::read_dir(parent)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entry| wildcard_match(pattern, &entry.file_name().to_string_lossy()))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        matches.sort();
+        if matches.is_empty() {
+            return Err(CliError::Usage(format!(
+                "no input files matched {}",
+                path.display()
+            )));
+        }
+        expanded.extend(matches);
+    }
+    Ok(expanded)
+}
+
+fn has_wildcard(text: &str) -> bool {
+    text.contains('*') || text.contains('?')
 }
 
 fn collect_path(
