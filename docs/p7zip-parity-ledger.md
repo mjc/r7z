@@ -45,6 +45,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   add explicit API/CLI knobs before enabling it.
 - Update: current `a`/`u`/`d` rewrite archives atomically for supported codecs,
   but does not preserve original folder graph or unsupported method streams.
+  Unsupported-method update attempts are expected to fail before rewriting the
+  source archive.
 - Security: AES decryption still buffers encrypted streams; replace with a
   streaming CBC path before treating large encrypted archives as parity-complete.
 - Robustness: malformed corpus and fuzzing need extension from parsing into
