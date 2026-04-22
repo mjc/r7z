@@ -42,24 +42,28 @@ impl<T: Read + Seek> ReadSeek for T {}
 
 enum ArchiveSource {
     Bytes(Bytes),
-    Seekable(Mutex<Box<dyn ReadSeek + Send>>),
+    Seekable {
+        reader: Mutex<Box<dyn ReadSeek + Send>>,
+        len: u64,
+    },
 }
 
 impl ArchiveSource {
-    fn from_reader<R>(reader: R) -> Self
+    fn from_reader<R>(mut reader: R) -> Result<Self, R7zError>
     where
         R: Read + Seek + Send + 'static,
     {
-        Self::Seekable(Mutex::new(Box::new(reader)))
+        let len = reader.seek(SeekFrom::End(0)).map_err(R7zError::Io)?;
+        Ok(Self::Seekable {
+            reader: Mutex::new(Box::new(reader)),
+            len,
+        })
     }
 
     fn len(&self) -> Result<u64, R7zError> {
         match self {
             Self::Bytes(bytes) => u64::try_from(bytes.len()).map_err(|_| R7zError::Parse),
-            Self::Seekable(reader) => {
-                let mut reader = reader.lock().map_err(|_| R7zError::Parse)?;
-                reader.seek(SeekFrom::End(0)).map_err(R7zError::Io)
-            }
+            Self::Seekable { len, .. } => Ok(*len),
         }
     }
 
@@ -80,7 +84,7 @@ impl ArchiveSource {
                 dst.copy_from_slice(bytes.get(start..end).ok_or(R7zError::Parse)?);
                 Ok(())
             }
-            Self::Seekable(reader) => {
+            Self::Seekable { reader, .. } => {
                 let mut reader = reader.lock().map_err(|_| R7zError::Parse)?;
                 reader.seek(SeekFrom::Start(offset))?;
                 reader.read_exact(dst)?;
@@ -247,7 +251,7 @@ impl Archive {
                 let mmap = unsafe { Mmap::map(&file)? };
                 ArchiveSource::Bytes(Bytes::from_owner(mmap))
             }
-            ArchiveStorageMode::Seek => ArchiveSource::from_reader(file),
+            ArchiveStorageMode::Seek => ArchiveSource::from_reader(file)?,
         };
         Self::from_source_with_password(source, password, options)
     }
@@ -312,7 +316,7 @@ impl Archive {
     where
         R: Read + Seek + Send + 'static,
     {
-        Self::from_source_with_password(ArchiveSource::from_reader(reader), password, options)
+        Self::from_source_with_password(ArchiveSource::from_reader(reader)?, password, options)
     }
 
     /// Parse a 7z archive from in-memory bytes.

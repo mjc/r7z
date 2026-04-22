@@ -138,7 +138,7 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
     if let SolidMode::Limit {
         max_files: None,
         max_bytes: None,
-    } = options.compression.solid
+    } = &options.compression.solid
     {
         return Err(R7zError::InvalidOptions(
             "solid limit requires max_files or max_bytes",

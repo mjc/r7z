@@ -16,7 +16,7 @@
 //!
 //! \* Byte 1 is only present if either the salt or IV flag is set.
 //!
-//! Salt size = ((byte0 >> 7) & 1) + (byte1 >> 4)\
+//! Salt size = ((byte0 >> 7) & 1) + (byte1 >> 4)
 //! IV size   = ((byte0 >> 6) & 1) + (byte1 & 0x0F)
 
 use crate::R7zError;
