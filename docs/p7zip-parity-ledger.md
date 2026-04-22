@@ -17,8 +17,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   `-aoa`, and `-aos`.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
-- CLI warnings: extract returns warning status when explicit operands match no
-  archive entries.
+- CLI warnings: test/extract return warning status when explicit operands match
+  no archive entries.
 - Metadata: names, empty files, directories, anti-items, timestamps, attributes,
   symlink payloads.
 - Volumes: write support from `r7z a -vSIZE`; read support opens first volumes

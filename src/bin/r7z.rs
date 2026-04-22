@@ -486,6 +486,7 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let selected = selected_patterns(&cli.operands);
     let mut sink = io::sink();
     let mut warnings = 0u8;
+    let mut matched = 0usize;
     for i in 0..archive.num_files() {
         let fi = archive.files_info();
         let name = fi
@@ -494,6 +495,7 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
         if !entry_is_selected(&name, &selected) {
             continue;
         }
+        matched += 1;
         if fi.is_some_and(|files| {
             files.is_directory(i) || files.is_anti(i) || files.is_empty_file(i)
         }) {
@@ -505,6 +507,10 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
             warnings = EXIT_WARNING;
             eprintln!("Testing entry {i} failed: {err}");
         }
+    }
+    if !selected.is_empty() && matched == 0 {
+        eprintln!("No files to process");
+        return Ok(EXIT_WARNING);
     }
     if warnings == 0 {
         println!("Everything is Ok");

@@ -242,6 +242,30 @@ fn cli_extract_warns_when_operands_match_nothing() {
 }
 
 #[test]
+fn cli_test_warns_when_operands_match_nothing() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"archive").unwrap();
+    let archive = tmp.path().join("missing-test-selection.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+    ]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["t", archive.to_str().unwrap(), "*.bin"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No files to process"));
+}
+
+#[test]
 fn cli_delete_accepts_wildcard_entry_patterns() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
