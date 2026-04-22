@@ -305,6 +305,47 @@ fn cli_create_accepts_p7zip_method_chain_options() {
 }
 
 #[test]
+fn cli_create_accepts_method_scoped_threading_as_noop() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("method-threading.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA2:mt=off".into(),
+        archive.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+}
+
+#[test]
+fn cli_rejects_invalid_method_scoped_threading_value() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("bad-method-threading.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=LZMA2:mt=maybe",
+            archive.to_str().unwrap(),
+            input.join("payload.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mt"));
+}
+
+#[test]
 fn cli_create_accepts_p7zip_standalone_compression_options() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

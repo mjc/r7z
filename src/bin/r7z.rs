@@ -309,10 +309,21 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
                         .map_err(|_| CliError::Usage(format!("invalid fast bytes: {value}")))?,
                 );
             }
+            "mt" => parse_threading_value(value)?,
             _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
         }
     }
     Ok(())
+}
+
+fn parse_threading_value(value: &str) -> Result<(), CliError> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "off" | "yes" | "no" | "0" => Ok(()),
+        value if value.parse::<u64>().is_ok_and(|threads| threads > 0) => Ok(()),
+        _ => Err(CliError::Usage(format!(
+            "invalid method threading value for mt: {value}"
+        ))),
+    }
 }
 
 fn parse_filter(switch: &str, options: &mut ArchiveOptions) -> Result<(), CliError> {
