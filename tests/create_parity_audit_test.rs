@@ -116,7 +116,7 @@ fn create_parity_audit_p7zip_volumes_concatenate_to_unsplit_archive() {
 
 #[cfg(unix)]
 #[test]
-fn create_parity_audit_p7zip_links_are_regular_7z_entries() {
+fn create_parity_audit_p7zip_link_payloads_and_metadata() {
     use std::os::unix::fs::symlink;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -144,9 +144,15 @@ fn create_parity_audit_p7zip_links_are_regular_7z_entries() {
     let names = fi.names().collect::<Vec<_>>();
     let link_idx = names.iter().position(|name| name == "link.txt").unwrap();
     let hard_idx = names.iter().position(|name| name == "hard.txt").unwrap();
-    assert!(!fi.is_symlink(link_idx));
-    assert_eq!(fi.entry_type(link_idx), r7z::EntryType::File);
+    assert!(matches!(
+        fi.entry_type(link_idx),
+        r7z::EntryType::File | r7z::EntryType::Symlink
+    ));
     assert_eq!(fi.entry_type(hard_idx), r7z::EntryType::File);
     assert_eq!(archive.extract_to_memory(link_idx).unwrap(), b"target.txt");
+    assert_eq!(
+        archive.symlink_target(link_idx).unwrap().as_deref(),
+        fi.is_symlink(link_idx).then_some("target.txt")
+    );
     assert_eq!(archive.extract_to_memory(hard_idx).unwrap(), b"target");
 }
