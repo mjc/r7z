@@ -17,25 +17,13 @@ pub enum HeaderMode {
     Encoded,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArchiveOptions {
     pub codec: Codec,
     pub header_mode: HeaderMode,
     pub encryption: Option<EncryptionOptions>,
     pub compression: CompressionOptions,
     pub streaming: StreamingOptions,
-}
-
-impl Default for ArchiveOptions {
-    fn default() -> Self {
-        Self {
-            codec: Codec::default(),
-            header_mode: HeaderMode::default(),
-            encryption: None,
-            compression: CompressionOptions::default(),
-            streaming: StreamingOptions::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
