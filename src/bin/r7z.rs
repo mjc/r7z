@@ -42,14 +42,8 @@ fn run(args: Vec<String>) -> Result<u8, CliError> {
         Command::Test => test_archive(&cli),
         Command::ExtractFull => extract_archive(&cli, false),
         Command::ExtractFlat => extract_archive(&cli, true),
-        Command::Add => {
-            create_archive(&cli, true)?;
-            Ok(EXIT_OK)
-        }
-        Command::Update => {
-            update_archive(&cli)?;
-            Ok(EXIT_OK)
-        }
+        Command::Add => create_archive(&cli, true),
+        Command::Update => update_archive(&cli),
         Command::Delete => {
             delete_from_archive(&cli)?;
             Ok(EXIT_OK)
@@ -674,26 +668,34 @@ fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
     }
 }
 
-fn create_archive(cli: &Cli, allow_existing_merge: bool) -> Result<(), CliError> {
+fn create_archive(cli: &Cli, allow_existing_merge: bool) -> Result<u8, CliError> {
     if cli.operands.is_empty() {
         return Err(CliError::Usage("no input files were provided".to_string()));
     }
     if allow_existing_merge && cli.archive.exists() {
         return update_archive(cli);
     }
-    let paths = expand_disk_patterns(&cli.operands)?;
+    let scan = scan_disk_operands(&cli.operands)?;
+    let paths = scan.paths;
     let entries = collect_disk_entries(&paths)?;
-    write_archive_entries(&cli.archive, entries, &cli.options, &cli.volume_sizes)
+    write_archive_entries(&cli.archive, entries, &cli.options, &cli.volume_sizes)?;
+    print_scan_warnings(&scan.warnings);
+    Ok(if scan.warnings.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_WARNING
+    })
 }
 
-fn update_archive(cli: &Cli) -> Result<(), CliError> {
+fn update_archive(cli: &Cli) -> Result<u8, CliError> {
     if cli.operands.is_empty() {
         return Err(CliError::Usage("no input files were provided".to_string()));
     }
     if !cli.archive.exists() {
         return create_archive(cli, false);
     }
-    let paths = expand_disk_patterns(&cli.operands)?;
+    let scan = scan_disk_operands(&cli.operands)?;
+    let paths = scan.paths;
     let new_entries = collect_disk_entries(&paths)?;
     let new_names: BTreeSet<String> = new_entries.iter().map(|entry| entry.name.clone()).collect();
     let archive = open_archive(cli)?;
@@ -702,7 +704,13 @@ fn update_archive(cli: &Cli) -> Result<(), CliError> {
         .filter(|entry| !new_names.contains(&entry.name))
         .collect::<Vec<_>>();
     entries.extend(new_entries);
-    write_archive_entries_atomic(&cli.archive, entries, &cli.options)
+    write_archive_entries_atomic(&cli.archive, entries, &cli.options)?;
+    print_scan_warnings(&scan.warnings);
+    Ok(if scan.warnings.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_WARNING
+    })
 }
 
 fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
@@ -755,12 +763,28 @@ fn collect_disk_entries(paths: &[PathBuf]) -> Result<Vec<PendingEntry>, CliError
     Ok(entries)
 }
 
-fn expand_disk_patterns(paths: &[PathBuf]) -> Result<Vec<PathBuf>, CliError> {
+struct DiskScan {
+    paths: Vec<PathBuf>,
+    warnings: Vec<DiskScanWarning>,
+}
+
+struct DiskScanWarning {
+    path: PathBuf,
+}
+
+fn scan_disk_operands(paths: &[PathBuf]) -> Result<DiskScan, CliError> {
     let mut expanded = Vec::new();
+    let mut warnings = Vec::new();
     for path in paths {
         let text = path.to_string_lossy();
         if !has_wildcard(&text) {
-            expanded.push(path.clone());
+            match fs::symlink_metadata(path) {
+                Ok(_) => expanded.push(path.clone()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    warnings.push(DiskScanWarning { path: path.clone() });
+                }
+                Err(err) => return Err(err.into()),
+            }
             continue;
         }
 
@@ -779,22 +803,40 @@ fn expand_disk_patterns(paths: &[PathBuf]) -> Result<Vec<PathBuf>, CliError> {
             .and_then(OsStr::to_str)
             .ok_or_else(|| CliError::Usage(format!("invalid wildcard path: {}", path.display())))?;
 
-        let mut matches = fs::read_dir(parent)?
-            .collect::<Result<Vec<_>, _>>()?
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let mut matches = entries
             .into_iter()
             .filter(|entry| wildcard_match(pattern, &entry.file_name().to_string_lossy()))
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
         matches.sort();
-        if matches.is_empty() {
-            return Err(CliError::Usage(format!(
-                "no input files matched {}",
-                path.display()
-            )));
-        }
         expanded.extend(matches);
     }
-    Ok(expanded)
+    Ok(DiskScan {
+        paths: expanded,
+        warnings,
+    })
+}
+
+fn print_scan_warnings(warnings: &[DiskScanWarning]) {
+    if warnings.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("Scan WARNINGS for files and folders:");
+    eprintln!();
+    for warning in warnings {
+        eprintln!(
+            "{} : errno=2 : No such file or directory",
+            warning.path.display()
+        );
+    }
+    eprintln!("----------------");
+    eprintln!("Scan WARNINGS: {}", warnings.len());
 }
 
 fn has_wildcard(text: &str) -> bool {
@@ -882,11 +924,6 @@ fn write_archive_entries(
     options: &ArchiveOptions,
     volume_sizes: &[u64],
 ) -> Result<(), CliError> {
-    if entries.is_empty() {
-        return Err(CliError::Usage(
-            "cannot create an empty archive".to_string(),
-        ));
-    }
     let bytes = build_archive_bytes(entries, options)?;
     if volume_sizes.is_empty() {
         fs::write(archive_path, bytes)?;
@@ -901,11 +938,6 @@ fn write_archive_entries_atomic(
     entries: Vec<PendingEntry>,
     options: &ArchiveOptions,
 ) -> Result<(), CliError> {
-    if entries.is_empty() {
-        return Err(CliError::Usage(
-            "cannot create an empty archive".to_string(),
-        ));
-    }
     let bytes = build_archive_bytes(entries, options)?;
     let tmp_path = archive_path.with_extension(format!(
         "{}.tmp-{}",

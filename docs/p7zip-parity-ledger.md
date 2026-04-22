@@ -21,7 +21,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
 - CLI warnings: test/extract return warning status when explicit operands match
-  no archive entries.
+  no archive entries; create/update return warning status for missing literal
+  disk inputs while unmatched disk wildcards are ignored.
 - Metadata: names, empty files, directories, anti-items, timestamps, attributes,
   symlink payloads.
 - Volumes: write support from `r7z a -vSIZE`; read support opens first volumes

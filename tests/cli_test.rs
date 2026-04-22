@@ -160,6 +160,118 @@ fn cli_update_expands_wildcard_input_paths() {
 }
 
 #[test]
+fn cli_create_warns_for_missing_literal_but_adds_existing() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    let missing = input.join("missing.bin");
+    let archive = tmp.path().join("missing-literal.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=Copy",
+            archive.to_str().unwrap(),
+            input.join("a.txt").to_str().unwrap(),
+            missing.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing.bin"));
+    assert!(stderr.contains("No such file or directory"));
+    let listing = run_r7z(&["l".into(), "-slt".into(), archive.display().to_string()]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("Path = a.txt"));
+    assert!(!listing.contains("Path = missing.bin"));
+}
+
+#[test]
+fn cli_update_warns_for_missing_literal_but_keeps_existing_archive() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("base.txt"), b"base").unwrap();
+    fs::write(input.join("new.txt"), b"new").unwrap();
+    let missing = input.join("missing.bin");
+    let archive = tmp.path().join("missing-update.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("base.txt").display().to_string(),
+    ]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "u",
+            "-m0=Copy",
+            archive.to_str().unwrap(),
+            input.join("new.txt").to_str().unwrap(),
+            missing.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing.bin"));
+    assert!(stderr.contains("No such file or directory"));
+    let listing = run_r7z(&["l".into(), "-slt".into(), archive.display().to_string()]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("Path = base.txt"));
+    assert!(listing.contains("Path = new.txt"));
+    assert!(!listing.contains("Path = missing.bin"));
+}
+
+#[test]
+fn cli_create_ignores_unmatched_wildcard_input() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("empty-wildcard.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .current_dir(tmp.path())
+        .args(["a", "-m0=Copy", archive.to_str().unwrap(), "*.bin"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let archive = r7z::Archive::open(&archive).unwrap();
+    assert_eq!(archive.num_files(), 0);
+}
+
+#[test]
+fn cli_create_ignores_unmatched_wildcard_when_other_operands_match() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("skip.log"), b"skip").unwrap();
+    let archive = tmp.path().join("mixed-wildcards.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=Copy",
+            archive.to_str().unwrap(),
+            input.join("*.txt").to_str().unwrap(),
+            input.join("*.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let listing = run_r7z(&["l".into(), "-slt".into(), archive.display().to_string()]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("Path = a.txt"));
+    assert!(!listing.contains("Path = skip.log"));
+}
+
+#[test]
 fn cli_create_accepts_p7zip_method_chain_options() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

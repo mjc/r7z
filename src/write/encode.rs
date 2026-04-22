@@ -19,9 +19,6 @@ pub(crate) fn build_archive(
     entries: &[WriteEntry],
     options: &ArchiveOptions,
 ) -> Result<Vec<u8>, R7zError> {
-    if entries.is_empty() {
-        return Err(R7zError::Parse);
-    }
     validate_archive_options(options)?;
 
     let mut packed_data = Vec::new();
