@@ -216,6 +216,9 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.method_was_explicit = true;
         return Ok(());
     }
+    if lower.starts_with("mmt") {
+        return Ok(());
+    }
     if lower.starts_with("mx") {
         state.options.compression.level = parse_level(switch)?;
         return Ok(());
