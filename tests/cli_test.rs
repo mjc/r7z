@@ -160,6 +160,64 @@ fn cli_update_expands_wildcard_input_paths() {
 }
 
 #[test]
+fn cli_extract_aos_skips_existing_files() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"archive").unwrap();
+    let archive = tmp.path().join("overwrite.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+    ]);
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.txt"), b"existing").unwrap();
+
+    run_r7z(&[
+        "x".into(),
+        "-aos".into(),
+        archive.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"existing");
+}
+
+#[test]
+fn cli_extract_aoa_overwrites_existing_files() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"archive").unwrap();
+    let archive = tmp.path().join("overwrite-all.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+    ]);
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.txt"), b"existing").unwrap();
+
+    run_r7z(&[
+        "x".into(),
+        "-aoa".into(),
+        archive.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"archive");
+}
+
+#[test]
 fn cli_delete_accepts_wildcard_entry_patterns() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

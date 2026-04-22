@@ -73,6 +73,12 @@ enum Command {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverwriteMode {
+    Overwrite,
+    SkipExisting,
+}
+
 #[derive(Debug)]
 struct Cli {
     command: Command,
@@ -83,6 +89,7 @@ struct Cli {
     options: ArchiveOptions,
     technical: bool,
     volume_sizes: Vec<u64>,
+    overwrite_mode: OverwriteMode,
 }
 
 impl Cli {
@@ -102,12 +109,7 @@ impl Cli {
             other => return Err(CliError::Usage(format!("unsupported command: {other}"))),
         };
 
-        let mut output_dir = PathBuf::from(".");
-        let mut password = None;
-        let mut options = ArchiveOptions::default();
-        let mut technical = false;
-        let mut method_was_explicit = false;
-        let mut volume_sizes = Vec::new();
+        let mut state = CliParseState::default();
         let mut positional = Vec::new();
 
         for arg in args {
@@ -116,15 +118,7 @@ impl Cli {
                     positional.push(PathBuf::from(arg));
                     continue;
                 }
-                parse_switch(
-                    switch,
-                    &mut output_dir,
-                    &mut password,
-                    &mut options,
-                    &mut technical,
-                    &mut method_was_explicit,
-                    &mut volume_sizes,
-                )?;
+                parse_switch(switch, &mut state)?;
             } else {
                 positional.push(PathBuf::from(arg));
             }
@@ -135,52 +129,79 @@ impl Cli {
         };
         let operands = positional.into_iter().skip(1).collect();
 
-        if let Some(password) = &password {
+        if let Some(password) = &state.password {
             let mut encryption = EncryptionOptions::default_for_password(password.clone());
-            encryption.encrypt_header = options
+            encryption.encrypt_header = state
+                .options
                 .encryption
                 .as_ref()
                 .is_some_and(|enc| enc.encrypt_header);
-            options.encryption = Some(encryption);
-        } else if let Some(encryption) = &options.encryption {
+            state.options.encryption = Some(encryption);
+        } else if let Some(encryption) = &state.options.encryption {
             if encryption.encrypt_header {
                 return Err(CliError::Usage("-mhe=on requires -pPASS".to_string()));
             }
-            options.encryption = None;
+            state.options.encryption = None;
         }
 
-        if !method_was_explicit && options.compression.level == CompressionLevel::Store {
-            options.codec = Codec::Copy;
+        if !state.method_was_explicit && state.options.compression.level == CompressionLevel::Store
+        {
+            state.options.codec = Codec::Copy;
         }
 
         Ok(Self {
             command,
             archive,
             operands,
-            output_dir,
-            password,
-            options,
-            technical,
-            volume_sizes,
+            output_dir: state.output_dir,
+            password: state.password,
+            options: state.options,
+            technical: state.technical,
+            volume_sizes: state.volume_sizes,
+            overwrite_mode: state.overwrite_mode,
         })
     }
 }
 
-fn parse_switch(
-    switch: &str,
-    output_dir: &mut PathBuf,
-    password: &mut Option<String>,
-    options: &mut ArchiveOptions,
-    technical: &mut bool,
-    method_was_explicit: &mut bool,
-    volume_sizes: &mut Vec<u64>,
-) -> Result<(), CliError> {
+struct CliParseState {
+    output_dir: PathBuf,
+    password: Option<String>,
+    options: ArchiveOptions,
+    technical: bool,
+    method_was_explicit: bool,
+    volume_sizes: Vec<u64>,
+    overwrite_mode: OverwriteMode,
+}
+
+impl Default for CliParseState {
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("."),
+            password: None,
+            options: ArchiveOptions::default(),
+            technical: false,
+            method_was_explicit: false,
+            volume_sizes: Vec::new(),
+            overwrite_mode: OverwriteMode::Overwrite,
+        }
+    }
+}
+
+fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError> {
     let lower = switch.to_ascii_lowercase();
     if lower == "slt" {
-        *technical = true;
+        state.technical = true;
         return Ok(());
     }
     if lower == "y" {
+        return Ok(());
+    }
+    if lower == "aoa" {
+        state.overwrite_mode = OverwriteMode::Overwrite;
+        return Ok(());
+    }
+    if lower == "aos" {
+        state.overwrite_mode = OverwriteMode::SkipExisting;
         return Ok(());
     }
     if let Some(dir) = switch.strip_prefix('o') {
@@ -189,48 +210,49 @@ fn parse_switch(
                 "-o requires an attached directory".to_string(),
             ));
         }
-        *output_dir = PathBuf::from(dir);
+        state.output_dir = PathBuf::from(dir);
         return Ok(());
     }
     if let Some(pass) = switch.strip_prefix('p') {
-        *password = Some(pass.to_string());
+        state.password = Some(pass.to_string());
         return Ok(());
     }
     if lower.starts_with("m0=") {
         let method = &switch[3..];
-        options.codec = codec_from_method_name(method)?;
-        *method_was_explicit = true;
+        state.options.codec = codec_from_method_name(method)?;
+        state.method_was_explicit = true;
         return Ok(());
     }
     if lower.starts_with("mx") {
-        options.compression.level = parse_level(switch)?;
+        state.options.compression.level = parse_level(switch)?;
         return Ok(());
     }
     if lower.starts_with("ms") {
-        options.compression.solid = parse_solid(switch)?;
+        state.options.compression.solid = parse_solid(switch)?;
         return Ok(());
     }
     if lower.starts_with("mf") {
-        parse_filter(switch, options)?;
+        parse_filter(switch, &mut state.options)?;
         return Ok(());
     }
     if lower.starts_with("mhe") {
         let enabled = parse_on_off_value(switch, "mhe")?;
-        let mut encryption = options
+        let mut encryption = state
+            .options
             .encryption
             .take()
             .unwrap_or_else(|| EncryptionOptions::default_for_password(""));
         encryption.encrypt_header = enabled;
-        options.header_mode = if enabled {
+        state.options.header_mode = if enabled {
             HeaderMode::Encoded
         } else {
-            options.header_mode
+            state.options.header_mode
         };
-        options.encryption = Some(encryption);
+        state.options.encryption = Some(encryption);
         return Ok(());
     }
     if let Some(size) = switch.strip_prefix('v') {
-        volume_sizes.push(parse_size(size)?);
+        state.volume_sizes.push(parse_size(size)?);
         return Ok(());
     }
     Err(CliError::Usage(format!("unsupported switch: -{switch}")))
@@ -534,6 +556,9 @@ fn extract_archive(cli: &Cli, flat: bool) -> Result<(), CliError> {
         }
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if cli.overwrite_mode == OverwriteMode::SkipExisting && out_path.exists() {
+            continue;
         }
         if files.is_empty_file(i) {
             fs::File::create(out_path)?;
@@ -955,7 +980,7 @@ fn is_help(text: &str) -> bool {
 
 fn usage() -> String {
     "usage: r7z <l|x|e|t|a|d|u> [switches] <archive.7z> [files...]\n\
-     switches: -oDIR -pPASS -m0=METHOD -mx=N -ms=on|off -mf=BCJ -mhe=on|off -vSIZE -slt"
+     switches: -oDIR -pPASS -m0=METHOD -mx=N -ms=on|off -mf=BCJ -mhe=on|off -vSIZE -aoa|-aos -slt"
         .to_string()
 }
 

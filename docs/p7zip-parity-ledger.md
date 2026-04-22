@@ -13,7 +13,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - Decoder: Copy, LZMA, LZMA2, x86 BCJ filter, 7zAES in folder chains.
 - Encoder: Copy, LZMA, LZMA2, BCJ+LZMA2, 7zAES content/header encryption.
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
-  `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, and `-v`.
+  `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
+  `-aoa`, and `-aos`.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
 - Metadata: names, empty files, directories, anti-items, timestamps, attributes,
@@ -30,8 +31,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
 - Encoder: all missing decoder methods above, plus exact p7zip method-chain
   switch grammar beyond the currently supported subset.
-- CLI: overwrite prompts, warning paths, and byte-for-byte listing text are
-  still incomplete.
+- CLI: interactive overwrite prompts, warning paths, and byte-for-byte listing
+  text are still incomplete.
 - Metadata: p7zip-like unsafe link materialization is intentionally not default;
   add explicit API/CLI knobs before enabling it.
 - Update: current `a`/`u`/`d` rewrite archives atomically for supported codecs,
