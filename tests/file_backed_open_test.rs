@@ -1,4 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{
@@ -8,13 +9,16 @@ use std::sync::{
 
 struct CountingAlloc;
 
-static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
-            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            record_allocation(layout.size());
         }
         ptr
     }
@@ -26,7 +30,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() && new_size > layout.size() {
-            ALLOCATED_BYTES.fetch_add(new_size - layout.size(), Ordering::Relaxed);
+            record_allocation(new_size - layout.size());
         }
         new_ptr
     }
@@ -35,12 +39,23 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
+fn record_allocation(size: usize) {
+    COUNT_ALLOCATIONS.with(|enabled| {
+        if enabled.get() {
+            ALLOCATED_BYTES.with(|allocated| allocated.set(allocated.get() + size));
+        }
+    });
+}
+
 fn reset_allocated_bytes() {
-    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.with(|allocated| allocated.set(0));
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
 }
 
 fn allocated_bytes() -> usize {
-    ALLOCATED_BYTES.load(Ordering::Relaxed)
+    let allocated = ALLOCATED_BYTES.with(Cell::get);
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+    allocated
 }
 
 #[test]
