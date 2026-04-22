@@ -248,6 +248,39 @@ fn cli_create_accepts_p7zip_threading_switch_as_noop() {
 }
 
 #[test]
+fn cli_create_accepts_p7zip_solid_file_limit() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.bin"), b"alpha").unwrap();
+    fs::write(input.join("b.bin"), b"bravo").unwrap();
+    let archive = tmp.path().join("solid-limit.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA2".into(),
+        "-ms=1f".into(),
+        archive.display().to_string(),
+        input.join("a.bin").display().to_string(),
+        input.join("b.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    assert_eq!(
+        archive
+            .streams_info()
+            .unwrap()
+            .unpack_info
+            .as_ref()
+            .unwrap()
+            .num_folders,
+        2
+    );
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"alpha");
+    assert_eq!(archive.extract_to_memory(1).unwrap(), b"bravo");
+}
+
+#[test]
 fn cli_extract_aos_skips_existing_files() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

@@ -7,6 +7,7 @@ use std::{
     env,
     ffi::OsStr,
     fs, io,
+    num::NonZeroU64,
     path::{Component, Path, PathBuf},
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -352,13 +353,26 @@ fn parse_level(switch: &str) -> Result<CompressionLevel, CliError> {
 }
 
 fn parse_solid(switch: &str) -> Result<SolidMode, CliError> {
-    if !switch.contains('=') {
+    let Some((_, value)) = switch.split_once('=') else {
         return Ok(SolidMode::Solid);
-    }
-    if parse_on_off_value(switch, "ms")? {
-        Ok(SolidMode::Solid)
-    } else {
-        Ok(SolidMode::NonSolid)
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "1" | "yes" => Ok(SolidMode::Solid),
+        "off" | "0" | "no" => Ok(SolidMode::NonSolid),
+        value if value.ends_with('f') => {
+            let files = value[..value.len() - 1]
+                .parse::<u64>()
+                .ok()
+                .and_then(NonZeroU64::new)
+                .ok_or_else(|| CliError::Usage(format!("invalid solid file limit: {value}")))?;
+            Ok(SolidMode::Limit {
+                max_files: Some(files),
+                max_bytes: None,
+            })
+        }
+        _ => Err(CliError::Usage(
+            "-ms expects on, off, or a file limit like 1f".to_string(),
+        )),
     }
 }
 
