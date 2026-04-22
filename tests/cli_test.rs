@@ -248,6 +248,28 @@ fn cli_create_accepts_p7zip_threading_switch_as_noop() {
 }
 
 #[test]
+fn cli_create_accepts_p7zip_output_control_switches_as_noop() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("output-control-noop.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        "-bd".into(),
+        "-bb0".into(),
+        "-y".into(),
+        archive.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+}
+
+#[test]
 fn cli_create_accepts_p7zip_solid_file_limit() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

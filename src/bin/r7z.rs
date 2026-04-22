@@ -191,6 +191,12 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
     if lower == "y" {
         return Ok(());
     }
+    if lower == "bd" {
+        return Ok(());
+    }
+    if lower.starts_with("bb") {
+        return parse_log_level_switch(&lower);
+    }
     if lower == "aoa" {
         state.overwrite_mode = OverwriteMode::Overwrite;
         return Ok(());
@@ -349,6 +355,13 @@ fn parse_level(switch: &str) -> Result<CompressionLevel, CliError> {
         _ => Err(CliError::Usage(format!(
             "unsupported compression level: {value}"
         ))),
+    }
+}
+
+fn parse_log_level_switch(switch: &str) -> Result<(), CliError> {
+    match switch {
+        "bb" | "bb0" | "bb1" | "bb2" | "bb3" => Ok(()),
+        _ => Err(CliError::Usage("-bb expects 0, 1, 2, or 3".to_string())),
     }
 }
 
