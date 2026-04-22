@@ -370,9 +370,15 @@ fn parse_solid(switch: &str) -> Result<SolidMode, CliError> {
                 max_bytes: None,
             })
         }
-        _ => Err(CliError::Usage(
-            "-ms expects on, off, or a file limit like 1f".to_string(),
-        )),
+        value => {
+            let bytes = parse_size_with_label(value, "solid byte limit")?;
+            Ok(SolidMode::Limit {
+                max_files: None,
+                max_bytes: Some(
+                    NonZeroU64::new(bytes).expect("parse_size_with_label rejects zero"),
+                ),
+            })
+        }
     }
 }
 
@@ -388,6 +394,10 @@ fn parse_on_off_value(switch: &str, name: &str) -> Result<bool, CliError> {
 }
 
 fn parse_size(text: &str) -> Result<u64, CliError> {
+    parse_size_with_label(text, "volume size")
+}
+
+fn parse_size_with_label(text: &str, label: &str) -> Result<u64, CliError> {
     if text.is_empty() {
         return Err(CliError::Usage("-v requires an attached size".to_string()));
     }
@@ -399,11 +409,11 @@ fn parse_size(text: &str) -> Result<u64, CliError> {
     };
     let value = digits
         .parse::<u64>()
-        .map_err(|_| CliError::Usage(format!("invalid volume size: {text}")))?;
+        .map_err(|_| CliError::Usage(format!("invalid {label}: {text}")))?;
     value
         .checked_mul(multiplier)
         .filter(|&value| value > 0)
-        .ok_or_else(|| CliError::Usage(format!("invalid volume size: {text}")))
+        .ok_or_else(|| CliError::Usage(format!("invalid {label}: {text}")))
 }
 
 fn parse_attached_value<'a>(switch: &'a str, name: &str) -> Result<&'a str, CliError> {

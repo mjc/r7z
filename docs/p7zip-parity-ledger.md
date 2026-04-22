@@ -15,7 +15,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
   `-aoa`, `-aos`, and no-op compatibility for `-mmt`.
-- CLI solid mode: `-ms=on`, `-ms=off`, and file-count limits such as `-ms=1f`.
+- CLI solid mode: `-ms=on`, `-ms=off`, file-count limits such as `-ms=1f`, and byte limits such as `-ms=8k`.
 - CLI method grammar: `-m0=METHOD:d=SIZE:fb=N`, `-md=SIZE`, and `-mfb=N`
   for supported codecs.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete

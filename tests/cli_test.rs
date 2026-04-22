@@ -281,6 +281,39 @@ fn cli_create_accepts_p7zip_solid_file_limit() {
 }
 
 #[test]
+fn cli_create_accepts_p7zip_solid_byte_limit() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.bin"), vec![b'a'; 6 * 1024]).unwrap();
+    fs::write(input.join("b.bin"), vec![b'b'; 6 * 1024]).unwrap();
+    let archive = tmp.path().join("solid-byte-limit.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA2".into(),
+        "-ms=8k".into(),
+        archive.display().to_string(),
+        input.join("a.bin").display().to_string(),
+        input.join("b.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    assert_eq!(
+        archive
+            .streams_info()
+            .unwrap()
+            .unpack_info
+            .as_ref()
+            .unwrap()
+            .num_folders,
+        2
+    );
+    assert_eq!(archive.extract_to_memory(0).unwrap(), vec![b'a'; 6 * 1024]);
+    assert_eq!(archive.extract_to_memory(1).unwrap(), vec![b'b'; 6 * 1024]);
+}
+
+#[test]
 fn cli_extract_aos_skips_existing_files() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
