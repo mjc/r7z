@@ -330,15 +330,20 @@ fn parse_size(text: &str) -> Result<u64, CliError> {
 
 fn list_archive(cli: &Cli) -> Result<(), CliError> {
     let archive = open_archive(cli)?;
+    let selected = selected_patterns(&cli.operands);
     if cli.technical {
-        print_technical_listing(&archive)?;
+        print_technical_listing(&archive, &selected)?;
     } else {
-        print_listing(&archive, &cli.archive)?;
+        print_listing(&archive, &cli.archive, &selected)?;
     }
     Ok(())
 }
 
-fn print_listing(archive: &Archive, archive_path: &Path) -> Result<(), CliError> {
+fn print_listing(
+    archive: &Archive,
+    archive_path: &Path,
+    selected: &[String],
+) -> Result<(), CliError> {
     println!();
     println!("Path = {}", archive_path.display());
     println!("Type = 7z");
@@ -353,19 +358,25 @@ fn print_listing(archive: &Archive, archive_path: &Path) -> Result<(), CliError>
         let Some(entry) = listed_entry(archive, i)? else {
             continue;
         };
+        if !entry_is_selected(&entry.name, selected) {
+            continue;
+        }
         println!("{:>12}  {}", entry.size_text, entry.name);
     }
     println!();
     Ok(())
 }
 
-fn print_technical_listing(archive: &Archive) -> Result<(), CliError> {
+fn print_technical_listing(archive: &Archive, selected: &[String]) -> Result<(), CliError> {
     println!("Type = 7z");
     println!("Method = {}", archive_methods(archive).join(" "));
     for i in 0..archive.num_files() {
         let Some(entry) = listed_entry(archive, i)? else {
             continue;
         };
+        if !entry_is_selected(&entry.name, selected) {
+            continue;
+        }
         println!();
         println!("Path = {}", entry.name);
         println!("Size = {}", entry.size_text);

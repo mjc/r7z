@@ -146,6 +146,35 @@ fn cli_delete_accepts_wildcard_entry_patterns() {
 }
 
 #[test]
+fn cli_list_accepts_wildcard_entry_patterns() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.log"), b"bravo").unwrap();
+    let archive = tmp.path().join("list-wildcards.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+        input.join("b.log").display().to_string(),
+    ]);
+
+    let listing = run_r7z(&[
+        "l".into(),
+        "-slt".into(),
+        archive.display().to_string(),
+        "*.txt".into(),
+    ]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+
+    assert!(listing.contains("Path = a.txt"));
+    assert!(!listing.contains("Path = b.log"));
+}
+
+#[test]
 fn cli_unsupported_p7zip_method_is_command_line_error() {
     let tmp = tempdir().unwrap();
     let archive = tmp.path().join("bad.7z");
