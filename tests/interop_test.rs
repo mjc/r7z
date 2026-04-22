@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 //! Interop tests: create archives with p7zip, extract with r7z, byte-compare.
 //!
 //! These tests require `7z` (p7zip) to be available in PATH or via nix-shell.

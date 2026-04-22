@@ -48,6 +48,7 @@ pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 /// The properties byte encodes the maximum dictionary size needed for decompression.
 /// We advertise 32 MB (0x1c), which matches the default preset dictionary.
 /// p7zip uses this only for memory estimation — the LZMA2 stream is self-describing.
+#[allow(dead_code)]
 pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
     let buf = Vec::new();
     let mut writer = Lzma2Writer::new(buf, lzma_rust2::Lzma2Options::default());
@@ -72,12 +73,10 @@ fn lzma2_dict_size(props: Option<&[u8]>) -> Result<u32, R7zError> {
     }
 
     let p = props[0];
-    if p > 40 {
-        Err(R7zError::Decompression)
-    } else if p == 40 {
-        Ok(u32::MAX)
-    } else {
-        Ok((2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11))
+    match p.cmp(&40) {
+        std::cmp::Ordering::Greater => Err(R7zError::Decompression),
+        std::cmp::Ordering::Equal => Ok(u32::MAX),
+        std::cmp::Ordering::Less => Ok((2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11)),
     }
 }
 
@@ -123,7 +122,23 @@ pub fn decompress_folder_with_password(
     unpack_size: u64,
     password: Option<&str>,
 ) -> Result<Vec<u8>, R7zError> {
-    let mut reader = folder_reader(folder, packed_data, unpack_size, password)?;
+    decompress_folder_with_password_and_sizes(folder, packed_data, unpack_size, &[], password)
+}
+
+pub fn decompress_folder_with_password_and_sizes(
+    folder: &Folder,
+    packed_data: &[u8],
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Vec<u8>, R7zError> {
+    let mut reader = folder_reader_with_sizes(
+        folder,
+        packed_data,
+        unpack_size,
+        coder_unpack_sizes,
+        password,
+    )?;
     let mut data = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
     reader
         .read_to_end(&mut data)
@@ -131,14 +146,31 @@ pub fn decompress_folder_with_password(
     Ok(data)
 }
 
-pub(crate) fn folder_reader<'a>(
+pub(crate) fn folder_reader_with_sizes<'a>(
     folder: &Folder,
     packed_data: &'a [u8],
     unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Box<dyn Read + 'a>, R7zError> {
+    folder_reader_with_sizes_from_reader(
+        folder,
+        Box::new(Cursor::new(packed_data)),
+        unpack_size,
+        coder_unpack_sizes,
+        password,
+    )
+}
+
+pub(crate) fn folder_reader_with_sizes_from_reader<'a>(
+    folder: &Folder,
+    input: Box<dyn Read + 'a>,
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
     let order = coder_execution_order(folder)?;
-    let mut reader: Box<dyn Read + 'a> = Box::new(Cursor::new(packed_data));
+    let mut reader = input;
 
     // Multi-coder chain: resolve bind-pair ordering so that each coder's
     // output feeds the next one's input.
@@ -151,8 +183,10 @@ pub(crate) fn folder_reader<'a>(
     // packed stream (starts first) and following the bind pairs.
     for (i, &coder_idx) in order.iter().enumerate() {
         let coder = &folder.coders[coder_idx];
-        // For chained coders we don't know intermediate sizes; use 0 to signal "unknown".
-        let size = if i == order.len() - 1 { unpack_size } else { 0 };
+        let size = coder_unpack_sizes
+            .get(coder_idx)
+            .copied()
+            .unwrap_or(if i == order.len() - 1 { unpack_size } else { 0 });
         reader = coder_reader(coder, reader, size, password)?;
     }
     Ok(reader)
@@ -196,7 +230,10 @@ fn coder_reader<'a>(
         let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power)?;
         let mut encrypted = Vec::new();
         read_to_end_bounded(&mut input, &mut encrypted, MAX_BUFFERED_AES_BYTES)?;
-        let decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
+        let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
+        if unpack_size > 0 {
+            truncate_to(&mut decrypted, unpack_size)?;
+        }
         return Ok(Box::new(Cursor::new(decrypted)));
     }
 
@@ -220,6 +257,15 @@ fn read_to_end_bounded(
         }
         output.extend_from_slice(&buf[..n]);
     }
+}
+
+fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
+    let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
+    if data.len() < size {
+        return Err(R7zError::Decompression);
+    }
+    data.truncate(size);
+    Ok(())
 }
 
 /// Determine the order in which coders should be executed for decompression.

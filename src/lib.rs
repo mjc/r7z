@@ -19,6 +19,22 @@
 //! let bytes = archive.extract_to_memory_with_password(0, Some("pass")).unwrap();
 //! ```
 //!
+//! `Archive::open` is file-backed by default. Generic reader input must be
+//! seekable because 7z stores stream data and authoritative metadata in
+//! different file regions:
+//!
+//! ```compile_fail
+//! struct NetworkStream;
+//!
+//! impl std::io::Read for NetworkStream {
+//!     fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+//!         Ok(0)
+//!     }
+//! }
+//!
+//! let _archive = r7z::Archive::from_reader(NetworkStream).unwrap();
+//! ```
+//!
 //! `Archive::extract_all` rejects unsafe paths such as absolute names, parent
 //! directory traversal, and Windows-prefixed paths. Directory entries and zero-byte
 //! files are handled distinctly.
@@ -33,8 +49,8 @@
 //! std::fs::write("out.7z", bytes).unwrap();
 //! ```
 //!
-//! For streaming or multi-folder writes, use [`ArchiveWriter`]. [`EntryMeta`] can
-//! store optional modification times and Unix mode bits. [`Codec::Lzma2Bcj`] applies
+//! For file-backed or multi-folder writes, use [`ArchiveWriter`]. [`EntryMeta`] can
+//! store optional timestamps and attributes. [`Codec::Lzma2Bcj`] applies
 //! the x86 BCJ filter before LZMA2 compression for executable-like payloads.
 
 extern crate num;
@@ -44,7 +60,6 @@ extern crate num_derive;
 mod aes;
 mod archive;
 pub mod bcj;
-mod builder;
 mod codec;
 mod coder_info;
 mod error;
@@ -55,22 +70,28 @@ mod pack_info;
 mod parsers;
 mod property;
 mod stream_info;
+mod write;
 
-pub use archive::{Archive, ArchiveMetadata};
-pub use builder::{build_streaming, ArchiveBuilder, ArchiveWriter, Codec, EntryMeta};
+pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMode};
 pub use codec::{
     decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ_X86,
     CODEC_COPY, CODEC_LZMA, CODEC_LZMA2,
 };
 pub use coder_info::CoderInfo;
 pub use error::R7zError;
-pub use files_info::FilesInfo;
+pub use files_info::{EntryType, FilesInfo};
 pub use folder::Folder;
 pub use headers::{EncodedHeader, Header, SignatureHeader};
 pub use pack_info::{PackInfo, UnpackInfo};
 pub use parsers::*;
 pub use property::{find_next_property_id, Property};
 pub use stream_info::{StreamInfo, SubstreamInfo};
+pub use write::{
+    build_streaming, build_streaming_to_writer, build_streaming_volumes,
+    build_streaming_with_options, ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter,
+    Codec, CompressionLevel, CompressionOptions, EncryptionOptions, EntryKind, EntryMeta,
+    HeaderMode, SolidMode, SpoolMode, StreamingOptions, VolumeOptions,
+};
 
 // Re-export nom's IResult for convenience in integration tests
 pub use nom::IResult;

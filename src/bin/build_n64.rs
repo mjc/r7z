@@ -6,8 +6,7 @@
 /// - `root_dir` = `/mnt/emulation/n64`
 /// - `output`   = `/tmp/n64_build.7z`
 ///
-/// Files are piped one at a time through the LZMA2 encoder directly to the output file.
-/// Neither all input data nor the full compressed archive is held in memory.
+/// Files are collected into a .7z archive and written to the output path.
 use r7z::build_streaming;
 use std::fs::File;
 use std::io::{self, BufWriter};

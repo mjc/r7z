@@ -7,7 +7,7 @@
 //!
 //! The algorithm matches p7zip / LZMA SDK `Bra86.c` exactly.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 /// Test whether the most-significant byte of a 4-byte displacement indicates
 /// a near address (0x00 or 0xFF after biased addition).
@@ -26,6 +26,7 @@ fn test86_msb(b: u8) -> bool {
 ///
 /// Returns the number of bytes that were fully processed.  Trailing bytes
 /// (fewer than 5) are left untouched and should be prepended to the next call.
+#[allow(clippy::cast_possible_truncation)]
 pub fn bcj_x86_convert(data: &mut [u8], ip: u32, state: &mut u32, encoding: bool) -> usize {
     let size = data.len();
     let mut pos: usize = 0;
@@ -117,6 +118,56 @@ pub(crate) struct BcjX86Reader<R> {
     eof: bool,
 }
 
+pub(crate) struct BcjX86Writer<W> {
+    inner: W,
+    tail: Vec<u8>,
+    state: u32,
+    input_offset: u64,
+}
+
+impl<W: Write> BcjX86Writer<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            tail: Vec::with_capacity(4),
+            state: 0,
+            input_offset: 0,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        if !self.tail.is_empty() {
+            self.inner.write_all(&self.tail)?;
+            self.tail.clear();
+        }
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for BcjX86Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut data = Vec::with_capacity(self.tail.len() + buf.len());
+        data.extend_from_slice(&self.tail);
+        data.extend_from_slice(buf);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let processed = bcj_x86_convert(&mut data, self.input_offset as u32, &mut self.state, true);
+        self.inner.write_all(&data[..processed])?;
+        self.tail.clear();
+        self.tail.extend_from_slice(&data[processed..]);
+        self.input_offset = self.input_offset.wrapping_add(processed as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl<R: Read> BcjX86Reader<R> {
     pub(crate) fn new(inner: R) -> Self {
         Self {
@@ -149,6 +200,7 @@ impl<R: Read> BcjX86Reader<R> {
             data.extend_from_slice(&self.tail);
             data.extend_from_slice(&chunk[..n]);
 
+            #[allow(clippy::cast_possible_truncation)]
             let processed =
                 bcj_x86_convert(&mut data, self.input_offset as u32, &mut self.state, false);
             self.pending.extend_from_slice(&data[..processed]);
@@ -201,6 +253,7 @@ pub fn bcj_x86_encode(data: &mut [u8]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::pedantic)]
 mod tests {
     use super::*;
 
@@ -380,5 +433,27 @@ mod tests {
         }
 
         assert_eq!(actual, original);
+    }
+
+    #[test]
+    fn streaming_encode_matches_batch_for_chunk_sizes() {
+        let mut data = vec![0x90u8; 4096];
+        for pos in (3..data.len().saturating_sub(5)).step_by(37) {
+            data[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
+            let target = (pos as u32).wrapping_mul(11);
+            data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
+        }
+
+        let mut batch = data.clone();
+        bcj_x86_encode(&mut batch);
+
+        for chunk_size in [1, 2, 3, 4, 5, 7, 31, 1024] {
+            let mut writer = BcjX86Writer::new(Vec::new());
+            for chunk in data.chunks(chunk_size) {
+                writer.write_all(chunk).unwrap();
+            }
+            let streamed = writer.finish().unwrap();
+            assert_eq!(streamed, batch, "chunk_size={chunk_size}");
+        }
     }
 }

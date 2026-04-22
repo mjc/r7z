@@ -57,6 +57,11 @@ let written = archive.extract_to_writer(0, &mut out)?;
 println!("{written} bytes written");
 ```
 
+`Archive::open` is file-backed and uses `mmap` by default, so opening a large
+archive does not allocate a heap buffer for the full file. Use
+`ArchiveOpenOptions { storage_mode: ArchiveStorageMode::Seek, ..Default::default() }`
+when mmap is undesirable.
+
 ### Reading — extract all to disk safely
 
 ```rust
@@ -76,7 +81,7 @@ let archive = Archive::open_with_password(Path::new("secret.7z"), Some("passphra
 let data = archive.extract_to_memory_with_password(0, Some("passphrase"))?;
 ```
 
-### Building a single-file LZMA archive
+### Building a single-file LZMA2 archive
 
 ```rust
 use r7z::ArchiveBuilder;
@@ -87,17 +92,41 @@ let bytes = ArchiveBuilder::new()
 std::fs::write("out.7z", &bytes)?;
 ```
 
-### Building a multi-file LZMA2 archive
+### Building a multi-file archive with explicit entries
 
 ```rust
-use r7z::{ArchiveBuilder, Codec};
+use r7z::{ArchiveBuilder, EntryMeta};
 
 let bytes = ArchiveBuilder::new()
     .add_file("alpha.txt", b"AAAA")
+    .add_empty_file("empty.txt", EntryMeta::default())
+    .add_directory("beta", EntryMeta::default())
     .add_file("beta/beta.txt", b"BBBBBBBB")
-    .compression(Codec::Lzma2)
     .build()?;
 ```
+
+### Writing metadata and encoded headers
+
+```rust
+use r7z::{ArchiveBuilder, ArchiveOptions, EntryMeta, HeaderMode};
+use std::time::{Duration, UNIX_EPOCH};
+
+let meta = EntryMeta {
+    mtime: Some(UNIX_EPOCH + Duration::from_secs(1_710_504_000)),
+    start_pos: Some(0),
+    ..EntryMeta::from_unix_mode(0o100_644)
+};
+
+let bytes = ArchiveBuilder::new()
+    .options(ArchiveOptions {
+        header_mode: HeaderMode::Encoded,
+        ..ArchiveOptions::default()
+    })
+    .add_file_entry("metadata.txt", b"with metadata", meta)
+    .build()?;
+```
+
+`EntryMeta::attributes` stores raw 7z `WinAttrib` values. `EntryMeta::from_unix_mode(mode)` sets `(mode << 16) | 0x20`, `EntryMeta::directory_unix_mode(mode)` sets `(mode << 16) | 0x10`, and `EntryMeta::archive_file()` sets `0x20`.
 
 ### Building a BCJ+x86+LZMA2 archive
 
@@ -110,7 +139,29 @@ let bytes = ArchiveBuilder::new()
     .build()?;
 ```
 
-### Streaming builder — process large archives without loading all data into memory
+### Building Copy or AES-encrypted archives
+
+```rust
+use r7z::{ArchiveBuilder, ArchiveOptions, Codec, EncryptionOptions};
+
+let copy_bytes = ArchiveBuilder::new()
+    .compression(Codec::Copy)
+    .add_file("stored.bin", b"stored without compression")
+    .build()?;
+
+let mut options = ArchiveOptions::default();
+options.encryption = Some(EncryptionOptions::default_for_password("secret"));
+
+let encrypted_bytes = ArchiveBuilder::new()
+    .options(options)
+    .add_file("secret.txt", b"encrypted content")
+    .build()?;
+```
+
+Set `EncryptionOptions::encrypt_header = true` to hide filenames and metadata until the password is supplied.
+`EncryptionOptions::default_for_password(password)` uses p7zip-compatible writer defaults: cycle power 19, no salt, and a random 16-byte IV. Non-default salt and IV lengths up to 16 bytes are also supported.
+
+### Writer API — file-backed archive creation
 
 ```rust
 use r7z::build_streaming;
@@ -123,10 +174,36 @@ let entries = vec![
     ("file2.bin".to_string(), File::open("file2.bin")?),
 ].into_iter();
 
-build_streaming(entries, out_file)?;  // Pipes files through compressor directly to disk
+build_streaming(entries, out_file)?;
 ```
 
-### Parsing from an in-memory buffer
+### Parsing from a seekable reader or in-memory buffer
+
+7z archives require random access. `Archive::from_reader` accepts `Read + Seek`
+sources such as `std::io::Cursor<Vec<u8>>` or `std::fs::File`; non-seekable
+streams should be spooled by the caller before opening.
+
+```rust
+let file = std::fs::File::open("example.7z")?;
+let archive = Archive::from_reader(file)?;
+```
+
+`ArchiveOpenOptions` controls file-backed storage mode and metadata limits:
+
+```rust
+use r7z::{Archive, ArchiveOpenOptions, ArchiveStorageMode};
+use std::path::Path;
+
+let archive = Archive::open_with_options(
+    Path::new("example.7z"),
+    ArchiveOpenOptions {
+        storage_mode: ArchiveStorageMode::Seek,
+        max_metadata_bytes: 64 * 1024 * 1024,
+    },
+)?;
+```
+
+For explicitly in-memory archives, use `Archive::from_bytes`:
 
 ```rust
 let raw: Vec<u8> = std::fs::read("example.7z")?;
@@ -139,10 +216,11 @@ let archive = Archive::from_bytes(raw.into())?;
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `Archive::open(path: &Path)` | `Result<Archive, R7zError>` | Read and fully decode a `.7z` file from disk |
+| `Archive::open(path: &Path)` | `Result<Archive, R7zError>` | File-backed open using mmap by default |
 | `Archive::open_with_password(path, password)` | `Result<Archive, R7zError>` | Open an archive with encrypted headers |
-| `Archive::from_reader(reader)` | `Result<Archive, R7zError>` | Buffer and decode any `Read` source |
-| `Archive::from_reader_with_password(reader, password)` | `Result<Archive, R7zError>` | Buffer and decode a password-protected `Read` source |
+| `Archive::open_with_options(path, options)` | `Result<Archive, R7zError>` | Open with mmap/seek storage and metadata limits |
+| `Archive::from_reader(reader)` | `Result<Archive, R7zError>` | Decode a seekable `Read + Seek` source |
+| `Archive::from_reader_with_password(reader, password)` | `Result<Archive, R7zError>` | Decode a password-protected seekable source |
 | `Archive::from_bytes(data: bytes::Bytes)` | `Result<Archive, R7zError>` | Decode a `.7z` from an in-memory buffer |
 | `Archive::from_bytes_with_password(data, password)` | `Result<Archive, R7zError>` | Decode password-protected bytes |
 | `archive.num_files()` | `usize` | Number of entries (files and directories) |
@@ -172,30 +250,42 @@ Builder pattern — all methods consume `self` and return `Self` for chaining:
 
 | Method | Description |
 |--------|-------------|
-| `ArchiveBuilder::new()` | Create an empty builder (LZMA compression default) |
+| `ArchiveBuilder::new()` | Create an empty builder (LZMA2 compression default) |
 | `.add_file(name: &str, data: &[u8])` | Queue a file with its content |
-| `.compression(codec: Codec)` | Set compression (`Codec::Lzma` or `Codec::Lzma2`) |
+| `.add_symlink(name, target, meta)` | Queue a symlink-like entry; target bytes are stored as file data and Unix symlink mode bits are set |
+| `.add_entry(entry, data)` | Queue an explicit `ArchiveEntry`; non-file entries must not provide stream data |
+| `.add_empty_file(name, meta)` / `.add_directory(name, meta)` / `.add_anti_item(name, meta)` | Queue empty-stream entries |
+| `.compression(codec: Codec)` | Set compression (`Codec::Copy`, `Codec::Lzma`, `Codec::Lzma2`, or `Codec::Lzma2Bcj`) |
+| `.options(options: ArchiveOptions)` | Set codec, header mode, encryption, compression tuning, and streaming options |
 | `.build()` | Produce the final `.7z` bytes as `Result<Vec<u8>, R7zError>` |
 
-The builder uses **solid compression**: all files are concatenated into one stream before compressing, which gives better ratios for many small files.
+The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It uses **solid compression** for non-empty files: file data is concatenated into one stream before compression, while directories, anti-items, and zero-byte files are represented with 7z empty-stream metadata.
 
-### `ArchiveWriter` and `build_streaming` — Streaming builders for large archives
+`ArchiveOptions::compression` exposes p7zip-like tuning through `CompressionOptions`:
+`CompressionLevel`, optional dictionary size, optional fast bytes, `SolidMode`
+(`Solid`, `NonSolid`, or `Limit`), and optional LZMA2 chunk size. The existing
+`Codec` still selects the algorithm.
 
-`ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata:
+### `ArchiveWriter` and `build_streaming` — file-backed builders
+
+`ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata. It also accepts explicit `ArchiveEntry` values through `.append_archive_entry(...)` and `.append_empty_entry(...)`:
 
 ```rust
-use r7z::{ArchiveWriter, Codec, EntryMeta};
+use r7z::{ArchiveOptions, ArchiveWriter, Codec, EntryMeta};
 use std::fs::File;
 
 let file = File::create("out.7z")?;
-let mut writer = ArchiveWriter::new(file)?.compression(Codec::Lzma2);
-writer.append("a.txt", &mut b"hello".as_ref())?;
+let mut writer = ArchiveWriter::new(file, ArchiveOptions::default())?.compression(Codec::Lzma2);
+writer.append_file("a.txt", &mut b"hello".as_ref(), EntryMeta::default())?;
+writer.append_empty_file("empty.txt", EntryMeta::default())?;
 writer.new_folder()?;
 writer.append_entry("b.txt", &mut b"world".as_ref(), EntryMeta::default())?;
 writer.finish()?;
 ```
 
-For archives too large to fit in memory, use the streaming builder:
+When configured with `Codec::Copy` and no encryption, `ArchiveWriter` writes non-empty file payloads directly to the output as they are appended. With `Codec::Lzma`, default `Codec::Lzma2`, or `Codec::Lzma2Bcj` and no encryption, it streams into the compressed folder and writes those bytes when the folder is sealed by `new_folder()` or `finish()`. Encrypted writer paths still collect input before final archive assembly.
+
+For file-backed output, use the convenience builder:
 
 ```rust
 pub fn build_streaming<W, I, R>(entries: I, out: W) -> Result<(), R7zError>
@@ -203,21 +293,66 @@ where
     W: Write + Seek,
     I: IntoIterator<Item = (String, R)>,
     R: Read,
+
+pub fn build_streaming_with_options<W, I, R>(
+    entries: I,
+    out: W,
+    options: ArchiveOptions
+) -> Result<(), R7zError>
+where
+    W: Write + Seek,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+
+pub fn build_streaming_to_writer<W, I, R>(
+    entries: I,
+    out: W,
+    options: ArchiveOptions
+) -> Result<(), R7zError>
+where
+    W: Write,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+
+pub fn build_streaming_volumes<P, I, R>(
+    entries: I,
+    base_path: P,
+    archive_options: ArchiveOptions,
+    volume_options: VolumeOptions
+) -> Result<Vec<PathBuf>, R7zError>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
 ```
 
-Each `entry` (filename, `impl Read`) is piped through the LZMA2 compressor directly to the output file. Neither all input data nor all compressed output is held in memory simultaneously — only one file at a time.
+Each `entry` is provided as a filename and `impl Read`; the builder writes the final `.7z` archive to any `Write + Seek` output. Use `build_streaming_with_options` for Copy, explicit header mode, or encryption settings.
+`build_streaming_to_writer` accepts plain `Write` sinks by assembling through an
+internal spool first. `build_streaming_volumes` writes p7zip-style split output
+such as `archive.7z.001`, `archive.7z.002`, and returns the created paths.
+
+### Link metadata
+
+`FilesInfo::entry_type(index)` classifies entries as `File`, `Directory`,
+`EmptyFile`, `Anti`, or `Symlink`. `Archive::symlink_target(index)` returns the
+stored symlink target for entries marked with Unix symlink mode bits. `extract_all`
+does not create filesystem symlinks; symlink entries extract as regular files
+containing the target path bytes. Hard-link preservation is not supported for
+`.7z` because p7zip does not reliably emit a standard hard-link representation
+for this format.
 
 ### `Codec` — Compression algorithms
 
 ```rust
 pub enum Codec {
-    Lzma,      // Classic LZMA  — codec ID [0x03, 0x01, 0x01]
-    Lzma2,     // Modern LZMA2  — codec ID [0x21]
+    Copy,      // No compression — codec ID [0x00]
+    Lzma,      // Classic LZMA — codec ID [0x03, 0x01, 0x01]
+    Lzma2,     // Default — codec ID [0x21]
     Lzma2Bcj,  // x86 BCJ filter followed by LZMA2
 }
 ```
 
-`Lzma2` is the p7zip default and generally gives slightly better compression ratios.
+`Lzma2` is the default and generally gives slightly better compression ratios.
 
 ### `R7zError` — Error variants
 
@@ -233,6 +368,7 @@ pub enum Codec {
 | `R7zError::WrongPassword` | Reserved for password-specific failures |
 | `R7zError::UnsafePath(String)` | Extracted path would escape the destination |
 | `R7zError::Directory` | Requested entry is a directory or anti-item |
+| `R7zError::LimitExceeded(&'static str)` | Configured metadata or safety limit was exceeded |
 
 **Error handling example:**
 
@@ -270,23 +406,31 @@ These are public but primarily used for building advanced tooling:
 | Feature | Status |
 |---------|--------|
 | LZMA compression | Read + Write |
-| LZMA2 compression | Read + Write |
-| Copy codec | Read |
+| LZMA2 compression | Read + Write (default) |
+| Copy codec | Read + Write |
 | BCJ x86 filter + LZMA2 | Read + Write |
-| Uncompressed Copy codec | Read |
-| EncodedHeader archives (p7zip default) | Read |
+| EncodedHeader archives (p7zip default) | Read + Write |
 | Uncompressed Header archives | Read + Write |
 | Solid archives | Read + Write |
 | Multi-file archives | Read + Write |
 | Multi-folder / non-solid archives | Read + Write via `ArchiveWriter` |
-| AES-256-SHA-256 encrypted content | Read |
-| AES encrypted headers (`-mhe=on`) | Read with password |
+| Directories / zero-byte files / anti-items | Read + Write |
+| AES-256-SHA-256 encrypted content | Read + Write |
+| AES encrypted headers (`-mhe=on`) | Read + Write with password |
+| Update existing archives | Not supported |
 | Deflate / BZip2 / PPMd | Not supported |
-| AES writing | Not supported |
+| Read split volumes | Not supported |
+| Hard-link preservation | Not supported |
 
 **7z specification:** [7zFormat.txt](https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt)
 
-Archives written by r7z use format version 0.4 (standard), are in uncompressed-Header format, and are fully readable by 7-Zip ≥ 9.x and p7zip.
+Archives written by r7z use format version 0.4 (standard). Multi-entry archives use EncodedHeader by default, matching p7zip behavior, and are fully readable by 7-Zip ≥ 9.x and p7zip.
+
+`extract_to_writer` streams decoded file data into the supplied writer and is
+the preferred low-allocation extraction API. `extract_to_memory` intentionally
+allocates the requested file contents. AES-encrypted extraction still buffers
+the encrypted pack stream internally before AES-CBC decryption; streaming AES is
+a planned hardening follow-up.
 
 Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
 LZMA2, and BCJ+x86+LZMA2 archives. The parity target is matching archive
@@ -312,7 +456,7 @@ This loads the dev shell with:
 - **Profiling**: `perf`, `cargo-flamegraph`, `valgrind`
 - **Build**: `cargo-nextest`, `gnuplot`, `hyperfine`
 
-Running `cargo flamegraph --bin build_n64 -- /mnt/emulation/n64 /tmp/n64_build.7z` will build a streaming 7z archive from a directory tree and profile the codepath.
+Running `cargo flamegraph --bin build_n64 -- /mnt/emulation/n64 /tmp/n64_build.7z` will build a 7z archive from a directory tree and profile the codepath.
 
 ### Without Nix
 

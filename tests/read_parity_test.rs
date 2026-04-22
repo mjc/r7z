@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
     let mut header = Vec::new();
     header.push(0x01); // Header

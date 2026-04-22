@@ -103,6 +103,10 @@ fn streaming_extract_reports_corrupt_lzma_and_lzma2_payloads() {
 #[test]
 fn streaming_extract_stops_after_target_when_folder_crc_is_absent() {
     let mut bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            header_mode: r7z::HeaderMode::Plain,
+            ..Default::default()
+        })
         .compression(r7z::Codec::Lzma2)
         .add_file("first.txt", b"first")
         .add_file("second.bin", &vec![0xA5u8; 128 * 1024])
@@ -176,7 +180,9 @@ fn write_with_archive_writer(
     multi_folder: bool,
 ) {
     let file = std::fs::File::create(archive_path).unwrap();
-    let mut writer = r7z::ArchiveWriter::new(file).unwrap().compression(codec);
+    let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
+        .unwrap()
+        .compression(codec);
     for (idx, (path, data)) in files.iter().enumerate() {
         if multi_folder && idx == files.len() / 2 {
             writer.new_folder().unwrap();
