@@ -4,6 +4,8 @@ mod support;
 
 use support::{extract_with_p7zip, run_7z_checked};
 
+type CompressionCase<'a> = (&'a str, &'a [&'a str], &'a [u8], Option<usize>);
+
 fn write_payload(dir: &std::path::Path) {
     let data = (0u8..=255).cycle().take(16 * 1024).collect::<Vec<_>>();
     std::fs::write(dir.join("payload.bin"), data).unwrap();
@@ -12,7 +14,7 @@ fn write_payload(dir: &std::path::Path) {
 
 #[test]
 fn create_parity_audit_p7zip_compression_switches_open_with_r7z() {
-    let cases: &[(&str, &[&str], &[u8], Option<usize>)] = &[
+    let cases: &[CompressionCase<'_>] = &[
         ("mx0", &["-mx0"], &[0x00], None),
         ("mx1", &["-mx1"], &[0x21], Some(1)),
         ("mx3", &["-mx3"], &[0x21], Some(1)),
