@@ -7,35 +7,60 @@ struct CorpusCase {
     path: String,
     password: Option<String>,
     expectation: Expectation,
-    expected_files: usize,
+    expected_files: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Expectation {
     Extract,
     OpenOnly,
+    OpenError,
 }
 
 #[test]
 fn checked_in_7z_corpus_cases_open_and_extract_as_expected() {
-    for case in read_manifest("tests/corpus/7z/manifest.tsv") {
+    run_manifest("tests/corpus/7z/manifest.tsv");
+}
+
+#[test]
+fn external_7z_corpus_cases_open_and_extract_as_expected_when_configured() {
+    let Ok(manifest) = std::env::var("R7Z_EXTERNAL_7Z_CORPUS_MANIFEST") else {
+        return;
+    };
+    run_manifest(&manifest);
+}
+
+fn run_manifest(path: &str) {
+    for case in read_manifest(path) {
         let path = Path::new(&case.path);
         assert!(
             path.is_file(),
             "corpus archive is missing: {}",
             path.display()
         );
-        let archive = r7z::Archive::open_with_password(path, case.password.as_deref())
-            .unwrap_or_else(|err| {
-                panic!("failed to open corpus archive {}: {err}", path.display())
-            });
-
-        assert_eq!(
-            archive.num_files(),
-            case.expected_files,
-            "unexpected file count for {}",
+        let archive = match r7z::Archive::open_with_password(path, case.password.as_deref()) {
+            Ok(archive) => archive,
+            Err(err) if case.expectation == Expectation::OpenError => {
+                eprintln!("known corpus open failure for {}: {err}", path.display());
+                continue;
+            }
+            Err(err) => panic!("failed to open corpus archive {}: {err}", path.display()),
+        };
+        assert_ne!(
+            case.expectation,
+            Expectation::OpenError,
+            "corpus archive unexpectedly opened: {}",
             path.display()
         );
+
+        if let Some(expected_files) = case.expected_files {
+            assert_eq!(
+                archive.num_files(),
+                expected_files,
+                "unexpected file count for {}",
+                path.display()
+            );
+        }
         if case.expectation == Expectation::Extract {
             extract_all_file_entries(&archive, case.password.as_deref(), path);
         }
@@ -99,10 +124,16 @@ fn parse_manifest_line(line_idx: usize, line: &str) -> CorpusCase {
         expectation: match fields[2] {
             "extract" => Expectation::Extract,
             "open" => Expectation::OpenOnly,
+            "open_err" => Expectation::OpenError,
             other => panic!("unknown corpus expectation {other:?} on line {line_idx}"),
         },
-        expected_files: fields[3]
-            .parse()
-            .unwrap_or_else(|err| panic!("invalid file count on line {line_idx}: {err}")),
+        expected_files: match fields[3] {
+            "-" => None,
+            value => Some(
+                value
+                    .parse()
+                    .unwrap_or_else(|err| panic!("invalid file count on line {line_idx}: {err}")),
+            ),
+        },
     }
 }

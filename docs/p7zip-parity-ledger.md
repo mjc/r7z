@@ -29,6 +29,9 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   symlink payloads.
 - Volumes: write support from `r7z a -vSIZE`; read support opens first volumes
   such as `.7z.001` and reads sequential sibling volumes as one archive.
+- Robustness: checked-in and generated 7z corpus manifest exercises supported,
+  encrypted, split-volume, and known-unsupported archives; an optional Apache
+  Commons Compress corpus fetcher records external open successes/failures.
 
 ## Gaps By Category
 
@@ -49,5 +52,5 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   source archive.
 - Security: AES decryption still buffers encrypted streams; replace with a
   streaming CBC path before treating large encrypted archives as parity-complete.
-- Robustness: malformed corpus and fuzzing need extension from parsing into
-  extraction and CLI argument parsing.
+- Robustness: fuzzing still needs extension from parsing into extraction and CLI
+  argument parsing.
