@@ -76,6 +76,76 @@ fn cli_create_list_test_extract_update_delete() {
 }
 
 #[test]
+fn cli_extract_accepts_wildcard_entry_patterns() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(input.join("nested")).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.log"), b"bravo").unwrap();
+    fs::write(input.join("nested/c.txt"), b"charlie").unwrap();
+    let archive = tmp.path().join("wildcards.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+        input.join("b.log").display().to_string(),
+        input.join("nested").display().to_string(),
+    ]);
+
+    let out = tmp.path().join("out");
+    run_r7z(&[
+        "x".into(),
+        archive.display().to_string(),
+        "*.txt".into(),
+        format!("-o{}", out.display()),
+    ]);
+
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(fs::read(out.join("nested/c.txt")).unwrap(), b"charlie");
+    assert!(!out.join("b.log").exists());
+}
+
+#[test]
+fn cli_delete_accepts_wildcard_entry_patterns() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.tmp"), b"alpha").unwrap();
+    fs::write(input.join("b.tmp"), b"bravo").unwrap();
+    fs::write(input.join("keep.txt"), b"keep").unwrap();
+    let archive = tmp.path().join("delete-wildcards.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.tmp").display().to_string(),
+        input.join("b.tmp").display().to_string(),
+        input.join("keep.txt").display().to_string(),
+    ]);
+
+    run_r7z(&[
+        "d".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        "*.tmp".into(),
+    ]);
+
+    let out = tmp.path().join("out-delete");
+    run_r7z(&[
+        "x".into(),
+        archive.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+
+    assert!(!out.join("a.tmp").exists());
+    assert!(!out.join("b.tmp").exists());
+    assert_eq!(fs::read(out.join("keep.txt")).unwrap(), b"keep");
+}
+
+#[test]
 fn cli_unsupported_p7zip_method_is_command_line_error() {
     let tmp = tempdir().unwrap();
     let archive = tmp.path().join("bad.7z");

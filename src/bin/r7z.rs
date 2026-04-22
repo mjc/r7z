@@ -481,14 +481,14 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
 fn extract_archive(cli: &Cli, flat: bool) -> Result<(), CliError> {
     let archive = open_archive(cli)?;
     fs::create_dir_all(&cli.output_dir)?;
-    let selected = selected_names(&cli.operands);
+    let selected = selected_patterns(&cli.operands);
 
     for i in 0..archive.num_files() {
         let fi = archive.files_info();
         let name = fi
             .and_then(|files| files.name(i))
             .unwrap_or_else(|| format!("unknown-{i}"));
-        if !selected.is_empty() && !selected.contains(&name) {
+        if !entry_is_selected(&name, &selected) {
             continue;
         }
         let Some(files) = fi else {
@@ -562,11 +562,11 @@ fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
             "no archive entries were provided".to_string(),
         ));
     }
-    let delete_names = selected_names(&cli.operands);
+    let delete_patterns = selected_patterns(&cli.operands);
     let archive = open_archive(cli)?;
     let entries = archive_entries(&archive, cli.password.as_deref())?
         .into_iter()
-        .filter(|entry| !delete_names.contains(&entry.name))
+        .filter(|entry| !entry_is_selected(&entry.name, &delete_patterns))
         .collect::<Vec<_>>();
     write_archive_entries_atomic(&cli.archive, entries, &cli.options)
 }
@@ -810,11 +810,45 @@ fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, nanos as u32))
 }
 
-fn selected_names(paths: &[PathBuf]) -> BTreeSet<String> {
+fn selected_patterns(paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
         .collect()
+}
+
+fn entry_is_selected(name: &str, patterns: &[String]) -> bool {
+    patterns.is_empty() || patterns.iter().any(|pattern| wildcard_match(pattern, name))
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let mut matched = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+    matched[0][0] = true;
+
+    for p_idx in 0..pattern.len() {
+        for t_idx in 0..=text.len() {
+            if !matched[p_idx][t_idx] {
+                continue;
+            }
+            match pattern[p_idx] {
+                '*' => {
+                    matched[p_idx + 1][t_idx] = true;
+                    if t_idx < text.len() {
+                        matched[p_idx][t_idx + 1] = true;
+                    }
+                }
+                '?' if t_idx < text.len() => matched[p_idx + 1][t_idx + 1] = true,
+                ch if t_idx < text.len() && ch == text[t_idx] => {
+                    matched[p_idx + 1][t_idx + 1] = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    matched[pattern.len()][text.len()]
 }
 
 fn archive_name_to_string(path: &Path) -> Result<String, CliError> {
