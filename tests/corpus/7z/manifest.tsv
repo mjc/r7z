@@ -1,0 +1,4 @@
+# archive_path	password_or_-	expectation	expected_file_count
+tests/fixtures/test_1.7z	-	extract	4
+tests/fixtures/bcj_lzma2.7z	-	extract	1
+tests/fixtures/aes256.7z	test123	extract	1
