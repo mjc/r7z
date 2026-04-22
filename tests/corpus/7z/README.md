@@ -17,3 +17,9 @@ Expectations:
 Keep third-party corpus archives out of this directory unless their provenance
 and license are recorded. Use `target/corpus/7z/external` for downloaded
 external corpora.
+
+`generated/` is reproducible from the pinned p7zip oracle:
+
+```sh
+scripts/generate_p7zip_corpus.sh
+```
