@@ -66,6 +66,7 @@ mod error;
 mod files_info;
 mod folder;
 mod headers;
+mod method;
 mod pack_info;
 mod parsers;
 mod property;
@@ -82,6 +83,9 @@ pub use error::R7zError;
 pub use files_info::{EntryType, FilesInfo};
 pub use folder::Folder;
 pub use headers::{EncodedHeader, Header, SignatureHeader};
+pub use method::{
+    method_from_id, method_from_name, MethodKind, SevenZMethod, ALL_METHODS, P7ZIP_ORACLE_SHA,
+};
 pub use pack_info::{PackInfo, UnpackInfo};
 pub use parsers::*;
 pub use property::{find_next_property_id, Property};
