@@ -114,6 +114,13 @@ fn create_parity_audit_p7zip_volumes_concatenate_to_unsplit_archive() {
         std::fs::read(out.join("payload.bin")).unwrap(),
         std::fs::read(dir.join("payload.bin")).unwrap()
     );
+
+    let archive = r7z::Archive::open(&dir.join("split.7z.001")).unwrap();
+    assert_eq!(archive.num_files(), 1);
+    assert_eq!(
+        archive.extract_to_memory(0).unwrap(),
+        std::fs::read(dir.join("payload.bin")).unwrap()
+    );
 }
 
 #[cfg(unix)]

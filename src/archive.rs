@@ -46,6 +46,10 @@ enum ArchiveSource {
         reader: Mutex<Box<dyn ReadSeek + Send>>,
         len: u64,
     },
+    Volumes {
+        readers: Mutex<Vec<VolumeReader>>,
+        len: u64,
+    },
 }
 
 impl ArchiveSource {
@@ -60,10 +64,44 @@ impl ArchiveSource {
         })
     }
 
+    fn from_split_first_volume(path: &Path) -> Result<Option<Self>, R7zError> {
+        if !is_split_first_volume(path) {
+            return Ok(None);
+        }
+
+        let mut readers = Vec::new();
+        let mut len = 0u64;
+        for idx in 1.. {
+            let path = split_volume_path(path, idx);
+            if !path.exists() {
+                break;
+            }
+            let mut file = std::fs::File::open(&path)?;
+            let volume_len = file.seek(SeekFrom::End(0)).map_err(R7zError::Io)?;
+            let start = len;
+            len = checked_add_u64(len, volume_len)?;
+            readers.push(VolumeReader {
+                file,
+                start,
+                end: len,
+            });
+        }
+
+        if readers.len() > 1 {
+            Ok(Some(Self::Volumes {
+                readers: Mutex::new(readers),
+                len,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn len(&self) -> Result<u64, R7zError> {
         match self {
             Self::Bytes(bytes) => u64::try_from(bytes.len()).map_err(|_| R7zError::Parse),
             Self::Seekable { len, .. } => Ok(*len),
+            Self::Volumes { len, .. } => Ok(*len),
         }
     }
 
@@ -90,6 +128,30 @@ impl ArchiveSource {
                 reader.read_exact(dst)?;
                 Ok(())
             }
+            Self::Volumes { readers, .. } => {
+                let mut readers = readers.lock().map_err(|_| R7zError::Parse)?;
+                let mut logical_offset = offset;
+                let mut remaining = dst;
+                while !remaining.is_empty() {
+                    let volume = readers
+                        .iter_mut()
+                        .find(|volume| {
+                            logical_offset >= volume.start && logical_offset < volume.end
+                        })
+                        .ok_or(R7zError::Parse)?;
+                    let volume_offset = logical_offset - volume.start;
+                    let available = volume.end - logical_offset;
+                    let n = usize::try_from(available.min(remaining.len() as u64))
+                        .map_err(|_| R7zError::Parse)?;
+                    volume.file.seek(SeekFrom::Start(volume_offset))?;
+                    volume.file.read_exact(&mut remaining[..n])?;
+                    logical_offset = logical_offset
+                        .checked_add(n as u64)
+                        .ok_or(R7zError::Parse)?;
+                    remaining = &mut remaining[n..];
+                }
+                Ok(())
+            }
         }
     }
 
@@ -114,6 +176,12 @@ impl ArchiveSource {
             end: range.end,
         })
     }
+}
+
+struct VolumeReader {
+    file: std::fs::File,
+    start: u64,
+    end: u64,
 }
 
 struct ArchiveRangeReader<'a> {
@@ -242,16 +310,20 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        let file = std::fs::File::open(path)?;
-        let source = match options.storage_mode {
-            ArchiveStorageMode::Mmap => {
-                // SAFETY: The file is opened read-only and we do not mutate the
-                // mapping. A concurrent truncation could cause SIGBUS; callers
-                // that need stronger guarantees can select Seek mode.
-                let mmap = unsafe { Mmap::map(&file)? };
-                ArchiveSource::Bytes(Bytes::from_owner(mmap))
+        let source = if let Some(source) = ArchiveSource::from_split_first_volume(path)? {
+            source
+        } else {
+            let file = std::fs::File::open(path)?;
+            match options.storage_mode {
+                ArchiveStorageMode::Mmap => {
+                    // SAFETY: The file is opened read-only and we do not mutate the
+                    // mapping. A concurrent truncation could cause SIGBUS; callers
+                    // that need stronger guarantees can select Seek mode.
+                    let mmap = unsafe { Mmap::map(&file)? };
+                    ArchiveSource::Bytes(Bytes::from_owner(mmap))
+                }
+                ArchiveStorageMode::Seek => ArchiveSource::from_reader(file)?,
             }
-            ArchiveStorageMode::Seek => ArchiveSource::from_reader(file)?,
         };
         Self::from_source_with_password(source, password, options)
     }
@@ -820,6 +892,16 @@ fn checked_range_u64(total_len: u64, start: u64, len: u64) -> Result<Range<u64>,
     } else {
         Err(R7zError::Parse)
     }
+}
+
+fn is_split_first_volume(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "001")
+}
+
+fn split_volume_path(first_volume: &Path, idx: u64) -> PathBuf {
+    first_volume.with_extension(format!("{idx:03}"))
 }
 
 fn folder_coder_unpack_sizes(

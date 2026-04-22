@@ -84,6 +84,35 @@ fn open_seek_mode_parses_fixture() {
 }
 
 #[test]
+fn open_split_archive_first_volume_reads_siblings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("alpha.txt", b"alpha")
+        .add_file("nested/beta.txt", &vec![0x5Au8; 4096])
+        .build()
+        .unwrap();
+    let first = tmp.path().join("split.7z.001");
+    let chunk = bytes.len() / 3;
+    std::fs::write(&first, &bytes[..chunk]).unwrap();
+    std::fs::write(tmp.path().join("split.7z.002"), &bytes[chunk..chunk * 2]).unwrap();
+    std::fs::write(tmp.path().join("split.7z.003"), &bytes[chunk * 2..]).unwrap();
+
+    let archive = r7z::Archive::open(&first).unwrap();
+    let names = archive.files_info().unwrap().names().collect::<Vec<_>>();
+    let alpha_idx = names.iter().position(|name| name == "alpha.txt").unwrap();
+    let beta_idx = names
+        .iter()
+        .position(|name| name == "nested/beta.txt")
+        .unwrap();
+
+    assert_eq!(archive.extract_to_memory(alpha_idx).unwrap(), b"alpha");
+    assert_eq!(
+        archive.extract_to_memory(beta_idx).unwrap(),
+        vec![0x5Au8; 4096]
+    );
+}
+
+#[test]
 fn sparse_large_seek_open_does_not_read_whole_file() {
     let tmp = tempfile::tempdir().unwrap();
     let archive_path = tmp.path().join("sparse.7z");

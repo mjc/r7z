@@ -15,12 +15,12 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, and `-v`.
 - Metadata: names, empty files, directories, anti-items, timestamps, attributes,
   symlink payloads.
-- Volumes: write support from `r7z a -vSIZE`; read support remains concatenate
-  first for now.
+- Volumes: write support from `r7z a -vSIZE`; read support opens first volumes
+  such as `.7z.001` and reads sequential sibling volumes as one archive.
 
 ## Gaps By Category
 
-- Parser: split archive `.7z.001` direct open; SFX/prepended-byte signature scan.
+- Parser: SFX/prepended-byte signature scan.
 - Decoder: BCJ2 multi-packed-stream graph, BZip2, PPMd, Deflate, Deflate64,
   Delta, ARM, ARMT, IA64, PPC, SPARC, Swap2, Swap4.
 - Decoder extensions: ZSTD, Brotli, LZ4, LZ5, Lizard, LZHAM. `FLZMA2` is tracked
