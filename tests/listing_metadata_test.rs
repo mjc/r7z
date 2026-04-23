@@ -1,6 +1,7 @@
 use r7z::{
     Archive, ArchiveBuilder, ArchiveOptions, Codec, EncryptionOptions, ListingEntryKind, SolidMode,
 };
+use std::collections::BTreeSet;
 
 fn open_listing(bytes: Vec<u8>) -> r7z::ArchiveListing {
     let physical_size = bytes.len() as u64;
@@ -8,6 +9,17 @@ fn open_listing(bytes: Vec<u8>) -> r7z::ArchiveListing {
         .unwrap()
         .listing(Some(physical_size))
         .unwrap()
+}
+
+fn method_bases(methods: &[String]) -> BTreeSet<&str> {
+    methods
+        .iter()
+        .map(|method| {
+            method
+                .split_once(':')
+                .map_or(method.as_str(), |(base, _)| base)
+        })
+        .collect()
 }
 
 #[test]
@@ -23,7 +35,7 @@ fn listing_metadata_single_file_uses_header_sizes_without_extraction() {
     assert_eq!(listing.archive_type, "7z");
     assert_eq!(listing.blocks, 1);
     assert!(!listing.solid);
-    assert_eq!(listing.methods, vec!["LZMA2"]);
+    assert_eq!(method_bases(&listing.methods), BTreeSet::from(["LZMA2"]));
     assert_eq!(listing.entries.len(), 1);
     let entry = &listing.entries[0];
     assert_eq!(entry.path, "payload.txt");
@@ -31,7 +43,7 @@ fn listing_metadata_single_file_uses_header_sizes_without_extraction() {
     assert_eq!(entry.size, Some(22));
     assert!(entry.packed_size.is_some());
     assert_eq!(entry.block, Some(0));
-    assert_eq!(entry.methods, vec!["LZMA2"]);
+    assert_eq!(method_bases(&entry.methods), BTreeSet::from(["LZMA2"]));
     assert!(!entry.encrypted);
     assert!(listing.headers_size.is_some());
 }
@@ -113,8 +125,8 @@ fn listing_metadata_marks_encrypted_content_entries() {
     let listing = open_listing(bytes);
 
     assert_eq!(listing.blocks, 1);
-    assert!(listing.methods.contains(&"7zAES".to_string()));
+    assert!(method_bases(&listing.methods).contains("7zAES"));
     assert_eq!(listing.entries[0].path, "secret.txt");
     assert!(listing.entries[0].encrypted);
-    assert!(listing.entries[0].methods.contains(&"7zAES".to_string()));
+    assert!(method_bases(&listing.entries[0].methods).contains("7zAES"));
 }

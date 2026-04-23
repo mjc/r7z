@@ -1,7 +1,8 @@
+use chrono::{DateTime, Local};
 use r7z::{
-    Archive, ArchiveBuilder, ArchiveEntry, ArchiveOptions, Codec, CompressionLevel,
-    EncryptionOptions, EntryMeta, HeaderMode, R7zError, SevenZMethod, SolidMode, method_from_id,
-    method_from_name,
+    Archive, ArchiveBuilder, ArchiveEntry, ArchiveListing, ArchiveListingEntry, ArchiveOptions,
+    Codec, CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, R7zError,
+    SevenZMethod, SolidMode, method_from_name,
 };
 use std::{
     collections::BTreeSet,
@@ -450,196 +451,237 @@ fn parse_attached_value<'a>(switch: &'a str, name: &str) -> Result<&'a str, CliE
 
 fn list_archive(cli: &Cli) -> Result<(), CliError> {
     let archive = open_archive(cli)?;
+    let physical_size = fs::metadata(&cli.archive).ok().map(|meta| meta.len());
+    let listing = archive.listing(physical_size)?;
     let selected = selected_patterns(&cli.operands);
     if cli.technical {
-        print_technical_listing(&archive, &selected)?;
+        print_technical_listing(&listing, &cli.archive, &selected);
     } else {
-        print_listing(&archive, &cli.archive, &selected)?;
+        print_listing(&listing, &cli.archive, &selected);
     }
     Ok(())
 }
 
-fn print_listing(
-    archive: &Archive,
-    archive_path: &Path,
-    selected: &[String],
-) -> Result<(), CliError> {
+fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
     println!();
     println!("Path = {}", archive_path.display());
-    println!("Type = 7z");
-    if let Ok(meta) = fs::metadata(archive_path) {
-        println!("Physical Size = {}", meta.len());
+    println!("Type = {}", listing.archive_type);
+    if let Some(size) = listing.physical_size {
+        println!("Physical Size = {size}");
     }
-    println!("Method = {}", archive_methods(archive).join(" "));
+    if let Some(size) = listing.headers_size {
+        println!("Headers Size = {size}");
+    }
+    if !listing.methods.is_empty() {
+        println!("Method = {}", listing.methods.join(" "));
+    }
+    println!("Solid = {}", if listing.solid { "+" } else { "-" });
+    println!("Blocks = {}", listing.blocks);
     println!();
     println!("   Date      Time    Attr         Size   Compressed  Name");
     println!("------------------- ----- ------------ ------------  ------------------------");
-    for i in 0..archive.num_files() {
-        let Some(entry) = listed_entry(archive, i)? else {
+    let mut total_size = 0u64;
+    let mut total_packed = 0u64;
+    let mut file_count = 0usize;
+    let mut folder_count = 0usize;
+    let mut summary_time = None;
+
+    for entry in listing
+        .entries
+        .iter()
+        .filter(|entry| entry_is_selected(&entry.path, selected))
+    {
+        if matches!(entry.kind, ListingEntryKind::Anti) {
             continue;
         };
-        if !entry_is_selected(&entry.name, selected) {
-            continue;
-        }
+        if matches!(entry.kind, ListingEntryKind::Directory) {
+            folder_count += 1;
+        } else {
+            file_count += 1;
+        };
+        total_size += entry.size.unwrap_or(0);
+        total_packed += entry_packed_for_summary(entry);
+        summary_time = newest_time(summary_time, entry.modified);
         println!(
             "{:19} {:5} {:>12} {:>12}  {}",
-            "",
-            entry.kind.attribute_text(),
-            entry.size_text(),
-            "",
-            entry.name
+            format_listing_time(entry.modified),
+            human_attributes(entry),
+            size_text(entry.size),
+            size_text(entry_packed_for_row(entry)),
+            entry.path
         );
     }
     println!("------------------- ----- ------------ ------------  ------------------------");
+    println!(
+        "{:19} {:5} {:>12} {:>12}  {}",
+        format_listing_time(summary_time),
+        "",
+        total_size,
+        total_packed,
+        summary_text(file_count, folder_count)
+    );
     println!();
-    Ok(())
 }
 
-fn print_technical_listing(archive: &Archive, selected: &[String]) -> Result<(), CliError> {
-    println!("Type = 7z");
-    println!("Method = {}", archive_methods(archive).join(" "));
+fn print_technical_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
+    println!("Path = {}", archive_path.display());
+    println!("Type = {}", listing.archive_type);
+    if let Some(size) = listing.physical_size {
+        println!("Physical Size = {size}");
+    }
+    if let Some(size) = listing.headers_size {
+        println!("Headers Size = {size}");
+    }
+    if !listing.methods.is_empty() {
+        println!("Method = {}", listing.methods.join(" "));
+    }
+    println!("Solid = {}", if listing.solid { "+" } else { "-" });
+    println!("Blocks = {}", listing.blocks);
     println!();
     println!("----------");
-    for i in 0..archive.num_files() {
-        let Some(entry) = listed_entry(archive, i)? else {
-            continue;
-        };
-        if !entry_is_selected(&entry.name, selected) {
-            continue;
+    for entry in listing
+        .entries
+        .iter()
+        .filter(|entry| entry_is_selected(&entry.path, selected))
+    {
+        println!("Path = {}", entry.path);
+        println!("Size = {}", size_text(entry.size));
+        println!("Packed Size = {}", size_text(entry_packed_for_row(entry)));
+        if let Some(modified) = entry.modified {
+            println!("Modified = {}", format_listing_time(Some(modified)));
         }
+        if let Some(attrs) = technical_attributes(entry) {
+            println!("Attributes = {attrs}");
+        }
+        if let Some(crc) = entry.crc {
+            println!("CRC = {crc:08X}");
+        } else if !matches!(entry.kind, ListingEntryKind::Anti) {
+            println!("CRC = ");
+        }
+        println!("Encrypted = {}", if entry.encrypted { "+" } else { "-" });
+        println!("Method = {}", entry.methods.join(" "));
+        println!(
+            "Block = {}",
+            entry
+                .block
+                .map_or_else(String::new, |block| block.to_string())
+        );
         println!();
-        println!("Path = {}", entry.name);
-        println!("Size = {}", entry.size_text());
-        println!("Packed Size = ");
-        if let Some(mtime) = entry.mtime {
-            println!("Modified = {mtime}");
-        }
-        if let Some(attrs) = entry.attributes {
-            println!("Attributes = {} {attrs:08X}", entry.kind.attribute_class());
-        } else {
-            println!("Attributes = {}", entry.kind.attribute_class());
-        }
-        println!("CRC = ");
-        println!("Encrypted = -");
-        println!("Method = {}", entry.method_text);
-        println!("Block = ");
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ListedKind {
-    File,
-    Directory,
-    Symlink,
-    Anti,
-}
-
-impl ListedKind {
-    fn attribute_class(self) -> &'static str {
-        match self {
-            Self::Directory => "D",
-            Self::File | Self::Symlink => "A",
-            Self::Anti => "",
-        }
-    }
-
-    fn attribute_text(self) -> &'static str {
-        match self {
-            Self::Directory => "D....",
-            Self::File | Self::Symlink => "....A",
-            Self::Anti => ".....",
-        }
     }
 }
 
-struct ListedEntry {
-    name: String,
-    size: Option<u64>,
-    kind: ListedKind,
-    mtime: Option<u64>,
-    attributes: Option<u32>,
-    method_text: String,
+fn size_text(size: Option<u64>) -> String {
+    size.map_or_else(String::new, |size| size.to_string())
 }
 
-impl ListedEntry {
-    fn size_text(&self) -> String {
-        self.size.map_or_else(String::new, |size| size.to_string())
-    }
-}
-
-fn listed_entry(archive: &Archive, index: usize) -> Result<Option<ListedEntry>, CliError> {
-    let fi = archive.files_info();
-    let name = fi
-        .and_then(|files| files.name(index))
-        .unwrap_or_else(|| format!("unknown-{index}"));
-    let Some(files) = fi else {
-        return Ok(Some(ListedEntry {
-            name,
-            size: None,
-            kind: ListedKind::File,
-            mtime: None,
-            attributes: None,
-            method_text: archive_methods(archive).join(" "),
-        }));
-    };
-    let kind = if files.is_anti(index) {
-        ListedKind::Anti
-    } else if files.is_directory(index) {
-        ListedKind::Directory
-    } else if files.is_symlink(index) {
-        ListedKind::Symlink
-    } else {
-        ListedKind::File
-    };
-    let size = if files.is_directory(index) {
-        Some(0)
-    } else if files.is_anti(index) {
-        None
-    } else if files.is_empty_file(index) {
+fn entry_packed_for_row(entry: &ArchiveListingEntry) -> Option<u64> {
+    if matches!(entry.kind, ListingEntryKind::Directory) || entry.size == Some(0) {
         Some(0)
     } else {
-        archive
-            .extract_to_memory(index)
-            .map(|bytes| bytes.len() as u64)
-            .ok()
-    };
-    let method_text = if matches!(kind, ListedKind::File | ListedKind::Symlink) {
-        archive_methods(archive).join(" ")
-    } else {
-        String::new()
-    };
-    Ok(Some(ListedEntry {
-        name,
-        size,
-        kind,
-        mtime: files.mtimes.get(index).copied().flatten(),
-        attributes: files.attributes.get(index).copied().flatten(),
-        method_text,
-    }))
+        entry.packed_size
+    }
 }
 
-fn archive_methods(archive: &Archive) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    if let Some(streams) = archive.streams_info() {
-        if let Some(unpack) = &streams.unpack_info {
-            for idx in 0..unpack.num_folders_usize() {
-                if let Ok(folder) = unpack.parse_folder(idx) {
-                    for coder in folder.coders {
-                        let name = method_from_id(&coder.codec_id).map_or_else(
-                            || format!("{:02X?}", coder.codec_id),
-                            |m| m.name().to_string(),
-                        );
-                        names.insert(name);
-                    }
+fn entry_packed_for_summary(entry: &ArchiveListingEntry) -> u64 {
+    if matches!(entry.kind, ListingEntryKind::Anti) {
+        0
+    } else {
+        entry_packed_for_row(entry).unwrap_or(0)
+    }
+}
+
+fn newest_time(left: Option<SystemTime>, right: Option<SystemTime>) -> Option<SystemTime> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn format_listing_time(time: Option<SystemTime>) -> String {
+    time.map_or_else(String::new, |time| {
+        let datetime: DateTime<Local> = time.into();
+        datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+    })
+}
+
+fn human_attributes(entry: &ArchiveListingEntry) -> &'static str {
+    match entry.kind {
+        ListingEntryKind::Directory => "D....",
+        ListingEntryKind::File | ListingEntryKind::Symlink => "....A",
+        ListingEntryKind::Anti => ".....",
+    }
+}
+
+fn technical_attributes(entry: &ArchiveListingEntry) -> Option<String> {
+    if matches!(entry.kind, ListingEntryKind::Anti) {
+        return None;
+    }
+    let class = match entry.kind {
+        ListingEntryKind::Directory => "D",
+        ListingEntryKind::File | ListingEntryKind::Symlink => "A",
+        ListingEntryKind::Anti => unreachable!(),
+    };
+    let Some(attrs) = entry.attributes else {
+        return Some(class.to_string());
+    };
+    let mode = attrs >> 16;
+    if mode == 0 {
+        return Some(format!("{class} {attrs:08X}"));
+    }
+    let mode_text = unix_mode_text(mode);
+    let separator = if matches!(entry.kind, ListingEntryKind::Symlink) {
+        ""
+    } else {
+        "_"
+    };
+    Some(format!("{class}{separator} {mode_text}"))
+}
+
+fn unix_mode_text(mode: u32) -> String {
+    let kind = match mode & 0o170_000 {
+        0o040_000 => 'd',
+        0o120_000 => 'l',
+        _ => '-',
+    };
+    let mut text = String::with_capacity(10);
+    text.push(kind);
+    for bit in [
+        0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+    ] {
+        text.push(match bit {
+            0o400 | 0o040 | 0o004 => {
+                if mode & bit != 0 {
+                    'r'
+                } else {
+                    '-'
                 }
             }
-        }
+            0o200 | 0o020 | 0o002 => {
+                if mode & bit != 0 {
+                    'w'
+                } else {
+                    '-'
+                }
+            }
+            _ => {
+                if mode & bit != 0 {
+                    'x'
+                } else {
+                    '-'
+                }
+            }
+        });
     }
-    if names.is_empty() {
-        vec!["Copy".to_string()]
-    } else {
-        names.into_iter().collect()
+    text
+}
+
+fn summary_text(files: usize, folders: usize) -> String {
+    match (files, folders) {
+        (files, 0) => format!("{files} files"),
+        (0, folders) => format!("{folders} folders"),
+        (files, folders) => format!("{files} files, {folders} folders"),
     }
 }
 

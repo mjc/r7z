@@ -46,11 +46,16 @@ fn technical_listing_normalizes_paths_sizes_and_methods_against_p7zip() {
         &["-m0=LZMA2", "-mmt=off"],
     );
 
-    let p7zip = parse_technical_listing(&list_with_p7zip_technical(tmp.path(), &archive));
-    let r7z = parse_technical_listing(&list_with_r7z(
-        &["l", "-slt", archive.to_str().unwrap()],
-        tmp.path(),
-    ));
+    let p7zip_output = list_with_p7zip_technical(tmp.path(), &archive);
+    let r7z_output = list_with_r7z(&["l", "-slt", archive.to_str().unwrap()], tmp.path());
+
+    assert_eq!(
+        stable_listing_body(&r7z_output),
+        stable_listing_body(&p7zip_output)
+    );
+
+    let p7zip = parse_technical_listing(&p7zip_output);
+    let r7z = parse_technical_listing(&r7z_output);
 
     assert_eq!(r7z, p7zip);
 }
@@ -71,13 +76,29 @@ fn human_listing_normalizes_paths_sizes_and_kinds_against_p7zip() {
         &["-m0=LZMA2", "-mmt=off"],
     );
 
-    let p7zip = parse_human_listing(&list_with_p7zip(tmp.path(), &archive));
-    let r7z = parse_human_listing(&list_with_r7z(
-        &["l", archive.to_str().unwrap()],
-        tmp.path(),
-    ));
+    let p7zip_output = list_with_p7zip(tmp.path(), &archive);
+    let r7z_output = list_with_r7z(&["l", archive.to_str().unwrap()], tmp.path());
+
+    assert_eq!(
+        stable_listing_body(&r7z_output),
+        stable_listing_body(&p7zip_output)
+    );
+
+    let p7zip = parse_human_listing(&p7zip_output);
+    let r7z = parse_human_listing(&r7z_output);
 
     assert_eq!(r7z, p7zip);
+}
+
+fn stable_listing_body(text: &str) -> &str {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).starts_with("Path = ") {
+            return text[offset..].trim_end_matches(['\r', '\n']);
+        }
+        offset += line.len();
+    }
+    text.trim_end_matches(['\r', '\n'])
 }
 
 fn parse_technical_listing(text: &str) -> NormalizedArchiveListing {

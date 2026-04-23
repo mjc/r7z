@@ -1181,28 +1181,95 @@ fn archive_method_names(streams: Option<&StreamInfo>) -> Result<Vec<String>, R7z
         if let Some(unpack) = &streams.unpack_info {
             for idx in 0..unpack.num_folders_usize() {
                 let folder = unpack.parse_folder(idx)?;
-                names.extend(folder_method_names(&folder));
+                names.extend(folder.coders.iter().map(archive_method_name));
             }
         }
     }
-    if names.is_empty() {
-        Ok(vec!["Copy".to_string()])
-    } else {
-        Ok(names.into_iter().collect())
-    }
+    Ok(names.into_iter().collect())
 }
 
 fn folder_method_names(folder: &crate::Folder) -> Vec<String> {
-    folder
-        .coders
-        .iter()
-        .map(|coder| {
-            crate::method_from_id(&coder.codec_id).map_or_else(
-                || format!("{:02X?}", coder.codec_id),
-                |method| method.name().to_string(),
-            )
-        })
-        .collect()
+    folder.coders.iter().map(entry_method_name).collect()
+}
+
+fn archive_method_name(coder: &crate::CoderInfo) -> String {
+    match crate::method_from_id(&coder.codec_id) {
+        Some(crate::SevenZMethod::Lzma | crate::SevenZMethod::Lzma2) => entry_method_name(coder),
+        Some(crate::SevenZMethod::Ppmd) => "PPMD".to_string(),
+        Some(crate::SevenZMethod::SevenZAes) => "7zAES".to_string(),
+        Some(method) => method.name().to_string(),
+        None => format!("{:02X?}", coder.codec_id),
+    }
+}
+
+fn entry_method_name(coder: &crate::CoderInfo) -> String {
+    match crate::method_from_id(&coder.codec_id) {
+        Some(crate::SevenZMethod::Lzma) => coder
+            .properties
+            .as_deref()
+            .and_then(lzma_dictionary_bits)
+            .map_or_else(|| "LZMA".to_string(), |bits| format!("LZMA:{bits}")),
+        Some(crate::SevenZMethod::Lzma2) => coder
+            .properties
+            .as_deref()
+            .and_then(lzma2_dictionary_bits)
+            .map_or_else(|| "LZMA2".to_string(), |bits| format!("LZMA2:{bits}")),
+        Some(crate::SevenZMethod::Ppmd) => {
+            ppmd_method_text(coder).unwrap_or_else(|| "PPMD".to_string())
+        }
+        Some(crate::SevenZMethod::SevenZAes) => coder
+            .properties
+            .as_deref()
+            .and_then(|props| props.first().map(|byte| byte & 0x3f))
+            .map_or_else(|| "7zAES".to_string(), |cycles| format!("7zAES:{cycles}")),
+        Some(method) => method.name().to_string(),
+        None => format!("{:02X?}", coder.codec_id),
+    }
+}
+
+fn lzma_dictionary_bits(props: &[u8]) -> Option<u32> {
+    if props.len() != 5 {
+        return None;
+    }
+    dictionary_bits(u32::from_le_bytes([props[1], props[2], props[3], props[4]]))
+}
+
+fn lzma2_dictionary_bits(props: &[u8]) -> Option<u32> {
+    let &[prop] = props else {
+        return None;
+    };
+    let dict_size = match prop {
+        0..=39 => {
+            let base = 2u32 | (u32::from(prop) & 1);
+            base.checked_shl((u32::from(prop) >> 1) + 11)?
+        }
+        40 => u32::MAX,
+        _ => return None,
+    };
+    dictionary_bits(dict_size)
+}
+
+fn dictionary_bits(size: u32) -> Option<u32> {
+    if size.is_power_of_two() {
+        Some(size.trailing_zeros())
+    } else {
+        None
+    }
+}
+
+fn ppmd_method_text(coder: &crate::CoderInfo) -> Option<String> {
+    let props = coder.properties.as_deref()?;
+    if props.len() != 5 {
+        return None;
+    }
+    let order = props[0];
+    let mem_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+    let mem_text = if mem_size % (1024 * 1024) == 0 {
+        (mem_size / (1024 * 1024)).to_string()
+    } else {
+        mem_size.to_string()
+    };
+    Some(format!("PPMD:o{order}:mem{mem_text}"))
 }
 
 fn archive_is_solid(streams: Option<&StreamInfo>) -> bool {
