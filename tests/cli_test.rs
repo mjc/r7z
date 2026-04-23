@@ -578,6 +578,151 @@ fn cli_extract_aoa_overwrites_existing_files() {
 }
 
 #[test]
+fn cli_extract_default_noninteractive_refuses_existing_file() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"archive").unwrap();
+    let archive = tmp.path().join("default-overwrite.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+    ]);
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.txt"), b"existing").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "x",
+            archive.to_str().unwrap(),
+            &format!("-o{}", out.display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"existing");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Skipping existing path"));
+}
+
+#[test]
+fn cli_extract_y_overwrites_existing_file() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"archive").unwrap();
+    let archive = tmp.path().join("yes-overwrite.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        archive.display().to_string(),
+        input.join("a.txt").display().to_string(),
+    ]);
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.txt"), b"existing").unwrap();
+
+    run_r7z(&[
+        "x".into(),
+        "-y".into(),
+        archive.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"archive");
+}
+
+#[test]
+fn cli_extract_flat_duplicate_basenames_use_overwrite_policy() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("flat-duplicates.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("one/a.txt", b"one")
+        .add_file("two/a.txt", b"two")
+        .build()
+        .unwrap();
+    fs::write(&archive, bytes).unwrap();
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "e",
+            archive.to_str().unwrap(),
+            &format!("-o{}", out.display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"one");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Skipping existing path"));
+}
+
+#[test]
+fn cli_extract_directory_over_file_replaces_file_with_yes() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("dir-over-file.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_directory("dir", r7z::EntryMeta::default())
+        .build()
+        .unwrap();
+    fs::write(&archive, bytes).unwrap();
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("dir"), b"file").unwrap();
+
+    run_r7z(&[
+        "x".into(),
+        "-y".into(),
+        archive.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+
+    assert!(out.join("dir").is_dir());
+}
+
+#[test]
+fn cli_extract_file_over_directory_is_not_recursive_delete() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("file-over-dir.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("dir", b"archive")
+        .build()
+        .unwrap();
+    fs::write(&archive, bytes).unwrap();
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(out.join("dir")).unwrap();
+    fs::write(out.join("dir/keep.txt"), b"keep").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "x",
+            "-y",
+            archive.to_str().unwrap(),
+            &format!("-o{}", out.display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(out.join("dir").is_dir());
+    assert_eq!(fs::read(out.join("dir/keep.txt")).unwrap(), b"keep");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Skipping existing path"));
+}
+
+#[test]
 fn cli_extract_warns_when_operands_match_nothing() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

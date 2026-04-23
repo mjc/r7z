@@ -8,7 +8,8 @@ use std::{
     collections::BTreeSet,
     env,
     ffi::OsStr,
-    fs, io,
+    fs,
+    io::{self, IsTerminal, Write},
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
     process::ExitCode,
@@ -66,6 +67,7 @@ enum Command {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverwriteMode {
+    Ask,
     Overwrite,
     SkipExisting,
 }
@@ -81,6 +83,7 @@ struct Cli {
     technical: bool,
     volume_sizes: Vec<u64>,
     overwrite_mode: OverwriteMode,
+    assume_yes: bool,
 }
 
 impl Cli {
@@ -150,6 +153,7 @@ impl Cli {
             technical: state.technical,
             volume_sizes: state.volume_sizes,
             overwrite_mode: state.overwrite_mode,
+            assume_yes: state.assume_yes,
         })
     }
 }
@@ -162,6 +166,7 @@ struct CliParseState {
     method_was_explicit: bool,
     volume_sizes: Vec<u64>,
     overwrite_mode: OverwriteMode,
+    assume_yes: bool,
 }
 
 impl Default for CliParseState {
@@ -173,7 +178,8 @@ impl Default for CliParseState {
             technical: false,
             method_was_explicit: false,
             volume_sizes: Vec::new(),
-            overwrite_mode: OverwriteMode::Overwrite,
+            overwrite_mode: OverwriteMode::Ask,
+            assume_yes: false,
         }
     }
 }
@@ -185,6 +191,7 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         return Ok(());
     }
     if lower == "y" {
+        state.assume_yes = true;
         return Ok(());
     }
     if lower == "bd" {
@@ -723,10 +730,21 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
 }
 
 fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
+    let mut ui = TerminalOverwriteUi;
+    extract_archive_with_ui(cli, flat, &mut ui)
+}
+
+fn extract_archive_with_ui(
+    cli: &Cli,
+    flat: bool,
+    ui: &mut impl OverwriteUi,
+) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     fs::create_dir_all(&cli.output_dir)?;
     let selected = selected_patterns(&cli.operands);
     let mut matched = 0usize;
+    let mut warnings = 0u8;
+    let mut overwrite_mode = cli.overwrite_mode;
 
     for i in 0..archive.num_files() {
         let fi = archive.files_info();
@@ -756,15 +774,42 @@ fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
 
         if files.is_directory(i) {
             if !flat {
+                if out_path.exists() && !out_path.is_dir() {
+                    match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
+                        CollisionAction::Overwrite => fs::remove_file(&out_path)?,
+                        CollisionAction::Skip { warning } => {
+                            if warning {
+                                warnings = EXIT_WARNING;
+                            }
+                            continue;
+                        }
+                        CollisionAction::Quit => return Ok(EXIT_WARNING),
+                    }
+                }
                 fs::create_dir_all(&out_path)?;
             }
             continue;
         }
+
+        if out_path.exists() {
+            if out_path.is_dir() {
+                ui.warn_skip_existing(&out_path)?;
+                warnings = EXIT_WARNING;
+                continue;
+            }
+            match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
+                CollisionAction::Overwrite => fs::remove_file(&out_path)?,
+                CollisionAction::Skip { warning } => {
+                    if warning {
+                        warnings = EXIT_WARNING;
+                    }
+                    continue;
+                }
+                CollisionAction::Quit => return Ok(EXIT_WARNING),
+            }
+        }
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
-        }
-        if cli.overwrite_mode == OverwriteMode::SkipExisting && out_path.exists() {
-            continue;
         }
         if files.is_empty_file(i) {
             fs::File::create(out_path)?;
@@ -777,7 +822,103 @@ fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
         eprintln!("No files to process");
         Ok(EXIT_WARNING)
     } else {
-        Ok(EXIT_OK)
+        Ok(warnings)
+    }
+}
+
+trait OverwriteUi {
+    fn is_interactive(&self) -> bool;
+    fn prompt_overwrite(&mut self, path: &Path) -> Result<OverwriteAnswer, CliError>;
+    fn warn_skip_existing(&mut self, path: &Path) -> Result<(), CliError>;
+}
+
+struct TerminalOverwriteUi;
+
+impl OverwriteUi for TerminalOverwriteUi {
+    fn is_interactive(&self) -> bool {
+        io::stdin().is_terminal()
+    }
+
+    fn prompt_overwrite(&mut self, path: &Path) -> Result<OverwriteAnswer, CliError> {
+        loop {
+            eprint!(
+                "Overwrite {}? [y]es/[n]o/[a]ll/[s]kip all/[q]uit: ",
+                path.display()
+            );
+            io::stderr().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if let Some(answer) = parse_overwrite_answer(&answer) {
+                return Ok(answer);
+            }
+            eprintln!("Invalid response");
+        }
+    }
+
+    fn warn_skip_existing(&mut self, path: &Path) -> Result<(), CliError> {
+        eprintln!("WARNING: Skipping existing path: {}", path.display());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverwriteAnswer {
+    Yes,
+    No,
+    All,
+    SkipAll,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollisionAction {
+    Overwrite,
+    Skip { warning: bool },
+    Quit,
+}
+
+fn decide_overwrite(
+    mode: &mut OverwriteMode,
+    assume_yes: bool,
+    ui: &mut impl OverwriteUi,
+    path: &Path,
+) -> Result<CollisionAction, CliError> {
+    match *mode {
+        OverwriteMode::Overwrite => Ok(CollisionAction::Overwrite),
+        OverwriteMode::SkipExisting => Ok(CollisionAction::Skip { warning: false }),
+        OverwriteMode::Ask if assume_yes => Ok(CollisionAction::Overwrite),
+        OverwriteMode::Ask if !ui.is_interactive() => {
+            ui.warn_skip_existing(path)?;
+            Ok(CollisionAction::Skip { warning: true })
+        }
+        OverwriteMode::Ask => match ui.prompt_overwrite(path)? {
+            OverwriteAnswer::Yes => Ok(CollisionAction::Overwrite),
+            OverwriteAnswer::No => {
+                ui.warn_skip_existing(path)?;
+                Ok(CollisionAction::Skip { warning: true })
+            }
+            OverwriteAnswer::All => {
+                *mode = OverwriteMode::Overwrite;
+                Ok(CollisionAction::Overwrite)
+            }
+            OverwriteAnswer::SkipAll => {
+                *mode = OverwriteMode::SkipExisting;
+                ui.warn_skip_existing(path)?;
+                Ok(CollisionAction::Skip { warning: true })
+            }
+            OverwriteAnswer::Quit => Ok(CollisionAction::Quit),
+        },
+    }
+}
+
+fn parse_overwrite_answer(input: &str) -> Option<OverwriteAnswer> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(OverwriteAnswer::Yes),
+        "" | "n" | "no" => Some(OverwriteAnswer::No),
+        "a" | "all" => Some(OverwriteAnswer::All),
+        "s" | "skip" | "skip all" => Some(OverwriteAnswer::SkipAll),
+        "q" | "quit" => Some(OverwriteAnswer::Quit),
+        _ => None,
     }
 }
 
@@ -1248,5 +1389,33 @@ impl From<R7zError> for CliError {
 impl From<io::Error> for CliError {
     fn from(value: io::Error) -> Self {
         Self::Fatal(value.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OverwriteAnswer, parse_overwrite_answer};
+
+    #[test]
+    fn parse_overwrite_answers_matches_p7zip_prompt_words() {
+        for input in ["y", "yes", "YES"] {
+            assert_eq!(parse_overwrite_answer(input), Some(OverwriteAnswer::Yes));
+        }
+        for input in ["", "n", "no"] {
+            assert_eq!(parse_overwrite_answer(input), Some(OverwriteAnswer::No));
+        }
+        for input in ["a", "all"] {
+            assert_eq!(parse_overwrite_answer(input), Some(OverwriteAnswer::All));
+        }
+        for input in ["s", "skip", "skip all"] {
+            assert_eq!(
+                parse_overwrite_answer(input),
+                Some(OverwriteAnswer::SkipAll)
+            );
+        }
+        for input in ["q", "quit"] {
+            assert_eq!(parse_overwrite_answer(input), Some(OverwriteAnswer::Quit));
+        }
+        assert_eq!(parse_overwrite_answer("maybe"), None);
     }
 }
