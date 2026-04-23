@@ -18,8 +18,8 @@ use std::{
 
 pub use model::{
     ArchiveEntry, ArchiveOptions, Codec, CompressionLevel, CompressionOptions, EncryptionOptions,
-    EntryKind, EntryMeta, HeaderMode, MatchFinder, SolidMode, SpoolMode, StreamingOptions,
-    VolumeOptions,
+    EntryKind, EntryMeta, HeaderMode, LzmaAlgorithm, MatchFinder, SolidMode, SpoolMode,
+    StreamingOptions, VolumeOptions,
 };
 
 use model::WriteEntry;

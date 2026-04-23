@@ -2,8 +2,9 @@ use chrono::{DateTime, Local};
 use r7z::{
     Archive, ArchiveBuilder, ArchiveEntry, ArchiveListing, ArchiveListingEntry, ArchiveOptions,
     Codec, CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind,
-    MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock,
-    SevenZMethod, SolidMode, build_archive_with_preserved_folders, method_from_name,
+    LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError,
+    RawFolderBlock, SevenZMethod, SolidMode, build_archive_with_preserved_folders,
+    method_from_name,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -231,6 +232,11 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.method_was_explicit = true;
         return Ok(());
     }
+    if lower.starts_with("ma") {
+        let value = parse_attached_value(switch, "ma")?;
+        state.options.compression.lzma_algorithm = Some(parse_lzma_algorithm(value)?);
+        return Ok(());
+    }
     if lower.starts_with("mlc") {
         let value = parse_attached_value(switch, "mlc")?;
         state.options.compression.literal_context_bits =
@@ -248,6 +254,11 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
     if lower.starts_with("mmf") {
         let value = parse_attached_value(switch, "mmf")?;
         state.options.compression.match_finder = Some(parse_match_finder(value)?);
+        return Ok(());
+    }
+    if lower.starts_with("mmc") {
+        let value = parse_attached_value(switch, "mmc")?;
+        state.options.compression.match_cycles = Some(parse_match_cycles(value)?);
         return Ok(());
     }
     if lower.starts_with("mpb") {
@@ -348,6 +359,9 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
                         .map_err(|_| CliError::Usage(format!("invalid fast bytes: {value}")))?,
                 );
             }
+            "a" => {
+                options.compression.lzma_algorithm = Some(parse_lzma_algorithm(value)?);
+            }
             "lc" => {
                 options.compression.literal_context_bits =
                     Some(parse_lzma_property_bits(value, "lc")?);
@@ -361,6 +375,9 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
             }
             "mf" => {
                 options.compression.match_finder = Some(parse_match_finder(value)?);
+            }
+            "mc" => {
+                options.compression.match_cycles = Some(parse_match_cycles(value)?);
             }
             "mt" => parse_threading_value(value)?,
             _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
@@ -398,6 +415,25 @@ fn validate_lzma_property_bit_combination(
         )));
     }
     Ok(())
+}
+
+fn parse_lzma_algorithm(value: &str) -> Result<LzmaAlgorithm, CliError> {
+    match value {
+        "0" => Ok(LzmaAlgorithm::Fast),
+        "1" => Ok(LzmaAlgorithm::Normal),
+        _ => Err(CliError::Usage(format!(
+            "invalid LZMA algorithm value: {value}; expected 0 or 1"
+        ))),
+    }
+}
+
+fn parse_match_cycles(value: &str) -> Result<u32, CliError> {
+    let match_cycles = value
+        .parse::<u32>()
+        .map_err(|_| CliError::Usage(format!("invalid LZMA match cycles: {value}")))?;
+    i32::try_from(match_cycles)
+        .map_err(|_| CliError::Usage(format!("LZMA match cycles is too large: {value}")))?;
+    Ok(match_cycles)
 }
 
 fn parse_match_finder(value: &str) -> Result<MatchFinder, CliError> {

@@ -36,6 +36,8 @@ pub struct CompressionOptions {
     pub literal_position_bits: Option<u32>,
     pub position_bits: Option<u32>,
     pub match_finder: Option<MatchFinder>,
+    pub lzma_algorithm: Option<LzmaAlgorithm>,
+    pub match_cycles: Option<u32>,
     pub solid: SolidMode,
     pub lzma2_chunk_size: Option<NonZeroU64>,
 }
@@ -50,6 +52,8 @@ impl Default for CompressionOptions {
             literal_position_bits: None,
             position_bits: None,
             match_finder: None,
+            lzma_algorithm: None,
+            match_cycles: None,
             solid: SolidMode::Solid,
             lzma2_chunk_size: None,
         }
@@ -60,6 +64,12 @@ impl Default for CompressionOptions {
 pub enum MatchFinder {
     Hc4,
     Bt4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LzmaAlgorithm {
+    Fast,
+    Normal,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

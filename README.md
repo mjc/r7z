@@ -264,8 +264,9 @@ The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It us
 `ArchiveOptions::compression` exposes p7zip-like tuning through `CompressionOptions`:
 `CompressionLevel`, optional dictionary size, optional fast bytes, optional LZMA
 literal context / literal position / position bits, optional LZMA match finder,
-`SolidMode` (`Solid`, `NonSolid`, or `Limit`), and optional LZMA2 chunk size.
-The existing `Codec` still selects the algorithm.
+optional LZMA algorithm mode, optional LZMA match cycles, `SolidMode` (`Solid`,
+`NonSolid`, or `Limit`), and optional LZMA2 chunk size. The existing `Codec`
+still selects the algorithm.
 
 ### `ArchiveWriter` and `build_streaming` — file-backed builders
 
@@ -475,7 +476,9 @@ replacement archive.
 Compression method parsing accepts p7zip-style LZMA property options such as
 `-m0=LZMA:lc=2:lp=1:pb=1` or standalone `-mlc=2 -mlp=1 -mpb=1`,
 plus match-finder options such as `-m0=LZMA:mf=bt4` or `-mmf=hc4`, alongside
-dictionary, fast-bytes, solid, and threading compatibility switches.
+algorithm and match-cycle options such as `-m0=LZMA:a=0:mc=16` or
+`-ma=1 -mmc=32`, dictionary, fast-bytes, solid, and threading compatibility
+switches.
 
 ## Development
 

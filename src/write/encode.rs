@@ -5,10 +5,11 @@ use super::header::{
 };
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
-    EncryptionOptions, HeaderMode, MatchFinder, PreparedFolder, SolidMode, WriteEntry,
+    EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, PreparedFolder, SolidMode,
+    WriteEntry,
 };
 use crate::{R7zError, aes, bcj, codec};
-use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter, MfType};
+use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter, MfType};
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
 };
@@ -132,6 +133,8 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
             || options.compression.literal_position_bits.is_some()
             || options.compression.position_bits.is_some()
             || options.compression.match_finder.is_some()
+            || options.compression.lzma_algorithm.is_some()
+            || options.compression.match_cycles.is_some()
             || options.compression.lzma2_chunk_size.is_some())
     {
         return Err(R7zError::InvalidOptions(
@@ -168,13 +171,16 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
         && (options.compression.literal_context_bits.is_some()
             || options.compression.literal_position_bits.is_some()
             || options.compression.position_bits.is_some()
-            || options.compression.match_finder.is_some())
+            || options.compression.match_finder.is_some()
+            || options.compression.lzma_algorithm.is_some()
+            || options.compression.match_cycles.is_some())
     {
         return Err(R7zError::InvalidOptions(
             "PPMd does not support LZMA-specific tuning",
         ));
     }
     validate_lzma_property_bits(&options.compression)?;
+    validate_match_cycles(&options.compression)?;
     if let Some(chunk_size) = options.compression.lzma2_chunk_size {
         let dict = lzma_options(&options.compression).dict_size;
         if chunk_size.get() < u64::from(dict) {
@@ -191,6 +197,15 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
         return Err(R7zError::InvalidOptions(
             "solid limit requires max_files or max_bytes",
         ));
+    }
+    Ok(())
+}
+
+fn validate_match_cycles(compression: &CompressionOptions) -> Result<(), R7zError> {
+    if let Some(match_cycles) = compression.match_cycles {
+        i32::try_from(match_cycles)
+            .map(|_| ())
+            .map_err(|_| R7zError::InvalidOptions("match_cycles is too large"))?;
     }
     Ok(())
 }
@@ -409,6 +424,16 @@ pub(crate) fn lzma_options(compression: &CompressionOptions) -> LzmaOptions {
             MatchFinder::Hc4 => MfType::Hc4,
             MatchFinder::Bt4 => MfType::Bt4,
         };
+    }
+    if let Some(algorithm) = compression.lzma_algorithm {
+        options.mode = match algorithm {
+            LzmaAlgorithm::Fast => EncodeMode::Fast,
+            LzmaAlgorithm::Normal => EncodeMode::Normal,
+        };
+    }
+    if let Some(match_cycles) = compression.match_cycles {
+        options.depth_limit =
+            i32::try_from(match_cycles).expect("validate_match_cycles rejects too-large values");
     }
     options
 }

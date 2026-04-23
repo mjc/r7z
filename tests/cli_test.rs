@@ -344,6 +344,81 @@ fn cli_create_accepts_lzma_match_finder_options() {
 }
 
 #[test]
+fn cli_create_accepts_lzma_algorithm_and_match_cycles_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"algorithm cycle payload").unwrap();
+    let scoped = tmp.path().join("lzma-algo-scoped.7z");
+    let standalone = tmp.path().join("lzma-algo-standalone.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA:a=0:mc=16".into(),
+        scoped.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA".into(),
+        "-ma=1".into(),
+        "-mmc=32".into(),
+        standalone.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    assert_eq!(
+        r7z::Archive::open(&scoped)
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        b"algorithm cycle payload"
+    );
+    assert_eq!(
+        r7z::Archive::open(&standalone)
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        b"algorithm cycle payload"
+    );
+}
+
+#[test]
+fn cli_rejects_invalid_lzma_algorithm_and_match_cycles_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("bad-lzma-algorithm.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=LZMA:a=2",
+            archive.to_str().unwrap(),
+            input.join("payload.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("algorithm"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=LZMA:mc=bad",
+            archive.to_str().unwrap(),
+            input.join("payload.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("match cycles"));
+}
+
+#[test]
 fn cli_rejects_invalid_lzma_match_finder_option() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
