@@ -2,9 +2,9 @@
 
 mod support;
 
-use std::{fs, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
-use support::{create_p7zip_archive, run_7z_checked};
+use support::{assert_extracted_files, create_p7zip_archive, extract_with_p7zip, run_7z_checked};
 use tempfile::tempdir;
 
 #[test]
@@ -105,5 +105,103 @@ fn updating_archive_with_retained_zstd_folder_succeeds() {
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(stdout.contains("Path = original.txt"));
     assert!(stdout.contains("Path = new.txt"));
+    assert!(stdout.contains("Method = ZSTD"));
+}
+
+#[test]
+fn deleting_only_file_from_zstd_archive_succeeds() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("original.txt"), b"original").unwrap();
+    let archive = tmp.path().join("zstd-delete.7z");
+
+    create_p7zip_archive(&input, &archive, &["original.txt"], &["-m0=ZSTD"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["d", archive.to_str().unwrap(), "original.txt"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z delete failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let list = run_7z_checked(&["l", "-slt", archive.to_str().unwrap()], tmp.path());
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(!stdout.contains("Path = original.txt"));
+}
+
+#[test]
+fn updating_same_name_zstd_file_replaces_without_decoding_old_folder() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("same.txt"), b"old").unwrap();
+    let archive = tmp.path().join("zstd-replace.7z");
+
+    create_p7zip_archive(&input, &archive, &["same.txt"], &["-m0=ZSTD"]);
+    fs::write(input.join("same.txt"), b"new").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "u",
+            archive.to_str().unwrap(),
+            input.join("same.txt").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z update failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = tmp.path().join("out");
+    extract_with_p7zip(tmp.path(), &archive, &out);
+    assert_extracted_files(&out, &[(PathBuf::from("same.txt"), b"new".to_vec())]);
+}
+
+#[test]
+fn deleting_one_non_solid_zstd_file_preserves_other_raw_folder() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.txt"), b"bravo").unwrap();
+    let archive = tmp.path().join("zstd-nonsolid-delete.7z");
+
+    create_p7zip_archive(
+        &input,
+        &archive,
+        &["a.txt", "b.txt"],
+        &["-m0=ZSTD", "-ms=off"],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["d", archive.to_str().unwrap(), "a.txt"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z delete failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = tmp.path().join("out");
+    extract_with_p7zip(tmp.path(), &archive, &out);
+    assert_extracted_files(&out, &[(PathBuf::from("b.txt"), b"bravo".to_vec())]);
+    assert!(!out.join("a.txt").exists());
+
+    let list = run_7z_checked(&["l", "-slt", archive.to_str().unwrap()], tmp.path());
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("Path = b.txt"));
     assert!(stdout.contains("Method = ZSTD"));
 }
