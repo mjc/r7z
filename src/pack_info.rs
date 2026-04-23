@@ -55,12 +55,33 @@ impl PackInfo {
             input = sliced;
         }
 
-        let (input, end_marker) = Property::parse(input)?;
-        if end_marker != Property::END {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Satisfy,
-            )));
+        loop {
+            let (i, tag) = Property::parse(input)?;
+            input = i;
+            match tag {
+                Property::END => break,
+                Property::CRC => {
+                    let num_pack_streams = usize::try_from(num_pack_streams).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, ()) = scan_digests(input, num_pack_streams)?;
+                    input = i;
+                }
+                _ => {
+                    let (i, size) = sevenzip_varuint64_decode(input)?;
+                    let sz = usize::try_from(size).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, _) = nom::bytes::complete::take(sz)(i)?;
+                    input = i;
+                }
+            }
         }
 
         Ok((
@@ -280,12 +301,34 @@ pub(crate) fn scan_pack_info(input: &[u8]) -> IResult<&[u8], ()> {
         let (i, _) = sevenzip_varuint64_decode(input)?;
         input = i;
     }
-    let (input, end_marker) = Property::parse(input)?;
-    if end_marker != Property::END {
-        return Err(nom::Err::Failure(nom::error::Error::new(
+
+    let num_pack_streams = usize::try_from(num_pack_streams).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
             input,
-            nom::error::ErrorKind::Satisfy,
-        )));
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+    loop {
+        let (i, tag) = Property::parse(input)?;
+        input = i;
+        match tag {
+            Property::END => break,
+            Property::CRC => {
+                let (i, ()) = scan_digests(input, num_pack_streams)?;
+                input = i;
+            }
+            _ => {
+                let (i, size) = sevenzip_varuint64_decode(input)?;
+                let sz = usize::try_from(size).map_err(|_| {
+                    nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                let (i, _) = nom::bytes::complete::take(sz)(i)?;
+                input = i;
+            }
+        }
     }
     Ok((input, ()))
 }
@@ -407,7 +450,7 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_pack_info, scan_unpack_info};
+    use super::{scan_pack_info, scan_unpack_info, PackInfo};
 
     // ── scan_pack_info ──────────────────────────────────────────────
 
@@ -426,6 +469,33 @@ mod tests {
         // sizes: 100, 50, 25
         let input = [0x06u8, 0x00, 0x03, 0x09, 0x64, 0x32, 0x19, 0x00, 0xFF];
         let (rem, ()) = scan_pack_info(&input).unwrap();
+        assert_eq!(rem, &[0xFF]);
+    }
+
+    #[test]
+    fn parse_pack_info_with_crc() {
+        let input = [
+            0x06u8, 0x00, 0x02, 0x09, 0x56, 0x81, 0x6A, 0x0A, 0x01, 0xA3, 0x52, 0x01, 0x40, 0x5C,
+            0x5F, 0x6E, 0x3E, 0x00,
+        ];
+
+        let (rem, pack_info) = PackInfo::parse(&input).unwrap();
+
+        assert!(rem.is_empty());
+        assert_eq!(pack_info.pack_pos, 0);
+        assert_eq!(pack_info.num_pack_streams, 2);
+        assert_eq!(pack_info.pack_size.as_slice(), &[86, 362]);
+    }
+
+    #[test]
+    fn scan_pack_info_with_crc() {
+        let input = [
+            0x06u8, 0x00, 0x02, 0x09, 0x56, 0x81, 0x6A, 0x0A, 0x01, 0xA3, 0x52, 0x01, 0x40, 0x5C,
+            0x5F, 0x6E, 0x3E, 0x00, 0xFF,
+        ];
+
+        let (rem, ()) = scan_pack_info(&input).unwrap();
+
         assert_eq!(rem, &[0xFF]);
     }
 
