@@ -623,9 +623,7 @@ fn technical_attributes(entry: &ArchiveListingEntry) -> Option<String> {
         ListingEntryKind::File | ListingEntryKind::Symlink => "A",
         ListingEntryKind::Anti => unreachable!(),
     };
-    let Some(attrs) = entry.attributes else {
-        return None;
-    };
+    let attrs = entry.attributes?;
     let mode = attrs >> 16;
     if mode == 0 {
         return Some(format!("{class} {attrs:08X}"));
@@ -1387,7 +1385,11 @@ impl From<io::Error> for CliError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OverwriteAnswer, parse_overwrite_answer};
+    use super::{
+        CollisionAction, OverwriteAnswer, OverwriteMode, OverwriteUi, decide_overwrite,
+        parse_overwrite_answer,
+    };
+    use std::{collections::VecDeque, path::Path};
 
     #[test]
     fn parse_overwrite_answers_matches_p7zip_prompt_words() {
@@ -1410,5 +1412,119 @@ mod tests {
             assert_eq!(parse_overwrite_answer(input), Some(OverwriteAnswer::Quit));
         }
         assert_eq!(parse_overwrite_answer("maybe"), None);
+    }
+
+    #[test]
+    fn overwrite_policy_noninteractive_ask_skips_with_warning() {
+        let mut ui = FakeOverwriteUi::noninteractive([]);
+        let mut mode = OverwriteMode::Ask;
+
+        let action = decide_overwrite(&mut mode, false, &mut ui, Path::new("exists.txt")).unwrap();
+
+        assert_eq!(action, CollisionAction::Skip { warning: true });
+        assert_eq!(mode, OverwriteMode::Ask);
+        assert_eq!(ui.warned, vec!["exists.txt"]);
+        assert!(ui.prompts.is_empty());
+    }
+
+    #[test]
+    fn overwrite_policy_assume_yes_overwrites_without_prompt() {
+        let mut ui = FakeOverwriteUi::noninteractive([]);
+        let mut mode = OverwriteMode::Ask;
+
+        let action = decide_overwrite(&mut mode, true, &mut ui, Path::new("exists.txt")).unwrap();
+
+        assert_eq!(action, CollisionAction::Overwrite);
+        assert_eq!(mode, OverwriteMode::Ask);
+        assert!(ui.warned.is_empty());
+        assert!(ui.prompts.is_empty());
+    }
+
+    #[test]
+    fn overwrite_policy_all_switches_later_collisions_to_overwrite() {
+        let mut ui = FakeOverwriteUi::interactive([OverwriteAnswer::All]);
+        let mut mode = OverwriteMode::Ask;
+
+        let first = decide_overwrite(&mut mode, false, &mut ui, Path::new("first.txt")).unwrap();
+        let second = decide_overwrite(&mut mode, false, &mut ui, Path::new("second.txt")).unwrap();
+
+        assert_eq!(first, CollisionAction::Overwrite);
+        assert_eq!(second, CollisionAction::Overwrite);
+        assert_eq!(mode, OverwriteMode::Overwrite);
+        assert_eq!(ui.prompts, vec!["first.txt"]);
+        assert!(ui.warned.is_empty());
+    }
+
+    #[test]
+    fn overwrite_policy_skip_all_switches_later_collisions_to_silent_skip() {
+        let mut ui = FakeOverwriteUi::interactive([OverwriteAnswer::SkipAll]);
+        let mut mode = OverwriteMode::Ask;
+
+        let first = decide_overwrite(&mut mode, false, &mut ui, Path::new("first.txt")).unwrap();
+        let second = decide_overwrite(&mut mode, false, &mut ui, Path::new("second.txt")).unwrap();
+
+        assert_eq!(first, CollisionAction::Skip { warning: true });
+        assert_eq!(second, CollisionAction::Skip { warning: false });
+        assert_eq!(mode, OverwriteMode::SkipExisting);
+        assert_eq!(ui.prompts, vec!["first.txt"]);
+        assert_eq!(ui.warned, vec!["first.txt"]);
+    }
+
+    #[test]
+    fn overwrite_policy_quit_stops_without_warning_side_effect() {
+        let mut ui = FakeOverwriteUi::interactive([OverwriteAnswer::Quit]);
+        let mut mode = OverwriteMode::Ask;
+
+        let action = decide_overwrite(&mut mode, false, &mut ui, Path::new("exists.txt")).unwrap();
+
+        assert_eq!(action, CollisionAction::Quit);
+        assert_eq!(mode, OverwriteMode::Ask);
+        assert_eq!(ui.prompts, vec!["exists.txt"]);
+        assert!(ui.warned.is_empty());
+    }
+
+    struct FakeOverwriteUi {
+        interactive: bool,
+        answers: VecDeque<OverwriteAnswer>,
+        prompts: Vec<String>,
+        warned: Vec<String>,
+    }
+
+    impl FakeOverwriteUi {
+        fn interactive(answers: impl IntoIterator<Item = OverwriteAnswer>) -> Self {
+            Self {
+                interactive: true,
+                answers: answers.into_iter().collect(),
+                prompts: Vec::new(),
+                warned: Vec::new(),
+            }
+        }
+
+        fn noninteractive(answers: impl IntoIterator<Item = OverwriteAnswer>) -> Self {
+            Self {
+                interactive: false,
+                answers: answers.into_iter().collect(),
+                prompts: Vec::new(),
+                warned: Vec::new(),
+            }
+        }
+    }
+
+    impl OverwriteUi for FakeOverwriteUi {
+        fn is_interactive(&self) -> bool {
+            self.interactive
+        }
+
+        fn prompt_overwrite(&mut self, path: &Path) -> Result<OverwriteAnswer, super::CliError> {
+            self.prompts.push(path.display().to_string());
+            self.answers.pop_front().ok_or_else(|| {
+                super::CliError::Usage("fake overwrite UI ran out of answers".to_string())
+            })
+        }
+
+        fn warn_skip_existing(&mut self, path: &Path) -> Result<(), super::CliError> {
+            self.warned.push(path.display().to_string());
+            Ok(())
+        }
     }
 }
