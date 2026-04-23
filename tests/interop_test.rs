@@ -1056,6 +1056,27 @@ fn p7zip_branch_filters_extract_with_r7z() {
     }
 }
 
+#[test]
+fn p7zip_bcj2_lzma2_extracts_with_r7z() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let original = executable_payload(16 * 1024);
+    std::fs::write(dir.join("payload.bin"), &original).unwrap();
+
+    let archive_path = dir.join("bcj2.7z");
+    create_p7zip_archive(
+        dir,
+        &archive_path,
+        &["payload.bin"],
+        &["-m0=BCJ2", "-m1=LZMA2"],
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let extracted = archive.extract_to_memory(0).unwrap();
+
+    assert_eq!(extracted, original);
+}
+
 /// Decrypt a file from a large real-world AES-encrypted archive.
 /// Requires /mnt/emulation/Nintendo64Archive.7z to be present.
 #[test]

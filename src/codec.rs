@@ -41,6 +41,8 @@ pub const CODEC_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 pub const CODEC_LZMA2: &[u8] = &[0x21];
 /// Codec ID for the x86 BCJ (Branch/Call/Jump) filter.
 pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
+/// Codec ID for the BCJ2 multi-stream x86 branch filter.
+pub const CODEC_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
 /// Codec ID for the ARM branch filter.
 pub const CODEC_BCJ_ARM: &[u8] = &[0x03, 0x03, 0x05, 0x01];
 /// Codec ID for the ARM Thumb branch filter.
@@ -217,6 +219,38 @@ pub(crate) fn folder_reader_with_sizes_from_reader<'a>(
     Ok(reader)
 }
 
+pub(crate) fn folder_reader_with_pack_streams(
+    folder: &Folder,
+    packed_streams: Vec<Vec<u8>>,
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Box<dyn Read>, R7zError> {
+    if is_bcj2_folder(folder) {
+        return bcj2_folder_reader(
+            folder,
+            packed_streams,
+            unpack_size,
+            coder_unpack_sizes,
+            password,
+        );
+    }
+
+    if packed_streams.len() != 1 {
+        return Err(R7zError::Parse);
+    }
+
+    folder_reader_with_sizes_from_reader(
+        folder,
+        Box::new(Cursor::new(
+            packed_streams.into_iter().next().ok_or(R7zError::Parse)?,
+        )),
+        unpack_size,
+        coder_unpack_sizes,
+        password,
+    )
+}
+
 fn coder_reader<'a>(
     coder: &crate::CoderInfo,
     mut input: Box<dyn Read + 'a>,
@@ -323,6 +357,119 @@ fn coder_reader<'a>(
     }
 
     Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
+}
+
+fn is_bcj2_folder(folder: &Folder) -> bool {
+    folder
+        .coders
+        .last()
+        .is_some_and(|coder| coder.codec_id.as_slice() == CODEC_BCJ2)
+}
+
+fn bcj2_folder_reader(
+    folder: &Folder,
+    packed_streams: Vec<Vec<u8>>,
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Box<dyn Read>, R7zError> {
+    if packed_streams.len() != 4 {
+        return Err(R7zError::Parse);
+    }
+
+    if folder.coders.len() == 2
+        && folder.coders[1].num_in_streams == 4
+        && folder.coders[1].num_out_streams == 1
+        && folder.packed_indices.as_slice() == [0, 2, 3, 4]
+        && folder.bind_pairs.as_slice() == [(1, 0)]
+    {
+        let output_size = usize::try_from(unpack_size).map_err(|_| R7zError::Parse)?;
+        let main = decode_single_coder_to_vec(
+            &folder.coders[0],
+            packed_streams[0].clone(),
+            *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
+            password,
+        )?;
+        if main
+            .len()
+            .checked_add(packed_streams[1].len())
+            .and_then(|len| len.checked_add(packed_streams[2].len()))
+            .ok_or(R7zError::Decompression)?
+            != output_size
+        {
+            return Err(R7zError::Decompression);
+        }
+
+        let decoded = crate::bcj2::decode(
+            &main,
+            &packed_streams[1],
+            &packed_streams[2],
+            &packed_streams[3],
+            output_size,
+        )?;
+        return Ok(Box::new(Cursor::new(decoded)));
+    }
+
+    if folder.coders.len() != 4
+        || folder.coders[3].num_in_streams != 4
+        || folder.coders[3].num_out_streams != 1
+        || folder.packed_indices.as_slice() != [2, 6, 1, 0]
+        || folder.bind_pairs.as_slice() != [(5, 0), (4, 1), (3, 2)]
+    {
+        return Err(R7zError::Parse);
+    }
+
+    let output_size = usize::try_from(unpack_size).map_err(|_| R7zError::Parse)?;
+    let jump = decode_single_coder_to_vec(
+        &folder.coders[0],
+        packed_streams[3].clone(),
+        *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
+        password,
+    )?;
+    let call = decode_single_coder_to_vec(
+        &folder.coders[1],
+        packed_streams[2].clone(),
+        *coder_unpack_sizes.get(1).ok_or(R7zError::Parse)?,
+        password,
+    )?;
+    let main = decode_single_coder_to_vec(
+        &folder.coders[2],
+        packed_streams[0].clone(),
+        *coder_unpack_sizes.get(2).ok_or(R7zError::Parse)?,
+        password,
+    )?;
+
+    if main
+        .len()
+        .checked_add(call.len())
+        .and_then(|len| len.checked_add(jump.len()))
+        .ok_or(R7zError::Decompression)?
+        != output_size
+    {
+        return Err(R7zError::Decompression);
+    }
+
+    let decoded = crate::bcj2::decode(&main, &call, &jump, &packed_streams[1], output_size)?;
+    Ok(Box::new(Cursor::new(decoded)))
+}
+
+fn decode_single_coder_to_vec(
+    coder: &crate::CoderInfo,
+    packed_stream: Vec<u8>,
+    unpack_size: u64,
+    password: Option<&str>,
+) -> Result<Vec<u8>, R7zError> {
+    let mut reader = coder_reader(
+        coder,
+        Box::new(Cursor::new(packed_stream)),
+        unpack_size,
+        password,
+    )?;
+    let mut output = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
+    reader
+        .read_to_end(&mut output)
+        .map_err(|_| R7zError::Decompression)?;
+    Ok(output)
 }
 
 fn read_to_end_bounded(

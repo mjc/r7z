@@ -11,6 +11,7 @@ tests/corpus/7z/generated/delta_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/swap2_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/swap4_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/bcj_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/bcj2_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/arm_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/armt_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/ia64_lzma2.7z	-	extract	1

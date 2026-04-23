@@ -705,14 +705,30 @@ impl Archive {
         }
 
         let location = self.extraction_location(file_index)?;
-        let packed = self.source.range_reader(location.packed_range.clone())?;
-        let mut reader = codec::folder_reader_with_sizes_from_reader(
-            &location.folder,
-            Box::new(packed),
-            location.folder_unpack_size,
-            &location.coder_unpack_sizes,
-            password,
-        )?;
+        let mut reader: Box<dyn Read> = if location.packed_ranges.len() == 1 {
+            let packed = self
+                .source
+                .range_reader(location.packed_ranges[0].clone())?;
+            codec::folder_reader_with_sizes_from_reader(
+                &location.folder,
+                Box::new(packed),
+                location.folder_unpack_size,
+                &location.coder_unpack_sizes,
+                password,
+            )?
+        } else {
+            let mut packed_streams = Vec::with_capacity(location.packed_ranges.len());
+            for range in &location.packed_ranges {
+                packed_streams.push(self.source.read_range_to_vec(range.clone(), u64::MAX)?);
+            }
+            codec::folder_reader_with_pack_streams(
+                &location.folder,
+                packed_streams,
+                location.folder_unpack_size,
+                &location.coder_unpack_sizes,
+                password,
+            )?
+        };
 
         let mut folder_hasher = location.folder_digest.map(|_| crc32fast::Hasher::new());
         let mut stream_hasher = location.substream_digest.map(|_| crc32fast::Hasher::new());
@@ -816,19 +832,31 @@ impl Archive {
 
         // Locate the packed bytes for the folder that contains this file stream.
         let folder = unpack_info.parse_folder(folder_idx)?;
+        let pack_stream_base = folder_pack_stream_base(folder_idx, unpack_info)?;
+        let num_pack_streams = folder_num_pack_streams(&folder)?;
         let prior_pack_sizes = pack_info
             .pack_size
-            .get(..folder_idx)
+            .get(..pack_stream_base)
             .ok_or(R7zError::Parse)?;
-        let pack_offset_u64 = prior_pack_sizes.iter().try_fold(0u64, |acc, &size| {
+        let mut pack_offset_u64 = prior_pack_sizes.iter().try_fold(0u64, |acc, &size| {
             acc.checked_add(size).ok_or(R7zError::Parse)
         })?;
-        let pack_size = *pack_info.pack_size.get(folder_idx).ok_or(R7zError::Parse)?;
-        let data_start = checked_add_u64(
-            checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?,
-            pack_offset_u64,
-        )?;
-        let packed_range = checked_range_u64(self.source.len()?, data_start, pack_size)?;
+        let data_start =
+            checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
+        let pack_sizes = pack_info
+            .pack_size
+            .get(pack_stream_base..pack_stream_base + num_pack_streams)
+            .ok_or(R7zError::Parse)?;
+        let mut packed_ranges = Vec::with_capacity(num_pack_streams);
+        for &pack_size in pack_sizes {
+            let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
+            packed_ranges.push(checked_range_u64(
+                self.source.len()?,
+                stream_start,
+                pack_size,
+            )?);
+            pack_offset_u64 = checked_add_u64(pack_offset_u64, pack_size)?;
+        }
 
         let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
         let coder_unpack_sizes = folder_coder_unpack_sizes(folder_idx, unpack_info)?;
@@ -846,7 +874,7 @@ impl Archive {
 
         Ok(ExtractionLocation {
             folder,
-            packed_range,
+            packed_ranges,
             folder_unpack_size,
             coder_unpack_sizes,
             stream_start,
@@ -919,7 +947,7 @@ impl Archive {
 
 struct ExtractionLocation {
     folder: crate::Folder,
-    packed_range: Range<u64>,
+    packed_ranges: Vec<Range<u64>>,
     folder_unpack_size: u64,
     coder_unpack_sizes: Vec<u64>,
     stream_start: usize,
@@ -1026,6 +1054,29 @@ fn folder_coder_unpack_sizes(
         .get(global_base..global_base + num)
         .map(<[u64]>::to_vec)
         .ok_or(R7zError::Parse)
+}
+
+fn folder_pack_stream_base(
+    folder_idx: usize,
+    unpack_info: &crate::UnpackInfo,
+) -> Result<usize, R7zError> {
+    let mut base = 0usize;
+    for idx in 0..folder_idx {
+        let folder = unpack_info.parse_folder(idx)?;
+        base = base
+            .checked_add(folder_num_pack_streams(&folder)?)
+            .ok_or(R7zError::Parse)?;
+    }
+    Ok(base)
+}
+
+fn folder_num_pack_streams(folder: &crate::Folder) -> Result<usize, R7zError> {
+    let num_in = folder.coders.iter().try_fold(0u64, |acc, coder| {
+        acc.checked_add(coder.num_in_streams).ok_or(R7zError::Parse)
+    })?;
+    let num_bind_pairs = u64::try_from(folder.bind_pairs.len()).map_err(|_| R7zError::Parse)?;
+    let num_packed = num_in.checked_sub(num_bind_pairs).ok_or(R7zError::Parse)?;
+    usize::try_from(num_packed).map_err(|_| R7zError::Parse)
 }
 
 fn safe_archive_path(dest: &Path, name: &str) -> Result<Option<PathBuf>, R7zError> {

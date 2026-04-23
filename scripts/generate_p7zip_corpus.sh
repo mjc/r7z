@@ -110,6 +110,10 @@ run_7z a "$out_dir/bcj_lzma2.7z" \
   "$tmp/input/prog.bin" \
   -m0=BCJ -m1=LZMA2 -mmt=off
 
+run_7z a "$out_dir/bcj2_lzma2.7z" \
+  "$tmp/input/prog.bin" \
+  -m0=BCJ2 -m1=LZMA2 -mmt=off
+
 run_7z a "$out_dir/arm_lzma2.7z" \
   "$tmp/input/arm.bin" \
   -m0=ARM -m1=LZMA2 -mmt=off

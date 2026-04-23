@@ -135,6 +135,7 @@ impl SevenZMethod {
                 | Self::Deflate
                 | Self::Deflate64
                 | Self::Bcj
+                | Self::Bcj2
                 | Self::Arm
                 | Self::ArmThumb
                 | Self::Ia64

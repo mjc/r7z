@@ -415,6 +415,7 @@ These are public but primarily used for building advanced tooling:
 | Swap2 / Swap4 filters + compression | Read |
 | ARM / ARMT / IA64 / PPC / SPARC filters + compression | Read |
 | BCJ x86 filter + LZMA2 | Read + Write |
+| BCJ2 x86 filter + LZMA2 | Read |
 | EncodedHeader archives (p7zip default) | Read + Write |
 | Uncompressed Header archives | Read + Write |
 | Solid archives | Read + Write |
