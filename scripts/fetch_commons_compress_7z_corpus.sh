@@ -38,6 +38,9 @@ done
       bla.encrypted.7z)
         printf '%s\t%s\t%s\t%s\n' "$out_dir/$file" "-" "password_required" "-"
         ;;
+      COMPRESS-681.7z|bla.deflate.7z)
+        printf '%s\t%s\t%s\t%s\n' "$out_dir/$file" "-" "extract" "-"
+        ;;
       *)
         printf '%s\t%s\t%s\t%s\n' "$out_dir/$file" "-" "open" "-"
         ;;

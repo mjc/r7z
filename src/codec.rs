@@ -1,4 +1,5 @@
 use crate::{Folder, R7zError};
+use flate2::read::DeflateDecoder;
 use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
@@ -42,6 +43,8 @@ pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
 pub const CODEC_COPY: &[u8] = &[0x00];
 /// Codec ID for AES-256-SHA-256 encryption (7zAES).
 pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
+/// Codec ID for raw Deflate streams.
+pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
 
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
@@ -221,6 +224,10 @@ fn coder_reader<'a>(
 
     if *coder.codec_id == *CODEC_BCJ_X86 {
         return Ok(Box::new(crate::bcj::BcjX86Reader::new(input)));
+    }
+
+    if *coder.codec_id == *CODEC_DEFLATE {
+        return Ok(Box::new(DeflateDecoder::new(input)));
     }
 
     if *coder.codec_id == *CODEC_AES_256_SHA_256 {

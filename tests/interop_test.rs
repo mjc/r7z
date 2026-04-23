@@ -869,7 +869,7 @@ fn p7zip_aes_encrypted_headers_round_trip() {
 
 #[test]
 fn p7zip_unsupported_codecs_return_unsupported_codec() {
-    for method in ["BZip2", "PPMd", "Deflate"] {
+    for method in ["BZip2", "PPMd"] {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("payload.txt"), b"unsupported codec payload").unwrap();
@@ -900,6 +900,22 @@ fn p7zip_unsupported_codecs_return_unsupported_codec() {
             "expected UnsupportedCodec for {method}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn p7zip_deflate_extracts_with_r7z() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let original = b"deflate codec payload repeated repeated repeated";
+    std::fs::write(dir.join("payload.txt"), original).unwrap();
+
+    let archive_path = dir.join("deflate.7z");
+    create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=Deflate"]);
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let extracted = archive.extract_to_memory(0).unwrap();
+
+    assert_eq!(extracted, original);
 }
 
 /// Decrypt a file from a large real-world AES-encrypted archive.
