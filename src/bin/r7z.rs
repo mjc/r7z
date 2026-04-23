@@ -232,6 +232,11 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.method_was_explicit = true;
         return Ok(());
     }
+    if lower.starts_with("mc") {
+        let value = parse_attached_value(switch, "mc")?;
+        state.options.compression.lzma2_chunk_size = Some(parse_chunk_size(value)?);
+        return Ok(());
+    }
     if lower.starts_with("ma") {
         let value = parse_attached_value(switch, "ma")?;
         state.options.compression.lzma_algorithm = Some(parse_lzma_algorithm(value)?);
@@ -359,6 +364,9 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
                         .map_err(|_| CliError::Usage(format!("invalid fast bytes: {value}")))?,
                 );
             }
+            "c" => {
+                options.compression.lzma2_chunk_size = Some(parse_chunk_size(value)?);
+            }
             "a" => {
                 options.compression.lzma_algorithm = Some(parse_lzma_algorithm(value)?);
             }
@@ -415,6 +423,12 @@ fn validate_lzma_property_bit_combination(
         )));
     }
     Ok(())
+}
+
+fn parse_chunk_size(value: &str) -> Result<NonZeroU64, CliError> {
+    let bytes = parse_size_with_label(value, "LZMA2 chunk size")?;
+    NonZeroU64::new(bytes)
+        .ok_or_else(|| CliError::Usage(format!("invalid LZMA2 chunk size: {value}")))
 }
 
 fn parse_lzma_algorithm(value: &str) -> Result<LzmaAlgorithm, CliError> {

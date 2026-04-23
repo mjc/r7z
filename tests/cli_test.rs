@@ -419,6 +419,46 @@ fn cli_rejects_invalid_lzma_algorithm_and_match_cycles_options() {
 }
 
 #[test]
+fn cli_create_accepts_lzma2_chunk_size_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), vec![0x5Au8; 64 * 1024]).unwrap();
+    let scoped = tmp.path().join("lzma2-chunk-scoped.7z");
+    let standalone = tmp.path().join("lzma2-chunk-standalone.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA2:d=1m:c=1m".into(),
+        scoped.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA2".into(),
+        "-md=1m".into(),
+        "-mc=1m".into(),
+        standalone.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    assert_eq!(
+        r7z::Archive::open(&scoped)
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        vec![0x5Au8; 64 * 1024]
+    );
+    assert_eq!(
+        r7z::Archive::open(&standalone)
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        vec![0x5Au8; 64 * 1024]
+    );
+}
+
+#[test]
 fn cli_rejects_invalid_lzma_match_finder_option() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

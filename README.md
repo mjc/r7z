@@ -477,8 +477,8 @@ Compression method parsing accepts p7zip-style LZMA property options such as
 `-m0=LZMA:lc=2:lp=1:pb=1` or standalone `-mlc=2 -mlp=1 -mpb=1`,
 plus match-finder options such as `-m0=LZMA:mf=bt4` or `-mmf=hc4`, alongside
 algorithm and match-cycle options such as `-m0=LZMA:a=0:mc=16` or
-`-ma=1 -mmc=32`, dictionary, fast-bytes, solid, and threading compatibility
-switches.
+`-ma=1 -mmc=32`, LZMA2 chunk-size options such as `-m0=LZMA2:c=1m` or
+`-mc=1m`, dictionary, fast-bytes, solid, and threading compatibility switches.
 
 ## Development
 
