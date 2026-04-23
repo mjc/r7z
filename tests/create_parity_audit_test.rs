@@ -28,6 +28,12 @@ fn create_parity_audit_p7zip_compression_switches_open_with_r7z() {
             &[0x03, 0x01, 0x01],
             Some(5),
         ),
+        (
+            "lzma_mf",
+            &["-m0=LZMA:mf=hc4"],
+            &[0x03, 0x01, 0x01],
+            Some(5),
+        ),
         ("lzma2", &["-m0=LZMA2"], &[0x21], Some(1)),
         ("dict", &["-md=1m"], &[0x21], Some(1)),
         ("fast_bytes", &["-mfb=32"], &[0x21], Some(1)),

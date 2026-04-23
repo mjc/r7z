@@ -17,8 +17,9 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   `-aoa`, `-aos`, `-y`, and no-op compatibility for `-mmt`, `-bd`, and `-bb`.
 - CLI solid mode: `-ms=on`, `-ms=off`, file-count limits such as `-ms=1f`, and byte limits such as `-ms=8k`.
 - CLI method grammar: `-m0=METHOD:d=SIZE:fb=N:lc=N:lp=N:pb=N:mt=N`,
-  `-md=SIZE`, `-mfb=N`, `-mlc=N`, `-mlp=N`, and `-mpb=N` for supported
-  codecs; method-scoped `mt` is accepted as a no-op.
+  `-m0=METHOD:mf=bt4|hc4`, `-md=SIZE`, `-mfb=N`, `-mlc=N`, `-mlp=N`,
+  `-mpb=N`, and `-mmf=bt4|hc4` for supported codecs; method-scoped `mt` is
+  accepted as a no-op.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
 - CLI listing: `l` and `l -slt` report p7zip-like stable body fields and

@@ -701,6 +701,29 @@ fn archive_builder_lzma_literal_position_options_p7zip_extracts() {
 }
 
 #[test]
+fn archive_builder_lzma_match_finder_option_p7zip_extracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("builder_lzma_match_finder.7z");
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Lzma,
+        compression: r7z::CompressionOptions {
+            match_finder: Some(r7z::MatchFinder::Hc4),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = r7z::ArchiveBuilder::new().options(options);
+    for (name, data) in &files {
+        builder = builder.add_file(&name.to_string_lossy(), data);
+    }
+    std::fs::write(&archive_path, builder.build().unwrap()).unwrap();
+
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA"]);
+}
+
+#[test]
 fn archive_builder_lzma2_multi_file_p7zip_extracts_and_lists_method() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

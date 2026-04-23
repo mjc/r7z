@@ -5,10 +5,10 @@ use super::header::{
 };
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
-    EncryptionOptions, HeaderMode, PreparedFolder, SolidMode, WriteEntry,
+    EncryptionOptions, HeaderMode, MatchFinder, PreparedFolder, SolidMode, WriteEntry,
 };
 use crate::{R7zError, aes, bcj, codec};
-use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
+use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter, MfType};
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
 };
@@ -131,6 +131,7 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
             || options.compression.literal_context_bits.is_some()
             || options.compression.literal_position_bits.is_some()
             || options.compression.position_bits.is_some()
+            || options.compression.match_finder.is_some()
             || options.compression.lzma2_chunk_size.is_some())
     {
         return Err(R7zError::InvalidOptions(
@@ -166,10 +167,11 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
     if options.codec == Codec::Ppmd
         && (options.compression.literal_context_bits.is_some()
             || options.compression.literal_position_bits.is_some()
-            || options.compression.position_bits.is_some())
+            || options.compression.position_bits.is_some()
+            || options.compression.match_finder.is_some())
     {
         return Err(R7zError::InvalidOptions(
-            "PPMd does not support LZMA literal/position tuning",
+            "PPMd does not support LZMA-specific tuning",
         ));
     }
     validate_lzma_property_bits(&options.compression)?;
@@ -401,6 +403,12 @@ pub(crate) fn lzma_options(compression: &CompressionOptions) -> LzmaOptions {
     }
     if let Some(pb) = compression.position_bits {
         options.pb = pb;
+    }
+    if let Some(match_finder) = compression.match_finder {
+        options.mf = match match_finder {
+            MatchFinder::Hc4 => MfType::Hc4,
+            MatchFinder::Bt4 => MfType::Bt4,
+        };
     }
     options
 }

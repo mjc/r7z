@@ -305,6 +305,67 @@ fn cli_create_accepts_p7zip_method_chain_options() {
 }
 
 #[test]
+fn cli_create_accepts_lzma_match_finder_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"match finder payload").unwrap();
+    let scoped = tmp.path().join("lzma-mf-scoped.7z");
+    let standalone = tmp.path().join("lzma-mf-standalone.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA:mf=bt4".into(),
+        scoped.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA".into(),
+        "-mmf=hc4".into(),
+        standalone.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    assert_eq!(
+        r7z::Archive::open(&scoped)
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        b"match finder payload"
+    );
+    assert_eq!(
+        r7z::Archive::open(&standalone)
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        b"match finder payload"
+    );
+}
+
+#[test]
+fn cli_rejects_invalid_lzma_match_finder_option() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("bad-lzma-mf.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=LZMA:mf=bt3",
+            archive.to_str().unwrap(),
+            input.join("payload.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("match finder"));
+}
+
+#[test]
 fn cli_create_accepts_lzma_literal_position_options() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

@@ -2,8 +2,8 @@ use chrono::{DateTime, Local};
 use r7z::{
     Archive, ArchiveBuilder, ArchiveEntry, ArchiveListing, ArchiveListingEntry, ArchiveOptions,
     Codec, CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind,
-    PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock, SevenZMethod, SolidMode,
-    build_archive_with_preserved_folders, method_from_name,
+    MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock,
+    SevenZMethod, SolidMode, build_archive_with_preserved_folders, method_from_name,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -245,6 +245,11 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         validate_lzma_property_bit_combination(&state.options.compression)?;
         return Ok(());
     }
+    if lower.starts_with("mmf") {
+        let value = parse_attached_value(switch, "mmf")?;
+        state.options.compression.match_finder = Some(parse_match_finder(value)?);
+        return Ok(());
+    }
     if lower.starts_with("mpb") {
         let value = parse_attached_value(switch, "mpb")?;
         state.options.compression.position_bits = Some(parse_lzma_property_bits(value, "pb")?);
@@ -354,6 +359,9 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
             "pb" => {
                 options.compression.position_bits = Some(parse_lzma_property_bits(value, "pb")?);
             }
+            "mf" => {
+                options.compression.match_finder = Some(parse_match_finder(value)?);
+            }
             "mt" => parse_threading_value(value)?,
             _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
         }
@@ -390,6 +398,16 @@ fn validate_lzma_property_bit_combination(
         )));
     }
     Ok(())
+}
+
+fn parse_match_finder(value: &str) -> Result<MatchFinder, CliError> {
+    match value.to_ascii_lowercase().as_str() {
+        "hc4" => Ok(MatchFinder::Hc4),
+        "bt4" => Ok(MatchFinder::Bt4),
+        _ => Err(CliError::Usage(format!(
+            "invalid LZMA match finder: {value}"
+        ))),
+    }
 }
 
 fn parse_threading_value(value: &str) -> Result<(), CliError> {

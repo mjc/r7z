@@ -100,10 +100,10 @@ pub use property::{Property, find_next_property_id};
 pub use stream_info::{StreamInfo, SubstreamInfo};
 pub use write::{
     ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec, CompressionLevel,
-    CompressionOptions, EncryptionOptions, EntryKind, EntryMeta, HeaderMode, PreservedArchiveEntry,
-    PreservedEntryStream, SolidMode, SpoolMode, StreamingOptions, VolumeOptions,
-    build_archive_with_preserved_folders, build_streaming, build_streaming_to_writer,
-    build_streaming_volumes, build_streaming_with_options,
+    CompressionOptions, EncryptionOptions, EntryKind, EntryMeta, HeaderMode, MatchFinder,
+    PreservedArchiveEntry, PreservedEntryStream, SolidMode, SpoolMode, StreamingOptions,
+    VolumeOptions, build_archive_with_preserved_folders, build_streaming,
+    build_streaming_to_writer, build_streaming_volumes, build_streaming_with_options,
 };
 
 // Re-export nom's IResult for convenience in integration tests
