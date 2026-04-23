@@ -7,6 +7,7 @@ tests/corpus/7z/generated/lzma_solid.7z	-	extract	3
 tests/corpus/7z/generated/lzma2_nonsolid.7z	-	extract	3
 tests/corpus/7z/generated/deflate_nonsolid.7z	-	extract	3
 tests/corpus/7z/generated/deflate64_nonsolid.7z	-	extract	3
+tests/corpus/7z/generated/delta_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/bcj_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/aes_header.7z	CorpusSecret	extract	1
 tests/corpus/7z/generated/split.7z.001	-	extract	2

@@ -411,6 +411,7 @@ These are public but primarily used for building advanced tooling:
 | Deflate compression | Read |
 | Deflate64 compression | Read |
 | BZip2 compression | Read |
+| Delta filter + compression | Read |
 | BCJ x86 filter + LZMA2 | Read + Write |
 | EncodedHeader archives (p7zip default) | Read + Write |
 | Uncompressed Header archives | Read + Write |

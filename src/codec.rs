@@ -51,6 +51,8 @@ pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
 pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
 /// Codec ID for Deflate64 streams.
 pub const CODEC_DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
+/// Codec ID for the Delta filter.
+pub const CODEC_DELTA: &[u8] = &[0x03];
 
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
@@ -242,6 +244,11 @@ fn coder_reader<'a>(
 
     if *coder.codec_id == *CODEC_DEFLATE64 {
         return Ok(Box::new(Deflate64Decoder::new(input)));
+    }
+
+    if *coder.codec_id == *CODEC_DELTA {
+        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        return Ok(Box::new(crate::delta::DeltaReader::new(input, props)?));
     }
 
     if *coder.codec_id == *CODEC_AES_256_SHA_256 {

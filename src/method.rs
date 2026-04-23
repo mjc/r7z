@@ -128,7 +128,15 @@ impl SevenZMethod {
     pub fn supported_by_r7z(self) -> bool {
         matches!(
             self,
-            Self::Copy | Self::Lzma | Self::Lzma2 | Self::Bcj | Self::SevenZAes
+            Self::Copy
+                | Self::Lzma
+                | Self::Lzma2
+                | Self::BZip2
+                | Self::Deflate
+                | Self::Deflate64
+                | Self::Bcj
+                | Self::Delta
+                | Self::SevenZAes
         )
     }
 }
