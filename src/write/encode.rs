@@ -228,7 +228,7 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     Ok(out)
 }
 
-fn encode_folder(
+pub(crate) fn encode_folder(
     entries: &[WriteEntry],
     file_indices: Vec<usize>,
     options: &ArchiveOptions,

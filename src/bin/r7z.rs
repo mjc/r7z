@@ -1,11 +1,12 @@
 use chrono::{DateTime, Local};
 use r7z::{
     Archive, ArchiveBuilder, ArchiveEntry, ArchiveListing, ArchiveListingEntry, ArchiveOptions,
-    Codec, CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, R7zError,
-    SevenZMethod, SolidMode, method_from_name,
+    Codec, CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind,
+    PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock, SevenZMethod, SolidMode,
+    build_archive_with_preserved_folders, method_from_name,
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fs,
@@ -944,12 +945,13 @@ fn update_archive(cli: &Cli) -> Result<u8, CliError> {
     let new_entries = collect_disk_entries(&paths)?;
     let new_names: BTreeSet<String> = new_entries.iter().map(|entry| entry.name.clone()).collect();
     let archive = open_archive(cli)?;
-    let mut entries = archive_entries(&archive, cli.password.as_deref())?
-        .into_iter()
-        .filter(|entry| !new_names.contains(&entry.name))
-        .collect::<Vec<_>>();
-    entries.extend(new_entries);
-    write_archive_entries_atomic(&cli.archive, entries, &cli.options)?;
+    let (entries, raw_folders) = preserved_rewrite_entries(
+        &archive,
+        cli.password.as_deref(),
+        |name| new_names.contains(name),
+        new_entries,
+    )?;
+    write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)?;
     print_scan_warnings(&scan.warnings);
     Ok(if scan.warnings.is_empty() {
         EXIT_OK
@@ -966,11 +968,13 @@ fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
     }
     let delete_patterns = selected_patterns(&cli.operands);
     let archive = open_archive(cli)?;
-    let entries = archive_entries(&archive, cli.password.as_deref())?
-        .into_iter()
-        .filter(|entry| !entry_is_selected(&entry.name, &delete_patterns))
-        .collect::<Vec<_>>();
-    write_archive_entries_atomic(&cli.archive, entries, &cli.options)
+    let (entries, raw_folders) = preserved_rewrite_entries(
+        &archive,
+        cli.password.as_deref(),
+        |name| entry_is_selected(name, &delete_patterns),
+        Vec::new(),
+    )?;
+    write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)
 }
 
 #[derive(Clone)]
@@ -985,7 +989,6 @@ enum PendingKind {
     File(Vec<u8>),
     EmptyFile,
     Directory,
-    Anti,
     Symlink(String),
 }
 
@@ -1133,34 +1136,123 @@ fn collect_path(
     Ok(())
 }
 
-fn archive_entries(
+fn preserved_rewrite_entries(
     archive: &Archive,
     password: Option<&str>,
-) -> Result<Vec<PendingEntry>, CliError> {
-    let mut entries = Vec::new();
+    should_drop: impl Fn(&str) -> bool,
+    append_entries: Vec<PendingEntry>,
+) -> Result<(Vec<PreservedArchiveEntry>, Vec<RawFolderBlock>), CliError> {
     let Some(files) = archive.files_info() else {
-        return Ok(entries);
+        return Ok((
+            append_entries
+                .into_iter()
+                .map(pending_to_preserved_entry)
+                .collect(),
+            Vec::new(),
+        ));
     };
-    for i in 0..archive.num_files() {
+    let listing = archive.listing(None)?;
+    let mut listing_by_index: Vec<Option<&ArchiveListingEntry>> = vec![None; archive.num_files()];
+    for entry in &listing.entries {
+        if let Some(slot) = listing_by_index.get_mut(entry.index) {
+            *slot = Some(entry);
+        }
+    }
+
+    let mut retained = vec![false; archive.num_files()];
+    let mut folder_entries: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, is_retained) in retained.iter_mut().enumerate().take(archive.num_files()) {
+        let name = files.name(i).unwrap_or_else(|| format!("unknown-{i}"));
+        *is_retained = !should_drop(&name);
+        if let Some(block) = listing_by_index
+            .get(i)
+            .and_then(|entry| entry.and_then(|entry| entry.block))
+        {
+            folder_entries.entry(block).or_default().push(i);
+        }
+    }
+
+    let mut raw_folder_ids = BTreeSet::new();
+    let mut decode_indices = BTreeSet::new();
+    for (folder, indices) in &folder_entries {
+        let retained_count = indices.iter().filter(|&&idx| retained[idx]).count();
+        if retained_count == indices.len() {
+            raw_folder_ids.insert(*folder);
+        } else if retained_count > 0 {
+            decode_indices.extend(indices.iter().copied().filter(|&idx| retained[idx]));
+        }
+    }
+
+    let raw_folders = raw_folder_ids
+        .iter()
+        .map(|&folder| archive.raw_folder_block(folder))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut entries = Vec::new();
+    for (i, is_retained) in retained.iter().enumerate().take(archive.num_files()) {
+        if !is_retained {
+            continue;
+        }
+        let listing_entry = listing_by_index
+            .get(i)
+            .and_then(|entry| *entry)
+            .ok_or(R7zError::Parse)?;
         let name = files.name(i).unwrap_or_else(|| format!("unknown-{i}"));
         let meta = entry_meta_from_archive(files, i);
-        let kind = if files.is_anti(i) {
-            PendingKind::Anti
-        } else if files.is_directory(i) {
-            PendingKind::Directory
-        } else if files.is_symlink(i) {
-            let target = archive
-                .extract_to_memory_with_password(i, password)
-                .and_then(|bytes| String::from_utf8(bytes).map_err(|_| R7zError::Parse))?;
-            PendingKind::Symlink(target)
-        } else if files.is_empty_file(i) {
-            PendingKind::EmptyFile
+        let kind = preserved_entry_kind(files, i);
+        let stream = if let Some(folder) = listing_entry.block {
+            if raw_folder_ids.contains(&folder) {
+                PreservedEntryStream::Raw {
+                    folder_id: folder,
+                    size: listing_entry.size.ok_or(R7zError::Parse)?,
+                    crc: listing_entry.crc,
+                }
+            } else if decode_indices.contains(&i) {
+                PreservedEntryStream::Data(archive.extract_to_memory_with_password(i, password)?)
+            } else {
+                return Err(R7zError::Parse.into());
+            }
         } else {
-            PendingKind::File(archive.extract_to_memory_with_password(i, password)?)
+            PreservedEntryStream::None
         };
-        entries.push(PendingEntry { name, kind, meta });
+        entries.push(PreservedArchiveEntry {
+            name,
+            kind,
+            meta,
+            stream,
+        });
     }
-    Ok(entries)
+    entries.extend(append_entries.into_iter().map(pending_to_preserved_entry));
+    Ok((entries, raw_folders))
+}
+
+fn preserved_entry_kind(files: &r7z::FilesInfo, index: usize) -> r7z::EntryKind {
+    if files.is_anti(index) {
+        r7z::EntryKind::Anti
+    } else if files.is_directory(index) {
+        r7z::EntryKind::Directory
+    } else {
+        r7z::EntryKind::File
+    }
+}
+
+fn pending_to_preserved_entry(entry: PendingEntry) -> PreservedArchiveEntry {
+    let PendingEntry { name, kind, meta } = entry;
+    let (kind, stream) = match kind {
+        PendingKind::File(data) => (r7z::EntryKind::File, PreservedEntryStream::Data(data)),
+        PendingKind::EmptyFile => (r7z::EntryKind::File, PreservedEntryStream::None),
+        PendingKind::Directory => (r7z::EntryKind::Directory, PreservedEntryStream::None),
+        PendingKind::Symlink(target) => (
+            r7z::EntryKind::File,
+            PreservedEntryStream::Data(target.into_bytes()),
+        ),
+    };
+    PreservedArchiveEntry {
+        name,
+        kind,
+        meta,
+        stream,
+    }
 }
 
 fn write_archive_entries(
@@ -1178,12 +1270,13 @@ fn write_archive_entries(
     Ok(())
 }
 
-fn write_archive_entries_atomic(
+fn write_preserved_archive_entries_atomic(
     archive_path: &Path,
-    entries: Vec<PendingEntry>,
+    entries: Vec<PreservedArchiveEntry>,
+    raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<(), CliError> {
-    let bytes = build_archive_bytes(entries, options)?;
+    let bytes = build_archive_with_preserved_folders(entries, raw_folders, options)?;
     let tmp_path = archive_path.with_extension(format!(
         "{}.tmp-{}",
         archive_path
@@ -1209,7 +1302,6 @@ fn build_archive_bytes(
             }
             PendingKind::EmptyFile => builder.add_empty_file(&entry.name, entry.meta),
             PendingKind::Directory => builder.add_directory(&entry.name, entry.meta),
-            PendingKind::Anti => builder.add_anti_item(&entry.name, entry.meta),
             PendingKind::Symlink(target) => builder.add_symlink(&entry.name, &target, entry.meta),
         };
     }

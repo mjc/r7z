@@ -2,9 +2,9 @@
 
 mod support;
 
-use std::fs;
+use std::{fs, process::Command};
 
-use support::create_p7zip_archive;
+use support::{create_p7zip_archive, run_7z_checked};
 use tempfile::tempdir;
 
 #[test]
@@ -72,4 +72,38 @@ fn raw_folder_block_exposes_multi_pack_stream_metadata() {
             .parse_folder(0)
             .unwrap()
     );
+}
+
+#[test]
+fn updating_archive_with_retained_zstd_folder_succeeds() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("original.txt"), b"original").unwrap();
+    fs::write(input.join("new.txt"), b"new").unwrap();
+    let archive = tmp.path().join("zstd-update.7z");
+
+    create_p7zip_archive(&input, &archive, &["original.txt"], &["-m0=ZSTD"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "u",
+            archive.to_str().unwrap(),
+            input.join("new.txt").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z update failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let list = run_7z_checked(&["l", "-slt", archive.to_str().unwrap()], tmp.path());
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("Path = original.txt"));
+    assert!(stdout.contains("Path = new.txt"));
+    assert!(stdout.contains("Method = ZSTD"));
 }
