@@ -32,6 +32,11 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - CLI warnings: test/extract return warning status when explicit operands match
   no archive entries; create/update return warning status for missing literal
   disk inputs while unmatched disk wildcards are ignored.
+- CLI update/delete preservation: `a`/`u`/`d` rewrite atomically and preserve
+  unchanged retained folders as raw packed streams when possible. Unsupported
+  visible-header folders such as ZSTD can be retained unchanged, dropped as a
+  whole folder, or replaced as a whole folder without decoding. Partial rewrites
+  of supported folders decode retained entries and re-encode them.
 - Metadata: names, empty files, directories, anti-items, timestamps, attributes,
   symlink payloads.
 - Volumes: write support from `r7z a -vSIZE`; read support opens first volumes
@@ -54,10 +59,11 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   prompt parsing and policy are covered.
 - Metadata: p7zip-like unsafe link materialization is intentionally not default;
   add explicit API/CLI knobs before enabling it.
-- Update: current `a`/`u`/`d` rewrite archives atomically for supported codecs,
-  but does not preserve original folder graph or unsupported method streams.
-  Unsupported-method update attempts are expected to fail before rewriting the
-  source archive.
+- Update: exact original folder graph preservation is not guaranteed for folders
+  that must be partially rewritten; supported partial folders are decoded and
+  re-encoded. Partial rewrites of unsupported solid folders fail before rewriting
+  the source archive. Updating split-volume inputs writes a normal unsplit
+  replacement archive.
 - Security: AES decryption still buffers encrypted streams; replace with a
   streaming CBC path before treating large encrypted archives as parity-complete.
 - Robustness: fuzzing still needs extension from parsing into extraction and CLI

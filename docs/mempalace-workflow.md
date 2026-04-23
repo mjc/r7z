@@ -83,3 +83,8 @@ R7Z_SEARCH_KEYWORDS: <space-separated search terms>
   bodies against p7zip, and extraction collision handling follows p7zip-like
   default ask/refuse, `-y`, `-aoa`, and `-aos` behavior. Banner/version
   impersonation and unsafe link materialization remain out of scope.
+- 2026-04-22: CLI update/delete preservation now copies unchanged retained
+  archive folders as raw packed streams. Unsupported visible-header folders can
+  be retained, deleted whole, or replaced whole without decoding; partial
+  unsupported solid-folder rewrites fail atomically, while supported partial
+  folders are decoded and re-encoded.

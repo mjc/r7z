@@ -425,7 +425,7 @@ These are public but primarily used for building advanced tooling:
 | AES-256-SHA-256 encrypted content | Read + Write |
 | AES encrypted headers (`-mhe=on`) | Read + Write with password |
 | PPMd | Read + Write |
-| Update existing archives | CLI rewrite for supported codecs |
+| Update existing archives | CLI rewrite with raw preservation for unchanged unsupported folders |
 | Read split volumes | Supported for sequential `.7z.001` sets |
 | Hard-link preservation | Not supported |
 
@@ -460,6 +460,16 @@ prompt before replacing an existing output path. Non-interactive extraction skip
 colliding paths, prints warnings, continues extracting other entries, and exits
 with warning status `1`. Use `-y` or `-aoa` to overwrite existing files without
 prompting, or `-aos` to skip existing outputs without warning status.
+
+`r7z a`, `r7z u`, and `r7z d` rewrite archives atomically. When an existing
+archive contains unsupported but visible folder methods such as ZSTD, unchanged
+retained folders are copied raw and whole deleted/replaced folders are dropped
+without decoding. If a partial update would require retaining one entry from an
+unsupported solid folder while deleting or replacing another, r7z fails before
+rewriting the source archive. Supported partial folders are decoded and
+re-encoded; exact original folder graph preservation is not guaranteed for those
+rewritten folders. Updating split-volume input writes a normal unsplit
+replacement archive.
 
 ## Development
 
