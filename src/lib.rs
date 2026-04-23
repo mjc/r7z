@@ -80,7 +80,7 @@ pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMo
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_IA64, CODEC_BCJ_PPC,
     CODEC_BCJ_SPARC, CODEC_BCJ_X86, CODEC_BCJ2, CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE,
-    CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2, CODEC_SWAP2, CODEC_SWAP4,
+    CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2, CODEC_PPMD, CODEC_SWAP2, CODEC_SWAP4,
     decompress_folder, decompress_folder_with_password,
 };
 pub use coder_info::CoderInfo;

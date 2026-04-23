@@ -12,6 +12,7 @@ fn method_registry_tracks_current_p7zip_extension_ids() {
         ("LZMA", &[0x03, 0x01, 0x01], SevenZMethod::Lzma),
         ("LZMA2", &[0x21], SevenZMethod::Lzma2),
         ("BZip2", &[0x04, 0x02, 0x02], SevenZMethod::BZip2),
+        ("PPMd", &[0x03, 0x04, 0x01], SevenZMethod::Ppmd),
         ("Deflate", &[0x04, 0x01, 0x08], SevenZMethod::Deflate),
         ("Deflate64", &[0x04, 0x01, 0x09], SevenZMethod::Deflate64),
         ("BCJ2", &[0x03, 0x03, 0x01, 0x1B], SevenZMethod::Bcj2),

@@ -14,9 +14,9 @@ fn update_rejects_unsupported_method_archive_without_rewriting_source() {
     fs::create_dir_all(&input).unwrap();
     fs::write(input.join("original.txt"), b"original").unwrap();
     fs::write(input.join("new.txt"), b"new").unwrap();
-    let archive = tmp.path().join("ppmd.7z");
+    let archive = tmp.path().join("zstd.7z");
 
-    create_p7zip_archive(&input, &archive, &["original.txt"], &["-m0=PPMd"]);
+    create_p7zip_archive(&input, &archive, &["original.txt"], &["-m0=ZSTD"]);
 
     let before = fs::read(&archive).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_r7z"))

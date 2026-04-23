@@ -147,4 +147,8 @@ run_7z a "$out_dir/bzip2_nonsolid.7z" \
   "$tmp/input/alpha.txt" \
   -m0=BZip2 -mmt=off
 
+run_7z a "$out_dir/ppmd_nonsolid.7z" \
+  "$tmp/input/alpha.txt" \
+  -m0=PPMd -mmt=off
+
 printf 'generated corpus with %s\n' "$sevenz"

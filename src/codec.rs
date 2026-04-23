@@ -3,6 +3,7 @@ use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
 use flate2::read::DeflateDecoder;
 use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
+use ppmd_rust::Ppmd7Decoder;
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
@@ -61,6 +62,8 @@ pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
 /// Codec ID for BZip2 streams.
 pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
+/// Codec ID for PPMd7 streams.
+pub const CODEC_PPMD: &[u8] = &[0x03, 0x04, 0x01];
 /// Codec ID for Deflate64 streams.
 pub const CODEC_DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
 /// Codec ID for the Delta filter.
@@ -325,6 +328,15 @@ fn coder_reader<'a>(
         return Ok(Box::new(Bzip2Decoder::new(input)));
     }
 
+    if *coder.codec_id == *CODEC_PPMD {
+        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        let (order, mem_size) = ppmd_properties(props)?;
+        let reader =
+            Ppmd7Decoder::new(input, order, mem_size).map_err(|_| R7zError::Decompression)?;
+        let reader = ExactSizeReader::new(reader, unpack_size);
+        return Ok(Box::new(reader));
+    }
+
     if *coder.codec_id == *CODEC_DEFLATE64 {
         return Ok(Box::new(Deflate64Decoder::new(input)));
     }
@@ -357,6 +369,52 @@ fn coder_reader<'a>(
     }
 
     Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
+}
+
+fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
+    if props.len() != 5 {
+        return Err(R7zError::Decompression);
+    }
+
+    let order = u32::from(props[0]);
+    let mem_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+    Ok((order, mem_size))
+}
+
+struct ExactSizeReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> ExactSizeReader<R> {
+    fn new(inner: R, size: u64) -> Self {
+        Self {
+            inner,
+            remaining: size,
+        }
+    }
+}
+
+impl<R: Read> Read for ExactSizeReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+
+        let limit = usize::try_from(self.remaining)
+            .ok()
+            .map_or(buf.len(), |remaining| remaining.min(buf.len()));
+        let n = self.inner.read(&mut buf[..limit])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "decoder ended before declared unpack size",
+            ));
+        }
+
+        self.remaining -= u64::try_from(n).expect("read length fits in u64");
+        Ok(n)
+    }
 }
 
 fn is_bcj2_folder(folder: &Folder) -> bool {
@@ -602,8 +660,11 @@ fn coder_execution_order(folder: &crate::Folder) -> Result<SmallVec<[usize; 4]>,
 
 #[cfg(test)]
 mod tests {
-    use super::{compress_lzma, decompress_lzma2, lzma2_dict_size};
+    use super::{
+        ExactSizeReader, compress_lzma, decompress_lzma2, lzma2_dict_size, ppmd_properties,
+    };
     use crate::R7zError;
+    use std::io::{Cursor, ErrorKind, Read};
 
     #[test]
     fn lzma_property_block_is_exactly_five_bytes() {
@@ -637,5 +698,33 @@ mod tests {
             let err = decompress_lzma2(Some(props), &[0x00]).unwrap_err();
             assert!(matches!(err, R7zError::Decompression));
         }
+    }
+
+    #[test]
+    fn ppmd_property_block_is_exactly_five_bytes() {
+        assert_eq!(
+            ppmd_properties(&[6, 0x00, 0x00, 0x10, 0x00]).unwrap(),
+            (6, 1024 * 1024)
+        );
+
+        for props in [
+            &[][..],
+            &[6, 0x00, 0x00, 0x10][..],
+            &[6, 0, 0, 0x10, 0, 0][..],
+        ] {
+            let err = ppmd_properties(props).unwrap_err();
+            assert!(matches!(err, R7zError::Decompression));
+        }
+    }
+
+    #[test]
+    fn exact_size_reader_rejects_early_eof() {
+        let mut reader = ExactSizeReader::new(Cursor::new(b"ab"), 3);
+        let mut out = Vec::new();
+
+        let err = reader.read_to_end(&mut out).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(out, b"ab");
     }
 }

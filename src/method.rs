@@ -132,6 +132,7 @@ impl SevenZMethod {
                 | Self::Lzma
                 | Self::Lzma2
                 | Self::BZip2
+                | Self::Ppmd
                 | Self::Deflate
                 | Self::Deflate64
                 | Self::Bcj

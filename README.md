@@ -360,7 +360,7 @@ pub enum Codec {
 |---------|---------|
 | `R7zError::Parse` | Malformed archive — not valid 7z binary |
 | `R7zError::InvalidProperty(u8)` | Unknown property tag byte in header |
-| `R7zError::UnsupportedCodec(Vec<u8>)` | Codec ID not implemented (e.g., PPMd) |
+| `R7zError::UnsupportedCodec(Vec<u8>)` | Codec ID not implemented (e.g., ZSTD) |
 | `R7zError::Crc` | CRC32 mismatch — data corruption detected |
 | `R7zError::Io(std::io::Error)` | File I/O failure |
 | `R7zError::Decompression` | LZMA/LZMA2 stream could not be decoded |
@@ -424,8 +424,8 @@ These are public but primarily used for building advanced tooling:
 | Directories / zero-byte files / anti-items | Read + Write |
 | AES-256-SHA-256 encrypted content | Read + Write |
 | AES encrypted headers (`-mhe=on`) | Read + Write with password |
+| PPMd | Read |
 | Update existing archives | Not supported |
-| PPMd | Not supported |
 | Read split volumes | Not supported |
 | Hard-link preservation | Not supported |
 
