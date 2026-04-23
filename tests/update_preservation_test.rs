@@ -205,3 +205,150 @@ fn deleting_one_non_solid_zstd_file_preserves_other_raw_folder() {
     assert!(stdout.contains("Path = b.txt"));
     assert!(stdout.contains("Method = ZSTD"));
 }
+
+#[test]
+fn deleting_part_of_solid_zstd_folder_fails_without_rewriting_archive() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.txt"), b"bravo").unwrap();
+    let archive = tmp.path().join("zstd-solid-delete.7z");
+
+    create_p7zip_archive(
+        &input,
+        &archive,
+        &["a.txt", "b.txt"],
+        &["-m0=ZSTD", "-ms=on"],
+    );
+    let before = fs::read(&archive).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["d", archive.to_str().unwrap(), "a.txt"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "partial unsupported delete unexpectedly succeeded"
+    );
+    assert_eq!(fs::read(&archive).unwrap(), before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("would require decoding retained entry"));
+    assert!(stderr.contains("unsupported codec"));
+}
+
+#[test]
+fn replacing_part_of_solid_zstd_folder_fails_without_rewriting_archive() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.txt"), b"bravo").unwrap();
+    let archive = tmp.path().join("zstd-solid-replace.7z");
+
+    create_p7zip_archive(
+        &input,
+        &archive,
+        &["a.txt", "b.txt"],
+        &["-m0=ZSTD", "-ms=on"],
+    );
+    let before = fs::read(&archive).unwrap();
+    fs::write(input.join("a.txt"), b"new alpha").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "u",
+            archive.to_str().unwrap(),
+            input.join("a.txt").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "partial unsupported replace unexpectedly succeeded"
+    );
+    assert_eq!(fs::read(&archive).unwrap(), before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("would require decoding retained entry"));
+    assert!(stderr.contains("unsupported codec"));
+}
+
+#[test]
+fn deleting_part_of_solid_lzma2_folder_decodes_retained_entries() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.txt"), b"bravo").unwrap();
+    let archive = tmp.path().join("lzma2-solid-delete.7z");
+
+    create_p7zip_archive(
+        &input,
+        &archive,
+        &["a.txt", "b.txt"],
+        &["-m0=LZMA2", "-ms=on"],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["d", archive.to_str().unwrap(), "a.txt"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z delete failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = tmp.path().join("out");
+    extract_with_p7zip(tmp.path(), &archive, &out);
+    assert_extracted_files(&out, &[(PathBuf::from("b.txt"), b"bravo".to_vec())]);
+    assert!(!out.join("a.txt").exists());
+}
+
+#[test]
+fn replacing_part_of_solid_lzma2_folder_decodes_retained_entries() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("a.txt"), b"alpha").unwrap();
+    fs::write(input.join("b.txt"), b"bravo").unwrap();
+    let archive = tmp.path().join("lzma2-solid-replace.7z");
+
+    create_p7zip_archive(
+        &input,
+        &archive,
+        &["a.txt", "b.txt"],
+        &["-m0=LZMA2", "-ms=on"],
+    );
+    fs::write(input.join("a.txt"), b"new alpha").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "u",
+            archive.to_str().unwrap(),
+            input.join("a.txt").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z update failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = tmp.path().join("out");
+    extract_with_p7zip(tmp.path(), &archive, &out);
+    assert_extracted_files(
+        &out,
+        &[
+            (PathBuf::from("a.txt"), b"new alpha".to_vec()),
+            (PathBuf::from("b.txt"), b"bravo".to_vec()),
+        ],
+    );
+}

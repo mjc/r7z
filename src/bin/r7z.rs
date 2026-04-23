@@ -33,6 +33,10 @@ fn main() -> ExitCode {
             eprintln!("Error: {err}");
             ExitCode::from(EXIT_FATAL)
         }
+        Err(CliError::FatalMessage(msg)) => {
+            eprintln!("Error: {msg}");
+            ExitCode::from(EXIT_FATAL)
+        }
     }
 }
 
@@ -1208,7 +1212,20 @@ fn preserved_rewrite_entries(
                     crc: listing_entry.crc,
                 }
             } else if decode_indices.contains(&i) {
-                PreservedEntryStream::Data(archive.extract_to_memory_with_password(i, password)?)
+                match archive.extract_to_memory_with_password(i, password) {
+                    Ok(data) => PreservedEntryStream::Data(data),
+                    Err(
+                        err @ (R7zError::UnsupportedCodec(_)
+                        | R7zError::PasswordRequired
+                        | R7zError::Decompression
+                        | R7zError::Crc),
+                    ) => {
+                        return Err(CliError::FatalMessage(format!(
+                            "operation would require decoding retained entry '{name}' in a partially changed archive folder: {err}"
+                        )));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             } else {
                 return Err(R7zError::Parse.into());
             }
@@ -1461,6 +1478,7 @@ fn usage() -> String {
 enum CliError {
     Usage(String),
     Fatal(R7zError),
+    FatalMessage(String),
 }
 
 impl From<R7zError> for CliError {
