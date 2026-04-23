@@ -36,8 +36,8 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 ## Gaps By Category
 
 - Parser: no known p7zip parity gaps in the currently tracked subset.
-- Decoder: BCJ2 multi-packed-stream graph, PPMd, Deflate64,
-  Delta, ARM, ARMT, IA64, PPC, SPARC, Swap2, Swap4.
+- Decoder: BCJ2 multi-packed-stream graph, PPMd, Delta, ARM, ARMT, IA64,
+  PPC, SPARC, Swap2, Swap4.
 - Decoder extensions: ZSTD, Brotli, LZ4, LZ5, Lizard, LZHAM. `FLZMA2` is tracked
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
 - Encoder: all missing decoder methods above, plus exact p7zip method-chain

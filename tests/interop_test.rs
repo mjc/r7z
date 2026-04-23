@@ -934,6 +934,22 @@ fn p7zip_deflate_extracts_with_r7z() {
     assert_eq!(extracted, original);
 }
 
+#[test]
+fn p7zip_deflate64_extracts_with_r7z() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let original = b"deflate64 codec payload repeated repeated repeated";
+    std::fs::write(dir.join("payload.txt"), original).unwrap();
+
+    let archive_path = dir.join("deflate64.7z");
+    create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=Deflate64"]);
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let extracted = archive.extract_to_memory(0).unwrap();
+
+    assert_eq!(extracted, original);
+}
+
 /// Decrypt a file from a large real-world AES-encrypted archive.
 /// Requires /mnt/emulation/Nintendo64Archive.7z to be present.
 #[test]

@@ -76,7 +76,7 @@ mod write;
 pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMode};
 pub use codec::{
     decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ_X86,
-    CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE, CODEC_LZMA, CODEC_LZMA2,
+    CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE, CODEC_DEFLATE64, CODEC_LZMA, CODEC_LZMA2,
 };
 pub use coder_info::CoderInfo;
 pub use error::R7zError;

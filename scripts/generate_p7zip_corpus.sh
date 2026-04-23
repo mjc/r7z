@@ -51,6 +51,10 @@ run_7z a "$out_dir/deflate_nonsolid.7z" \
   "$tmp/input/alpha.txt" "$tmp/input/nested" \
   -m0=Deflate -ms=off -mmt=off
 
+run_7z a "$out_dir/deflate64_nonsolid.7z" \
+  "$tmp/input/alpha.txt" "$tmp/input/nested" \
+  -m0=Deflate64 -ms=off -mmt=off
+
 run_7z a "$out_dir/bcj_lzma2.7z" \
   "$tmp/input/prog.bin" \
   -m0=BCJ -m1=LZMA2 -mmt=off
