@@ -78,7 +78,7 @@ mod write;
 
 pub use archive::{
     Archive, ArchiveListing, ArchiveListingEntry, ArchiveMetadata, ArchiveOpenOptions,
-    ArchiveStorageMode, ListingEntryKind,
+    ArchiveStorageMode, ListingEntryKind, RawFolderBlock,
 };
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_IA64, CODEC_BCJ_PPC,

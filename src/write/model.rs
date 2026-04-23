@@ -230,11 +230,19 @@ pub(crate) struct WriteEntry {
     pub folder_id: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct CompletedFolder {
     pub file_indices: Vec<usize>,
-    pub pack_size: u64,
+    pub pack_sizes: Vec<u64>,
     pub coder_info: Vec<u8>,
     pub coder_unpack_sizes: Vec<u64>,
+    pub folder_crc: Option<u32>,
     pub file_sizes: Vec<u64>,
-    pub file_crcs: Vec<u32>,
+    pub file_crcs: Vec<Option<u32>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedFolder {
+    pub metadata: CompletedFolder,
+    pub packed_streams: Vec<Vec<u8>>,
 }

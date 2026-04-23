@@ -135,6 +135,13 @@ impl UnpackInfo {
     /// (should not happen — bytes are validated during [`parse`](UnpackInfo::parse)).
     ///
     pub fn parse_folder(&self, idx: usize) -> Result<Folder, crate::R7zError> {
+        let bytes = self.folder_bytes(idx)?;
+        let (_, folder) = Folder::parse(bytes).map_err(|_| crate::R7zError::Parse)?;
+        Ok(folder)
+    }
+
+    #[doc(hidden)]
+    pub fn folder_bytes(&self, idx: usize) -> Result<&[u8], crate::R7zError> {
         let start = *self.folder_offsets.get(idx).ok_or(crate::R7zError::Parse)? as usize;
         let end = *self
             .folder_offsets
@@ -143,9 +150,7 @@ impl UnpackInfo {
         if start > end || end > self.folder_data.len() {
             return Err(crate::R7zError::Parse);
         }
-        let (_, folder) =
-            Folder::parse(&self.folder_data[start..end]).map_err(|_| crate::R7zError::Parse)?;
-        Ok(folder)
+        Ok(&self.folder_data[start..end])
     }
 
     /// Number of folders (as `usize`).

@@ -364,6 +364,17 @@ pub enum ListingEntryKind {
     Anti,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawFolderBlock {
+    pub folder_index: usize,
+    pub folder_info: Vec<u8>,
+    pub packed_streams: Vec<Vec<u8>>,
+    pub pack_sizes: Vec<u64>,
+    pub coder_unpack_sizes: Vec<u64>,
+    pub folder_crc: Option<u32>,
+}
+
 impl Archive {
     /// Open and fully decode a 7z archive from disk.
     ///
@@ -700,6 +711,50 @@ impl Archive {
             solid,
             blocks,
             entries,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {
+        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
+        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        if folder_index >= unpack_info.num_folders_usize() {
+            return Err(R7zError::Parse);
+        }
+
+        let folder = unpack_info.parse_folder(folder_index)?;
+        let pack_stream_base = folder_pack_stream_base(folder_index, unpack_info)?;
+        let num_pack_streams = folder_num_pack_streams(&folder)?;
+        let prior_pack_sizes = pack_info
+            .pack_size
+            .get(..pack_stream_base)
+            .ok_or(R7zError::Parse)?;
+        let mut pack_offset = prior_pack_sizes.iter().try_fold(0u64, |acc, &size| {
+            acc.checked_add(size).ok_or(R7zError::Parse)
+        })?;
+        let data_start =
+            checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
+        let pack_sizes = pack_info
+            .pack_size
+            .get(pack_stream_base..pack_stream_base + num_pack_streams)
+            .ok_or(R7zError::Parse)?
+            .to_vec();
+        let mut packed_streams = Vec::with_capacity(pack_sizes.len());
+        for &pack_size in &pack_sizes {
+            let stream_start = checked_add_u64(data_start, pack_offset)?;
+            let range = checked_range_u64(self.source.len()?, stream_start, pack_size)?;
+            packed_streams.push(self.source.read_range_to_vec(range, u64::MAX)?);
+            pack_offset = checked_add_u64(pack_offset, pack_size)?;
+        }
+
+        Ok(RawFolderBlock {
+            folder_index,
+            folder_info: unpack_info.folder_bytes(folder_index)?.to_vec(),
+            packed_streams,
+            pack_sizes,
+            coder_unpack_sizes: folder_coder_unpack_sizes(folder_index, unpack_info)?,
+            folder_crc: unpack_info.digests.get(folder_index).copied().flatten(),
         })
     }
 

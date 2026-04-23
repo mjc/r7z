@@ -5,7 +5,7 @@ use super::header::{
 };
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
-    EncryptionOptions, HeaderMode, SolidMode, WriteEntry,
+    EncryptionOptions, HeaderMode, PreparedFolder, SolidMode, WriteEntry,
 };
 use crate::{R7zError, aes, bcj, codec};
 use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
@@ -24,7 +24,6 @@ pub(crate) fn build_archive(
 ) -> Result<Vec<u8>, R7zError> {
     validate_archive_options(options)?;
 
-    let mut packed_data = Vec::new();
     let mut folders = Vec::new();
     let mut by_folder: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, entry) in entries.iter().enumerate() {
@@ -34,12 +33,32 @@ pub(crate) fn build_archive(
     }
 
     for file_indices in by_folder.into_values() {
-        let (folder, pack) = encode_folder(entries, file_indices, options)?;
-        packed_data.extend_from_slice(&pack);
+        let folder = encode_folder(entries, file_indices, options)?;
         folders.push(folder);
     }
 
-    let raw_header = build_header(entries, &folders);
+    build_archive_from_prepared(entries, &folders, options)
+}
+
+pub(crate) fn build_archive_from_prepared(
+    entries: &[WriteEntry],
+    folders: &[PreparedFolder],
+    options: &ArchiveOptions,
+) -> Result<Vec<u8>, R7zError> {
+    validate_archive_options(options)?;
+
+    let mut packed_data = Vec::new();
+    for folder in folders {
+        for stream in &folder.packed_streams {
+            packed_data.extend_from_slice(stream);
+        }
+    }
+    let folder_metadata = folders
+        .iter()
+        .map(|folder| folder.metadata.clone())
+        .collect::<Vec<_>>();
+
+    let raw_header = build_header(entries, &folder_metadata);
     let should_encode = match options.header_mode {
         HeaderMode::Plain => false,
         HeaderMode::Encoded => true,
@@ -173,7 +192,10 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     validate_archive_options(options)?;
 
     let packed_size = folders.iter().try_fold(0u64, |acc, folder| {
-        acc.checked_add(folder.pack_size).ok_or(R7zError::Parse)
+        let folder_size = folder.pack_sizes.iter().try_fold(0u64, |acc, &size| {
+            acc.checked_add(size).ok_or(R7zError::Parse)
+        })?;
+        acc.checked_add(folder_size).ok_or(R7zError::Parse)
     })?;
     let raw_header = build_header(entries, folders);
     let should_encode = match options.header_mode {
@@ -210,14 +232,14 @@ fn encode_folder(
     entries: &[WriteEntry],
     file_indices: Vec<usize>,
     options: &ArchiveOptions,
-) -> Result<(CompletedFolder, Vec<u8>), R7zError> {
+) -> Result<PreparedFolder, R7zError> {
     let mut data = Vec::new();
     let mut file_sizes = Vec::new();
     let mut file_crcs = Vec::new();
     for &idx in &file_indices {
         let bytes = entries[idx].data.as_ref().ok_or(R7zError::Parse)?;
         file_sizes.push(bytes.len() as u64);
-        file_crcs.push(crc32fast::hash(bytes));
+        file_crcs.push(Some(crc32fast::hash(bytes)));
         data.extend_from_slice(bytes);
     }
 
@@ -234,17 +256,19 @@ fn encode_folder(
         coder_unpack_sizes = sizes;
     }
 
-    Ok((
-        CompletedFolder {
+    let pack_size = pack.len() as u64;
+    Ok(PreparedFolder {
+        metadata: CompletedFolder {
             file_indices,
-            pack_size: pack.len() as u64,
+            pack_sizes: vec![pack_size],
             coder_info,
             coder_unpack_sizes,
+            folder_crc: None,
             file_sizes,
             file_crcs,
         },
-        pack,
-    ))
+        packed_streams: vec![pack],
+    })
 }
 
 fn encode_payload_with_options(

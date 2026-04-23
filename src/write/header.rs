@@ -156,10 +156,13 @@ pub(crate) fn build_encoded_header_descriptor(
 fn write_pack_info(h: &mut Vec<u8>, folders: &[CompletedFolder]) {
     h.push(0x06);
     h.extend_from_slice(&sevenzip_varuint64_encode(0));
-    h.extend_from_slice(&sevenzip_varuint64_encode(folders.len() as u64));
+    let num_pack_streams: usize = folders.iter().map(|folder| folder.pack_sizes.len()).sum();
+    h.extend_from_slice(&sevenzip_varuint64_encode(num_pack_streams as u64));
     h.push(0x09);
     for folder in folders {
-        h.extend_from_slice(&sevenzip_varuint64_encode(folder.pack_size));
+        for &pack_size in &folder.pack_sizes {
+            h.extend_from_slice(&sevenzip_varuint64_encode(pack_size));
+        }
     }
     h.push(0x00);
 }
@@ -178,6 +181,7 @@ fn write_unpack_info(h: &mut Vec<u8>, folders: &[CompletedFolder]) {
             h.extend_from_slice(&sevenzip_varuint64_encode(size));
         }
     }
+    write_folder_crcs(h, folders);
     h.push(0x00);
 }
 
@@ -197,14 +201,36 @@ fn write_substreams_info(h: &mut Vec<u8>, folders: &[CompletedFolder]) {
             }
         }
     }
-    h.push(0x0a);
-    h.push(0x01);
-    for folder in folders {
-        for &crc in &folder.file_crcs {
-            h.extend_from_slice(&crc.to_le_bytes());
-        }
-    }
+    let crcs = folders
+        .iter()
+        .flat_map(|folder| folder.file_crcs.iter().copied())
+        .collect::<Vec<_>>();
+    write_optional_crcs(h, &crcs);
     h.push(0x00);
+}
+
+fn write_folder_crcs(h: &mut Vec<u8>, folders: &[CompletedFolder]) {
+    let crcs = folders
+        .iter()
+        .map(|folder| folder.folder_crc)
+        .collect::<Vec<_>>();
+    write_optional_crcs(h, &crcs);
+}
+
+fn write_optional_crcs(h: &mut Vec<u8>, crcs: &[Option<u32>]) {
+    if !crcs.iter().any(Option::is_some) {
+        return;
+    }
+    let all_defined = crcs.iter().all(Option::is_some);
+    h.push(0x0a);
+    h.push(u8::from(all_defined));
+    if !all_defined {
+        let defined = crcs.iter().map(Option::is_some).collect::<Vec<_>>();
+        h.extend_from_slice(&bools_to_bytes(&defined));
+    }
+    for crc in crcs.iter().flatten() {
+        h.extend_from_slice(&crc.to_le_bytes());
+    }
 }
 
 fn write_files_info(h: &mut Vec<u8>, entries: &[WriteEntry]) {

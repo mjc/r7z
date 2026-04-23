@@ -699,13 +699,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.out = Some(count_writer.inner);
         self.lzma2_completed.push(model::CompletedFolder {
             file_indices,
-            pack_size,
+            pack_sizes: vec![pack_size],
             coder_info: encode_coder_info_lzma2(encode::lzma2_property_byte(
                 &self.options.compression,
             )?),
             coder_unpack_sizes: vec![unpack_size],
+            folder_crc: None,
             file_sizes,
-            file_crcs,
+            file_crcs: file_crcs.into_iter().map(Some).collect(),
         });
         self.current_folder += 1;
         Ok(())
@@ -834,11 +835,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.out = Some(count_writer.inner);
         self.lzma_completed.push(model::CompletedFolder {
             file_indices,
-            pack_size,
+            pack_sizes: vec![pack_size],
             coder_info: encode_coder_info_lzma(&props),
             coder_unpack_sizes: vec![unpack_size],
+            folder_crc: None,
             file_sizes,
-            file_crcs,
+            file_crcs: file_crcs.into_iter().map(Some).collect(),
         });
         self.current_folder += 1;
         Ok(())
@@ -959,13 +961,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.out = Some(count_writer.inner);
         self.bcj_lzma2_completed.push(model::CompletedFolder {
             file_indices,
-            pack_size,
+            pack_sizes: vec![pack_size],
             coder_info: encode_coder_info_bcj_lzma2(encode::lzma2_property_byte(
                 &self.options.compression,
             )?),
             coder_unpack_sizes: vec![unpack_size, unpack_size],
+            folder_crc: None,
             file_sizes,
-            file_crcs,
+            file_crcs: file_crcs.into_iter().map(Some).collect(),
         });
         self.current_folder += 1;
         Ok(())
@@ -976,11 +979,12 @@ impl From<StreamingCopyFolder> for model::CompletedFolder {
     fn from(folder: StreamingCopyFolder) -> Self {
         Self {
             file_indices: folder.file_indices,
-            pack_size: folder.pack_size,
+            pack_sizes: vec![folder.pack_size],
             coder_info: encode_coder_info_copy(),
             coder_unpack_sizes: vec![folder.pack_size],
+            folder_crc: None,
             file_sizes: folder.file_sizes,
-            file_crcs: folder.file_crcs,
+            file_crcs: folder.file_crcs.into_iter().map(Some).collect(),
         }
     }
 }
