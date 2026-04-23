@@ -471,19 +471,7 @@ fn list_archive(cli: &Cli) -> Result<(), CliError> {
 
 fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
     println!();
-    println!("Path = {}", archive_path.display());
-    println!("Type = {}", listing.archive_type);
-    if let Some(size) = listing.physical_size {
-        println!("Physical Size = {size}");
-    }
-    if let Some(size) = listing.headers_size {
-        println!("Headers Size = {size}");
-    }
-    if !listing.methods.is_empty() {
-        println!("Method = {}", listing.methods.join(" "));
-    }
-    println!("Solid = {}", if listing.solid { "+" } else { "-" });
-    println!("Blocks = {}", listing.blocks);
+    print_listing_header(listing, archive_path);
     println!();
     println!("   Date      Time    Attr         Size   Compressed  Name");
     println!("------------------- ----- ------------ ------------  ------------------------");
@@ -531,19 +519,7 @@ fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[Stri
 }
 
 fn print_technical_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
-    println!("Path = {}", archive_path.display());
-    println!("Type = {}", listing.archive_type);
-    if let Some(size) = listing.physical_size {
-        println!("Physical Size = {size}");
-    }
-    if let Some(size) = listing.headers_size {
-        println!("Headers Size = {size}");
-    }
-    if !listing.methods.is_empty() {
-        println!("Method = {}", listing.methods.join(" "));
-    }
-    println!("Solid = {}", if listing.solid { "+" } else { "-" });
-    println!("Blocks = {}", listing.blocks);
+    print_listing_header(listing, archive_path);
     println!();
     println!("----------");
     for entry in listing
@@ -573,6 +549,22 @@ fn print_technical_listing(listing: &ArchiveListing, archive_path: &Path, select
         );
         println!();
     }
+}
+
+fn print_listing_header(listing: &ArchiveListing, archive_path: &Path) {
+    println!("Path = {}", archive_path.display());
+    println!("Type = {}", listing.archive_type);
+    if let Some(size) = listing.physical_size {
+        println!("Physical Size = {size}");
+    }
+    if let Some(size) = listing.headers_size {
+        println!("Headers Size = {size}");
+    }
+    if !listing.methods.is_empty() {
+        println!("Method = {}", listing.methods.join(" "));
+    }
+    println!("Solid = {}", if listing.solid { "+" } else { "-" });
+    println!("Blocks = {}", listing.blocks);
 }
 
 fn size_text(size: Option<u64>) -> String {
