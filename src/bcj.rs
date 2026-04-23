@@ -9,6 +9,47 @@
 
 use std::io::{self, Read, Write};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BranchFilter {
+    Arm,
+    ArmThumb,
+    Ia64,
+    Ppc,
+    Sparc,
+}
+
+impl BranchFilter {
+    fn convert(self, data: &mut [u8], ip: u32, encoding: bool) -> usize {
+        match self {
+            Self::Arm => arm_convert(data, ip, encoding),
+            Self::ArmThumb => arm_thumb_convert(data, ip, encoding),
+            Self::Ia64 => ia64_convert(data, ip, encoding),
+            Self::Ppc => ppc_convert(data, ip, encoding),
+            Self::Sparc => sparc_convert(data, ip, encoding),
+        }
+    }
+}
+
+#[inline]
+fn get_u32_le(data: &[u8], pos: usize) -> u32 {
+    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+}
+
+#[inline]
+fn set_u32_le(data: &mut [u8], pos: usize, value: u32) {
+    data[pos..pos + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn get_u32_be(data: &[u8], pos: usize) -> u32 {
+    u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+}
+
+#[inline]
+fn set_u32_be(data: &mut [u8], pos: usize, value: u32) {
+    data[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
+}
+
 /// Test whether the most-significant byte of a 4-byte displacement indicates
 /// a near address (0x00 or 0xFF after biased addition).
 #[inline]
@@ -114,6 +155,16 @@ pub(crate) struct BcjX86Reader<R> {
     pending: Vec<u8>,
     pending_pos: usize,
     state: u32,
+    input_offset: u64,
+    eof: bool,
+}
+
+pub(crate) struct BranchReader<R> {
+    inner: R,
+    filter: BranchFilter,
+    tail: Vec<u8>,
+    pending: Vec<u8>,
+    pending_pos: usize,
     input_offset: u64,
     eof: bool,
 }
@@ -234,6 +285,73 @@ impl<R: Read> Read for BcjX86Reader<R> {
     }
 }
 
+impl<R: Read> BranchReader<R> {
+    pub(crate) fn new(inner: R, filter: BranchFilter) -> Self {
+        Self {
+            inner,
+            filter,
+            tail: Vec::with_capacity(16),
+            pending: Vec::new(),
+            pending_pos: 0,
+            input_offset: 0,
+            eof: false,
+        }
+    }
+
+    fn fill_pending(&mut self) -> io::Result<()> {
+        self.pending.clear();
+        self.pending_pos = 0;
+
+        while self.pending.is_empty() && !self.eof {
+            let mut chunk = [0u8; 8192];
+            let n = self.inner.read(&mut chunk)?;
+
+            if n == 0 {
+                self.eof = true;
+                self.pending.extend_from_slice(&self.tail);
+                self.tail.clear();
+                break;
+            }
+
+            let mut data = Vec::with_capacity(self.tail.len() + n);
+            data.extend_from_slice(&self.tail);
+            data.extend_from_slice(&chunk[..n]);
+
+            #[allow(clippy::cast_possible_truncation)]
+            let processed = self
+                .filter
+                .convert(&mut data, self.input_offset as u32, false);
+            self.pending.extend_from_slice(&data[..processed]);
+            self.tail.clear();
+            self.tail.extend_from_slice(&data[processed..]);
+            self.input_offset = self.input_offset.wrapping_add(processed as u64);
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for BranchReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        if self.pending_pos == self.pending.len() {
+            self.fill_pending()?;
+        }
+
+        let available = &self.pending[self.pending_pos..];
+        if available.is_empty() {
+            return Ok(0);
+        }
+
+        let n = available.len().min(out.len());
+        out[..n].copy_from_slice(&available[..n]);
+        self.pending_pos += n;
+        Ok(n)
+    }
+}
+
 /// Decode (post-decompress) x86 BCJ filter.
 ///
 /// Convenience wrapper around [`bcj_x86_convert`] with `encoding = false`.
@@ -252,10 +370,216 @@ pub fn bcj_x86_encode(data: &mut [u8]) {
     bcj_x86_convert(data, 0, &mut state, true);
 }
 
+fn arm_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
+    let size = data.len() & !3;
+    let ip = ip.wrapping_add(4);
+    let mut pos = 0usize;
+
+    while pos < size {
+        pos += 4;
+        if data[pos - 1] == 0xEB {
+            let start = pos - 4;
+            let mut value = get_u32_le(data, start) << 2;
+            let current = ip.wrapping_add(pos as u32);
+            if encoding {
+                value = value.wrapping_add(current);
+            } else {
+                value = value.wrapping_sub(current);
+            }
+            value >>= 2;
+            value &= 0x00FF_FFFF;
+            value |= 0xEB00_0000;
+            set_u32_le(data, start, value);
+        }
+    }
+
+    pos
+}
+
+fn arm_thumb_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
+    let size = data.len() & !1;
+    if size < 4 {
+        return 0;
+    }
+
+    let limit = size - 4;
+    let mut pos = 0usize;
+
+    loop {
+        let mut b1;
+        loop {
+            if pos > limit {
+                return pos;
+            }
+            b1 = u32::from(data[pos + 1]);
+            let b3 = u32::from(data[pos + 3]);
+            pos += 2;
+            b1 ^= 8;
+            if (b3 & b1) >= 0xF8 {
+                break;
+            }
+        }
+
+        let mut value = (b1 << 19)
+            + ((u32::from(data[pos + 1]) & 0x7) << 8)
+            + (u32::from(data[pos - 2]) << 11)
+            + u32::from(data[pos]);
+
+        pos += 2;
+        let current = ip.wrapping_add(pos as u32) >> 1;
+        if encoding {
+            value = value.wrapping_add(current);
+        } else {
+            value = value.wrapping_sub(current);
+        }
+
+        data[pos - 4] = (value >> 11) as u8;
+        data[pos - 3] = (0xF0 | ((value >> 19) & 0x7)) as u8;
+        data[pos - 2] = value as u8;
+        data[pos - 1] = (0xF8 | (value >> 8)) as u8;
+    }
+}
+
+fn ppc_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
+    let size = data.len() & !3;
+    let ip = ip.wrapping_sub(4);
+    let mut pos = 0usize;
+
+    while pos < size {
+        pos += 4;
+        if (data[pos - 4] & 0xFC) == 0x48 && (data[pos - 1] & 3) == 1 {
+            let start = pos - 4;
+            let mut value = get_u32_be(data, start);
+            let current = ip.wrapping_add(pos as u32);
+            if encoding {
+                value = value.wrapping_add(current);
+            } else {
+                value = value.wrapping_sub(current);
+            }
+            value &= 0x03FF_FFFF;
+            value |= 0x4800_0000;
+            set_u32_be(data, start, value);
+        }
+    }
+
+    pos
+}
+
+fn sparc_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
+    let size = data.len() & !3;
+    let ip = ip.wrapping_sub(4);
+    let mut pos = 0usize;
+
+    while pos < size {
+        pos += 4;
+        if (data[pos - 4] == 0x40 && (data[pos - 3] & 0xC0) == 0)
+            || (data[pos - 4] == 0x7F && data[pos - 3] >= 0xC0)
+        {
+            let start = pos - 4;
+            let mut value = get_u32_be(data, start) << 2;
+            let current = ip.wrapping_add(pos as u32);
+            if encoding {
+                value = value.wrapping_add(current);
+            } else {
+                value = value.wrapping_sub(current);
+            }
+            value &= 0x01FF_FFFF;
+            value = value.wrapping_sub(1 << 24);
+            value ^= 0xFF00_0000;
+            value >>= 2;
+            value |= 0x4000_0000;
+            set_u32_be(data, start, value);
+        }
+    }
+
+    pos
+}
+
+fn ia64_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
+    if data.len() < 16 {
+        return 0;
+    }
+
+    let limit = data.len() - 16;
+    let mut pos = 0usize;
+
+    loop {
+        let mut mask = (0x334B_0000u32 >> (data[pos] & 0x1E)) & 3;
+        if mask != 0 {
+            mask += 1;
+            while mask <= 4 {
+                let p = pos + mask as usize * 5 - 8;
+                if ((u32::from(data[p + 3]) >> mask) & 15) == 5
+                    && (((u32::from(data[p - 1]) | (u32::from(data[p]) << 8)) >> mask) & 0x70) == 0
+                {
+                    let mut raw = get_u32_le(data, p);
+                    let mut value = raw >> mask;
+                    value = (value & 0xFFFFF) | ((value & (1 << 23)) >> 3);
+                    value <<= 4;
+                    let current = ip.wrapping_add(pos as u32);
+                    if encoding {
+                        value = value.wrapping_add(current);
+                    } else {
+                        value = value.wrapping_sub(current);
+                    }
+                    value >>= 4;
+
+                    value &= 0x1F_FFFF;
+                    value = value.wrapping_add(0x70_0000);
+                    value &= 0x8F_FFFF;
+                    raw &= !(0x8F_FFFF << mask);
+                    raw |= value << mask;
+                    set_u32_le(data, p, raw);
+                }
+                mask += 1;
+            }
+        }
+
+        pos += 16;
+        if pos > limit {
+            return pos;
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::pedantic)]
 mod tests {
     use super::*;
+
+    fn branch_payload(filter: BranchFilter) -> Vec<u8> {
+        let mut data = vec![0u8; 256];
+        match filter {
+            BranchFilter::Arm => {
+                for pos in (0..data.len()).step_by(16) {
+                    data[pos] = pos as u8;
+                    data[pos + 3] = 0xEB;
+                }
+            }
+            BranchFilter::ArmThumb => {
+                for pos in (0..data.len() - 4).step_by(16) {
+                    data[pos..pos + 4].copy_from_slice(&[0x00, 0xF0, 0x00, 0xF8]);
+                }
+            }
+            BranchFilter::Ia64 => {
+                for pos in (0..data.len()).step_by(16) {
+                    data[pos] = 0x16;
+                    data[pos + 5] = 0x14;
+                }
+            }
+            BranchFilter::Ppc => {
+                for pos in (0..data.len()).step_by(16) {
+                    data[pos..pos + 4].copy_from_slice(&[0x48, 0x00, 0x00, 0x01]);
+                }
+            }
+            BranchFilter::Sparc => {
+                for pos in (0..data.len()).step_by(16) {
+                    data[pos..pos + 4].copy_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+                }
+            }
+        }
+        data
+    }
 
     #[test]
     fn test86_msb_check() {
@@ -454,6 +778,59 @@ mod tests {
             }
             let streamed = writer.finish().unwrap();
             assert_eq!(streamed, batch, "chunk_size={chunk_size}");
+        }
+    }
+
+    #[test]
+    fn branch_filters_encode_decode_roundtrip() {
+        for filter in [
+            BranchFilter::Arm,
+            BranchFilter::ArmThumb,
+            BranchFilter::Ia64,
+            BranchFilter::Ppc,
+            BranchFilter::Sparc,
+        ] {
+            let original = branch_payload(filter);
+            let mut data = original.clone();
+
+            let processed = filter.convert(&mut data, 0, true);
+            assert!(processed > 0, "filter {filter:?} processed no bytes");
+            assert_ne!(data, original, "filter {filter:?} did not encode payload");
+
+            filter.convert(&mut data, 0, false);
+            assert_eq!(data, original, "filter {filter:?} failed roundtrip");
+        }
+    }
+
+    #[test]
+    fn branch_reader_decodes_filtered_stream() {
+        for filter in [
+            BranchFilter::Arm,
+            BranchFilter::ArmThumb,
+            BranchFilter::Ia64,
+            BranchFilter::Ppc,
+            BranchFilter::Sparc,
+        ] {
+            let original = branch_payload(filter);
+            let mut encoded = original.clone();
+            filter.convert(&mut encoded, 0, true);
+
+            let cursor = std::io::Cursor::new(encoded);
+            let mut reader = BranchReader::new(cursor, filter);
+            let mut actual = Vec::new();
+            let mut buf = [0u8; 3];
+            loop {
+                let n = reader.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buf[..n]);
+            }
+
+            assert_eq!(
+                actual, original,
+                "filter {filter:?} failed streaming decode"
+            );
         }
     }
 }

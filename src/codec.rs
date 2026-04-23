@@ -41,6 +41,16 @@ pub const CODEC_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 pub const CODEC_LZMA2: &[u8] = &[0x21];
 /// Codec ID for the x86 BCJ (Branch/Call/Jump) filter.
 pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
+/// Codec ID for the ARM branch filter.
+pub const CODEC_BCJ_ARM: &[u8] = &[0x03, 0x03, 0x05, 0x01];
+/// Codec ID for the ARM Thumb branch filter.
+pub const CODEC_BCJ_ARM_THUMB: &[u8] = &[0x03, 0x03, 0x07, 0x01];
+/// Codec ID for the IA-64 branch filter.
+pub const CODEC_BCJ_IA64: &[u8] = &[0x03, 0x03, 0x04, 0x01];
+/// Codec ID for the PowerPC branch filter.
+pub const CODEC_BCJ_PPC: &[u8] = &[0x03, 0x03, 0x02, 0x05];
+/// Codec ID for the SPARC branch filter.
+pub const CODEC_BCJ_SPARC: &[u8] = &[0x03, 0x03, 0x08, 0x05];
 /// Codec ID for the no-op copy codec (uncompressed).
 pub const CODEC_COPY: &[u8] = &[0x00];
 /// Codec ID for AES-256-SHA-256 encryption (7zAES).
@@ -236,6 +246,41 @@ fn coder_reader<'a>(
 
     if *coder.codec_id == *CODEC_BCJ_X86 {
         return Ok(Box::new(crate::bcj::BcjX86Reader::new(input)));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_ARM {
+        return Ok(Box::new(crate::bcj::BranchReader::new(
+            input,
+            crate::bcj::BranchFilter::Arm,
+        )));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_ARM_THUMB {
+        return Ok(Box::new(crate::bcj::BranchReader::new(
+            input,
+            crate::bcj::BranchFilter::ArmThumb,
+        )));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_IA64 {
+        return Ok(Box::new(crate::bcj::BranchReader::new(
+            input,
+            crate::bcj::BranchFilter::Ia64,
+        )));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_PPC {
+        return Ok(Box::new(crate::bcj::BranchReader::new(
+            input,
+            crate::bcj::BranchFilter::Ppc,
+        )));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_SPARC {
+        return Ok(Box::new(crate::bcj::BranchReader::new(
+            input,
+            crate::bcj::BranchFilter::Sparc,
+        )));
     }
 
     if *coder.codec_id == *CODEC_DEFLATE {

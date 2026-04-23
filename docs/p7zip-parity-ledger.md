@@ -10,7 +10,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 
 - Parser: core 7z headers, encoded headers, stream info, files info,
   SFX/prepended-byte signature scan.
-- Decoder: Copy, LZMA, LZMA2, x86 BCJ filter, 7zAES in folder chains.
+- Decoder: Copy, LZMA, LZMA2, x86/ARM/ARMT/IA64/PPC/SPARC BCJ filters, 7zAES in folder chains.
 - Encoder: Copy, LZMA, LZMA2, BCJ+LZMA2, 7zAES content/header encryption.
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
@@ -36,8 +36,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 ## Gaps By Category
 
 - Parser: no known p7zip parity gaps in the currently tracked subset.
-- Decoder: BCJ2 multi-packed-stream graph, PPMd, ARM, ARMT, IA64, PPC,
-  SPARC.
+- Decoder: BCJ2 multi-packed-stream graph, PPMd.
 - Decoder extensions: ZSTD, Brotli, LZ4, LZ5, Lizard, LZHAM. `FLZMA2` is tracked
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
 - Encoder: all missing decoder methods above, plus exact p7zip method-chain

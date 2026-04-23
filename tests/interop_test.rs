@@ -107,6 +107,43 @@ fn executable_payload(size: usize) -> Vec<u8> {
     data
 }
 
+fn branch_filter_payload(method: &str) -> Vec<u8> {
+    let mut data = vec![0u8; 256];
+    match method {
+        "ARM" => {
+            for pos in (0..data.len()).step_by(16) {
+                data[pos] = pos as u8;
+                data[pos + 1] = (pos >> 8) as u8;
+                data[pos + 2] = 0;
+                data[pos + 3] = 0xEB;
+            }
+        }
+        "ARMT" => {
+            for pos in (0..data.len() - 4).step_by(16) {
+                data[pos..pos + 4].copy_from_slice(&[0x00, 0xF0, 0x00, 0xF8]);
+            }
+        }
+        "PPC" => {
+            for pos in (0..data.len()).step_by(16) {
+                data[pos..pos + 4].copy_from_slice(&[0x48, 0x00, 0x00, 0x01]);
+            }
+        }
+        "SPARC" => {
+            for pos in (0..data.len()).step_by(16) {
+                data[pos..pos + 4].copy_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+            }
+        }
+        "IA64" => {
+            for pos in (0..data.len()).step_by(16) {
+                data[pos] = 0x16;
+                data[pos + 5] = 0x14;
+            }
+        }
+        _ => unreachable!("unknown branch filter method"),
+    }
+    data
+}
+
 #[test]
 fn p7zip_read_interop_single_lzma() {
     let tmp = tempfile::tempdir().unwrap();
@@ -985,6 +1022,30 @@ fn p7zip_byte_swap_filters_extract_with_r7z() {
             dir,
             &archive_path,
             &["payload.txt"],
+            &[method_arg.as_str(), "-m1=LZMA2"],
+        );
+
+        let archive = r7z::Archive::open(&archive_path).unwrap();
+        let extracted = archive.extract_to_memory(0).unwrap();
+
+        assert_eq!(extracted, original, "mismatch for {method}");
+    }
+}
+
+#[test]
+fn p7zip_branch_filters_extract_with_r7z() {
+    for method in ["ARM", "ARMT", "PPC", "SPARC", "IA64"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let original = branch_filter_payload(method);
+        std::fs::write(dir.join("payload.bin"), &original).unwrap();
+
+        let archive_path = dir.join(format!("{method}.7z"));
+        let method_arg = format!("-m0={method}");
+        create_p7zip_archive(
+            dir,
+            &archive_path,
+            &["payload.bin"],
             &[method_arg.as_str(), "-m1=LZMA2"],
         );
 

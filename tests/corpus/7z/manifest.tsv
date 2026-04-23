@@ -11,6 +11,11 @@ tests/corpus/7z/generated/delta_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/swap2_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/swap4_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/bcj_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/arm_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/armt_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/ia64_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/ppc_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/sparc_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/aes_header.7z	CorpusSecret	extract	1
 tests/corpus/7z/generated/split.7z.001	-	extract	2
 tests/corpus/7z/generated/bzip2_nonsolid.7z	-	extract	1

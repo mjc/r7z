@@ -29,6 +29,45 @@ perl -e '
   open my $fh, ">:raw", $path or die "open $path: $!";
   print {$fh} $data;
 ' "$tmp/input/prog.bin"
+perl -e '
+  my ($dir) = @ARGV;
+  sub emit {
+    my ($name, $data) = @_;
+    open my $fh, ">:raw", "$dir/$name" or die "open $dir/$name: $!";
+    print {$fh} $data;
+  }
+
+  my $data = "\0" x 256;
+  for (my $pos = 0; $pos < length($data); $pos += 16) {
+    substr($data, $pos, 1) = pack("C", $pos & 0xFF);
+    substr($data, $pos + 3, 1) = "\xEB";
+  }
+  emit("arm.bin", $data);
+
+  $data = "\0" x 256;
+  for (my $pos = 0; $pos < length($data) - 4; $pos += 16) {
+    substr($data, $pos, 4) = "\x00\xF0\x00\xF8";
+  }
+  emit("armt.bin", $data);
+
+  $data = "\0" x 256;
+  for (my $pos = 0; $pos < length($data); $pos += 16) {
+    substr($data, $pos, 16) = "\x16\0\0\0\0\x14" . ("\0" x 10);
+  }
+  emit("ia64.bin", $data);
+
+  $data = "\0" x 256;
+  for (my $pos = 0; $pos < length($data); $pos += 16) {
+    substr($data, $pos, 4) = "\x48\x00\x00\x01";
+  }
+  emit("ppc.bin", $data);
+
+  $data = "\0" x 256;
+  for (my $pos = 0; $pos < length($data); $pos += 16) {
+    substr($data, $pos, 4) = "\x40\x00\x00\x00";
+  }
+  emit("sparc.bin", $data);
+' "$tmp/input"
 find "$tmp/input" -exec touch -t 202401020304.05 {} +
 
 run_7z() {
@@ -70,6 +109,26 @@ run_7z a "$out_dir/swap4_lzma2.7z" \
 run_7z a "$out_dir/bcj_lzma2.7z" \
   "$tmp/input/prog.bin" \
   -m0=BCJ -m1=LZMA2 -mmt=off
+
+run_7z a "$out_dir/arm_lzma2.7z" \
+  "$tmp/input/arm.bin" \
+  -m0=ARM -m1=LZMA2 -mmt=off
+
+run_7z a "$out_dir/armt_lzma2.7z" \
+  "$tmp/input/armt.bin" \
+  -m0=ARMT -m1=LZMA2 -mmt=off
+
+run_7z a "$out_dir/ia64_lzma2.7z" \
+  "$tmp/input/ia64.bin" \
+  -m0=IA64 -m1=LZMA2 -mmt=off
+
+run_7z a "$out_dir/ppc_lzma2.7z" \
+  "$tmp/input/ppc.bin" \
+  -m0=PPC -m1=LZMA2 -mmt=off
+
+run_7z a "$out_dir/sparc_lzma2.7z" \
+  "$tmp/input/sparc.bin" \
+  -m0=SPARC -m1=LZMA2 -mmt=off
 
 run_7z a "$out_dir/aes_header.7z" \
   "$tmp/input/alpha.txt" \
