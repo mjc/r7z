@@ -4,7 +4,7 @@ mod support;
 
 use std::{fs, process::Command};
 
-use support::{assert_extracted_files, create_p7zip_archive, extract_with_p7zip};
+use support::{assert_extracted_files, extract_with_p7zip, try_create_p7zip_archive};
 use tempfile::tempdir;
 
 #[test]
@@ -16,7 +16,15 @@ fn update_preserves_unsupported_method_archive_when_folder_is_unchanged() {
     fs::write(input.join("new.txt"), b"new").unwrap();
     let archive = tmp.path().join("zstd.7z");
 
-    create_p7zip_archive(&input, &archive, &["original.txt"], &["-m0=ZSTD"]);
+    let out = try_create_p7zip_archive(&input, &archive, &["original.txt"], &["-m0=ZSTD"]);
+    if !out.status.success() {
+        eprintln!(
+            "skipping ZSTD update audit; this p7zip does not support ZSTD\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
 
     let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
         .args([

@@ -93,16 +93,25 @@ pub fn assert_extracted_files(root: &Path, expected: &[(PathBuf, Vec<u8>)]) {
 }
 
 pub fn create_p7zip_archive(dir: &Path, archive_path: &Path, files: &[&str], args: &[&str]) {
-    let mut argv: Vec<&str> = vec!["a", archive_path.to_str().unwrap()];
-    argv.extend_from_slice(files);
-    argv.extend_from_slice(args);
-    let out = run_7z(&argv, dir);
+    let out = try_create_p7zip_archive(dir, archive_path, files, args);
     assert!(
         out.status.success(),
         "7z a failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+pub fn try_create_p7zip_archive(
+    dir: &Path,
+    archive_path: &Path,
+    files: &[&str],
+    args: &[&str],
+) -> std::process::Output {
+    let mut argv: Vec<&str> = vec!["a", archive_path.to_str().unwrap()];
+    argv.extend_from_slice(files);
+    argv.extend_from_slice(args);
+    run_7z(&argv, dir)
 }
 
 pub fn extract_with_p7zip(dir: &Path, archive_path: &Path, out_dir: &Path) {
