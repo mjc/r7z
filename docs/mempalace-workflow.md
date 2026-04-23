@@ -69,9 +69,17 @@ R7Z_SEARCH_KEYWORDS: <space-separated search terms>
 - After each substantial session:
   - write a diary entry with `mempalace_diary_write`
   - reconnect if search freshness looks stale
+- If the native MCP transport is closed, use the direct stdio
+  `mempalace-mcp` fallback for `mempalace_check_duplicate`,
+  `mempalace_add_drawer`, and `mempalace_diary_write`, then reconnect native
+  search when it becomes available again.
 
 ## Current Acceptance Snapshot
 
 - 2026-04-21: common 7z read parity was completed and committed in four implementation commits plus this memory-seed commit.
 - Acceptance commands that passed: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --doc`, and `git diff --check`.
 - Durable scope: current-codec read robustness for Copy, Deflate, Deflate64, BZip2, PPMd, Delta, Swap2/Swap4, LZMA, LZMA2, BCJ+x86/BCJ2/ARM/ARMT/IA64/PPC/SPARC, AES-256-SHA-256 content, and AES encrypted headers; write parity for Copy, LZMA, LZMA2, PPMd, BCJ+x86+LZMA2, and 7zAES content/header encryption. Symmetric write parity for extension codecs remains intentionally out of scope.
+- 2026-04-22: CLI listing parity now compares stable `l` and `l -slt`
+  bodies against p7zip, and extraction collision handling follows p7zip-like
+  default ask/refuse, `-y`, `-aoa`, and `-aos` behavior. Banner/version
+  impersonation and unsafe link materialization remain out of scope.

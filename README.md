@@ -11,7 +11,7 @@ r7z implements the 7z binary format spec in pure Rust using `nom` parser combina
 ## Features
 
 - **Read** Copy, LZMA, LZMA2, BCJ+x86, and AES-256-SHA-256 encrypted `.7z` archives
-- **Write** solid and multi-folder `.7z` archives with LZMA, LZMA2, or BCJ+x86+LZMA2 compression
+- **Write** solid and multi-folder `.7z` archives with LZMA, LZMA2, PPMd, or BCJ+x86+LZMA2 compression
 - **CRC32 validation** on both the signature start-header and header/data blocks
 - **p7zip / 7-Zip interoperability** — read p7zip archives, write archives p7zip can open
 - Supports **EncodedHeader** format (compressed metadata; most p7zip archives) and **uncompressed Header** format
@@ -425,8 +425,8 @@ These are public but primarily used for building advanced tooling:
 | AES-256-SHA-256 encrypted content | Read + Write |
 | AES encrypted headers (`-mhe=on`) | Read + Write with password |
 | PPMd | Read + Write |
-| Update existing archives | Not supported |
-| Read split volumes | Not supported |
+| Update existing archives | CLI rewrite for supported codecs |
+| Read split volumes | Supported for sequential `.7z.001` sets |
 | Hard-link preservation | Not supported |
 
 **7z specification:** [7zFormat.txt](https://github.com/google/omaha/blob/master/third_party/lzma/files/7zFormat.txt)
@@ -442,11 +442,24 @@ a planned hardening follow-up.
 Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
 LZMA2, PPMd, and BCJ+x86+LZMA2 archives. The parity target is matching archive
 listing/extraction behavior: file names, file contents, nested paths,
-directories, zero-byte files, and exposed metadata where r7z supports it.
+directories, zero-byte files, p7zip-style `l` / `l -slt` stable body fields,
+and exposed metadata where r7z supports it.
 r7z does not guarantee byte-identical archive output, matching compression ratios,
 or matching compressed stream bytes.
 
 LZHAM and Fast LZMA2 variants from p7zip-zstd are not supported.
+
+## CLI Compatibility
+
+`r7z l` and `r7z l -slt` render p7zip-like stable listing bodies starting at
+`Path = ...`. The banner, copyright, version line, and drive-scanning preamble
+are intentionally not cloned.
+
+Extraction uses p7zip-like collision handling. By default, interactive terminals
+prompt before replacing an existing output path. Non-interactive extraction skips
+colliding paths, prints warnings, continues extracting other entries, and exits
+with warning status `1`. Use `-y` or `-aoa` to overwrite existing files without
+prompting, or `-aos` to skip existing outputs without warning status.
 
 ## Development
 

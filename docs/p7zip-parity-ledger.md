@@ -14,14 +14,21 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - Encoder: Copy, LZMA, LZMA2, PPMd, BCJ+LZMA2, 7zAES content/header encryption.
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
-  `-aoa`, `-aos`, and no-op compatibility for `-y`, `-mmt`, `-bd`, and `-bb`.
+  `-aoa`, `-aos`, `-y`, and no-op compatibility for `-mmt`, `-bd`, and `-bb`.
 - CLI solid mode: `-ms=on`, `-ms=off`, file-count limits such as `-ms=1f`, and byte limits such as `-ms=8k`.
 - CLI method grammar: `-m0=METHOD:d=SIZE:fb=N:mt=N`, `-md=SIZE`, and
   `-mfb=N` for supported codecs; method-scoped `mt` is accepted as a no-op.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
-- CLI listing: `l` and `l -slt` report p7zip-like stable fields for paths,
-  sizes, entry kinds, and method names.
+- CLI listing: `l` and `l -slt` report p7zip-like stable body fields and
+  tables for archive metadata, paths, sizes, packed sizes, entry kinds, CRCs,
+  encryption markers, methods, solid state, and block numbers. p7zip banner,
+  version/copyright, and drive-scanning preamble text are intentionally not
+  cloned.
+- CLI overwrite policy: default extraction asks on interactive terminals and
+  refuses/skips colliding outputs in non-interactive mode with warning status
+  `1`; `-y` and `-aoa` overwrite without prompting; `-aos` skips existing
+  outputs without warning status.
 - CLI warnings: test/extract return warning status when explicit operands match
   no archive entries; create/update return warning status for missing literal
   disk inputs while unmatched disk wildcards are ignored.
@@ -41,8 +48,10 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
 - Encoder: extension codecs above, plus exact p7zip method-chain
   switch grammar beyond the currently supported dictionary/fast-bytes subset.
-- CLI: interactive overwrite prompts and byte-for-byte listing text are still
-  incomplete.
+- CLI: full p7zip banner/version/copyright/scanning preamble impersonation is
+  intentionally out of scope. PTY-level integration coverage for interactive
+  overwrite prompts is still narrower than p7zip's own console matrix, though
+  prompt parsing and policy are covered.
 - Metadata: p7zip-like unsafe link materialization is intentionally not default;
   add explicit API/CLI knobs before enabling it.
 - Update: current `a`/`u`/`d` rewrite archives atomically for supported codecs,
