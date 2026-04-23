@@ -1,6 +1,6 @@
 use crate::{
-    codec, find_next_property_id, EncodedHeader, FilesInfo, Header, Property, R7zError,
-    SignatureHeader, StreamInfo,
+    EncodedHeader, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo, codec,
+    find_next_property_id,
 };
 use bytes::Bytes;
 use memmap2::Mmap;

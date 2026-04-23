@@ -78,10 +78,10 @@ mod write;
 
 pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMode};
 pub use codec::{
-    decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ2,
-    CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_IA64, CODEC_BCJ_PPC, CODEC_BCJ_SPARC,
-    CODEC_BCJ_X86, CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE, CODEC_DEFLATE64, CODEC_DELTA,
-    CODEC_LZMA, CODEC_LZMA2, CODEC_SWAP2, CODEC_SWAP4,
+    CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_IA64, CODEC_BCJ_PPC,
+    CODEC_BCJ_SPARC, CODEC_BCJ_X86, CODEC_BCJ2, CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE,
+    CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2, CODEC_SWAP2, CODEC_SWAP4,
+    decompress_folder, decompress_folder_with_password,
 };
 pub use coder_info::CoderInfo;
 pub use error::R7zError;
@@ -89,17 +89,17 @@ pub use files_info::{EntryType, FilesInfo};
 pub use folder::Folder;
 pub use headers::{EncodedHeader, Header, SignatureHeader};
 pub use method::{
-    method_from_id, method_from_name, MethodKind, SevenZMethod, ALL_METHODS, P7ZIP_ORACLE_SHA,
+    ALL_METHODS, MethodKind, P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name,
 };
 pub use pack_info::{PackInfo, UnpackInfo};
 pub use parsers::*;
-pub use property::{find_next_property_id, Property};
+pub use property::{Property, find_next_property_id};
 pub use stream_info::{StreamInfo, SubstreamInfo};
 pub use write::{
-    build_streaming, build_streaming_to_writer, build_streaming_volumes,
-    build_streaming_with_options, ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter,
-    Codec, CompressionLevel, CompressionOptions, EncryptionOptions, EntryKind, EntryMeta,
-    HeaderMode, SolidMode, SpoolMode, StreamingOptions, VolumeOptions,
+    ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec, CompressionLevel,
+    CompressionOptions, EncryptionOptions, EntryKind, EntryMeta, HeaderMode, SolidMode, SpoolMode,
+    StreamingOptions, VolumeOptions, build_streaming, build_streaming_to_writer,
+    build_streaming_volumes, build_streaming_with_options,
 };
 
 // Re-export nom's IResult for convenience in integration tests

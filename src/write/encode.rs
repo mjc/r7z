@@ -1,13 +1,13 @@
 use super::header::{
-    build_encoded_header_descriptor, build_header, encode_coder_info_aes_then,
+    CoderSpec, build_encoded_header_descriptor, build_header, encode_coder_info_aes_then,
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
-    encode_coder_info_lzma2, CoderSpec,
+    encode_coder_info_lzma2,
 };
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
     EncryptionOptions, HeaderMode, SolidMode, WriteEntry,
 };
-use crate::{aes, bcj, codec, R7zError};
+use crate::{R7zError, aes, bcj, codec};
 use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};

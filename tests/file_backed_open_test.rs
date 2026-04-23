@@ -3,8 +3,8 @@ use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 struct CountingAlloc;

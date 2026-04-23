@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use nom::number::complete::le_u8;
 use nom::IResult;
+use nom::number::complete::le_u8;
 use smallvec::SmallVec;
 
 use crate::folder::scan_folder;
 use crate::parsers::{bitmap_is_set, scan_digests};
-use crate::{sevenzip_varuint64_decode, usize_cap, Folder, Property};
+use crate::{Folder, Property, sevenzip_varuint64_decode, usize_cap};
 
 /// Describes where the packed (compressed) data streams live in the archive file.
 #[derive(Debug, PartialEq)]
@@ -418,8 +418,8 @@ pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
 
 /// Parse CRC digests for `num_streams` streams using `AllAreDefined` + optional bitmap.
 fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[Option<u32>; 4]>> {
-    use nom::number::complete::le_u32;
     use nom::number::complete::le_u8;
+    use nom::number::complete::le_u32;
 
     let (input, all_defined) = le_u8(input)?;
 
@@ -450,7 +450,7 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_pack_info, scan_unpack_info, PackInfo};
+    use super::{PackInfo, scan_pack_info, scan_unpack_info};
 
     // ── scan_pack_info ──────────────────────────────────────────────
 

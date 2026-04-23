@@ -1,4 +1,4 @@
-use r7z::{method_from_id, method_from_name, SevenZMethod, P7ZIP_ORACLE_SHA};
+use r7z::{P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name};
 
 #[test]
 fn p7zip_oracle_sha_is_pinned() {

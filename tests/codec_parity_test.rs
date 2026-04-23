@@ -1,7 +1,7 @@
 mod support;
 
 use arrayvec::ArrayVec;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 use support::create_p7zip_archive;
 

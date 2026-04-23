@@ -1846,8 +1846,10 @@ fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
 
     archive.extract_all(&out).unwrap();
     assert_eq!(std::fs::read(out.join("link.txt")).unwrap(), b"target.txt");
-    assert!(!std::fs::symlink_metadata(out.join("link.txt"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        !std::fs::symlink_metadata(out.join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }

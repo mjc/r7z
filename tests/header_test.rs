@@ -1,5 +1,5 @@
 use nom::ToUsize;
-use r7z::{self, find_next_property_id, SignatureHeader};
+use r7z::{self, SignatureHeader, find_next_property_id};
 mod support;
 
 #[test]

@@ -4,7 +4,7 @@ mod encode;
 mod header;
 mod model;
 
-use crate::{bcj::BcjX86Writer, R7zError};
+use crate::{R7zError, bcj::BcjX86Writer};
 use header::{
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
     encode_coder_info_lzma2,

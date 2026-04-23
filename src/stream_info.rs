@@ -1,8 +1,8 @@
 use crate::pack_info::{scan_pack_info, scan_unpack_info};
 use crate::parsers::{bitmap_is_set, scan_digests};
-use crate::{sevenzip_varuint64_decode, PackInfo, Property, UnpackInfo};
+use crate::{PackInfo, Property, UnpackInfo, sevenzip_varuint64_decode};
 use bytes::Bytes;
-use nom::{number::complete::le_u8, IResult, ToUsize};
+use nom::{IResult, ToUsize, number::complete::le_u8};
 
 /// Per-file stream metadata within a solid (multi-file) folder.
 #[derive(Debug, PartialEq)]

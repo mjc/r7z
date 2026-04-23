@@ -27,7 +27,7 @@ r7z implements the 7z binary format spec in pure Rust using `nom` parser combina
 r7z = "0.1"
 ```
 
-**MSRV**: Rust 2021 edition (1.56+).
+**MSRV**: Rust 2024 edition (1.85+).
 
 ## Quick Start
 

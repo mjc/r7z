@@ -1,4 +1,4 @@
-use r7z::{decompress_folder, Archive, CODEC_BCJ_X86, CODEC_LZMA, CODEC_LZMA2};
+use r7z::{Archive, CODEC_BCJ_X86, CODEC_LZMA, CODEC_LZMA2, decompress_folder};
 
 mod support;
 

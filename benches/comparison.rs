@@ -1,7 +1,7 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use memmap2::Mmap;
 use std::fs::File;
 use std::hint::black_box;

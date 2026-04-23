@@ -1,6 +1,7 @@
 use r7z::{
-    method_from_id, method_from_name, Archive, ArchiveBuilder, ArchiveEntry, ArchiveOptions, Codec,
-    CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, R7zError, SevenZMethod, SolidMode,
+    Archive, ArchiveBuilder, ArchiveEntry, ArchiveOptions, Codec, CompressionLevel,
+    EncryptionOptions, EntryMeta, HeaderMode, R7zError, SevenZMethod, SolidMode, method_from_id,
+    method_from_name,
 };
 use std::{
     collections::BTreeSet,

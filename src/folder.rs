@@ -1,4 +1,4 @@
-use crate::{sevenzip_varuint64_decode, usize_cap, CoderInfo};
+use crate::{CoderInfo, sevenzip_varuint64_decode, usize_cap};
 use nom::IResult;
 use smallvec::SmallVec;
 

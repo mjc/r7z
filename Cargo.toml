@@ -1,7 +1,8 @@
 [package]
 name = "r7z"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 license = "LGPL-2.1-or-later"
 description = "Pure-Rust library for reading and writing .7z archives"
 

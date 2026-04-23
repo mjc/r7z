@@ -1,4 +1,4 @@
-use nom::{error::ErrorKind, IResult};
+use nom::{IResult, error::ErrorKind};
 use num::FromPrimitive;
 
 #[derive(PartialEq, Debug, FromPrimitive)]

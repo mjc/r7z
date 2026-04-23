@@ -1,6 +1,6 @@
 use crate::sevenzip_varuint64_decode;
 use arrayvec::ArrayVec;
-use nom::{bytes::complete::take, number::complete::le_u8, IResult};
+use nom::{IResult, bytes::complete::take, number::complete::le_u8};
 use smallvec::SmallVec;
 
 /// A single coder (codec) within a [`Folder`](crate::Folder).

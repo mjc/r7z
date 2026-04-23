@@ -238,7 +238,7 @@ impl Header {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_archive_properties, Header};
+    use super::{Header, scan_archive_properties};
     use bytes::Bytes;
 
     #[test]

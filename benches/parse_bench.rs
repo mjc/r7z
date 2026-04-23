@@ -1,6 +1,6 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::fs::File;
 use std::hint::black_box;
 use std::io::Write;

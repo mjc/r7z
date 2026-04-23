@@ -1,6 +1,6 @@
-use crate::{parsers::bitmap_is_set, sevenzip_varuint64_decode, Property};
+use crate::{Property, parsers::bitmap_is_set, sevenzip_varuint64_decode};
 use bytes::Bytes;
-use nom::{bytes::complete::take, IResult};
+use nom::{IResult, bytes::complete::take};
 
 /// File listing metadata from the 7z `FilesInfo` block.
 #[derive(Debug, PartialEq)]
@@ -459,7 +459,7 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_files_info, FilesInfo};
+    use super::{FilesInfo, scan_files_info};
     use bytes::Bytes;
 
     /// Minimal: 3 files, no sub-properties.

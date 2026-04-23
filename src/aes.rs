@@ -139,7 +139,7 @@ pub(crate) fn decrypt_aes256_cbc(
     key: &[u8; 32],
     iv: &[u8; 16],
 ) -> Result<Vec<u8>, R7zError> {
-    if !data.len().is_multiple_of(16) {
+    if data.len() % 16 != 0 {
         return Err(R7zError::Decompression);
     }
 

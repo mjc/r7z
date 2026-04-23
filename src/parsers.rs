@@ -1,4 +1,4 @@
-use nom::{bytes::complete::take, number::complete::le_u8, IResult};
+use nom::{IResult, bytes::complete::take, number::complete::le_u8};
 
 /// Saturate a `u64` count down to `usize`, capped at `max` so that
 /// `with_capacity` / `reserve_exact` never over-allocates more than the input
