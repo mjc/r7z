@@ -76,7 +76,10 @@ mod property;
 mod stream_info;
 mod write;
 
-pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMode};
+pub use archive::{
+    Archive, ArchiveListing, ArchiveListingEntry, ArchiveMetadata, ArchiveOpenOptions,
+    ArchiveStorageMode, ListingEntryKind,
+};
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_IA64, CODEC_BCJ_PPC,
     CODEC_BCJ_SPARC, CODEC_BCJ_X86, CODEC_BCJ2, CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE,

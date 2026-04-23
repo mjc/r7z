@@ -4,10 +4,12 @@ use crate::{
 };
 use bytes::Bytes;
 use memmap2::Mmap;
+use std::collections::BTreeSet;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Maximum decompressed size accepted for the compressed archive header (metadata only).
 /// A malicious archive could declare an enormous `unpack_size` to cause OOM during header
@@ -328,6 +330,41 @@ pub struct Archive {
     pub header: Header,
 }
 
+/// Archive-level and per-entry metadata used for p7zip-style listing output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveListing {
+    pub archive_type: &'static str,
+    pub physical_size: Option<u64>,
+    pub headers_size: Option<u64>,
+    pub methods: Vec<String>,
+    pub solid: bool,
+    pub blocks: usize,
+    pub entries: Vec<ArchiveListingEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveListingEntry {
+    pub index: usize,
+    pub path: String,
+    pub kind: ListingEntryKind,
+    pub size: Option<u64>,
+    pub packed_size: Option<u64>,
+    pub modified: Option<SystemTime>,
+    pub attributes: Option<u32>,
+    pub crc: Option<u32>,
+    pub encrypted: bool,
+    pub methods: Vec<String>,
+    pub block: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Anti,
+}
+
 impl Archive {
     /// Open and fully decode a 7z archive from disk.
     ///
@@ -622,6 +659,51 @@ impl Archive {
         self.header.streams_info()
     }
 
+    /// Build p7zip-style listing metadata without extracting file contents.
+    ///
+    /// `physical_size` should be the on-disk archive size when known. When it is
+    /// not supplied, r7z uses the logical source length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] when stream metadata is inconsistent.
+    pub fn listing(&self, physical_size: Option<u64>) -> Result<ArchiveListing, R7zError> {
+        let physical_size = physical_size.or_else(|| self.source.len().ok());
+        let streams = self.streams_info();
+        let pack_total = streams
+            .and_then(|streams| streams.pack_info.as_ref())
+            .map(|pack_info| {
+                pack_info.pack_size.iter().try_fold(0u64, |acc, &size| {
+                    acc.checked_add(size).ok_or(R7zError::Parse)
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let headers_size = physical_size.and_then(|size| size.checked_sub(pack_total));
+        let methods = archive_method_names(streams)?;
+        let blocks = streams
+            .and_then(|streams| streams.unpack_info.as_ref())
+            .map(|unpack_info| unpack_info.num_folders_usize())
+            .unwrap_or(0);
+        let solid = archive_is_solid(streams);
+
+        let mut first_entry_for_folder = vec![true; blocks];
+        let mut entries = Vec::with_capacity(self.num_files());
+        for index in 0..self.num_files() {
+            entries.push(self.listing_entry(index, &mut first_entry_for_folder)?);
+        }
+
+        Ok(ArchiveListing {
+            archive_type: "7z",
+            physical_size,
+            headers_size,
+            methods,
+            solid,
+            blocks,
+            entries,
+        })
+    }
+
     /// Extract a single file by its index in the `FilesInfo` list to memory.
     ///
     /// Returns zero bytes for zero-byte files and rejects directory/anti entries.
@@ -884,6 +966,133 @@ impl Archive {
         })
     }
 
+    fn listing_entry(
+        &self,
+        file_index: usize,
+        first_entry_for_folder: &mut [bool],
+    ) -> Result<ArchiveListingEntry, R7zError> {
+        let fi = self.header.files_info();
+        let path = fi
+            .and_then(|files| files.name(file_index))
+            .unwrap_or_else(|| format!("unknown-{file_index}"));
+        let Some(files) = fi else {
+            return Ok(ArchiveListingEntry {
+                index: file_index,
+                path,
+                kind: ListingEntryKind::File,
+                size: None,
+                packed_size: None,
+                modified: None,
+                attributes: None,
+                crc: None,
+                encrypted: false,
+                methods: archive_method_names(self.streams_info())?,
+                block: None,
+            });
+        };
+
+        let kind = if files.is_anti(file_index) {
+            ListingEntryKind::Anti
+        } else if files.is_directory(file_index) {
+            ListingEntryKind::Directory
+        } else if files.is_symlink(file_index) {
+            ListingEntryKind::Symlink
+        } else {
+            ListingEntryKind::File
+        };
+
+        let modified = files
+            .mtimes
+            .get(file_index)
+            .copied()
+            .flatten()
+            .and_then(filetime_to_system_time);
+        let attributes = files.attributes.get(file_index).copied().flatten();
+
+        if matches!(kind, ListingEntryKind::Directory | ListingEntryKind::Anti)
+            || files.is_empty_file(file_index)
+        {
+            return Ok(ArchiveListingEntry {
+                index: file_index,
+                path,
+                kind,
+                size: if matches!(kind, ListingEntryKind::Anti) {
+                    None
+                } else {
+                    Some(0)
+                },
+                packed_size: None,
+                modified,
+                attributes,
+                crc: files.is_empty_file(file_index).then_some(0),
+                encrypted: false,
+                methods: Vec::new(),
+                block: None,
+            });
+        }
+
+        let Some((folder_idx, stream_in_folder)) = self.folder_stream_for_file(file_index)? else {
+            return Err(R7zError::Parse);
+        };
+        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
+        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        let substream_info = streams.substream_info.as_ref();
+        let folder = unpack_info.parse_folder(folder_idx)?;
+        let methods = folder_method_names(&folder);
+        let encrypted = folder_is_encrypted(&folder);
+        let size = Some(
+            u64::try_from(stream_size_at(
+                folder_idx,
+                stream_in_folder,
+                substream_info,
+                unpack_info,
+            )?)
+            .map_err(|_| R7zError::Parse)?,
+        );
+        let is_first_in_folder = first_entry_for_folder
+            .get_mut(folder_idx)
+            .ok_or(R7zError::Parse)?;
+        let packed_size = if *is_first_in_folder {
+            *is_first_in_folder = false;
+            Some(folder_packed_size(folder_idx, pack_info, unpack_info)?)
+        } else {
+            None
+        };
+        let crc = stream_crc(folder_idx, stream_in_folder, unpack_info, substream_info);
+
+        Ok(ArchiveListingEntry {
+            index: file_index,
+            path,
+            kind,
+            size,
+            packed_size,
+            modified,
+            attributes,
+            crc,
+            encrypted,
+            methods,
+            block: Some(folder_idx),
+        })
+    }
+
+    fn folder_stream_for_file(
+        &self,
+        file_index: usize,
+    ) -> Result<Option<(usize, usize)>, R7zError> {
+        let fi = self.header.files_info();
+        let Some(data_stream_idx) = file_to_data_stream(file_index, fi) else {
+            return Ok(None);
+        };
+        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        Ok(data_stream_to_folder(
+            data_stream_idx,
+            streams.substream_info.as_ref(),
+            usize::try_from(unpack_info.num_folders).map_err(|_| R7zError::Parse)?,
+        ))
+    }
+
     /// Extract all files to a directory.
     ///
     /// # Errors
@@ -964,6 +1173,97 @@ impl ExtractionLocation {
             .ok_or(R7zError::Parse)?;
         u64::try_from(end).map_err(|_| R7zError::Parse)
     }
+}
+
+fn archive_method_names(streams: Option<&StreamInfo>) -> Result<Vec<String>, R7zError> {
+    let mut names = BTreeSet::new();
+    if let Some(streams) = streams {
+        if let Some(unpack) = &streams.unpack_info {
+            for idx in 0..unpack.num_folders_usize() {
+                let folder = unpack.parse_folder(idx)?;
+                names.extend(folder_method_names(&folder));
+            }
+        }
+    }
+    if names.is_empty() {
+        Ok(vec!["Copy".to_string()])
+    } else {
+        Ok(names.into_iter().collect())
+    }
+}
+
+fn folder_method_names(folder: &crate::Folder) -> Vec<String> {
+    folder
+        .coders
+        .iter()
+        .map(|coder| {
+            crate::method_from_id(&coder.codec_id).map_or_else(
+                || format!("{:02X?}", coder.codec_id),
+                |method| method.name().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn archive_is_solid(streams: Option<&StreamInfo>) -> bool {
+    streams
+        .and_then(|streams| streams.substream_info.as_ref())
+        .is_some_and(|substreams| {
+            substreams
+                .num_unpack_streams_per_folder
+                .iter()
+                .any(|&streams| streams > 1)
+        })
+}
+
+fn folder_is_encrypted(folder: &crate::Folder) -> bool {
+    folder
+        .coders
+        .iter()
+        .any(|coder| coder.codec_id.as_slice() == codec::CODEC_AES_256_SHA_256)
+}
+
+fn folder_packed_size(
+    folder_idx: usize,
+    pack_info: &crate::PackInfo,
+    unpack_info: &crate::UnpackInfo,
+) -> Result<u64, R7zError> {
+    let folder = unpack_info.parse_folder(folder_idx)?;
+    let pack_stream_base = folder_pack_stream_base(folder_idx, unpack_info)?;
+    let num_pack_streams = folder_num_pack_streams(&folder)?;
+    pack_info
+        .pack_size
+        .get(pack_stream_base..pack_stream_base + num_pack_streams)
+        .ok_or(R7zError::Parse)?
+        .iter()
+        .try_fold(0u64, |acc, &size| {
+            acc.checked_add(size).ok_or(R7zError::Parse)
+        })
+}
+
+fn stream_crc(
+    folder_idx: usize,
+    stream_in_folder: usize,
+    unpack_info: &crate::UnpackInfo,
+    substream_info: Option<&crate::SubstreamInfo>,
+) -> Option<u32> {
+    if let Some(substreams) = substream_info {
+        if let Ok(crc_idx) = substream_global_index(folder_idx, stream_in_folder, substreams) {
+            return substreams.digests.get(crc_idx).copied().flatten();
+        }
+        return None;
+    }
+    unpack_info.digests.get(folder_idx).copied().flatten()
+}
+
+fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
+    const WINDOWS_TO_UNIX_SECS: u64 = 11_644_473_600;
+    let secs = filetime / 10_000_000;
+    let nanos = (filetime % 10_000_000) * 100;
+    if secs < WINDOWS_TO_UNIX_SECS {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, nanos as u32))
 }
 
 fn checked_add_usize(lhs: usize, rhs: usize) -> Result<usize, R7zError> {
