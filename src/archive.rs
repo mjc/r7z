@@ -1,12 +1,12 @@
 use crate::{
-    EncodedHeader, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo, codec,
-    find_next_property_id,
+    EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
+    codec, find_next_property_id,
 };
 use bytes::Bytes;
 use memmap2::Mmap;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -364,6 +364,65 @@ pub enum ListingEntryKind {
     Anti,
 }
 
+/// High-level metadata for one archive entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveEntryInfo {
+    /// Zero-based index in the 7z `FilesInfo` table.
+    pub index: usize,
+    /// Raw archive entry name as stored in the header.
+    pub name: String,
+    /// Normalized relative path when the entry name is safe to extract.
+    pub safe_name: Option<PathBuf>,
+    /// Entry kind derived from 7z empty-stream, anti-item, and mode metadata.
+    pub entry_type: EntryType,
+}
+
+impl ArchiveEntryInfo {
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        matches!(
+            self.entry_type,
+            EntryType::File | EntryType::EmptyFile | EntryType::Symlink
+        )
+    }
+
+    #[must_use]
+    pub fn has_data_stream(&self) -> bool {
+        matches!(self.entry_type, EntryType::File | EntryType::Symlink)
+    }
+
+    #[must_use]
+    pub fn is_directory(&self) -> bool {
+        self.entry_type == EntryType::Directory
+    }
+
+    #[must_use]
+    pub fn is_anti(&self) -> bool {
+        self.entry_type == EntryType::Anti
+    }
+
+    #[must_use]
+    pub fn safe_path(&self) -> Option<&Path> {
+        self.safe_name.as_deref()
+    }
+}
+
+/// Iterator returned by [`Archive::entries`].
+pub struct ArchiveEntries<'a> {
+    archive: &'a Archive,
+    next: usize,
+}
+
+impl Iterator for ArchiveEntries<'_> {
+    type Item = ArchiveEntryInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.archive.entry(self.next)?;
+        self.next += 1;
+        Some(entry)
+    }
+}
+
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawFolderBlock {
@@ -664,6 +723,43 @@ impl Archive {
         self.header.files_info()
     }
 
+    /// Return high-level metadata for entry `index`.
+    #[must_use]
+    pub fn entry(&self, index: usize) -> Option<ArchiveEntryInfo> {
+        if index >= self.num_files() {
+            return None;
+        }
+        Some(self.entry_info(index))
+    }
+
+    /// Iterate high-level entry metadata in archive order.
+    #[must_use]
+    pub fn entries(&self) -> ArchiveEntries<'_> {
+        ArchiveEntries {
+            archive: self,
+            next: 0,
+        }
+    }
+
+    /// Return the normalized safe relative path for entry `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] when `index` is out of range and
+    /// [`R7zError::UnsafePath`] when the stored name is absolute, contains parent
+    /// traversal, uses a Windows drive/UNC prefix, or normalizes to an empty path.
+    pub fn safe_name(&self, index: usize) -> Result<PathBuf, R7zError> {
+        let entry = self.entry(index).ok_or(R7zError::Parse)?;
+        safe_archive_name(&entry.name)
+    }
+
+    /// Return the normalized safe relative path for entry `index`, or `None` if
+    /// the name is unsafe or the index is out of range.
+    #[must_use]
+    pub fn enclosed_name(&self, index: usize) -> Option<PathBuf> {
+        self.safe_name(index).ok()
+    }
+
     #[must_use]
     pub fn streams_info(&self) -> Option<&StreamInfo> {
         self.header.streams_info()
@@ -790,6 +886,37 @@ impl Archive {
         Ok(bytes)
     }
 
+    /// Extract a file selected by entry name to memory.
+    ///
+    /// Exact header-name matches are preferred. If no exact match exists and
+    /// `name` is a safe archive path, r7z also matches against normalized safe
+    /// entry names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::EntryNotFound`] if no entry matches `name`; otherwise
+    /// returns the same errors as [`extract_to_memory`](Self::extract_to_memory).
+    pub fn extract_to_memory_by_name(&self, name: &str) -> Result<Vec<u8>, R7zError> {
+        self.extract_to_memory_by_name_with_password(name, None)
+    }
+
+    /// Extract a file selected by entry name to memory, supplying a password for
+    /// encrypted archives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::EntryNotFound`] if no entry matches `name`; otherwise
+    /// returns the same errors as
+    /// [`extract_to_memory_with_password`](Self::extract_to_memory_with_password).
+    pub fn extract_to_memory_by_name_with_password(
+        &self,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<Vec<u8>, R7zError> {
+        let index = self.entry_index_by_name(name)?;
+        self.extract_to_memory_with_password(index, password)
+    }
+
     /// Extract a single file by index into a writer.
     ///
     /// This streams the decoded folder into `writer` instead of materializing
@@ -807,6 +934,42 @@ impl Archive {
         writer: &mut W,
     ) -> Result<u64, R7zError> {
         self.extract_to_writer_with_password(file_index, writer, None)
+    }
+
+    /// Extract a file selected by entry name into a writer.
+    ///
+    /// Exact header-name matches are preferred. If no exact match exists and
+    /// `name` is a safe archive path, r7z also matches against normalized safe
+    /// entry names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::EntryNotFound`] if no entry matches `name`; otherwise
+    /// returns the same errors as [`extract_to_writer`](Self::extract_to_writer).
+    pub fn extract_by_name<W: Write + ?Sized>(
+        &self,
+        name: &str,
+        writer: &mut W,
+    ) -> Result<u64, R7zError> {
+        self.extract_by_name_with_password(name, writer, None)
+    }
+
+    /// Extract a file selected by entry name into a writer, supplying a password
+    /// for encrypted archives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::EntryNotFound`] if no entry matches `name`; otherwise
+    /// returns the same errors as
+    /// [`extract_to_writer_with_password`](Self::extract_to_writer_with_password).
+    pub fn extract_by_name_with_password<W: Write + ?Sized>(
+        &self,
+        name: &str,
+        writer: &mut W,
+        password: Option<&str>,
+    ) -> Result<u64, R7zError> {
+        let index = self.entry_index_by_name(name)?;
+        self.extract_to_writer_with_password(index, writer, password)
     }
 
     /// Extract a single file by index into a writer, supplying a password for
@@ -934,6 +1097,79 @@ impl Archive {
         Ok(written)
     }
 
+    /// Stream every file-like entry through `callback`, decoding each solid
+    /// folder at most once.
+    ///
+    /// Directory and anti entries are skipped. Regular files, symlink entries,
+    /// and zero-byte files are passed to the callback with a reader limited to
+    /// that entry's contents. If the callback does not fully consume the reader,
+    /// r7z drains the rest of the entry so CRC checks and later entries in the
+    /// same folder remain valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns archive parse, codec, password, CRC, and callback errors.
+    pub fn stream_files<F>(&self, callback: F) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        self.stream_files_with_password(None, callback)
+    }
+
+    /// Stream every file-like entry through `callback`, supplying a password for
+    /// encrypted archives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::PasswordRequired`] if encrypted with no password,
+    /// [`R7zError::Crc`] for digest mismatches, [`R7zError::Decompression`] for
+    /// codec failures, or any error returned by the callback.
+    pub fn stream_files_with_password<F>(
+        &self,
+        password: Option<&str>,
+        mut callback: F,
+    ) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        let mut folder_state = None;
+
+        for index in 0..self.num_files() {
+            let entry = self.entry_info(index);
+            if entry.is_directory() || entry.is_anti() {
+                continue;
+            }
+            if !entry.has_data_stream() {
+                let mut empty = std::io::empty();
+                callback(&entry, &mut empty)?;
+                continue;
+            }
+
+            let (folder_idx, stream_in_folder) =
+                self.folder_stream_for_file(index)?.ok_or(R7zError::Parse)?;
+
+            let needs_new_folder = folder_state
+                .as_ref()
+                .is_none_or(|state: &FolderStreamReader<'_>| state.folder_idx != folder_idx);
+            if needs_new_folder {
+                if let Some(mut state) = folder_state.take() {
+                    state.finish()?;
+                }
+                folder_state = Some(self.open_folder_stream(folder_idx, password)?);
+            }
+
+            let state = folder_state.as_mut().ok_or(R7zError::Parse)?;
+            state.skip_to_stream(stream_in_folder)?;
+            state.read_current_stream(Some(&entry), &mut callback)?;
+        }
+
+        if let Some(mut state) = folder_state {
+            state.finish()?;
+        }
+
+        Ok(())
+    }
+
     pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
         let Some(fi) = self.files_info() else {
             return Ok(None);
@@ -1017,6 +1253,108 @@ impl Archive {
             stream_size,
             folder_digest,
             substream_digest,
+        })
+    }
+
+    fn open_folder_stream(
+        &self,
+        folder_idx: usize,
+        password: Option<&str>,
+    ) -> Result<FolderStreamReader<'_>, R7zError> {
+        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
+        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        let substream_info = streams.substream_info.as_ref();
+        let folder = unpack_info.parse_folder(folder_idx)?;
+        let pack_stream_base = folder_pack_stream_base(folder_idx, unpack_info)?;
+        let num_pack_streams = folder_num_pack_streams(&folder)?;
+        let prior_pack_sizes = pack_info
+            .pack_size
+            .get(..pack_stream_base)
+            .ok_or(R7zError::Parse)?;
+        let mut pack_offset_u64 = prior_pack_sizes.iter().try_fold(0u64, |acc, &size| {
+            acc.checked_add(size).ok_or(R7zError::Parse)
+        })?;
+        let data_start =
+            checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
+        let pack_sizes = pack_info
+            .pack_size
+            .get(pack_stream_base..pack_stream_base + num_pack_streams)
+            .ok_or(R7zError::Parse)?;
+        let mut packed_ranges = Vec::with_capacity(num_pack_streams);
+        for &pack_size in pack_sizes {
+            let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
+            packed_ranges.push(checked_range_u64(
+                self.source.len()?,
+                stream_start,
+                pack_size,
+            )?);
+            pack_offset_u64 = checked_add_u64(pack_offset_u64, pack_size)?;
+        }
+
+        let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
+        let coder_unpack_sizes = folder_coder_unpack_sizes(folder_idx, unpack_info)?;
+        let reader: Box<dyn Read> = if packed_ranges.len() == 1 {
+            let packed = self.source.range_reader(packed_ranges[0].clone())?;
+            codec::folder_reader_with_sizes_from_reader(
+                &folder,
+                Box::new(packed),
+                folder_unpack_size,
+                &coder_unpack_sizes,
+                password,
+            )?
+        } else {
+            let mut packed_streams = Vec::with_capacity(packed_ranges.len());
+            for range in &packed_ranges {
+                packed_streams.push(self.source.read_range_to_vec(range.clone(), u64::MAX)?);
+            }
+            codec::folder_reader_with_pack_streams(
+                &folder,
+                packed_streams,
+                folder_unpack_size,
+                &coder_unpack_sizes,
+                password,
+            )?
+        };
+        let n_streams = usize::try_from(
+            substream_info
+                .and_then(|s| s.num_unpack_streams_per_folder.get(folder_idx))
+                .copied()
+                .unwrap_or(1),
+        )
+        .map_err(|_| R7zError::Parse)?;
+        let mut stream_sizes = Vec::with_capacity(n_streams);
+        let mut stream_digests = Vec::with_capacity(n_streams);
+        for stream_idx in 0..n_streams {
+            stream_sizes.push(stream_size_at(
+                folder_idx,
+                stream_idx,
+                substream_info,
+                unpack_info,
+            )?);
+            stream_digests.push(stream_crc(
+                folder_idx,
+                stream_idx,
+                unpack_info,
+                substream_info,
+            ));
+        }
+
+        Ok(FolderStreamReader {
+            folder_idx,
+            reader,
+            stream_sizes,
+            stream_digests,
+            current_stream: 0,
+            folder_hasher: unpack_info
+                .digests
+                .get(folder_idx)
+                .copied()
+                .flatten()
+                .map(|_| crc32fast::Hasher::new()),
+            folder_digest: unpack_info.digests.get(folder_idx).copied().flatten(),
+            decoded_len: 0,
+            folder_unpack_size,
         })
     }
 
@@ -1130,6 +1468,41 @@ impl Archive {
         })
     }
 
+    fn entry_info(&self, file_index: usize) -> ArchiveEntryInfo {
+        let fi = self.header.files_info();
+        let name = fi
+            .and_then(|files| files.name(file_index))
+            .unwrap_or_else(|| format!("unknown-{file_index}"));
+        let entry_type = fi
+            .map(|files| files.entry_type(file_index))
+            .unwrap_or(EntryType::File);
+        let safe_name = safe_archive_name(&name).ok();
+        ArchiveEntryInfo {
+            index: file_index,
+            name,
+            safe_name,
+            entry_type,
+        }
+    }
+
+    fn entry_index_by_name(&self, name: &str) -> Result<usize, R7zError> {
+        if let Some(entry) = self.entries().find(|entry| entry.name == name) {
+            return Ok(entry.index);
+        }
+
+        let requested_safe_name = safe_archive_name(name).ok();
+        if let Some(requested_safe_name) = requested_safe_name {
+            if let Some(entry) = self
+                .entries()
+                .find(|entry| entry.safe_name.as_deref() == Some(requested_safe_name.as_path()))
+            {
+                return Ok(entry.index);
+            }
+        }
+
+        Err(R7zError::EntryNotFound(name.to_string()))
+    }
+
     fn folder_stream_for_file(
         &self,
         file_index: usize,
@@ -1177,9 +1550,7 @@ impl Archive {
             let name_owned = fi.and_then(|f| f.name(i));
             let name = name_owned.as_deref().unwrap_or("unknown");
 
-            let Some(dest_path) = safe_archive_path(dest, name)? else {
-                continue;
-            };
+            let dest_path = dest.join(safe_archive_name(name)?);
 
             if fi.is_some_and(|f| f.is_anti(i)) {
                 continue;
@@ -1227,6 +1598,145 @@ impl ExtractionLocation {
             .ok_or(R7zError::Parse)?;
         u64::try_from(end).map_err(|_| R7zError::Parse)
     }
+}
+
+struct FolderStreamReader<'a> {
+    folder_idx: usize,
+    reader: Box<dyn Read + 'a>,
+    stream_sizes: Vec<usize>,
+    stream_digests: Vec<Option<u32>>,
+    current_stream: usize,
+    folder_hasher: Option<crc32fast::Hasher>,
+    folder_digest: Option<u32>,
+    decoded_len: u64,
+    folder_unpack_size: u64,
+}
+
+impl FolderStreamReader<'_> {
+    fn skip_to_stream(&mut self, stream_idx: usize) -> Result<(), R7zError> {
+        if stream_idx < self.current_stream {
+            return Err(R7zError::Parse);
+        }
+        let mut callback = empty_stream_callback;
+        while self.current_stream < stream_idx {
+            self.read_current_stream(None, &mut callback)?;
+        }
+        Ok(())
+    }
+
+    fn read_current_stream<F>(
+        &mut self,
+        entry: Option<&ArchiveEntryInfo>,
+        callback: &mut F,
+    ) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        let size = *self
+            .stream_sizes
+            .get(self.current_stream)
+            .ok_or(R7zError::Parse)?;
+        let expected_stream_digest = self
+            .stream_digests
+            .get(self.current_stream)
+            .copied()
+            .ok_or(R7zError::Parse)?;
+        let mut content = EntryContentReader {
+            reader: &mut *self.reader,
+            remaining: u64::try_from(size).map_err(|_| R7zError::Parse)?,
+            folder_hasher: self.folder_hasher.as_mut(),
+            stream_hasher: expected_stream_digest.map(|_| crc32fast::Hasher::new()),
+            decoded_len: &mut self.decoded_len,
+        };
+
+        if let Some(entry) = entry {
+            callback(entry, &mut content)?;
+        }
+        content.drain_remaining()?;
+        let actual_stream_digest = content.stream_hasher.map(crc32fast::Hasher::finalize);
+        if let Some(expected) = expected_stream_digest {
+            if actual_stream_digest.ok_or(R7zError::Parse)? != expected {
+                return Err(R7zError::Crc);
+            }
+        }
+
+        self.current_stream = self.current_stream.checked_add(1).ok_or(R7zError::Parse)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), R7zError> {
+        let mut callback = empty_stream_callback;
+        while self.current_stream < self.stream_sizes.len() {
+            self.read_current_stream(None, &mut callback)?;
+        }
+
+        if self.decoded_len < self.folder_unpack_size {
+            return Err(R7zError::Decompression);
+        }
+        if let Some(expected) = self.folder_digest {
+            let actual = self.folder_hasher.take().ok_or(R7zError::Parse)?.finalize();
+            if actual != expected {
+                return Err(R7zError::Crc);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct EntryContentReader<'a> {
+    reader: &'a mut dyn Read,
+    remaining: u64,
+    folder_hasher: Option<&'a mut crc32fast::Hasher>,
+    stream_hasher: Option<crc32fast::Hasher>,
+    decoded_len: &'a mut u64,
+}
+
+impl EntryContentReader<'_> {
+    fn drain_remaining(&mut self) -> Result<(), R7zError> {
+        let mut buf = [0u8; 8192];
+        while self.remaining > 0 {
+            let n = self.read(&mut buf).map_err(|_| R7zError::Decompression)?;
+            if n == 0 {
+                return Err(R7zError::Decompression);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Read for EntryContentReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let n = usize::try_from(self.remaining.min(buf.len() as u64))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "entry too large"))?;
+        let n = self.reader.read(&mut buf[..n])?;
+        if n == 0 {
+            return Ok(0);
+        }
+
+        let n_u64 = n as u64;
+        self.remaining -= n_u64;
+        *self.decoded_len = self.decoded_len.checked_add(n_u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "entry too large")
+        })?;
+        if let Some(hasher) = self.folder_hasher.as_deref_mut() {
+            hasher.update(&buf[..n]);
+        }
+        if let Some(hasher) = self.stream_hasher.as_mut() {
+            hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+fn empty_stream_callback(
+    _entry: &ArchiveEntryInfo,
+    _reader: &mut dyn Read,
+) -> Result<(), R7zError> {
+    Ok(())
 }
 
 fn archive_method_names(streams: Option<&StreamInfo>) -> Result<Vec<String>, R7zError> {
@@ -1513,27 +2023,41 @@ fn folder_num_pack_streams(folder: &crate::Folder) -> Result<usize, R7zError> {
     usize::try_from(num_packed).map_err(|_| R7zError::Parse)
 }
 
-fn safe_archive_path(dest: &Path, name: &str) -> Result<Option<PathBuf>, R7zError> {
-    if name.is_empty() || has_windows_prefix(name) || has_parent_component(name) {
+/// Normalize an archive entry name into a safe relative path.
+///
+/// Both `/` and `\` are treated as archive separators. Empty path components
+/// and `.` are removed; absolute paths, parent traversal, Windows drive/UNC
+/// prefixes, and names that normalize to an empty path are rejected.
+///
+/// # Errors
+///
+/// Returns [`R7zError::UnsafePath`] when `name` cannot be safely joined under
+/// an extraction directory.
+pub fn safe_archive_name(name: &str) -> Result<PathBuf, R7zError> {
+    if name.is_empty()
+        || name.contains('\0')
+        || name.starts_with(['/', '\\'])
+        || has_windows_prefix(name)
+        || has_parent_component(name)
+    {
         return Err(R7zError::UnsafePath(name.to_string()));
     }
 
-    let relative = Path::new(name);
-    let mut saw_normal = false;
-    for component in relative.components() {
-        match component {
-            Component::Normal(_) => saw_normal = true,
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+    let mut normalized = PathBuf::new();
+    for part in name.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
                 return Err(R7zError::UnsafePath(name.to_string()));
             }
+            part => normalized.push(part),
         }
     }
 
-    if saw_normal {
-        Ok(Some(dest.join(relative)))
-    } else {
+    if normalized.as_os_str().is_empty() {
         Err(R7zError::UnsafePath(name.to_string()))
+    } else {
+        Ok(normalized)
     }
 }
 

@@ -1,5 +1,7 @@
 #![allow(clippy::pedantic)]
 
+use std::path::PathBuf;
+
 fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
     let mut header = Vec::new();
     header.push(0x01); // Header
@@ -98,6 +100,84 @@ fn extract_all_rejects_windows_prefixed_path() {
     let out = tempfile::tempdir().unwrap();
     let err = archive.extract_all(out.path()).unwrap_err();
     assert!(matches!(err, r7z::R7zError::UnsafePath(path) if path == "C:\\evil.txt"));
+}
+
+#[test]
+fn safe_archive_name_normalizes_separators_and_rejects_unsafe_names() {
+    assert_eq!(
+        r7z::safe_archive_name("dir\\.\\nested//file.txt").unwrap(),
+        PathBuf::from("dir").join("nested").join("file.txt")
+    );
+    assert!(matches!(
+        r7z::safe_archive_name("../evil.txt"),
+        Err(r7z::R7zError::UnsafePath(path)) if path == "../evil.txt"
+    ));
+    assert!(matches!(
+        r7z::safe_archive_name("C:\\evil.txt"),
+        Err(r7z::R7zError::UnsafePath(path)) if path == "C:\\evil.txt"
+    ));
+}
+
+#[test]
+fn entries_and_name_based_extraction_use_safe_names() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_directory("dir", r7z::EntryMeta::default())
+        .add_file("dir\\payload.txt", b"payload")
+        .add_empty_file("dir/empty.txt", r7z::EntryMeta::default())
+        .add_anti_item("removed.txt", r7z::EntryMeta::default())
+        .build()
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let entries = archive.entries().collect::<Vec<_>>();
+
+    assert_eq!(entries.len(), 4);
+    assert!(entries[0].is_directory());
+    assert!(entries[1].is_file());
+    assert!(entries[3].is_anti());
+    let payload_path = PathBuf::from("dir").join("payload.txt");
+    assert_eq!(entries[1].safe_path(), Some(payload_path.as_path()));
+    assert_eq!(archive.safe_name(1).unwrap(), payload_path);
+
+    let mut out = Vec::new();
+    let written = archive
+        .extract_by_name("dir/payload.txt", &mut out)
+        .unwrap();
+    assert_eq!(written, 7);
+    assert_eq!(out, b"payload");
+    assert!(matches!(
+        archive.extract_to_memory_by_name("missing.txt"),
+        Err(r7z::R7zError::EntryNotFound(name)) if name == "missing.txt"
+    ));
+}
+
+#[test]
+fn stream_files_visits_file_entries_and_drains_solid_folders() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("a.txt", b"alpha")
+        .add_empty_file("empty.txt", r7z::EntryMeta::default())
+        .add_file("b.txt", b"bravo")
+        .build()
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let mut seen = Vec::new();
+
+    archive
+        .stream_files(|entry, reader| {
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            seen.push((entry.name.clone(), data));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            ("a.txt".to_string(), b"alpha".to_vec()),
+            ("empty.txt".to_string(), Vec::new()),
+            ("b.txt".to_string(), b"bravo".to_vec()),
+        ]
+    );
 }
 
 #[test]
