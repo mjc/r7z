@@ -128,6 +128,9 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
     if options.codec == Codec::Copy
         && (options.compression.dictionary_size.is_some()
             || options.compression.fast_bytes.is_some()
+            || options.compression.literal_context_bits.is_some()
+            || options.compression.literal_position_bits.is_some()
+            || options.compression.position_bits.is_some()
             || options.compression.lzma2_chunk_size.is_some())
     {
         return Err(R7zError::InvalidOptions(
@@ -160,6 +163,16 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
             "PPMd does not support lzma2_chunk_size",
         ));
     }
+    if options.codec == Codec::Ppmd
+        && (options.compression.literal_context_bits.is_some()
+            || options.compression.literal_position_bits.is_some()
+            || options.compression.position_bits.is_some())
+    {
+        return Err(R7zError::InvalidOptions(
+            "PPMd does not support LZMA literal/position tuning",
+        ));
+    }
+    validate_lzma_property_bits(&options.compression)?;
     if let Some(chunk_size) = options.compression.lzma2_chunk_size {
         let dict = lzma_options(&options.compression).dict_size;
         if chunk_size.get() < u64::from(dict) {
@@ -175,6 +188,31 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
     {
         return Err(R7zError::InvalidOptions(
             "solid limit requires max_files or max_bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lzma_property_bits(compression: &CompressionOptions) -> Result<(), R7zError> {
+    let lc = compression.literal_context_bits.unwrap_or(3);
+    let lp = compression.literal_position_bits.unwrap_or(0);
+    let pb = compression.position_bits.unwrap_or(2);
+    if lc > 8 {
+        return Err(R7zError::InvalidOptions(
+            "literal_context_bits must be in 0..=8",
+        ));
+    }
+    if lp > 4 {
+        return Err(R7zError::InvalidOptions(
+            "literal_position_bits must be in 0..=4",
+        ));
+    }
+    if pb > 4 {
+        return Err(R7zError::InvalidOptions("position_bits must be in 0..=4"));
+    }
+    if lc + lp > 4 {
+        return Err(R7zError::InvalidOptions(
+            "literal_context_bits + literal_position_bits must be <= 4",
         ));
     }
     Ok(())
@@ -354,6 +392,15 @@ pub(crate) fn lzma_options(compression: &CompressionOptions) -> LzmaOptions {
     }
     if let Some(fast_bytes) = compression.fast_bytes {
         options.nice_len = fast_bytes;
+    }
+    if let Some(lc) = compression.literal_context_bits {
+        options.lc = lc;
+    }
+    if let Some(lp) = compression.literal_position_bits {
+        options.lp = lp;
+    }
+    if let Some(pb) = compression.position_bits {
+        options.pb = pb;
     }
     options
 }

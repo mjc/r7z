@@ -324,9 +324,51 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
                         .map_err(|_| CliError::Usage(format!("invalid fast bytes: {value}")))?,
                 );
             }
+            "lc" => {
+                options.compression.literal_context_bits =
+                    Some(parse_lzma_property_bits(value, "lc")?);
+            }
+            "lp" => {
+                options.compression.literal_position_bits =
+                    Some(parse_lzma_property_bits(value, "lp")?);
+            }
+            "pb" => {
+                options.compression.position_bits = Some(parse_lzma_property_bits(value, "pb")?);
+            }
             "mt" => parse_threading_value(value)?,
             _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
         }
+    }
+    validate_lzma_property_bit_combination(&options.compression)?;
+    Ok(())
+}
+
+fn parse_lzma_property_bits(value: &str, name: &str) -> Result<u32, CliError> {
+    let bits = value
+        .parse::<u32>()
+        .map_err(|_| CliError::Usage(format!("invalid LZMA {name} value: {value}")))?;
+    let max = match name {
+        "lc" => 8,
+        "lp" | "pb" => 4,
+        _ => return Err(CliError::Usage(format!("unknown LZMA property: {name}"))),
+    };
+    if bits > max {
+        return Err(CliError::Usage(format!(
+            "invalid LZMA {name} value: {value}; expected 0..={max}"
+        )));
+    }
+    Ok(bits)
+}
+
+fn validate_lzma_property_bit_combination(
+    compression: &r7z::CompressionOptions,
+) -> Result<(), CliError> {
+    let lc = compression.literal_context_bits.unwrap_or(3);
+    let lp = compression.literal_position_bits.unwrap_or(0);
+    if lc + lp > 4 {
+        return Err(CliError::Usage(format!(
+            "invalid LZMA lc/lp combination: lc + lp must be <= 4 (got {lc} + {lp})"
+        )));
     }
     Ok(())
 }

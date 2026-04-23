@@ -262,9 +262,10 @@ Builder pattern — all methods consume `self` and return `Self` for chaining:
 The builder defaults to **LZMA2**, matching p7zip / 7-Zip create behavior. It uses **solid compression** for non-empty files: file data is concatenated into one stream before compression, while directories, anti-items, and zero-byte files are represented with 7z empty-stream metadata.
 
 `ArchiveOptions::compression` exposes p7zip-like tuning through `CompressionOptions`:
-`CompressionLevel`, optional dictionary size, optional fast bytes, `SolidMode`
-(`Solid`, `NonSolid`, or `Limit`), and optional LZMA2 chunk size. The existing
-`Codec` still selects the algorithm.
+`CompressionLevel`, optional dictionary size, optional fast bytes, optional LZMA
+literal context / literal position / position bits, `SolidMode` (`Solid`,
+`NonSolid`, or `Limit`), and optional LZMA2 chunk size. The existing `Codec`
+still selects the algorithm.
 
 ### `ArchiveWriter` and `build_streaming` — file-backed builders
 
@@ -470,6 +471,10 @@ rewriting the source archive. Supported partial folders are decoded and
 re-encoded; exact original folder graph preservation is not guaranteed for those
 rewritten folders. Updating split-volume input writes a normal unsplit
 replacement archive.
+
+Compression method parsing accepts p7zip-style LZMA property options such as
+`-m0=LZMA:lc=2:lp=1:pb=1`, alongside dictionary, fast-bytes, solid, and
+threading compatibility switches.
 
 ## Development
 

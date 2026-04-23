@@ -32,6 +32,9 @@ pub struct CompressionOptions {
     pub level: CompressionLevel,
     pub dictionary_size: Option<u32>,
     pub fast_bytes: Option<u32>,
+    pub literal_context_bits: Option<u32>,
+    pub literal_position_bits: Option<u32>,
+    pub position_bits: Option<u32>,
     pub solid: SolidMode,
     pub lzma2_chunk_size: Option<NonZeroU64>,
 }
@@ -42,6 +45,9 @@ impl Default for CompressionOptions {
             level: CompressionLevel::Normal,
             dictionary_size: None,
             fast_bytes: None,
+            literal_context_bits: None,
+            literal_position_bits: None,
+            position_bits: None,
             solid: SolidMode::Solid,
             lzma2_chunk_size: None,
         }

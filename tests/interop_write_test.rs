@@ -659,6 +659,48 @@ fn archive_builder_lzma_multi_file_p7zip_extracts_and_lists_method() {
 }
 
 #[test]
+fn archive_builder_lzma_literal_position_options_p7zip_extracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("builder_lzma_literal_position.7z");
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Lzma,
+        compression: r7z::CompressionOptions {
+            literal_context_bits: Some(2),
+            literal_position_bits: Some(1),
+            position_bits: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = r7z::ArchiveBuilder::new().options(options);
+    for (name, data) in &files {
+        builder = builder.add_file(&name.to_string_lossy(), data);
+    }
+    let bytes = builder.build().unwrap();
+    std::fs::write(&archive_path, &bytes).unwrap();
+
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let folder = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .parse_folder(0)
+        .unwrap();
+    let lzma = folder
+        .coders
+        .iter()
+        .find(|coder| coder.codec_id.as_slice() == r7z::CODEC_LZMA)
+        .unwrap();
+    assert_eq!(lzma.properties.as_deref().map(|props| props[0]), Some(0x38));
+
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA"]);
+}
+
+#[test]
 fn archive_builder_lzma2_multi_file_p7zip_extracts_and_lists_method() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

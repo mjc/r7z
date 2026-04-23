@@ -305,6 +305,66 @@ fn cli_create_accepts_p7zip_method_chain_options() {
 }
 
 #[test]
+fn cli_create_accepts_lzma_literal_position_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"literal position payload").unwrap();
+    let archive = tmp.path().join("lzma-literal-position.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA:lc=2:lp=1:pb=1".into(),
+        archive.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    let folder = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .parse_folder(0)
+        .unwrap();
+    let lzma = folder
+        .coders
+        .iter()
+        .find(|coder| coder.codec_id.as_slice() == r7z::CODEC_LZMA)
+        .unwrap();
+    assert_eq!(lzma.properties.as_deref().map(|props| props[0]), Some(0x38));
+    assert_eq!(
+        archive.extract_to_memory(0).unwrap(),
+        b"literal position payload"
+    );
+}
+
+#[test]
+fn cli_rejects_invalid_lzma_literal_position_options() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("bad-lzma-literal-position.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=LZMA:lc=5:lp=1",
+            archive.to_str().unwrap(),
+            input.join("payload.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("lc"));
+    assert!(stderr.contains("lp"));
+}
+
+#[test]
 fn cli_create_accepts_ppmd_method() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

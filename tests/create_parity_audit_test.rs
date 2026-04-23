@@ -22,6 +22,12 @@ fn create_parity_audit_p7zip_compression_switches_open_with_r7z() {
         ("mx7", &["-mx7"], &[0x21], Some(1)),
         ("mx9", &["-mx9"], &[0x21], Some(1)),
         ("lzma", &["-m0=LZMA"], &[0x03, 0x01, 0x01], Some(5)),
+        (
+            "lzma_litpos",
+            &["-m0=LZMA:lc=2:lp=1:pb=1"],
+            &[0x03, 0x01, 0x01],
+            Some(5),
+        ),
         ("lzma2", &["-m0=LZMA2"], &[0x21], Some(1)),
         ("dict", &["-md=1m"], &[0x21], Some(1)),
         ("fast_bytes", &["-mfb=32"], &[0x21], Some(1)),
