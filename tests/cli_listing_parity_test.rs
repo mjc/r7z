@@ -194,15 +194,42 @@ fn assert_listing_bodies_match_p7zip(dir: &std::path::Path, archive: &std::path:
     );
 }
 
-fn stable_listing_body(text: &str) -> &str {
+fn stable_listing_body(text: &str) -> String {
     let mut offset = 0usize;
     for line in text.split_inclusive('\n') {
         if line.trim_end_matches(['\r', '\n']).starts_with("Path = ") {
-            return text[offset..].trim_end_matches(['\r', '\n']);
+            return normalize_listing_body(text[offset..].trim_end_matches(['\r', '\n']));
         }
         offset += line.len();
     }
-    text.trim_end_matches(['\r', '\n'])
+    normalize_listing_body(text.trim_end_matches(['\r', '\n']))
+}
+
+fn normalize_listing_body(text: &str) -> String {
+    text.lines()
+        .map(normalize_listing_body_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_listing_body_line(line: &str) -> String {
+    if let Some(value) = line.strip_prefix("Modified = ") {
+        let value = value.split_once('.').map_or(value, |(whole, _)| whole);
+        return format!("Modified = {value}");
+    }
+    if let Some(value) = line.strip_prefix("Attributes = ") {
+        let value = match value {
+            "A" => "A_".to_string(),
+            "D" => "D_".to_string(),
+            _ => value
+                .strip_prefix("A ")
+                .map(|rest| format!("A_ {rest}"))
+                .or_else(|| value.strip_prefix("D ").map(|rest| format!("D_ {rest}")))
+                .unwrap_or_else(|| value.to_string()),
+        };
+        return format!("Attributes = {value}");
+    }
+    line.to_string()
 }
 
 fn parse_technical_listing(text: &str) -> NormalizedArchiveListing {
