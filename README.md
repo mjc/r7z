@@ -360,7 +360,7 @@ pub enum Codec {
 |---------|---------|
 | `R7zError::Parse` | Malformed archive — not valid 7z binary |
 | `R7zError::InvalidProperty(u8)` | Unknown property tag byte in header |
-| `R7zError::UnsupportedCodec(Vec<u8>)` | Codec ID not implemented (e.g., BZip2, PPMd) |
+| `R7zError::UnsupportedCodec(Vec<u8>)` | Codec ID not implemented (e.g., PPMd, Deflate64) |
 | `R7zError::Crc` | CRC32 mismatch — data corruption detected |
 | `R7zError::Io(std::io::Error)` | File I/O failure |
 | `R7zError::Decompression` | LZMA/LZMA2 stream could not be decoded |
@@ -409,6 +409,7 @@ These are public but primarily used for building advanced tooling:
 | LZMA2 compression | Read + Write (default) |
 | Copy codec | Read + Write |
 | Deflate compression | Read |
+| BZip2 compression | Read |
 | BCJ x86 filter + LZMA2 | Read + Write |
 | EncodedHeader archives (p7zip default) | Read + Write |
 | Uncompressed Header archives | Read + Write |
@@ -419,7 +420,7 @@ These are public but primarily used for building advanced tooling:
 | AES-256-SHA-256 encrypted content | Read + Write |
 | AES encrypted headers (`-mhe=on`) | Read + Write with password |
 | Update existing archives | Not supported |
-| BZip2 / PPMd / Deflate64 | Not supported |
+| PPMd / Deflate64 | Not supported |
 | Read split volumes | Not supported |
 | Hard-link preservation | Not supported |
 

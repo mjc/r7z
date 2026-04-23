@@ -869,7 +869,7 @@ fn p7zip_aes_encrypted_headers_round_trip() {
 
 #[test]
 fn p7zip_unsupported_codecs_return_unsupported_codec() {
-    for method in ["BZip2", "PPMd"] {
+    for method in ["PPMd"] {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("payload.txt"), b"unsupported codec payload").unwrap();
@@ -900,6 +900,22 @@ fn p7zip_unsupported_codecs_return_unsupported_codec() {
             "expected UnsupportedCodec for {method}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn p7zip_bzip2_extracts_with_r7z() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let original = b"bzip2 codec payload repeated repeated repeated";
+    std::fs::write(dir.join("payload.txt"), original).unwrap();
+
+    let archive_path = dir.join("bzip2.7z");
+    create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=BZip2"]);
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let extracted = archive.extract_to_memory(0).unwrap();
+
+    assert_eq!(extracted, original);
 }
 
 #[test]

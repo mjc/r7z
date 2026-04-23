@@ -1,4 +1,5 @@
 use crate::{Folder, R7zError};
+use bzip2_rs::DecoderReader as Bzip2Decoder;
 use flate2::read::DeflateDecoder;
 use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
 use smallvec::SmallVec;
@@ -45,6 +46,8 @@ pub const CODEC_COPY: &[u8] = &[0x00];
 pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 /// Codec ID for raw Deflate streams.
 pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
+/// Codec ID for BZip2 streams.
+pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
 
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
@@ -228,6 +231,10 @@ fn coder_reader<'a>(
 
     if *coder.codec_id == *CODEC_DEFLATE {
         return Ok(Box::new(DeflateDecoder::new(input)));
+    }
+
+    if *coder.codec_id == *CODEC_BZIP2 {
+        return Ok(Box::new(Bzip2Decoder::new(input)));
     }
 
     if *coder.codec_id == *CODEC_AES_256_SHA_256 {

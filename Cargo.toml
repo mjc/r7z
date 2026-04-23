@@ -11,6 +11,7 @@ description = "Pure-Rust library for reading and writing .7z archives"
 arrayvec = "0.7"
 smallvec = "1"
 bytes = "1"
+bzip2-rs = "0.1.2"
 crc32fast = "1.5.0"
 flate2 = "1"
 lzma-rust2 = { version = "0.16.2", features = ["encoder", "optimization"] }

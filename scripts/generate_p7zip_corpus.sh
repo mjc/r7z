@@ -64,7 +64,7 @@ run_7z a "$out_dir/split.7z" \
   -m0=Copy -v128b -mmt=off
 rm -f "$out_dir/split.7z"
 
-run_7z a "$out_dir/unsupported_bzip2.7z" \
+run_7z a "$out_dir/bzip2_nonsolid.7z" \
   "$tmp/input/alpha.txt" \
   -m0=BZip2 -mmt=off
 
