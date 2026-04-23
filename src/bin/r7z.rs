@@ -231,6 +231,25 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.method_was_explicit = true;
         return Ok(());
     }
+    if lower.starts_with("mlc") {
+        let value = parse_attached_value(switch, "mlc")?;
+        state.options.compression.literal_context_bits =
+            Some(parse_lzma_property_bits(value, "lc")?);
+        validate_lzma_property_bit_combination(&state.options.compression)?;
+        return Ok(());
+    }
+    if lower.starts_with("mlp") {
+        let value = parse_attached_value(switch, "mlp")?;
+        state.options.compression.literal_position_bits =
+            Some(parse_lzma_property_bits(value, "lp")?);
+        validate_lzma_property_bit_combination(&state.options.compression)?;
+        return Ok(());
+    }
+    if lower.starts_with("mpb") {
+        let value = parse_attached_value(switch, "mpb")?;
+        state.options.compression.position_bits = Some(parse_lzma_property_bits(value, "pb")?);
+        return Ok(());
+    }
     if lower.starts_with("mmt") {
         return Ok(());
     }

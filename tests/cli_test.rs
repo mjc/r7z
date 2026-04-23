@@ -341,6 +341,41 @@ fn cli_create_accepts_lzma_literal_position_options() {
 }
 
 #[test]
+fn cli_create_accepts_standalone_lzma_literal_position_switches() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"standalone literal position").unwrap();
+    let archive = tmp.path().join("standalone-lzma-literal-position.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=LZMA".into(),
+        "-mlc=2".into(),
+        "-mlp=1".into(),
+        "-mpb=1".into(),
+        archive.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    let folder = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .parse_folder(0)
+        .unwrap();
+    let lzma = folder
+        .coders
+        .iter()
+        .find(|coder| coder.codec_id.as_slice() == r7z::CODEC_LZMA)
+        .unwrap();
+    assert_eq!(lzma.properties.as_deref().map(|props| props[0]), Some(0x38));
+}
+
+#[test]
 fn cli_rejects_invalid_lzma_literal_position_options() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

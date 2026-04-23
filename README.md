@@ -473,8 +473,8 @@ rewritten folders. Updating split-volume input writes a normal unsplit
 replacement archive.
 
 Compression method parsing accepts p7zip-style LZMA property options such as
-`-m0=LZMA:lc=2:lp=1:pb=1`, alongside dictionary, fast-bytes, solid, and
-threading compatibility switches.
+`-m0=LZMA:lc=2:lp=1:pb=1` or standalone `-mlc=2 -mlp=1 -mpb=1`,
+alongside dictionary, fast-bytes, solid, and threading compatibility switches.
 
 ## Development
 
