@@ -11,10 +11,6 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 r7z = { path = ".." }
 
-# Disable default features to avoid pulling in unneeded crates
-[dependencies.r7z]
-path = ".."
-
 [[bin]]
 name = "fuzz_parse_signature"
 path = "fuzz_targets/fuzz_parse_signature.rs"
