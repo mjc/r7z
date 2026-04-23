@@ -971,6 +971,30 @@ fn p7zip_delta_lzma2_extracts_with_r7z() {
     assert_eq!(extracted, original);
 }
 
+#[test]
+fn p7zip_byte_swap_filters_extract_with_r7z() {
+    for method in ["Swap2", "Swap4"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let original = b"abcdefghijklmnop";
+        std::fs::write(dir.join("payload.txt"), original).unwrap();
+
+        let archive_path = dir.join(format!("{method}.7z"));
+        let method_arg = format!("-m0={method}");
+        create_p7zip_archive(
+            dir,
+            &archive_path,
+            &["payload.txt"],
+            &[method_arg.as_str(), "-m1=LZMA2"],
+        );
+
+        let archive = r7z::Archive::open(&archive_path).unwrap();
+        let extracted = archive.extract_to_memory(0).unwrap();
+
+        assert_eq!(extracted, original, "mismatch for {method}");
+    }
+}
+
 /// Decrypt a file from a large real-world AES-encrypted archive.
 /// Requires /mnt/emulation/Nintendo64Archive.7z to be present.
 #[test]

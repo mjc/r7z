@@ -53,6 +53,10 @@ pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
 pub const CODEC_DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
 /// Codec ID for the Delta filter.
 pub const CODEC_DELTA: &[u8] = &[0x03];
+/// Codec ID for the 2-byte swap filter.
+pub const CODEC_SWAP2: &[u8] = &[0x02, 0x03, 0x02];
+/// Codec ID for the 4-byte swap filter.
+pub const CODEC_SWAP4: &[u8] = &[0x02, 0x03, 0x04];
 
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
@@ -249,6 +253,14 @@ fn coder_reader<'a>(
     if *coder.codec_id == *CODEC_DELTA {
         let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
         return Ok(Box::new(crate::delta::DeltaReader::new(input, props)?));
+    }
+
+    if *coder.codec_id == *CODEC_SWAP2 {
+        return Ok(Box::new(crate::byte_swap::ByteSwapReader::new(input, 2)));
+    }
+
+    if *coder.codec_id == *CODEC_SWAP4 {
+        return Ok(Box::new(crate::byte_swap::ByteSwapReader::new(input, 4)));
     }
 
     if *coder.codec_id == *CODEC_AES_256_SHA_256 {

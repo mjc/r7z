@@ -59,6 +59,14 @@ run_7z a "$out_dir/delta_lzma2.7z" \
   "$tmp/input/alpha.txt" "$tmp/input/nested" \
   -m0=Delta -m1=LZMA2 -ms=off -mmt=off
 
+run_7z a "$out_dir/swap2_lzma2.7z" \
+  "$tmp/input/alpha.txt" "$tmp/input/nested" \
+  -m0=Swap2 -m1=LZMA2 -ms=off -mmt=off
+
+run_7z a "$out_dir/swap4_lzma2.7z" \
+  "$tmp/input/alpha.txt" "$tmp/input/nested" \
+  -m0=Swap4 -m1=LZMA2 -ms=off -mmt=off
+
 run_7z a "$out_dir/bcj_lzma2.7z" \
   "$tmp/input/prog.bin" \
   -m0=BCJ -m1=LZMA2 -mmt=off

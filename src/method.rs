@@ -136,6 +136,8 @@ impl SevenZMethod {
                 | Self::Deflate64
                 | Self::Bcj
                 | Self::Delta
+                | Self::Swap2
+                | Self::Swap4
                 | Self::SevenZAes
         )
     }

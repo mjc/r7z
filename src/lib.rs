@@ -60,6 +60,7 @@ extern crate num_derive;
 mod aes;
 mod archive;
 pub mod bcj;
+mod byte_swap;
 mod codec;
 mod coder_info;
 mod delta;
@@ -78,6 +79,7 @@ pub use archive::{Archive, ArchiveMetadata, ArchiveOpenOptions, ArchiveStorageMo
 pub use codec::{
     decompress_folder, decompress_folder_with_password, CODEC_AES_256_SHA_256, CODEC_BCJ_X86,
     CODEC_BZIP2, CODEC_COPY, CODEC_DEFLATE, CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2,
+    CODEC_SWAP2, CODEC_SWAP4,
 };
 pub use coder_info::CoderInfo;
 pub use error::R7zError;
