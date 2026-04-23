@@ -33,12 +33,22 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+      - name: Cache p7zip-zstd oracle
+        id: p7zip-oracle-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/r7z-p7zip-oracle
+          key: ${{ runner.os }}-p7zip-oracle-6819e2dc1917e1267babddc6391cea56ead7123d-${{ hashFiles('scripts/ensure_p7zip_oracle.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-p7zip-oracle-6819e2dc1917e1267babddc6391cea56ead7123d-
+
       - name: Install p7zip oracle dependencies
+        if: steps.p7zip-oracle-cache.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake
 
       - name: Build p7zip-zstd oracle
         run: |
-          export P7ZIP_ORACLE_DIR="$PWD/target/p7zip-oracle"
+          export P7ZIP_ORACLE_DIR="$HOME/.cache/r7z-p7zip-oracle"
           bin="$(scripts/ensure_p7zip_oracle.sh)"
           echo "P7ZIP_BIN=$bin" >> "$GITHUB_ENV"
           "$bin" i
