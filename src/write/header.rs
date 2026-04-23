@@ -29,6 +29,15 @@ pub(crate) fn encode_coder_info_lzma2(props_byte: u8) -> Vec<u8> {
     bytes
 }
 
+pub(crate) fn encode_coder_info_ppmd(props: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(1));
+    bytes.extend_from_slice(&[0x23, 0x03, 0x04, 0x01]);
+    bytes.extend_from_slice(&sevenzip_varuint64_encode(5));
+    bytes.extend_from_slice(props);
+    bytes
+}
+
 pub(crate) fn encode_coder_info_bcj_lzma2(props_byte: u8) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&sevenzip_varuint64_encode(2));
@@ -70,6 +79,11 @@ pub(crate) fn encode_coder_info_aes_then(inner: &[CoderSpec], aes_props: &[u8]) 
                 bytes.extend_from_slice(&sevenzip_varuint64_encode(1));
                 bytes.push(*prop);
             }
+            CoderSpec::Ppmd(props) => {
+                bytes.extend_from_slice(&[0x23, 0x03, 0x04, 0x01]);
+                bytes.extend_from_slice(&sevenzip_varuint64_encode(5));
+                bytes.extend_from_slice(props);
+            }
             CoderSpec::Bcj => {
                 bytes.push(0x04);
                 bytes.extend_from_slice(&[0x03, 0x03, 0x01, 0x03]);
@@ -89,6 +103,7 @@ pub(crate) enum CoderSpec {
     Copy,
     Lzma(Vec<u8>),
     Lzma2(u8),
+    Ppmd(Vec<u8>),
     Bcj,
 }
 

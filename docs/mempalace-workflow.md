@@ -74,4 +74,4 @@ R7Z_SEARCH_KEYWORDS: <space-separated search terms>
 
 - 2026-04-21: common 7z read parity was completed and committed in four implementation commits plus this memory-seed commit.
 - Acceptance commands that passed: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --doc`, and `git diff --check`.
-- Durable scope: current-codec read robustness for Copy, Deflate, Deflate64, BZip2, PPMd, Delta, Swap2/Swap4, LZMA, LZMA2, BCJ+x86/BCJ2/ARM/ARMT/IA64/PPC/SPARC, AES-256-SHA-256 content, and AES encrypted headers. AES writing and symmetric write parity remain intentionally out of scope.
+- Durable scope: current-codec read robustness for Copy, Deflate, Deflate64, BZip2, PPMd, Delta, Swap2/Swap4, LZMA, LZMA2, BCJ+x86/BCJ2/ARM/ARMT/IA64/PPC/SPARC, AES-256-SHA-256 content, and AES encrypted headers; write parity for Copy, LZMA, LZMA2, PPMd, BCJ+x86+LZMA2, and 7zAES content/header encryption. Symmetric write parity for extension codecs remains intentionally out of scope.

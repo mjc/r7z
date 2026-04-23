@@ -305,6 +305,37 @@ fn cli_create_accepts_p7zip_method_chain_options() {
 }
 
 #[test]
+fn cli_create_accepts_ppmd_method() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.txt"), b"ppmd payload from cli").unwrap();
+    let archive = tmp.path().join("ppmd.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=PPMd".into(),
+        archive.display().to_string(),
+        input.join("payload.txt").display().to_string(),
+    ]);
+
+    let archive = r7z::Archive::open(&archive).unwrap();
+    let folder = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .parse_folder(0)
+        .unwrap();
+    assert_eq!(folder.coders[0].codec_id.as_slice(), r7z::CODEC_PPMD);
+    assert_eq!(
+        archive.extract_to_memory(0).unwrap(),
+        b"ppmd payload from cli"
+    );
+}
+
+#[test]
 fn cli_create_accepts_method_scoped_threading_as_noop() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

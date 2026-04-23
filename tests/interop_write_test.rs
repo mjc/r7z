@@ -670,6 +670,17 @@ fn archive_builder_lzma2_multi_file_p7zip_extracts_and_lists_method() {
 }
 
 #[test]
+fn archive_builder_ppmd_multi_file_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("builder_ppmd.7z");
+
+    write_builder_archive(&archive_path, r7z::Codec::Ppmd, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["PPMD"]);
+}
+
+#[test]
 fn archive_builder_bcj_lzma2_multi_file_p7zip_extracts_and_lists_method() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -700,6 +711,17 @@ fn archive_writer_lzma2_multi_folder_p7zip_extracts_and_lists_method() {
 
     write_writer_archive(&archive_path, r7z::Codec::Lzma2, &files);
     assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA2"]);
+}
+
+#[test]
+fn archive_writer_ppmd_multi_folder_p7zip_extracts_and_lists_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("writer_ppmd.7z");
+
+    write_writer_archive(&archive_path, r7z::Codec::Ppmd, &files);
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["PPMD"]);
 }
 
 #[test]
@@ -1427,6 +1449,12 @@ fn archive_builder_aes_content_copy_and_bcj_p7zip_and_r7z_extract() {
             "aes_bcj.7z",
             "bin/app.exe",
             executable_payload(4096),
+        ),
+        (
+            r7z::Codec::Ppmd,
+            "aes_ppmd.7z",
+            "text/secret.txt",
+            b"ppmd encrypted payload\n".repeat(64),
         ),
     ];
 

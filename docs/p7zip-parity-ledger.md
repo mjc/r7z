@@ -11,7 +11,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - Parser: core 7z headers, encoded headers, stream info, files info,
   SFX/prepended-byte signature scan.
 - Decoder: Copy, LZMA, LZMA2, PPMd, x86/BCJ2/ARM/ARMT/IA64/PPC/SPARC BCJ filters, 7zAES in folder chains.
-- Encoder: Copy, LZMA, LZMA2, BCJ+LZMA2, 7zAES content/header encryption.
+- Encoder: Copy, LZMA, LZMA2, PPMd, BCJ+LZMA2, 7zAES content/header encryption.
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
   `-aoa`, `-aos`, and no-op compatibility for `-y`, `-mmt`, `-bd`, and `-bb`.
@@ -39,7 +39,7 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - Decoder: no known classic p7zip decoder gaps in the currently tracked subset.
 - Decoder extensions: ZSTD, Brotli, LZ4, LZ5, Lizard, LZHAM. `FLZMA2` is tracked
   as p7zip's fast LZMA2 encoder but has the same method ID as LZMA2 on disk.
-- Encoder: PPMd and extension codecs above, plus exact p7zip method-chain
+- Encoder: extension codecs above, plus exact p7zip method-chain
   switch grammar beyond the currently supported dictionary/fast-bytes subset.
 - CLI: interactive overwrite prompts and byte-for-byte listing text are still
   incomplete.

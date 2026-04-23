@@ -1,7 +1,7 @@
 use super::header::{
     CoderSpec, build_encoded_header_descriptor, build_header, encode_coder_info_aes_then,
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
-    encode_coder_info_lzma2,
+    encode_coder_info_lzma2, encode_coder_info_ppmd,
 };
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
@@ -9,6 +9,9 @@ use super::model::{
 };
 use crate::{R7zError, aes, bcj, codec};
 use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
+use ppmd_rust::{
+    PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
+};
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 
@@ -113,16 +116,30 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
         ));
     }
     if let Some(dict) = options.compression.dictionary_size {
-        if dict < 4096 {
+        let min_dict = if options.codec == Codec::Ppmd {
+            PPMD7_MIN_MEM_SIZE
+        } else {
+            4096
+        };
+        if dict < min_dict {
             return Err(R7zError::InvalidOptions(
-                "dictionary_size must be at least 4096 bytes",
+                "dictionary_size is too small for selected codec",
             ));
         }
     }
     if let Some(fast_bytes) = options.compression.fast_bytes {
-        if !(8..=273).contains(&fast_bytes) {
+        if options.codec == Codec::Ppmd {
+            if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&fast_bytes) {
+                return Err(R7zError::InvalidOptions("PPMd order must be in 2..=64"));
+            }
+        } else if !(8..=273).contains(&fast_bytes) {
             return Err(R7zError::InvalidOptions("fast_bytes must be in 8..=273"));
         }
+    }
+    if options.codec == Codec::Ppmd && options.compression.lzma2_chunk_size.is_some() {
+        return Err(R7zError::InvalidOptions(
+            "PPMd does not support lzma2_chunk_size",
+        ));
     }
     if let Some(chunk_size) = options.compression.lzma2_chunk_size {
         let dict = lzma_options(&options.compression).dict_size;
@@ -260,6 +277,15 @@ fn encode_payload_with_options(
                 vec![CoderSpec::Lzma2(prop)],
             ))
         }
+        Codec::Ppmd => {
+            let (props, compressed) = compress_ppmd(data, compression)?;
+            Ok((
+                compressed,
+                encode_coder_info_ppmd(&props),
+                vec![data.len() as u64],
+                vec![CoderSpec::Ppmd(props)],
+            ))
+        }
         Codec::Lzma2Bcj => {
             let mut filtered = data.to_vec();
             bcj::bcj_x86_encode(&mut filtered);
@@ -363,6 +389,56 @@ fn compress_lzma2(
         .map_err(|_| R7zError::Decompression)?;
     let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
     Ok((prop, compressed))
+}
+
+fn compress_ppmd(
+    data: &[u8],
+    compression: &CompressionOptions,
+) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
+    let (order, mem_size) = ppmd_options(compression)?;
+    let mut writer = Ppmd7Encoder::new(Vec::new(), u32::from(order), mem_size).map_err(|_| {
+        R7zError::InvalidOptions("PPMd order or memory size is outside supported range")
+    })?;
+    writer
+        .write_all(data)
+        .map_err(|_| R7zError::Decompression)?;
+    let compressed = writer.finish(false).map_err(|_| R7zError::Decompression)?;
+
+    let mut props = Vec::with_capacity(5);
+    props.push(order);
+    props.extend_from_slice(&mem_size.to_le_bytes());
+    Ok((props, compressed))
+}
+
+fn ppmd_options(compression: &CompressionOptions) -> Result<(u8, u32), R7zError> {
+    let order = compression.fast_bytes.unwrap_or(6);
+    if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&order) {
+        return Err(R7zError::InvalidOptions("PPMd order must be in 2..=64"));
+    }
+
+    let mem_size = compression
+        .dictionary_size
+        .unwrap_or_else(|| ppmd_memory_size_preset(compression.level));
+    if !(PPMD7_MIN_MEM_SIZE..=PPMD7_MAX_MEM_SIZE).contains(&mem_size) {
+        return Err(R7zError::InvalidOptions(
+            "PPMd memory size is outside supported range",
+        ));
+    }
+
+    Ok((
+        u8::try_from(order).map_err(|_| R7zError::InvalidOptions("PPMd order is too large"))?,
+        mem_size,
+    ))
+}
+
+const fn ppmd_memory_size_preset(level: CompressionLevel) -> u32 {
+    match level {
+        CompressionLevel::Store | CompressionLevel::Fastest => 1 << 20,
+        CompressionLevel::Fast => 4 << 20,
+        CompressionLevel::Normal => 16 << 20,
+        CompressionLevel::Maximum => 32 << 20,
+        CompressionLevel::Ultra => 64 << 20,
+    }
 }
 
 fn encode_lzma2_dict_size(dict_size: u32) -> Result<u8, R7zError> {

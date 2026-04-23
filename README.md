@@ -424,7 +424,7 @@ These are public but primarily used for building advanced tooling:
 | Directories / zero-byte files / anti-items | Read + Write |
 | AES-256-SHA-256 encrypted content | Read + Write |
 | AES encrypted headers (`-mhe=on`) | Read + Write with password |
-| PPMd | Read |
+| PPMd | Read + Write |
 | Update existing archives | Not supported |
 | Read split volumes | Not supported |
 | Hard-link preservation | Not supported |
@@ -440,7 +440,7 @@ the encrypted pack stream internally before AES-CBC decryption; streaming AES is
 a planned hardening follow-up.
 
 Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
-LZMA2, and BCJ+x86+LZMA2 archives. The parity target is matching archive
+LZMA2, PPMd, and BCJ+x86+LZMA2 archives. The parity target is matching archive
 listing/extraction behavior: file names, file contents, nested paths,
 directories, zero-byte files, and exposed metadata where r7z supports it.
 r7z does not guarantee byte-identical archive output, matching compression ratios,

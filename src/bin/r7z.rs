@@ -281,6 +281,7 @@ fn codec_from_method_name(name: &str) -> Result<Codec, CliError> {
         SevenZMethod::Copy => Ok(Codec::Copy),
         SevenZMethod::Lzma => Ok(Codec::Lzma),
         SevenZMethod::Lzma2 | SevenZMethod::FastLzma2 => Ok(Codec::Lzma2),
+        SevenZMethod::Ppmd => Ok(Codec::Ppmd),
         other => Err(CliError::Usage(format!(
             "method {} is tracked for parity but not yet supported by r7z",
             other.name()

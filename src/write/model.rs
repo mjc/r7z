@@ -6,6 +6,7 @@ pub enum Codec {
     Lzma,
     #[default]
     Lzma2,
+    Ppmd,
     Lzma2Bcj,
 }
 
