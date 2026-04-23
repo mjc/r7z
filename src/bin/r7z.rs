@@ -554,9 +554,7 @@ fn print_technical_listing(listing: &ArchiveListing, archive_path: &Path, select
         println!("Path = {}", entry.path);
         println!("Size = {}", size_text(entry.size));
         println!("Packed Size = {}", size_text(entry_packed_for_row(entry)));
-        if let Some(modified) = entry.modified {
-            println!("Modified = {}", format_listing_time(Some(modified)));
-        }
+        println!("Modified = {}", format_listing_time(entry.modified));
         if let Some(attrs) = technical_attributes(entry) {
             println!("Attributes = {attrs}");
         }
@@ -614,6 +612,9 @@ fn format_listing_time(time: Option<SystemTime>) -> String {
 }
 
 fn human_attributes(entry: &ArchiveListingEntry) -> &'static str {
+    if entry.attributes.is_none() {
+        return ".....";
+    }
     match entry.kind {
         ListingEntryKind::Directory => "D....",
         ListingEntryKind::File | ListingEntryKind::Symlink => "....A",
@@ -631,7 +632,7 @@ fn technical_attributes(entry: &ArchiveListingEntry) -> Option<String> {
         ListingEntryKind::Anti => unreachable!(),
     };
     let Some(attrs) = entry.attributes else {
-        return Some(class.to_string());
+        return None;
     };
     let mode = attrs >> 16;
     if mode == 0 {

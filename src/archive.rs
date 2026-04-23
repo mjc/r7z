@@ -4,7 +4,6 @@ use crate::{
 };
 use bytes::Bytes;
 use memmap2::Mmap;
-use std::collections::BTreeSet;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
@@ -1176,20 +1175,36 @@ impl ExtractionLocation {
 }
 
 fn archive_method_names(streams: Option<&StreamInfo>) -> Result<Vec<String>, R7zError> {
-    let mut names = BTreeSet::new();
+    let mut names = Vec::new();
     if let Some(streams) = streams {
         if let Some(unpack) = &streams.unpack_info {
             for idx in 0..unpack.num_folders_usize() {
                 let folder = unpack.parse_folder(idx)?;
-                names.extend(folder.coders.iter().map(archive_method_name));
+                for name in folder.coders.iter().map(archive_method_name) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
             }
         }
     }
-    Ok(names.into_iter().collect())
+    Ok(p7zip_method_order(names))
 }
 
 fn folder_method_names(folder: &crate::Folder) -> Vec<String> {
-    folder.coders.iter().map(entry_method_name).collect()
+    p7zip_method_order(folder.coders.iter().map(entry_method_name).collect())
+}
+
+fn p7zip_method_order(names: Vec<String>) -> Vec<String> {
+    let (mut regular, crypto): (Vec<_>, Vec<_>) = names
+        .into_iter()
+        .partition(|name| !is_crypto_method_name(name));
+    regular.extend(crypto);
+    regular
+}
+
+fn is_crypto_method_name(name: &str) -> bool {
+    name.starts_with("7zAES") || name.starts_with("AES256CBC")
 }
 
 fn archive_method_name(coder: &crate::CoderInfo) -> String {
@@ -1264,11 +1279,8 @@ fn ppmd_method_text(coder: &crate::CoderInfo) -> Option<String> {
     }
     let order = props[0];
     let mem_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-    let mem_text = if mem_size % (1024 * 1024) == 0 {
-        (mem_size / (1024 * 1024)).to_string()
-    } else {
-        mem_size.to_string()
-    };
+    let mem_text =
+        dictionary_bits(mem_size).map_or_else(|| mem_size.to_string(), |bits| bits.to_string());
     Some(format!("PPMD:o{order}:mem{mem_text}"))
 }
 
