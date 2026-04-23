@@ -19,6 +19,15 @@ pub fn valid_7z_string() -> Vec<u8> {
 
 /// Run 7z directly, falling back to `nix-shell -p p7zip` if not in PATH.
 pub fn run_7z(args: &[&str], dir: &std::path::Path) -> std::process::Output {
+    if let Ok(bin) = env::var("P7ZIP_BIN") {
+        if !bin.is_empty() {
+            return Command::new(&bin)
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap_or_else(|err| panic!("P7ZIP_BIN should run ({bin}): {err}"));
+        }
+    }
     if let Ok(out) = Command::new("7z").args(args).current_dir(dir).output() {
         return out;
     }
