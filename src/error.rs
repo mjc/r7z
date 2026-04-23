@@ -39,6 +39,10 @@ pub enum R7zError {
     #[error("unsafe archive path: {0}")]
     UnsafePath(String),
 
+    /// No archive entry matched the requested name.
+    #[error("entry not found: {0}")]
+    EntryNotFound(String),
+
     /// The requested entry is a directory or anti-item, not a regular file.
     #[error("entry is a directory or anti-item")]
     Directory,

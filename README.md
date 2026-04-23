@@ -224,12 +224,17 @@ let archive = Archive::from_bytes(raw.into())?;
 | `Archive::from_bytes(data: bytes::Bytes)` | `Result<Archive, R7zError>` | Decode a `.7z` from an in-memory buffer |
 | `Archive::from_bytes_with_password(data, password)` | `Result<Archive, R7zError>` | Decode password-protected bytes |
 | `archive.num_files()` | `usize` | Number of entries (files and directories) |
+| `archive.entries()` | `Iterator<Item = ArchiveEntryInfo>` | High-level entry metadata with type and safe normalized name |
+| `archive.safe_name(index)` | `Result<PathBuf, R7zError>` | Reject unsafe names and normalize a relative archive path |
 | `archive.files_info()` | `Option<&FilesInfo>` | File names, sizes, and attributes |
 | `archive.streams_info()` | `Option<&StreamInfo>` | Raw stream/pack metadata |
 | `archive.extract_to_memory(index: usize)` | `Result<Vec<u8>, R7zError>` | Decompress file at `index` (0-based) |
 | `archive.extract_to_memory_with_password(index, password)` | `Result<Vec<u8>, R7zError>` | Decrypt/decompress file at `index` |
+| `archive.extract_to_memory_by_name(name)` | `Result<Vec<u8>, R7zError>` | Decompress file by exact or normalized safe name |
 | `archive.extract_to_writer(index, writer)` | `Result<u64, R7zError>` | Stream file at `index` into a writer |
 | `archive.extract_to_writer_with_password(index, writer, password)` | `Result<u64, R7zError>` | Stream encrypted file data into a writer |
+| `archive.extract_by_name(name, writer)` | `Result<u64, R7zError>` | Stream file selected by exact or normalized safe name |
+| `archive.stream_files(callback)` | `Result<(), R7zError>` | Stream all file-like entries while decoding each solid folder once |
 | `archive.extract_all(dest: &Path)` | `Result<(), R7zError>` | Extract all files; creates subdirectories as needed |
 | `archive.extract_all_with_password(dest, password)` | `Result<(), R7zError>` | Extract all files from an encrypted archive |
 
@@ -435,10 +440,12 @@ These are public but primarily used for building advanced tooling:
 Archives written by r7z use format version 0.4 (standard). Multi-entry archives use EncodedHeader by default, matching p7zip behavior, and are fully readable by 7-Zip ≥ 9.x and p7zip.
 
 `extract_to_writer` streams decoded file data into the supplied writer and is
-the preferred low-allocation extraction API. `extract_to_memory` intentionally
-allocates the requested file contents. AES-encrypted extraction still buffers
-the encrypted pack stream internally before AES-CBC decryption; streaming AES is
-a planned hardening follow-up.
+the preferred low-allocation single-entry extraction API. For full-archive scans,
+`stream_files` invokes a callback for every file-like entry while decoding each
+solid folder at most once. `extract_to_memory` intentionally allocates the
+requested file contents. AES-encrypted extraction still buffers the encrypted
+pack stream internally before AES-CBC decryption; streaming AES is a planned
+hardening follow-up.
 
 Interop tests cover behavioral parity for p7zip-created and r7z-created LZMA,
 LZMA2, PPMd, and BCJ+x86+LZMA2 archives. The parity target is matching archive
