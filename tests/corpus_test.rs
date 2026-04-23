@@ -15,6 +15,7 @@ enum Expectation {
     Extract,
     OpenOnly,
     OpenError,
+    PasswordRequired,
 }
 
 #[test]
@@ -44,12 +45,24 @@ fn run_manifest(path: &str) {
                 eprintln!("known corpus open failure for {}: {err}", path.display());
                 continue;
             }
+            Err(r7z::R7zError::PasswordRequired)
+                if case.expectation == Expectation::PasswordRequired =>
+            {
+                eprintln!("known corpus password requirement for {}", path.display());
+                continue;
+            }
             Err(err) => panic!("failed to open corpus archive {}: {err}", path.display()),
         };
         assert_ne!(
             case.expectation,
             Expectation::OpenError,
             "corpus archive unexpectedly opened: {}",
+            path.display()
+        );
+        assert_ne!(
+            case.expectation,
+            Expectation::PasswordRequired,
+            "corpus archive unexpectedly opened without a password: {}",
             path.display()
         );
 
@@ -125,6 +138,7 @@ fn parse_manifest_line(line_idx: usize, line: &str) -> CorpusCase {
             "extract" => Expectation::Extract,
             "open" => Expectation::OpenOnly,
             "open_err" => Expectation::OpenError,
+            "password_required" => Expectation::PasswordRequired,
             other => panic!("unknown corpus expectation {other:?} on line {line_idx}"),
         },
         expected_files: match fields[3] {

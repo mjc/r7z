@@ -35,8 +35,11 @@ done
   for file in "${files[@]}"; do
     case "$file" in
       *.002) ;;
-      COMPRESS-681.7z|bla-nonames.7z|bla.encrypted.7z)
+      COMPRESS-681.7z|bla-nonames.7z)
         printf '%s\t%s\t%s\t%s\n' "$out_dir/$file" "-" "open_err" "-"
+        ;;
+      bla.encrypted.7z)
+        printf '%s\t%s\t%s\t%s\n' "$out_dir/$file" "-" "password_required" "-"
         ;;
       *)
         printf '%s\t%s\t%s\t%s\n' "$out_dir/$file" "-" "open" "-"

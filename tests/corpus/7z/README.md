@@ -14,6 +14,8 @@ Expectations:
 - `extract`: parse, open, and extract all non-directory/non-anti entries.
 - `open`: parse and open only.
 - `open_err`: record a known parser/open failure from an external corpus.
+- `password_required`: record an encrypted-header archive that requires a
+  password before it can be opened.
 
 Keep third-party corpus archives out of this directory unless their provenance
 and license are recorded. Use `target/corpus/7z/external` for downloaded
