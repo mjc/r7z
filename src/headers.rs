@@ -5,6 +5,29 @@ use bytes::Bytes;
 use nom::IResult;
 use std::cell::OnceCell;
 
+fn scan_archive_properties(input: &[u8]) -> IResult<&[u8], ()> {
+    let mut input = input;
+    loop {
+        let (i, property_id) = crate::sevenzip_varuint64_decode(input)?;
+        input = i;
+        if property_id == Property::END as u64 {
+            break;
+        }
+
+        let (i, size) = crate::sevenzip_varuint64_decode(input)?;
+        let sz = usize::try_from(size).map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+        let (i, _) = nom::bytes::complete::take(sz)(i)?;
+        input = i;
+    }
+
+    Ok((input, ()))
+}
+
 /// The outer `EncodedHeader` block that describes where the compressed main header lives.
 ///
 /// Most 7z archives compress their metadata (the `Header`) using LZMA; the
@@ -180,16 +203,8 @@ impl Header {
                     input = i;
                 }
                 Property::ArchiveProperties => {
-                    // Skip: size-prefixed block
                     input = i;
-                    let (i, size) = crate::sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, _) = nom::bytes::complete::take(sz)(i)?;
+                    let (i, ()) = scan_archive_properties(input)?;
                     input = i;
                 }
                 _ => {
@@ -218,6 +233,38 @@ impl Header {
                 files_cache: OnceCell::new(),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_archive_properties, Header};
+    use bytes::Bytes;
+
+    #[test]
+    fn scan_archive_properties_with_long_ids() {
+        let input = [
+            0xFF, 0x01, 0x00, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x3F, 0x03, 0x00, 0x01, 0x02, 0xFF,
+            0x02, 0x00, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x3F, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14,
+            0x00, 0xEE,
+        ];
+
+        let (rem, ()) = scan_archive_properties(&input).unwrap();
+
+        assert_eq!(rem, &[0xEE]);
+    }
+
+    #[test]
+    fn parse_header_with_archive_properties() {
+        let header = Bytes::from_static(&[
+            0x01, 0x02, 0xFF, 0x01, 0x00, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x3F, 0x03, 0x00, 0x01,
+            0x02, 0x00, 0x00,
+        ]);
+
+        let (rem, parsed) = Header::parse(&header).unwrap();
+
+        assert!(rem.is_empty());
+        assert_eq!(parsed.num_files(), 0);
     }
 }
 

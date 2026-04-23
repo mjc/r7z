@@ -54,24 +54,24 @@ pub fn sevenzip_varuint64_decode(input: &[u8]) -> IResult<&[u8], u64> {
     let first_byte = input[0];
     let mut value: u64 = 0;
     let mut mask: u8 = 0x80;
-    let mut addr: usize = 0;
+    let mut consumed: usize = 1;
     for i in 0..8usize {
-        addr += 1;
         if (first_byte & mask) == 0 {
             value += u64::from(first_byte & (mask - 1)) << (8 * i);
             break;
         }
-        if addr >= input.len() {
+        if consumed >= input.len() {
             return Err(nom::Err::Error(nom::error::Error::new(
                 input,
                 nom::error::ErrorKind::Eof,
             )));
         }
-        let next = input[addr];
+        let next = input[consumed];
         value |= u64::from(next) << (8 * i);
+        consumed += 1;
         mask >>= 1;
     }
-    Ok((&input[addr..], value))
+    Ok((&input[consumed..], value))
 }
 
 /// Walk a digest (CRC32) block without allocating.
