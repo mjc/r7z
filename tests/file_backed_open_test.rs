@@ -147,7 +147,7 @@ fn open_prepended_archive_finds_embedded_signature() {
 }
 
 #[test]
-fn sparse_large_seek_open_does_not_read_whole_file() {
+fn sparse_seek_open_does_not_read_whole_file() {
     let tmp = tempfile::tempdir().unwrap();
     let archive_path = tmp.path().join("sparse.7z");
     let bytes = r7z::ArchiveBuilder::new()
@@ -181,7 +181,7 @@ fn sparse_large_seek_open_does_not_read_whole_file() {
 }
 
 #[test]
-fn metadata_limit_rejects_large_next_header() {
+fn metadata_limit_rejects_oversized_next_header() {
     let tmp = tempfile::tempdir().unwrap();
     let archive_path = tmp.path().join("limited.7z");
     let bytes = r7z::ArchiveBuilder::new()
@@ -205,7 +205,7 @@ fn metadata_limit_rejects_large_next_header() {
 }
 
 #[test]
-fn metadata_limit_rejects_large_decoded_header() {
+fn metadata_limit_rejects_oversized_decoded_header() {
     let tmp = tempfile::tempdir().unwrap();
     let archive_path = tmp.path().join("decoded-header-limited.7z");
     let mut builder = r7z::ArchiveBuilder::new();

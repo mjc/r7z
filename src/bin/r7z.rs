@@ -1,17 +1,16 @@
 use chrono::{DateTime, Local};
 use r7z::{
-    Archive, ArchiveBuilder, ArchiveEntry, ArchiveListing, ArchiveListingEntry, ArchiveOptions,
-    Codec, CompressionLevel, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind,
-    LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError,
-    RawFolderBlock, SevenZMethod, SolidMode, build_archive_with_preserved_folders,
-    method_from_name,
+    Archive, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec, CompressionLevel,
+    EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, LzmaAlgorithm, MatchFinder,
+    PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock, SevenZMethod, SolidMode,
+    method_from_name, write_archive_with_preserved_folders,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
     process::ExitCode,
@@ -22,6 +21,7 @@ const EXIT_OK: u8 = 0;
 const EXIT_WARNING: u8 = 1;
 const EXIT_FATAL: u8 = 2;
 const EXIT_COMMAND_LINE: u8 = 7;
+const MAX_LZMA2_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -427,6 +427,11 @@ fn validate_lzma_property_bit_combination(
 
 fn parse_chunk_size(value: &str) -> Result<NonZeroU64, CliError> {
     let bytes = parse_size_with_label(value, "LZMA2 chunk size")?;
+    if bytes > MAX_LZMA2_CHUNK_SIZE {
+        return Err(CliError::Usage(
+            "lzma2_chunk_size must be <= 1g".to_string(),
+        ));
+    }
     NonZeroU64::new(bytes)
         .ok_or_else(|| CliError::Usage(format!("invalid LZMA2 chunk size: {value}")))
 }
@@ -1119,7 +1124,7 @@ struct PendingEntry {
 
 #[derive(Clone)]
 enum PendingKind {
-    File(Vec<u8>),
+    File { path: PathBuf, size: u64 },
     EmptyFile,
     Directory,
     Symlink(String),
@@ -1254,11 +1259,14 @@ fn collect_path(
             )?;
         }
     } else if metadata.is_file() {
-        let data = fs::read(path)?;
-        let kind = if data.is_empty() {
+        let size = metadata.len();
+        let kind = if size == 0 {
             PendingKind::EmptyFile
         } else {
-            PendingKind::File(data)
+            PendingKind::File {
+                path: path.to_path_buf(),
+                size,
+            }
         };
         entries.push(PendingEntry {
             name: archive_name_to_string(archive_name)?,
@@ -1385,7 +1393,10 @@ fn preserved_entry_kind(files: &r7z::FilesInfo, index: usize) -> r7z::EntryKind 
 fn pending_to_preserved_entry(entry: PendingEntry) -> PreservedArchiveEntry {
     let PendingEntry { name, kind, meta } = entry;
     let (kind, stream) = match kind {
-        PendingKind::File(data) => (r7z::EntryKind::File, PreservedEntryStream::Data(data)),
+        PendingKind::File { path, size } => (
+            r7z::EntryKind::File,
+            PreservedEntryStream::Path { path, size },
+        ),
         PendingKind::EmptyFile => (r7z::EntryKind::File, PreservedEntryStream::None),
         PendingKind::Directory => (r7z::EntryKind::Directory, PreservedEntryStream::None),
         PendingKind::Symlink(target) => (
@@ -1407,11 +1418,23 @@ fn write_archive_entries(
     options: &ArchiveOptions,
     volume_sizes: &[u64],
 ) -> Result<(), CliError> {
-    let bytes = build_archive_bytes(entries, options)?;
+    let preserved = entries
+        .into_iter()
+        .map(pending_to_preserved_entry)
+        .collect::<Vec<_>>();
     if volume_sizes.is_empty() {
-        fs::write(archive_path, bytes)?;
+        write_preserved_archive_entries_atomic(archive_path, preserved, Vec::new(), options)?;
     } else {
-        write_volumes(archive_path, &bytes, volume_sizes)?;
+        let tmp_archive = temp_archive_path(archive_path);
+        write_preserved_archive_entries_atomic(&tmp_archive, preserved, Vec::new(), options)?;
+        let result = write_volumes_from_file(archive_path, &tmp_archive, volume_sizes);
+        let cleanup = fs::remove_file(&tmp_archive);
+        result?;
+        if let Err(err) = cleanup {
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
     }
     Ok(())
 }
@@ -1422,49 +1445,58 @@ fn write_preserved_archive_entries_atomic(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<(), CliError> {
-    let bytes = build_archive_with_preserved_folders(entries, raw_folders, options)?;
-    let tmp_path = archive_path.with_extension(format!(
+    let tmp_path = temp_archive_path(archive_path);
+    let file = fs::File::create(&tmp_path)?;
+    if let Err(err) = write_archive_with_preserved_folders(file, entries, raw_folders, options) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    fs::rename(&tmp_path, archive_path)?;
+    Ok(())
+}
+
+fn temp_archive_path(archive_path: &Path) -> PathBuf {
+    archive_path.with_extension(format!(
         "{}.tmp-{}",
         archive_path
             .extension()
             .and_then(OsStr::to_str)
             .unwrap_or("7z"),
         std::process::id()
-    ));
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(&tmp_path, archive_path)?;
-    Ok(())
+    ))
 }
 
-fn build_archive_bytes(
-    entries: Vec<PendingEntry>,
-    options: &ArchiveOptions,
-) -> Result<Vec<u8>, CliError> {
-    let mut builder = ArchiveBuilder::new().options(options.clone());
-    for entry in entries {
-        builder = match entry.kind {
-            PendingKind::File(data) => {
-                builder.add_entry(ArchiveEntry::file(entry.name, entry.meta), Some(&data))?
-            }
-            PendingKind::EmptyFile => builder.add_empty_file(&entry.name, entry.meta),
-            PendingKind::Directory => builder.add_directory(&entry.name, entry.meta),
-            PendingKind::Symlink(target) => builder.add_symlink(&entry.name, &target, entry.meta),
-        };
-    }
-    Ok(builder.build()?)
-}
-
-fn write_volumes(base: &Path, bytes: &[u8], sizes: &[u64]) -> Result<(), CliError> {
-    let mut offset = 0usize;
+fn write_volumes_from_file(
+    base: &Path,
+    archive_path: &Path,
+    sizes: &[u64],
+) -> Result<(), CliError> {
+    let mut input = fs::File::open(archive_path)?;
+    let input_len = input.metadata()?.len();
+    let mut written_total = 0u64;
     let mut idx = 0usize;
-    while offset < bytes.len() {
-        let size = usize::try_from(sizes[idx.min(sizes.len() - 1)])
-            .map_err(|_| CliError::Usage("volume size is too large".to_string()))?;
-        let end = offset.saturating_add(size).min(bytes.len());
+    while written_total < input_len || (idx == 0 && input_len == 0) {
+        let size = sizes[idx.min(sizes.len() - 1)];
         let path = PathBuf::from(format!("{}.{:03}", base.display(), idx + 1));
-        fs::write(path, &bytes[offset..end])?;
-        offset = end;
+        let tmp_path = path.with_extension(format!(
+            "{}.tmp-{}",
+            path.extension().and_then(OsStr::to_str).unwrap_or("vol"),
+            std::process::id()
+        ));
+        let mut output = fs::File::create(&tmp_path)?;
+        let written = {
+            let remaining = input_len.saturating_sub(written_total);
+            let limit = size.min(remaining);
+            let mut limited = Read::by_ref(&mut input).take(limit);
+            io::copy(&mut limited, &mut output)?
+        };
+        output.flush()?;
+        fs::rename(&tmp_path, &path)?;
+        written_total = written_total.checked_add(written).ok_or(R7zError::Parse)?;
         idx += 1;
+        if written == 0 {
+            break;
+        }
     }
     Ok(())
 }

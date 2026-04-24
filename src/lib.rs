@@ -105,6 +105,7 @@ pub use write::{
     MatchFinder, PreservedArchiveEntry, PreservedEntryStream, SolidMode, SpoolMode,
     StreamingOptions, VolumeOptions, build_archive_with_preserved_folders, build_streaming,
     build_streaming_to_writer, build_streaming_volumes, build_streaming_with_options,
+    write_archive_with_preserved_folders,
 };
 
 // Re-export nom's IResult for convenience in integration tests

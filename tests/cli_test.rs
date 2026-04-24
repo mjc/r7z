@@ -459,6 +459,62 @@ fn cli_create_accepts_lzma2_chunk_size_options() {
 }
 
 #[test]
+fn cli_create_rejects_oversized_lzma2_chunk_size() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("payload.bin"), b"payload").unwrap();
+    let archive = tmp.path().join("too-large-lzma2-chunk.7z");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "a",
+            "-m0=LZMA2:c=2g",
+            archive.to_str().unwrap(),
+            input.join("payload.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lzma2_chunk_size"));
+}
+
+#[test]
+fn cli_create_split_volumes_from_path_backed_input() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let payload = (0u8..=255).cycle().take(16 * 1024).collect::<Vec<_>>();
+    fs::write(input.join("payload.bin"), &payload).unwrap();
+    let archive = tmp.path().join("split.7z");
+
+    run_r7z(&[
+        "a".into(),
+        "-m0=Copy".into(),
+        "-v2k".into(),
+        archive.display().to_string(),
+        input.join("payload.bin").display().to_string(),
+    ]);
+
+    assert!(tmp.path().join("split.7z.001").exists());
+    assert!(tmp.path().join("split.7z.002").exists());
+
+    let mut joined = Vec::new();
+    let mut idx = 1;
+    loop {
+        let path = tmp.path().join(format!("split.7z.{idx:03}"));
+        if !path.exists() {
+            break;
+        }
+        joined.extend_from_slice(&fs::read(path).unwrap());
+        idx += 1;
+    }
+    let archive = r7z::Archive::from_bytes(joined.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), payload);
+}
+
+#[test]
 fn cli_rejects_invalid_lzma_match_finder_option() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
@@ -1151,4 +1207,36 @@ fn cli_unsupported_p7zip_method_is_command_line_error() {
         .unwrap();
     assert_eq!(output.status.code(), Some(7));
     assert!(String::from_utf8_lossy(&output.stderr).contains("not yet supported"));
+}
+
+fn create_sparse_lzma2_archive_and_list_size(size: u64) {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("large.bin");
+    let file = fs::File::create(&input).unwrap();
+    file.set_len(size).unwrap();
+    drop(file);
+    let archive = tmp.path().join("large.7z");
+
+    run_r7z(&[
+        "a".into(),
+        archive.display().to_string(),
+        input.display().to_string(),
+    ]);
+
+    let listing = run_r7z(&["l".into(), "-slt".into(), archive.display().to_string()]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("Path = large.bin"));
+    assert!(listing.contains(&format!("Size = {size}")));
+}
+
+#[test]
+#[ignore = "large"]
+fn large_cli_create_1gb_sparse_lzma2_archive() {
+    create_sparse_lzma2_archive_and_list_size(1024 * 1024 * 1024);
+}
+
+#[test]
+#[ignore = "large"]
+fn large_cli_create_5gb_sparse_lzma2_archive() {
+    create_sparse_lzma2_archive_and_list_size(5 * 1024 * 1024 * 1024);
 }

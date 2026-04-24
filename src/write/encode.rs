@@ -13,11 +13,13 @@ use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter,
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
 };
-use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
+use std::{collections::BTreeMap, num::NonZeroU64};
 
 type PayloadEncoding = (Vec<u8>, Vec<u8>, Vec<u64>, Vec<CoderSpec>);
 type HeaderEncoding = (Vec<u8>, Vec<u8>, Vec<u64>);
+pub(crate) const DEFAULT_LZMA2_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_LZMA2_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
 pub(crate) fn build_archive(
     entries: &[WriteEntry],
@@ -181,7 +183,18 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError
     }
     validate_lzma_property_bits(&options.compression)?;
     validate_match_cycles(&options.compression)?;
+    if matches!(options.codec, Codec::Lzma2 | Codec::Lzma2Bcj) {
+        let dict = lzma_options(&options.compression).dict_size;
+        if u64::from(dict) > MAX_LZMA2_CHUNK_SIZE {
+            return Err(R7zError::InvalidOptions(
+                "dictionary_size must be <= 1g for LZMA2",
+            ));
+        }
+    }
     if let Some(chunk_size) = options.compression.lzma2_chunk_size {
+        if chunk_size.get() > MAX_LZMA2_CHUNK_SIZE {
+            return Err(R7zError::InvalidOptions("lzma2_chunk_size must be <= 1g"));
+        }
         let dict = lzma_options(&options.compression).dict_size;
         if chunk_size.get() < u64::from(dict) {
             return Err(R7zError::InvalidOptions(
@@ -443,8 +456,17 @@ pub(crate) fn lzma2_options(compression: &CompressionOptions) -> Lzma2Options {
         lzma_options: lzma_options(compression),
         chunk_size: None,
     };
-    options.set_chunk_size(compression.lzma2_chunk_size);
+    options.set_chunk_size(Some(effective_lzma2_chunk_size(compression)));
     options
+}
+
+fn effective_lzma2_chunk_size(compression: &CompressionOptions) -> NonZeroU64 {
+    let dict = u64::from(lzma_options(compression).dict_size);
+    let size = compression
+        .lzma2_chunk_size
+        .map(NonZeroU64::get)
+        .unwrap_or_else(|| DEFAULT_LZMA2_CHUNK_SIZE.max(dict).min(MAX_LZMA2_CHUNK_SIZE));
+    NonZeroU64::new(size).expect("LZMA2 chunk size constants are non-zero")
 }
 
 pub(crate) fn lzma2_property_byte(compression: &CompressionOptions) -> Result<u8, R7zError> {
@@ -623,4 +645,35 @@ fn signature_bytes(next_header_offset: u64, next_header: &[u8]) -> [u8; 32] {
     signature[20..28].copy_from_slice(&next_header_size.to_le_bytes());
     signature[28..32].copy_from_slice(&next_header_crc.to_le_bytes());
     signature
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lzma2_options_uses_bounded_default_chunk_size() {
+        let compression = CompressionOptions::default();
+        let options = lzma2_options(&compression);
+
+        assert_eq!(
+            options.chunk_size.map(NonZeroU64::get),
+            Some(DEFAULT_LZMA2_CHUNK_SIZE)
+        );
+    }
+
+    #[test]
+    fn validate_lzma2_rejects_oversized_chunk_size() {
+        let options = ArchiveOptions {
+            codec: Codec::Lzma2,
+            compression: CompressionOptions {
+                lzma2_chunk_size: NonZeroU64::new(MAX_LZMA2_CHUNK_SIZE + 1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = validate_archive_options(&options).unwrap_err();
+        assert!(err.to_string().contains("lzma2_chunk_size"));
+    }
 }
