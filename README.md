@@ -516,6 +516,15 @@ cargo clippy --all-targets --all-features -- -D clippy::pedantic
 # Benchmarks (Criterion — parse, open, extract, build)
 cargo bench
 
+# CLI comparison against the pinned p7zip oracle across a size matrix
+nix develop -c bash scripts/compare_p7zip_perf.sh --sizes 1K,1M,64M,1G,5G --runs 3
+
+# Generate r7z flamegraphs for selected CLI ops during the same sweep
+nix develop -c bash scripts/compare_p7zip_perf.sh --sizes 1M,64M --runs 1 --flamegraphs --flamegraph-ops l,t,a
+
+# Manual large-file regression tests; CI excludes the large_ tag
+cargo test large_ -- --ignored --nocapture
+
 # Rustdoc
 cargo doc --no-deps --open
 ```
@@ -523,6 +532,15 @@ cargo doc --no-deps --open
 **Interop tests** require `7z` (p7zip) in `PATH`. On macOS: `brew install p7zip`; on Ubuntu: `apt install p7zip-full`.
 
 **CI** runs on GitHub Actions: format check → clippy → p7zip interop tests → rustdoc.
+
+The CLI comparison script defaults to materialized zero-filled payloads so large
+sizes like `5G` exercise real file I/O. Use `--pattern sparse-zero` only when
+you explicitly want a faster sparse-file shortcut instead. For flamegraphs, use
+`nix develop -c bash ...`; avoid `bash -lc` because login shells can reset the
+dev-shell `PATH` and hide `perf`.
+
+CI runs `cargo test --no-fail-fast -- --skip large_`. Tests whose names start
+with `large_` must also use `#[ignore = "large"]` and are manual-only.
 
 ## License
 

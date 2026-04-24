@@ -54,7 +54,7 @@ jobs:
           "$bin" i
 
       - name: Test
-        run: cargo test
+        run: cargo test --no-fail-fast -- --skip large_
 
   docs:
     name: Docs
