@@ -3,7 +3,6 @@
   "projects": [
     "r7z",
     "7z",
-    "p7zip",
-    "MemPalace"
+    "p7zip"
   ]
 }
