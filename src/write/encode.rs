@@ -417,8 +417,35 @@ fn encode_header_stream(
 
 pub(crate) fn lzma_options(compression: &CompressionOptions) -> LzmaOptions {
     let mut options = LzmaOptions::with_preset(compression_level_preset(compression.level));
-    if compression.level == CompressionLevel::Normal {
-        options.dict_size = 16 << 20;
+    // Match the pinned p7zip defaults. lzma-rust2 only offers HC4 at fast
+    // levels, where p7zip uses HC5, so HC4 remains the closest available finder.
+    match compression.level {
+        CompressionLevel::Fastest => {
+            options.dict_size = 256 << 10;
+            options.nice_len = 32;
+            options.depth_limit = 16;
+        }
+        CompressionLevel::Fast => {
+            options.dict_size = 4 << 20;
+            options.nice_len = 32;
+            options.depth_limit = 16;
+        }
+        CompressionLevel::Normal => {
+            options.dict_size = 16 << 20;
+            options.nice_len = 32;
+            options.depth_limit = 32;
+        }
+        CompressionLevel::Maximum => {
+            options.dict_size = 32 << 20;
+            options.nice_len = 64;
+            options.depth_limit = 48;
+        }
+        CompressionLevel::Ultra => {
+            options.dict_size = 64 << 20;
+            options.nice_len = 64;
+            options.depth_limit = 48;
+        }
+        CompressionLevel::Store => {}
     }
     if let Some(dict_size) = compression.dictionary_size {
         options.dict_size = dict_size;
@@ -662,6 +689,85 @@ mod tests {
         assert_eq!(options.nice_len, 32);
         assert!(matches!(options.mf, MfType::Bt4));
         assert!(matches!(options.mode, EncodeMode::Normal));
+    }
+
+    #[test]
+    fn lzma2_level_defaults_match_p7zip_levels_one_three_seven_and_nine() {
+        let cases = [
+            (
+                CompressionLevel::Fastest,
+                256 << 10,
+                32,
+                16,
+                12,
+                MfType::Hc4,
+                EncodeMode::Fast,
+            ),
+            (
+                CompressionLevel::Fast,
+                4 << 20,
+                32,
+                16,
+                20,
+                MfType::Hc4,
+                EncodeMode::Fast,
+            ),
+            (
+                CompressionLevel::Maximum,
+                32 << 20,
+                64,
+                48,
+                26,
+                MfType::Bt4,
+                EncodeMode::Normal,
+            ),
+            (
+                CompressionLevel::Ultra,
+                64 << 20,
+                64,
+                48,
+                28,
+                MfType::Bt4,
+                EncodeMode::Normal,
+            ),
+        ];
+
+        for (level, dict_size, nice_len, depth_limit, property_byte, mf, mode) in cases {
+            let compression = CompressionOptions {
+                level,
+                ..Default::default()
+            };
+            let options = lzma2_options(&compression).lzma_options;
+
+            assert_eq!(options.dict_size, dict_size, "{level:?} dictionary");
+            assert_eq!(options.nice_len, nice_len, "{level:?} fast bytes");
+            assert_eq!(options.depth_limit, depth_limit, "{level:?} match cycles");
+            assert_eq!(options.mf, mf, "{level:?} match finder");
+            assert_eq!(options.mode, mode, "{level:?} algorithm");
+            assert_eq!(
+                lzma2_property_byte(&compression).unwrap(),
+                property_byte,
+                "{level:?} encoded dictionary property"
+            );
+        }
+    }
+
+    #[test]
+    fn lzma2_level_defaults_preserve_explicit_overrides() {
+        let compression = CompressionOptions {
+            level: CompressionLevel::Fast,
+            dictionary_size: Some(8 << 20),
+            fast_bytes: Some(48),
+            match_finder: Some(MatchFinder::Bt4),
+            match_cycles: Some(8),
+            ..Default::default()
+        };
+        let options = lzma2_options(&compression).lzma_options;
+
+        assert_eq!(options.dict_size, 8 << 20);
+        assert_eq!(options.nice_len, 48);
+        assert_eq!(options.depth_limit, 8);
+        assert!(matches!(options.mf, MfType::Bt4));
     }
 
     #[test]

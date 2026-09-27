@@ -490,6 +490,10 @@ algorithm and match-cycle options such as `-m0=LZMA:a=0:mc=16` or
 `-ma=1 -mmc=32`, LZMA2 chunk-size options such as `-m0=LZMA2:c=1m` or
 `-mc=1m`, dictionary, fast-bytes, solid, and threading compatibility switches.
 Normal LZMA2 (`-mx=5`) uses a 16 MiB dictionary, 32 fast bytes, and BT4.
+For zero-heavy or repetitive inputs, `-m0=LZMA2:mf=HC4` can use less memory
+and encode much faster; on tested zero-filled and repeated-text inputs it kept
+the archive size unchanged. It did not speed up the tested pseudo-random input,
+so keep BT4 when matching p7zip's default or when compression ratio matters.
 `-mmt=off`, `-mmt=1`, and method-scoped `mt=off|1` select the supported
 single-threaded encoder; other thread counts are rejected.
 

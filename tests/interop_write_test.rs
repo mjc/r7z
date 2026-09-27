@@ -724,6 +724,29 @@ fn archive_builder_lzma_match_finder_option_p7zip_extracts() {
 }
 
 #[test]
+fn archive_builder_lzma2_hc4_profile_p7zip_extracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let files = parity_files();
+    let archive_path = dir.join("builder_lzma2_hc4.7z");
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Lzma2,
+        compression: r7z::CompressionOptions {
+            match_finder: Some(r7z::MatchFinder::Hc4),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = r7z::ArchiveBuilder::new().options(options);
+    for (name, data) in &files {
+        builder = builder.add_file(&name.to_string_lossy(), data);
+    }
+    std::fs::write(&archive_path, builder.build().unwrap()).unwrap();
+
+    assert_p7zip_extracts_archive(dir, &archive_path, &files, &["LZMA2"]);
+}
+
+#[test]
 fn archive_builder_lzma_algorithm_and_match_cycles_p7zip_extracts() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -941,6 +964,56 @@ fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
         .unwrap();
     let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders[0].codec_id.as_slice(), r7z::CODEC_LZMA2);
+}
+
+#[test]
+fn archive_builder_lzma2_levels_write_p7zip_dictionary_properties() {
+    let cases = [
+        (r7z::CompressionLevel::Fastest, 12),
+        (r7z::CompressionLevel::Fast, 20),
+        (r7z::CompressionLevel::Maximum, 26),
+        (r7z::CompressionLevel::Ultra, 28),
+    ];
+
+    for (level, expected_property) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let archive_path = dir.join("level.7z");
+        let payload = b"level metadata".to_vec();
+        let bytes = r7z::ArchiveBuilder::new()
+            .options(r7z::ArchiveOptions {
+                compression: r7z::CompressionOptions {
+                    level,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .add_file("payload.bin", &payload)
+            .build()
+            .unwrap();
+        std::fs::write(&archive_path, &bytes).unwrap();
+        let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+        let folder = archive
+            .streams_info()
+            .unwrap()
+            .unpack_info
+            .as_ref()
+            .unwrap()
+            .parse_folder(0)
+            .unwrap();
+
+        assert_eq!(
+            folder.coders[0].properties.as_deref(),
+            Some(&[expected_property][..]),
+            "{level:?}"
+        );
+        assert_p7zip_extracts_archive(
+            dir,
+            &archive_path,
+            &[(PathBuf::from("payload.bin"), payload)],
+            &["LZMA2"],
+        );
+    }
 }
 
 #[test]

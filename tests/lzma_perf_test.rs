@@ -1,5 +1,6 @@
 #![allow(clippy::pedantic)]
 
+use sha2::{Digest, Sha256};
 /// Head-to-head comparison: lzma_rust2 (pure Rust) vs C liblzma (via xz2).
 ///
 /// Uses LZMA-alone format for both so the underlying algorithm is identical
@@ -222,6 +223,86 @@ fn large_lzma2_matched_input_vs_liblzma() {
 
     let random = pseudo_random_payload(16 * 1024 * 1024);
     bench_matched_lzma2(&random, "16 MiB pseudo-random");
+}
+
+#[test]
+#[ignore = "large"]
+fn large_lzma2_mt_candidate() {
+    let input_path = std::env::var("R7Z_BENCH_INPUT").expect("set R7Z_BENCH_INPUT");
+    let workers = std::env::var("R7Z_BENCH_WORKERS")
+        .expect("set R7Z_BENCH_WORKERS")
+        .parse::<u32>()
+        .unwrap();
+    let chunk_size = NonZeroU64::new(
+        std::env::var("R7Z_BENCH_CHUNK_SIZE")
+            .unwrap_or_else(|_| (64 * 1024 * 1024).to_string())
+            .parse::<u64>()
+            .unwrap(),
+    )
+    .unwrap();
+    let input_path = std::path::Path::new(&input_path);
+    let input_size = std::fs::metadata(input_path).unwrap().len();
+    let mut input_hash = Sha256::new();
+    let mut input = std::fs::File::open(input_path).unwrap();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        input_hash.update(&buffer[..read]);
+    }
+    let expected_hash = input_hash.finalize();
+
+    let mut options = lzma_rust2::Lzma2Options::with_preset(5);
+    options.lzma_options.dict_size = 16 << 20;
+    options.lzma_options.nice_len = 32;
+    options.lzma_options.depth_limit = 32;
+    options.set_chunk_size(Some(chunk_size));
+
+    let output = Vec::new();
+    let start = Instant::now();
+    let mut input = std::fs::File::open(input_path).unwrap();
+    let output = if workers == 1 {
+        let mut writer = lzma_rust2::Lzma2Writer::new(output, options.clone());
+        std::io::copy(&mut input, &mut writer).unwrap();
+        writer.finish().unwrap()
+    } else {
+        let mut writer = lzma_rust2::Lzma2WriterMt::new(output, options.clone(), workers).unwrap();
+        std::io::copy(&mut input, &mut writer).unwrap();
+        writer.finish().unwrap()
+    };
+    let elapsed = start.elapsed();
+    println!(
+        "workers={workers}, chunk_size={}, input_bytes={input_size}, packed_bytes={}, elapsed={elapsed:?}",
+        chunk_size.get(),
+        output.len()
+    );
+
+    let mut decoder =
+        lzma_rust2::Lzma2Reader::new(output.as_slice(), options.lzma_options.dict_size, None);
+    let mut decoded = Sha256Sink::default();
+    std::io::copy(&mut decoder, &mut decoded).unwrap();
+    assert_eq!(decoded.len, input_size);
+    assert_eq!(decoded.hasher.finalize(), expected_hash);
+}
+
+#[derive(Default)]
+struct Sha256Sink {
+    hasher: Sha256,
+    len: u64,
+}
+
+impl Write for Sha256Sink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(bytes);
+        self.len += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn bench_matched_lzma2(data: &[u8], label: &str) {
