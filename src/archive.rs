@@ -1064,6 +1064,13 @@ impl Archive {
                 location.folder_unpack_size,
                 &location.coder_unpack_sizes,
                 password,
+                usize::try_from(
+                    location.packed_ranges[0]
+                        .end
+                        .checked_sub(location.packed_ranges[0].start)
+                        .ok_or(R7zError::Parse)?,
+                )
+                .map_err(|_| R7zError::Parse)?,
             )?
         } else {
             ensure_packed_ranges_buffer_limit(&location.packed_ranges)?;
@@ -1409,9 +1416,12 @@ impl Archive {
         })?;
         let data_start =
             checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
+        let pack_stream_end = pack_stream_base
+            .checked_add(num_pack_streams)
+            .ok_or(R7zError::Parse)?;
         let pack_sizes = pack_info
             .pack_size
-            .get(pack_stream_base..pack_stream_base + num_pack_streams)
+            .get(pack_stream_base..pack_stream_end)
             .ok_or(R7zError::Parse)?;
         if num_pack_streams > 1 {
             ensure_packed_folder_buffer_limit(pack_sizes)?;
@@ -1477,9 +1487,12 @@ impl Archive {
         let mut pack_offset_u64 = pack_byte_base;
         let data_start =
             checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
+        let pack_stream_end = pack_stream_base
+            .checked_add(num_pack_streams)
+            .ok_or(R7zError::Parse)?;
         let pack_sizes = pack_info
             .pack_size
-            .get(pack_stream_base..pack_stream_base + num_pack_streams)
+            .get(pack_stream_base..pack_stream_end)
             .ok_or(R7zError::Parse)?;
         if num_pack_streams > 1 {
             ensure_packed_folder_buffer_limit(pack_sizes)?;
@@ -1507,6 +1520,13 @@ impl Archive {
                 folder_unpack_size,
                 &coder_unpack_sizes,
                 password,
+                usize::try_from(
+                    packed_ranges[0]
+                        .end
+                        .checked_sub(packed_ranges[0].start)
+                        .ok_or(R7zError::Parse)?,
+                )
+                .map_err(|_| R7zError::Parse)?,
             )?
         } else {
             let mut packed_streams = Vec::with_capacity(packed_ranges.len());

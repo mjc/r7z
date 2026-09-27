@@ -477,7 +477,13 @@ mod tests {
         ));
         input.extend([0x0A, 0x00]);
 
-        assert!(SubstreamInfo::parse(&input, 1).is_err());
+        assert!(matches!(
+            SubstreamInfo::parse(&input, 1),
+            Err(nom::Err::Error(nom::error::Error {
+                code: nom::error::ErrorKind::TooLarge,
+                ..
+            }))
+        ));
     }
 
     /// Wrong opening tag returns a hard Failure.
