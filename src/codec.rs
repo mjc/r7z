@@ -717,7 +717,7 @@ fn bcj2_lzma_predecoders(
     let output_size = bcj2_output_size(unpack_size)?;
     let packed_bytes = total_buffered_len(packed_streams)?;
     let jump_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
-    let jump_limit = bcj2_intermediate_limit(packed_bytes, output_size, 0, jump_memory)?;
+    let jump_limit = bcj2_intermediate_available(packed_bytes, output_size, 0, jump_memory)?;
     let jump_limit = declared_or_fallback_limit(coder_unpack_sizes.first(), jump_limit);
     let jump = decode_single_coder_to_vec(
         &folder.coders[0],
@@ -728,7 +728,7 @@ fn bcj2_lzma_predecoders(
     )?;
     let call_memory = coder_working_set_bytes(&folder.coders[1], packed_bytes)?;
     let call_limit =
-        bcj2_intermediate_limit(packed_bytes, output_size, jump.capacity(), call_memory)?;
+        bcj2_intermediate_available(packed_bytes, output_size, jump.capacity(), call_memory)?;
     let call_limit = declared_or_fallback_limit(coder_unpack_sizes.get(1), call_limit);
     let call = decode_single_coder_to_vec(
         &folder.coders[1],
@@ -738,7 +738,7 @@ fn bcj2_lzma_predecoders(
         password,
     )?;
     let main_memory = coder_working_set_bytes(&folder.coders[2], packed_bytes)?;
-    let main_limit = bcj2_intermediate_limit(
+    let main_limit = bcj2_intermediate_available(
         packed_bytes,
         output_size,
         jump.capacity()
@@ -800,10 +800,11 @@ fn decode_single_coder_to_vec(
     Ok(output)
 }
 
-fn declared_or_fallback_limit(declared_size: Option<&u64>, fallback: usize) -> usize {
+fn declared_or_fallback_limit(declared_size: Option<&u64>, available: usize) -> usize {
+    let fallback = growth_safe_output_limit(available);
     declared_size
         .and_then(|size| usize::try_from(*size).ok())
-        .filter(|size| *size <= fallback)
+        .filter(|size| *size <= available)
         .unwrap_or(fallback)
 }
 
@@ -880,6 +881,20 @@ fn bcj2_intermediate_limit(
     intermediate_bytes: usize,
     decoder_memory: usize,
 ) -> Result<usize, R7zError> {
+    Ok(growth_safe_output_limit(bcj2_intermediate_available(
+        packed_bytes,
+        output_size,
+        intermediate_bytes,
+        decoder_memory,
+    )?))
+}
+
+fn bcj2_intermediate_available(
+    packed_bytes: usize,
+    output_size: usize,
+    intermediate_bytes: usize,
+    decoder_memory: usize,
+) -> Result<usize, R7zError> {
     let committed = packed_bytes
         .checked_add(output_size)
         .and_then(|total| total.checked_add(intermediate_bytes))
@@ -888,7 +903,7 @@ fn bcj2_intermediate_limit(
     let available = MAX_BCJ2_BUFFERED_BYTES
         .checked_sub(committed)
         .ok_or_else(|| resource_limit("BCJ2 working buffers", MAX_BCJ2_BUFFERED_BYTES))?;
-    Ok(growth_safe_output_limit(available))
+    Ok(available)
 }
 
 fn ensure_bcj2_buffer_budget(
@@ -1196,6 +1211,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn bcj2_declared_intermediate_uses_exact_available_budget() {
+        let packed = 45 * 1024 * 1024;
+        let output = 150 * 1024 * 1024;
+        let decoder = 64 * 1024 * 1024;
+        let available = super::bcj2_intermediate_available(packed, output, 0, decoder).unwrap();
+        let declared = 150 * 1024 * 1024;
+
+        assert_eq!(
+            super::declared_or_fallback_limit(Some(&(declared as u64)), available),
+            declared
+        );
     }
 
     #[test]
