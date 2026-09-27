@@ -95,8 +95,11 @@ RSS was 3,428 MiB / 2,601 MiB for r7z / p7zip. Matched one-thread medians were
 15.335 s / 19.342 s on zeros, 0.244 s / 0.344 s on text, 4.283 s / 3.776 s
 on random input, and 5.355 s / 4.762 s on the binary. The wide ranges on
 zeros and the binary reflect host CPU-speed variation; the raw log includes
-rejected load spikes as well. Every final archive was cross-extracted by the
-other tool and matched the input SHA-256 exactly.
+rejected load spikes as well. A separate three-round run under 96% host idle
+rechecked the random and binary inputs after two slower samples passed the
+initial load filter: random 3.656 / 0.851 s and binary 5.120 / 2.427 s
+(r7z / p7zip medians). The remaining gap is consistent. Every final archive
+was cross-extracted by the other tool and matched the input SHA-256 exactly.
 
 The input SHA-256 values are `49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14`
 (zeros), `30b5e90094f86bd54484e90f99d40c14a70f80fb44265bbebc85c6b1c8ca91dc`
