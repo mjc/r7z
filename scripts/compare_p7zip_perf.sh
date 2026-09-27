@@ -197,7 +197,7 @@ generate_flamegraph() {
   local label="$1"
   shift
   local out="$FLAMEGRAPH_DIR/$label.svg"
-  local cargo_args=(flamegraph --bin r7z -o "$out")
+  local cargo_args=(flamegraph --profile profiling --bin r7z -o "$out")
   if [[ "$FLAMEGRAPH_ROOT" == "1" ]]; then
     cargo_args+=(--root)
   fi
