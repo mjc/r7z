@@ -7,6 +7,7 @@
 ///
 /// Run with:  cargo test --release lzma_perf -- --nocapture --ignored
 use std::io::{Cursor, Read, Write};
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 const ITERS: u32 = 5;
@@ -211,4 +212,74 @@ fn lzma_rust_vs_c_performance() {
     assert_eq!(rust_decompress(&rust_text_compressed), text_data);
     assert_eq!(c_decompress(&c_text_compressed), text_data);
     println!("✓ Both produce identical output");
+}
+
+#[test]
+#[ignore = "large manual encoder comparison"]
+fn large_lzma2_matched_input_vs_liblzma() {
+    let zeros = vec![0u8; 64 * 1024 * 1024];
+    bench_matched_lzma2(&zeros, "64 MiB zeros");
+
+    let random = pseudo_random_payload(16 * 1024 * 1024);
+    bench_matched_lzma2(&random, "16 MiB pseudo-random");
+}
+
+fn bench_matched_lzma2(data: &[u8], label: &str) {
+    let size = data.len();
+
+    let mut rust_options = lzma_rust2::Lzma2Options::with_preset(5);
+    rust_options.lzma_options.dict_size = 16 << 20;
+    rust_options.set_chunk_size(Some(NonZeroU64::new(size as u64).unwrap()));
+
+    let mut c_options = xz2::stream::LzmaOptions::new_preset(5).unwrap();
+    c_options
+        .dict_size(16 << 20)
+        .nice_len(32)
+        .mode(xz2::stream::Mode::Normal)
+        .match_finder(xz2::stream::MatchFinder::BinaryTree4)
+        .depth(0);
+
+    let rust_encode = |chunk_size: usize| {
+        let mut writer = lzma_rust2::Lzma2Writer::new(Vec::new(), rust_options.clone());
+        for chunk in data.chunks(chunk_size) {
+            writer.write_all(chunk).unwrap();
+        }
+        writer.finish().unwrap()
+    };
+    let c_encode = |chunk_size: usize| {
+        let mut filters = xz2::stream::Filters::new();
+        filters.lzma2(&c_options);
+        let stream =
+            xz2::stream::Stream::new_stream_encoder(&filters, xz2::stream::Check::None).unwrap();
+        let mut writer = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+        for chunk in data.chunks(chunk_size) {
+            writer.write_all(chunk).unwrap();
+        }
+        writer.finish().unwrap()
+    };
+
+    let rust_output = rust_encode(size);
+    let mut rust_decoded = Vec::new();
+    lzma_rust2::Lzma2Reader::new(rust_output.as_slice(), 16 << 20, None)
+        .read_to_end(&mut rust_decoded)
+        .unwrap();
+    assert_eq!(rust_decoded, data);
+
+    let c_output = c_encode(size);
+    let mut c_decoded = Vec::new();
+    xz2::read::XzDecoder::new(c_output.as_slice())
+        .read_to_end(&mut c_decoded)
+        .unwrap();
+    assert_eq!(c_decoded, data);
+
+    println!("{label}, preset 5, 16 MiB dict, 32 fast bytes, BT4");
+    println!(
+        "compressed bytes: Rust={}, liblzma/XZ={}",
+        rust_output.len(),
+        c_output.len()
+    );
+    bench("Rust one write", 2, || rust_encode(size));
+    bench("liblzma one write", 2, || c_encode(size));
+    bench("Rust 8 KiB writes", 2, || rust_encode(8192));
+    bench("liblzma 8 KiB writes", 2, || c_encode(8192));
 }
