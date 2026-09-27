@@ -4,7 +4,6 @@ set -euo pipefail
 sha="${P7ZIP_ORACLE_SHA:-6819e2dc1917e1267babddc6391cea56ead7123d}"
 repo="${P7ZIP_ORACLE_REPO:-https://github.com/p7zip-project/p7zip.git}"
 dir="${P7ZIP_ORACLE_DIR:-/tmp/r7z-p7zip-compare}"
-script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 find_oracle_bin() {
   local make_dir="$1"
@@ -19,15 +18,13 @@ find_oracle_bin() {
 }
 
 ensure_build_tools() {
-  if command -v make >/dev/null 2>&1; then
-    return 0
-  fi
-  if command -v nix-shell >/dev/null 2>&1 && [[ "${R7Z_ORACLE_IN_NIX:-0}" != 1 ]]; then
-    export P7ZIP_ORACLE_SHA="$sha" P7ZIP_ORACLE_REPO="$repo" P7ZIP_ORACLE_DIR="$dir"
-    exec nix-shell -p gnumake gcc git cmake --run "R7Z_ORACLE_IN_NIX=1 bash '$script'"
-  fi
-  echo "make is required to build the p7zip oracle" >&2
-  exit 127
+  local tool
+  for tool in make gcc git cmake; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "$tool is required to build the p7zip oracle; enter devenv or install it" >&2
+      exit 127
+    fi
+  done
 }
 
 checkout_oracle_sha() {

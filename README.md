@@ -504,14 +504,14 @@ devenv shell
 ```
 
 This loads the dev shell with:
-- **Rust toolchain** (stable + clippy + rustfmt)
+- **Rust toolchain** (pinned in `rust-toolchain.toml`; used by rustup, devenv, and CI)
 - **Profiling**: `perf`, `cargo-flamegraph`, `valgrind`
 - **Build**: `cargo-nextest`, `gnuplot`, `hyperfine`
 
 Use `cargo flamegraph --profile profiling --bin r7z -- a archive.7z input`
 to profile archive creation with full debug symbols.
 
-### Without Nix
+### Manual Commands
 
 ```bash
 # Run all tests (unit + integration + p7zip interop)

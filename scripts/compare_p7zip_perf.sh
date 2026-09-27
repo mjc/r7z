@@ -146,8 +146,7 @@ if [[ "$FLAMEGRAPHS" == "1" ]]; then
   fi
   if ! command -v perf >/dev/null 2>&1; then
     echo "perf is required for flamegraphs and was not found in PATH." >&2
-    echo "Try: nix develop -c bash scripts/compare_p7zip_perf.sh ..." >&2
-    echo "Avoid: nix develop -c bash -lc '...' because login shells can reset PATH." >&2
+    echo "Try: devenv shell -- bash scripts/compare_p7zip_perf.sh ..." >&2
     exit 1
   fi
   mkdir -p "$FLAMEGRAPH_DIR"

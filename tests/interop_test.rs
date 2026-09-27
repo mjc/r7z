@@ -2,8 +2,8 @@
 
 //! Interop tests: create archives with p7zip, extract with r7z, byte-compare.
 //!
-//! These tests require `7z` (p7zip) to be available in PATH or via nix-shell.
-//! Run with: `nix-shell -p p7zip --run "cargo test interop"`
+//! These tests require `7z` (p7zip) in PATH or `P7ZIP_BIN` set to its executable.
+//! Run with: `devenv shell -- cargo test --test interop_test`
 
 mod support;
 
