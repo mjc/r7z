@@ -3,13 +3,14 @@ use super::header::{
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
     encode_coder_info_lzma2, encode_coder_info_ppmd,
 };
+use super::lzma2;
 use super::model::{
-    ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions,
+    ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions, EncoderThreads,
     EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, PreparedFolder, SolidMode,
     WriteEntry,
 };
 use crate::{R7zError, aes, bcj, codec};
-use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter, MfType};
+use lzma_rust2::{EncodeMode, Lzma2Options, LzmaOptions, LzmaWriter, MfType};
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
 };
@@ -100,6 +101,18 @@ pub(crate) fn build_archive_from_prepared(
 
 pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R7zError> {
     validate_compression_options(options)?;
+    if matches!(options.compression.threads, EncoderThreads::Fixed(0)) {
+        return Err(R7zError::InvalidOptions(
+            "encoder thread count must be positive",
+        ));
+    }
+    if !matches!(options.codec, Codec::Lzma2 | Codec::Lzma2Bcj)
+        && matches!(options.compression.threads, EncoderThreads::Fixed(_))
+    {
+        return Err(R7zError::InvalidOptions(
+            "multiple encoder threads require LZMA2",
+        ));
+    }
     let Some(enc) = &options.encryption else {
         return Ok(());
     };
@@ -312,7 +325,7 @@ pub(crate) fn encode_folder(
     }
 
     let (mut pack, mut coder_info, mut coder_unpack_sizes, specs) =
-        encode_payload_with_options(&data, options.codec, &options.compression)?;
+        encode_payload_with_options(&data, options)?;
 
     if let Some(enc) = &options.encryption {
         let aes = make_aes_material(enc)?;
@@ -341,10 +354,10 @@ pub(crate) fn encode_folder(
 
 fn encode_payload_with_options(
     data: &[u8],
-    method: Codec,
-    compression: &CompressionOptions,
+    options: &ArchiveOptions,
 ) -> Result<PayloadEncoding, R7zError> {
-    match method {
+    let compression = &options.compression;
+    match options.codec {
         Codec::Copy => Ok((
             data.to_vec(),
             encode_coder_info_copy(),
@@ -539,11 +552,9 @@ fn compress_lzma2(
 ) -> Result<(u8, Vec<u8>), R7zError> {
     let options = lzma2_options(compression);
     let prop = encode_lzma2_dict_size(options.lzma_options.dict_size)?;
-    let mut writer = Lzma2Writer::new(Vec::new(), options);
-    writer
-        .write_all(data)
-        .map_err(|_| R7zError::Decompression)?;
-    let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
+    let mut writer = lzma2::Encoder::new(Vec::new(), compression, Some(data.len() as u64))?;
+    writer.write_all(data)?;
+    let compressed = writer.finish()?;
     Ok((prop, compressed))
 }
 

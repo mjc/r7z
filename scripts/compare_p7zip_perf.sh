@@ -7,7 +7,8 @@ P7Z_BIN="${P7ZIP_BIN:-$("$ROOT/scripts/ensure_p7zip_oracle.sh")}"
 SIZES="${SIZES:-1K,4K,16K,64K,256K,1M,4M,16M,64M,256M,1G}"
 RUNS="${RUNS:-5}"
 MX="${MX:-5}"
-P7ZIP_THREADS="${P7ZIP_THREADS:-1}"
+R7Z_THREADS="${R7Z_THREADS:-auto}"
+P7ZIP_THREADS="${P7ZIP_THREADS:-auto}"
 PATTERN="${PATTERN:-zero}"
 WORKDIR="${WORKDIR:-$(mktemp -d)}"
 KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
@@ -32,7 +33,8 @@ Options:
   --sizes CSV       Comma-separated sizes accepted by `truncate` (default: built-in matrix)
   --runs N          Number of timing runs per command (default: 5)
   --mx N            Compression level passed to both tools (default: 5)
-  --p7zip-threads N  Oracle thread count (default: 1; auto uses its default)
+  --r7z-threads N    r7z thread count (default: auto)
+  --p7zip-threads N  Oracle thread count (default: auto)
   --pattern MODE    `zero` (default), `random`, or `sparse-zero`
   --workdir DIR     Reuse a specific working directory
   --keep-workdir    Preserve generated payloads/archives
@@ -69,6 +71,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --p7zip-threads)
       P7ZIP_THREADS="$2"
+      shift 2
+      ;;
+    --r7z-threads)
+      R7Z_THREADS="$2"
       shift 2
       ;;
     --pattern)
@@ -125,12 +131,18 @@ if [[ "$P7ZIP_THREADS" != "auto" && ! "$P7ZIP_THREADS" =~ ^[1-9][0-9]*$ ]]; then
   echo "--p7zip-threads expects a positive integer or auto" >&2
   exit 2
 fi
+if [[ "$R7Z_THREADS" != "auto" && ! "$R7Z_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--r7z-threads expects a positive integer or auto" >&2
+  exit 2
+fi
 
 p7zip_thread_args=()
-p7zip_thread_flag=""
 if [[ "$P7ZIP_THREADS" != "auto" ]]; then
   p7zip_thread_args=("-mmt=$P7ZIP_THREADS")
-  p7zip_thread_flag="-mmt=$P7ZIP_THREADS"
+fi
+r7z_thread_args=()
+if [[ "$R7Z_THREADS" != "auto" ]]; then
+  r7z_thread_args=("-mmt=$R7Z_THREADS")
 fi
 
 if [[ "$KEEP_WORKDIR" != "1" ]]; then
@@ -162,6 +174,20 @@ average_seconds() {
 
 ratio_string() {
   awk -v a="$1" -v b="$2" 'BEGIN {printf "%.2fx", a / b}'
+}
+
+median_and_range() {
+  sort -n | awk '{samples[NR] = $1} END {
+    if (NR == 0) exit 1
+    middle = int(NR / 2) + 1
+    median = NR % 2 ? samples[middle] : (samples[middle - 1] + samples[middle]) / 2
+    printf "%.3f %.3f %.3f\n", median, samples[1], samples[NR]
+  }'
+}
+
+time_direct() {
+  TIMEFORMAT='%3R'
+  { time "$@" >/dev/null; } 2>&1
 }
 
 op_selected() {
@@ -237,6 +263,7 @@ echo "- p7zip: $P7Z_BIN"
 echo "- sizes: $SIZES"
 echo "- runs per command: $RUNS"
 echo "- compression level: -mx=$MX"
+echo "- r7z threads: $R7Z_THREADS"
 echo "- p7zip threads: $P7ZIP_THREADS"
 echo "- payload pattern: $PATTERN"
 echo "- workdir: $WORKDIR"
@@ -280,12 +307,27 @@ for size in "${size_list[@]}"; do
     generate_flamegraph "test-$size" t "$source_archive"
   fi
 
-  r7z_create="$(time_command "rm -f $r7z_archive_q" "$r7z_q a -mx=$MX $r7z_archive_q $payload_q >/dev/null")"
-  p7zip_create="$(time_command "rm -f $p7zip_archive_q" "$p7z_q a -bd -bb0 $p7zip_thread_flag -mx=$MX $p7zip_archive_q $payload_q >/dev/null")"
-  printf '| %s | a | %s | %s | %s |\n' \
-    "$size" "$r7z_create" "$p7zip_create" "$(ratio_string "$r7z_create" "$p7zip_create")"
+  r7z_samples=()
+  p7zip_samples=()
+  for ((run = 1; run <= RUNS; run++)); do
+    if ((run % 2 == 1)); then
+      rm -f "$r7z_archive"
+      r7z_samples+=("$(time_direct "$R7Z_BIN" a "-mx=$MX" "${r7z_thread_args[@]}" "$r7z_archive" "$payload")")
+      rm -f "$p7zip_archive"
+      p7zip_samples+=("$(time_direct "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$p7zip_archive" "$payload")")
+    else
+      rm -f "$p7zip_archive"
+      p7zip_samples+=("$(time_direct "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$p7zip_archive" "$payload")")
+      rm -f "$r7z_archive"
+      r7z_samples+=("$(time_direct "$R7Z_BIN" a "-mx=$MX" "${r7z_thread_args[@]}" "$r7z_archive" "$payload")")
+    fi
+  done
+  read -r r7z_create r7z_min r7z_max <<<"$(printf '%s\n' "${r7z_samples[@]}" | median_and_range)"
+  read -r p7zip_create p7zip_min p7zip_max <<<"$(printf '%s\n' "${p7zip_samples[@]}" | median_and_range)"
+  printf '| %s | a | %s [%s,%s] | %s [%s,%s] | %s |\n' \
+    "$size" "$r7z_create" "$r7z_min" "$r7z_max" "$p7zip_create" "$p7zip_min" "$p7zip_max" "$(ratio_string "$r7z_create" "$p7zip_create")"
   if [[ "$FLAMEGRAPHS" == "1" ]] && op_selected "a"; then
     rm -f "$WORKDIR/flamegraph-$size.7z"
-    generate_flamegraph "add-$size" a "-mx=$MX" "$WORKDIR/flamegraph-$size.7z" "$payload"
+    generate_flamegraph "add-$size" a "-mx=$MX" "${r7z_thread_args[@]}" "$WORKDIR/flamegraph-$size.7z" "$payload"
   fi
 done

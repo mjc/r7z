@@ -17,14 +17,14 @@ fn run_r7z(args: &[String]) -> std::process::Output {
 }
 
 #[test]
-fn cli_help_describes_single_thread_encoder_limit() {
+fn cli_help_describes_encoder_thread_selection() {
     let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
         .arg("--help")
         .output()
         .expect("r7z binary should run");
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(help.contains("-mmt=off|1"), "{help}");
+    assert!(help.contains("-mmt=off|on|N"), "{help}");
 }
 
 #[test]
@@ -770,32 +770,67 @@ fn cli_create_accepts_single_thread_switches() {
 }
 
 #[test]
-fn cli_rejects_unsupported_encoder_thread_counts() {
+fn cli_encoder_thread_switches_create_readable_archives() {
     let tmp = tempdir().unwrap();
     let payload = tmp.path().join("payload.bin");
-    fs::write(&payload, b"payload").unwrap();
+    let data = (0..(3 * 1024 * 1024 + 17))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&payload, &data).unwrap();
 
     for (index, switch) in ["-mmt", "-mmt=on", "-mmt=2", "-mmt2", "-m0=LZMA2:mt=2"]
         .into_iter()
         .enumerate()
     {
-        let archive = tmp.path().join(format!("unsupported-threads-{index}.7z"));
-        let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
-            .args([
+        let archive = tmp.path().join(format!("threads-{index}.7z"));
+        run_r7z(&[
+            "a".into(),
+            "-md=1m".into(),
+            "-mc=1m".into(),
+            switch.into(),
+            archive.display().to_string(),
+            payload.display().to_string(),
+        ]);
+        assert_eq!(
+            r7z::Archive::open(&archive)
+                .unwrap()
+                .extract_to_memory(0)
+                .unwrap(),
+            data
+        );
+    }
+}
+
+#[test]
+fn cli_rejects_threads_for_unsupported_codec_and_out_of_range_count() {
+    let tmp = tempdir().unwrap();
+    let payload = tmp.path().join("payload.bin");
+    fs::write(&payload, b"payload").unwrap();
+    for switch in ["-m0=Copy", "-mmt=257"] {
+        let archive = tmp.path().join(format!("bad-{switch}.7z"));
+        let args = if switch == "-m0=Copy" {
+            vec![
+                "a",
+                switch,
+                "-mmt=2",
+                archive.to_str().unwrap(),
+                payload.to_str().unwrap(),
+            ]
+        } else {
+            vec![
                 "a",
                 switch,
                 archive.to_str().unwrap(),
                 payload.to_str().unwrap(),
-            ])
+            ]
+        };
+        let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+            .args(args)
             .output()
             .unwrap();
-
         assert_eq!(output.status.code(), Some(7), "{switch}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("thread"),
-            "{switch}"
-        );
-        assert!(!archive.exists(), "{switch}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("thread"));
+        assert!(!archive.exists());
     }
 }
 

@@ -1,9 +1,9 @@
 use chrono::{DateTime, Local};
 use r7z::{
     Archive, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec, CompressionLevel,
-    EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, LzmaAlgorithm, MatchFinder,
-    PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock, SevenZMethod, SolidMode,
-    method_from_name, write_archive_with_preserved_folders,
+    EncoderThreads, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, LzmaAlgorithm,
+    MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock,
+    SevenZMethod, SolidMode, method_from_name, write_archive_with_preserved_folders,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -154,6 +154,14 @@ impl Cli {
         {
             state.options.codec = Codec::Copy;
         }
+        if state.threading_was_explicit
+            && !matches!(state.options.codec, Codec::Lzma2 | Codec::Lzma2Bcj)
+            && !matches!(state.options.compression.threads, EncoderThreads::Single)
+        {
+            return Err(CliError::Usage(
+                "multiple encoder threads require LZMA2".to_string(),
+            ));
+        }
 
         Ok(Self {
             command,
@@ -176,6 +184,7 @@ struct CliParseState {
     options: ArchiveOptions,
     technical: bool,
     method_was_explicit: bool,
+    threading_was_explicit: bool,
     volume_sizes: Vec<u64>,
     overwrite_mode: OverwriteMode,
     assume_yes: bool,
@@ -189,6 +198,7 @@ impl Default for CliParseState {
             options: ArchiveOptions::default(),
             technical: false,
             method_was_explicit: false,
+            threading_was_explicit: false,
             volume_sizes: Vec::new(),
             overwrite_mode: OverwriteMode::Ask,
             assume_yes: false,
@@ -234,7 +244,7 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         return Ok(());
     }
     if lower.starts_with("m0=") {
-        apply_method_spec(&switch[3..], &mut state.options)?;
+        state.threading_was_explicit |= apply_method_spec(&switch[3..], &mut state.options)?;
         state.method_was_explicit = true;
         return Ok(());
     }
@@ -279,7 +289,9 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
     }
     if let Some(thread_value) = lower.strip_prefix("mmt") {
         let value = thread_value.strip_prefix('=').unwrap_or(thread_value);
-        return parse_threading_value(value, "-mmt");
+        state.options.compression.threads = parse_threading_value(value, "-mmt")?;
+        state.threading_was_explicit = true;
+        return Ok(());
     }
     if lower.starts_with("mx") {
         state.options.compression.level = parse_level(switch)?;
@@ -349,8 +361,9 @@ fn codec_from_method_name(name: &str) -> Result<Codec, CliError> {
     }
 }
 
-fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), CliError> {
+fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<bool, CliError> {
     let mut parts = spec.split(':');
+    let mut threading_was_explicit = false;
     let method = parts.next().unwrap_or("");
     options.codec = codec_from_method_name(method)?;
     for param in parts {
@@ -394,12 +407,15 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
             "mc" => {
                 options.compression.match_cycles = Some(parse_match_cycles(value)?);
             }
-            "mt" => parse_threading_value(value, "mt")?,
+            "mt" => {
+                options.compression.threads = parse_threading_value(value, "mt")?;
+                threading_was_explicit = true;
+            }
             _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
         }
     }
     validate_lzma_property_bit_combination(&options.compression)?;
-    Ok(())
+    Ok(threading_was_explicit)
 }
 
 fn parse_lzma_property_bits(value: &str, name: &str) -> Result<u32, CliError> {
@@ -472,15 +488,19 @@ fn parse_match_finder(value: &str) -> Result<MatchFinder, CliError> {
     }
 }
 
-fn parse_threading_value(value: &str, option: &str) -> Result<(), CliError> {
+fn parse_threading_value(value: &str, option: &str) -> Result<EncoderThreads, CliError> {
     match value.to_ascii_lowercase().as_str() {
-        "off" | "no" | "0" | "1" => Ok(()),
-        "" | "on" | "yes" => Err(CliError::Usage(format!(
-            "{option} requests automatic threading; r7z supports one encoder thread"
-        ))),
-        value if value.parse::<u64>().is_ok_and(|threads| threads > 1) => Err(CliError::Usage(
-            format!("{option} requests multiple encoder threads; r7z supports one"),
-        )),
+        "off" | "no" | "0" | "1" => Ok(EncoderThreads::Single),
+        "" | "on" | "yes" => Ok(EncoderThreads::Auto),
+        value
+            if value
+                .parse::<u32>()
+                .is_ok_and(|threads| (2..=256).contains(&threads)) =>
+        {
+            Ok(EncoderThreads::Fixed(
+                value.parse().expect("validated count"),
+            ))
+        }
         _ => Err(CliError::Usage(format!(
             "invalid threading value for {option}: {value}"
         ))),
@@ -1643,7 +1663,7 @@ fn is_help(text: &str) -> bool {
 
 fn usage() -> String {
     "usage: r7z <l|x|e|t|a|d|u> [switches] <archive.7z> [files...]\n\
-     switches: -oDIR -pPASS -m0=METHOD -mx=N -ms=on|off -mf=BCJ -mhe=on|off -vSIZE -aoa|-aos -slt -mmt=off|1"
+     switches: -oDIR -pPASS -m0=METHOD -mx=N -ms=on|off -mf=BCJ -mhe=on|off -vSIZE -aoa|-aos -slt -mmt=off|on|N"
         .to_string()
 }
 

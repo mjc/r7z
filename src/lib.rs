@@ -101,8 +101,8 @@ pub use property::{Property, find_next_property_id};
 pub use stream_info::{StreamInfo, SubstreamInfo};
 pub use write::{
     ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec, CompressionLevel,
-    CompressionOptions, EncryptionOptions, EntryKind, EntryMeta, HeaderMode, LzmaAlgorithm,
-    MatchFinder, PreservedArchiveEntry, PreservedEntryStream, SolidMode, SpoolMode,
+    CompressionOptions, EncoderThreads, EncryptionOptions, EntryKind, EntryMeta, HeaderMode,
+    LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, SolidMode, SpoolMode,
     StreamingOptions, VolumeOptions, build_archive_with_preserved_folders, build_streaming,
     build_streaming_to_writer, build_streaming_volumes, build_streaming_with_options,
     write_archive_with_preserved_folders,

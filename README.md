@@ -494,8 +494,14 @@ For zero-heavy or repetitive inputs, `-m0=LZMA2:mf=HC4` can use less memory
 and encode much faster; on tested zero-filled and repeated-text inputs it kept
 the archive size unchanged. It did not speed up the tested pseudo-random input,
 so keep BT4 when matching p7zip's default or when compression ratio matters.
-`-mmt=off`, `-mmt=1`, and method-scoped `mt=off|1` select the supported
-single-threaded encoder; other thread counts are rejected.
+LZMA2 creation selects encoder threads automatically. `-mmt=off|1` selects one
+thread; `-mmt=on` and `-mmt=N` select automatic or fixed parallel encoding.
+Method-scoped `mt` has the same values. Parallel LZMA2 uses independent 64 MiB
+blocks at level five. Inputs no larger than one block use the serial writer.
+The public compression options also expose an encoder memory allowance. Automatic
+selection reserves at most half of available memory, capped at 8 GiB; if memory
+availability cannot be read, it reserves 512 MiB. An explicit thread count that
+exceeds the allowance returns an error.
 
 ## Development
 
@@ -528,7 +534,7 @@ cargo clippy --all-targets --all-features -- -D clippy::pedantic
 cargo bench
 
 # CLI comparison against the pinned p7zip oracle across a size matrix
-devenv shell -- bash scripts/compare_p7zip_perf.sh --sizes 1K,1M,64M,1G --runs 3 --p7zip-threads 1
+devenv shell -- bash scripts/compare_p7zip_perf.sh --sizes 1K,1M,64M,1G --runs 5 --r7z-threads auto --p7zip-threads auto
 
 # Generate r7z flamegraphs for selected CLI ops during the same sweep
 devenv shell -- bash scripts/compare_p7zip_perf.sh --sizes 1M,64M --runs 1 --flamegraphs --flamegraph-ops l,t,a

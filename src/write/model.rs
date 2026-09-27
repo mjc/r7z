@@ -40,6 +40,10 @@ pub struct CompressionOptions {
     pub match_cycles: Option<u32>,
     pub solid: SolidMode,
     pub lzma2_chunk_size: Option<NonZeroU64>,
+    /// Encoder threads for LZMA2 data. Auto uses the available CPUs and memory.
+    pub threads: EncoderThreads,
+    /// Maximum bytes reserved for LZMA2 encoder work, excluding caller-owned buffers.
+    pub encoder_memory_limit: Option<u64>,
 }
 
 impl Default for CompressionOptions {
@@ -56,8 +60,18 @@ impl Default for CompressionOptions {
             match_cycles: None,
             solid: SolidMode::Solid,
             lzma2_chunk_size: None,
+            threads: EncoderThreads::Auto,
+            encoder_memory_limit: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EncoderThreads {
+    #[default]
+    Auto,
+    Single,
+    Fixed(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

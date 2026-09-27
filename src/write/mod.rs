@@ -2,6 +2,7 @@
 
 mod encode;
 mod header;
+mod lzma2;
 mod model;
 
 use crate::{R7zError, RawFolderBlock, bcj::BcjX86Writer};
@@ -9,7 +10,7 @@ use header::{
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
     encode_coder_info_lzma2,
 };
-use lzma_rust2::{Lzma2Writer, LzmaWriter};
+use lzma_rust2::LzmaWriter;
 use std::{
     fs::{File, OpenOptions},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
@@ -17,9 +18,9 @@ use std::{
 };
 
 pub use model::{
-    ArchiveEntry, ArchiveOptions, Codec, CompressionLevel, CompressionOptions, EncryptionOptions,
-    EntryKind, EntryMeta, HeaderMode, LzmaAlgorithm, MatchFinder, SolidMode, SpoolMode,
-    StreamingOptions, VolumeOptions,
+    ArchiveEntry, ArchiveOptions, Codec, CompressionLevel, CompressionOptions, EncoderThreads,
+    EncryptionOptions, EntryKind, EntryMeta, HeaderMode, LzmaAlgorithm, MatchFinder, SolidMode,
+    SpoolMode, StreamingOptions, VolumeOptions,
 };
 
 use model::WriteEntry;
@@ -85,7 +86,7 @@ impl<W: Write> Write for CountingWriter<W> {
 }
 
 struct StreamingLzma2Folder<W: Write> {
-    writer: Lzma2Writer<CountingWriter<W>>,
+    writer: lzma2::Encoder<CountingWriter<W>>,
     file_indices: Vec<usize>,
     unpack_size: u64,
     file_sizes: Vec<u64>,
@@ -93,7 +94,7 @@ struct StreamingLzma2Folder<W: Write> {
 }
 
 struct StreamingBcjLzma2Folder<W: Write> {
-    writer: BcjX86Writer<Lzma2Writer<CountingWriter<W>>>,
+    writer: BcjX86Writer<lzma2::Encoder<CountingWriter<W>>>,
     file_indices: Vec<usize>,
     unpack_size: u64,
     file_sizes: Vec<u64>,
@@ -240,8 +241,10 @@ impl ArchiveBuilder {
     }
 
     pub fn build(self) -> Result<Vec<u8>, R7zError> {
-        let entries = entries_with_solid_folders(self.entries, &self.options.compression.solid)?;
-        encode::build_archive(&entries, &self.options)
+        let mut options = self.options;
+        lzma2::set_default_budget(&mut options);
+        let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
+        encode::build_archive(&entries, &options)
     }
 }
 
@@ -261,8 +264,10 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<W, R7zError> {
-    if entries.is_empty() || !can_stream_preserved_options(options) {
-        let bytes = build_archive_with_preserved_folders_buffered(entries, raw_folders, options)?;
+    let mut options = options.clone();
+    lzma2::set_default_budget(&mut options);
+    if entries.is_empty() || !can_stream_preserved_options(&options) {
+        let bytes = build_archive_with_preserved_folders_buffered(entries, raw_folders, &options)?;
         let mut out = out;
         out.seek(SeekFrom::Start(0))?;
         out.write_all(&bytes)?;
@@ -271,7 +276,7 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
     }
 
     let (write_entries, streams, folder_order, raw_by_id) =
-        stage_preserved_entries(entries, raw_folders, options)?;
+        stage_preserved_entries(entries, raw_folders, &options)?;
     let mut out = out;
     out.seek(SeekFrom::Start(0))?;
     out.write_all(&[0u8; 32])?;
@@ -301,12 +306,12 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
                 &write_entries,
                 &streams,
                 file_indices,
-                options,
+                &options,
             )?);
         }
     }
 
-    encode::finish_streamed_archive(out, &write_entries, &completed, options)
+    encode::finish_streamed_archive(out, &write_entries, &completed, &options)
 }
 
 fn build_archive_with_preserved_folders_buffered(
@@ -314,6 +319,8 @@ fn build_archive_with_preserved_folders_buffered(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<Vec<u8>, R7zError> {
+    let mut options = options.clone();
+    lzma2::set_default_budget(&mut options);
     let max_raw_folder = raw_folders
         .iter()
         .map(|folder| folder.folder_index)
@@ -422,12 +429,12 @@ fn build_archive_with_preserved_folders_buffered(
             prepared.push(encode::encode_folder(
                 &write_entries,
                 file_indices,
-                options,
+                &options,
             )?);
         }
     }
 
-    encode::build_archive_from_prepared(&write_entries, &prepared, options)
+    encode::build_archive_from_prepared(&write_entries, &prepared, &options)
 }
 
 enum StagedStream {
@@ -435,6 +442,17 @@ enum StagedStream {
     Data(Vec<u8>),
     Path { path: PathBuf, size: u64 },
     Raw { size: u64, crc: Option<u32> },
+}
+
+fn staged_folder_size(streams: &[StagedStream], indices: &[usize]) -> Result<u64, R7zError> {
+    indices.iter().try_fold(0u64, |total, &index| {
+        let size = match streams.get(index).ok_or(R7zError::Parse)? {
+            StagedStream::Data(data) => data.len() as u64,
+            StagedStream::Path { size, .. } => *size,
+            StagedStream::None | StagedStream::Raw { .. } => return Err(R7zError::Parse),
+        };
+        total.checked_add(size).ok_or(R7zError::Parse)
+    })
 }
 
 type StagedPreserved = (
@@ -613,7 +631,8 @@ fn write_lzma2_folder_streaming<W: Write>(
         inner: out,
         count: 0,
     };
-    let mut writer = Lzma2Writer::new(counting, encode::lzma2_options(&options.compression));
+    let known_size = staged_folder_size(streams, &file_indices)?;
+    let mut writer = lzma2::Encoder::new(counting, &options.compression, Some(known_size))?;
     let mut file_sizes = Vec::new();
     let mut file_crcs = Vec::new();
     let mut unpack_size = 0u64;
@@ -623,7 +642,7 @@ fn write_lzma2_folder_streaming<W: Write>(
         file_sizes.push(size);
         file_crcs.push(Some(crc));
     }
-    let counting = writer.finish().map_err(|_| R7zError::Decompression)?;
+    let counting = writer.finish()?;
     Ok(model::CompletedFolder {
         file_indices,
         pack_sizes: vec![counting.count],
@@ -684,7 +703,8 @@ fn write_bcj_lzma2_folder_streaming<W: Write>(
         inner: out,
         count: 0,
     };
-    let lzma2 = Lzma2Writer::new(counting, encode::lzma2_options(&options.compression));
+    let known_size = staged_folder_size(streams, &file_indices)?;
+    let lzma2 = lzma2::Encoder::new(counting, &options.compression, Some(known_size))?;
     let mut writer = BcjX86Writer::new(lzma2);
     let mut file_sizes = Vec::new();
     let mut file_crcs = Vec::new();
@@ -695,8 +715,8 @@ fn write_bcj_lzma2_folder_streaming<W: Write>(
         file_sizes.push(size);
         file_crcs.push(Some(crc));
     }
-    let lzma2 = writer.finish().map_err(|_| R7zError::Decompression)?;
-    let counting = lzma2.finish().map_err(|_| R7zError::Decompression)?;
+    let lzma2 = writer.finish()?;
+    let counting = lzma2.finish()?;
     Ok(model::CompletedFolder {
         file_indices,
         pack_sizes: vec![counting.count],
@@ -715,7 +735,7 @@ fn write_staged_stream_to<W: Write>(
 ) -> Result<(u64, u32), R7zError> {
     let mut hasher = crc32fast::Hasher::new();
     let mut size = 0u64;
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 1024 * 1024];
     match streams.get(index).ok_or(R7zError::Parse)? {
         StagedStream::Data(data) => {
             out.write_all(data)?;
@@ -863,8 +883,9 @@ pub struct ArchiveWriter<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> ArchiveWriter<W> {
-    pub fn new(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
+    pub fn new(out: W, mut options: ArchiveOptions) -> Result<Self, R7zError> {
         encode::validate_archive_options(&options)?;
+        lzma2::set_default_budget(&mut options);
         Ok(Self {
             out: Some(out),
             entries: Vec::new(),
@@ -1269,10 +1290,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         size: &mut u64,
     ) -> Result<(), R7zError> {
         let folder = self.lzma2_current.as_mut().ok_or(R7zError::Parse)?;
-        folder
-            .writer
-            .write_all(chunk)
-            .map_err(|_| R7zError::Decompression)?;
+        folder.writer.write_all(chunk)?;
         hasher.update(chunk);
         *size = size
             .checked_add(chunk.len() as u64)
@@ -1290,13 +1308,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             out.write_all(&[0u8; 32])?;
         }
         let out = self.out.take().ok_or(R7zError::Parse)?;
-        let writer = Lzma2Writer::new(
+        let writer = lzma2::Encoder::new(
             CountingWriter {
                 inner: out,
                 count: 0,
             },
-            encode::lzma2_options(&self.options.compression),
-        );
+            &self.options.compression,
+            None,
+        )?;
         self.lzma2_current = Some(StreamingLzma2Folder {
             writer,
             file_indices: Vec::new(),
@@ -1318,7 +1337,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             file_sizes,
             file_crcs,
         } = folder;
-        let count_writer = writer.finish().map_err(|_| R7zError::Decompression)?;
+        let count_writer = writer.finish()?;
         let pack_size = count_writer.count;
         self.out = Some(count_writer.inner);
         self.lzma2_completed.push(model::CompletedFolder {
@@ -1396,10 +1415,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         size: &mut u64,
     ) -> Result<(), R7zError> {
         let folder = self.lzma_current.as_mut().ok_or(R7zError::Parse)?;
-        folder
-            .writer
-            .write_all(chunk)
-            .map_err(|_| R7zError::Decompression)?;
+        folder.writer.write_all(chunk)?;
         hasher.update(chunk);
         *size = size
             .checked_add(chunk.len() as u64)
@@ -1530,10 +1546,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         size: &mut u64,
     ) -> Result<(), R7zError> {
         let folder = self.bcj_lzma2_current.as_mut().ok_or(R7zError::Parse)?;
-        folder
-            .writer
-            .write_all(chunk)
-            .map_err(|_| R7zError::Decompression)?;
+        folder.writer.write_all(chunk)?;
         hasher.update(chunk);
         *size = size
             .checked_add(chunk.len() as u64)
@@ -1551,13 +1564,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             out.write_all(&[0u8; 32])?;
         }
         let out = self.out.take().ok_or(R7zError::Parse)?;
-        let lzma2 = Lzma2Writer::new(
+        let lzma2 = lzma2::Encoder::new(
             CountingWriter {
                 inner: out,
                 count: 0,
             },
-            encode::lzma2_options(&self.options.compression),
-        );
+            &self.options.compression,
+            None,
+        )?;
         self.bcj_lzma2_current = Some(StreamingBcjLzma2Folder {
             writer: BcjX86Writer::new(lzma2),
             file_indices: Vec::new(),
@@ -1579,8 +1593,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             file_sizes,
             file_crcs,
         } = folder;
-        let lzma2 = writer.finish().map_err(|_| R7zError::Decompression)?;
-        let count_writer = lzma2.finish().map_err(|_| R7zError::Decompression)?;
+        let lzma2 = writer.finish()?;
+        let count_writer = lzma2.finish()?;
         let pack_size = count_writer.count;
         self.out = Some(count_writer.inner);
         self.bcj_lzma2_completed.push(model::CompletedFolder {
