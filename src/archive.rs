@@ -411,13 +411,23 @@ impl ArchiveEntryInfo {
 pub struct ArchiveEntries<'a> {
     archive: &'a Archive,
     next: usize,
+    names: Option<crate::files_info::FilesInfoNameSlices<'a>>,
 }
 
 impl Iterator for ArchiveEntries<'_> {
     type Item = ArchiveEntryInfo;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.archive.entry(self.next)?;
+        if self.next >= self.archive.num_files() {
+            return None;
+        }
+        let name = self
+            .names
+            .as_mut()
+            .and_then(Iterator::next)
+            .flatten()
+            .map(crate::files_info::decode_name);
+        let entry = self.archive.entry_info_with_name(self.next, name);
         self.next += 1;
         Some(entry)
     }
@@ -738,6 +748,7 @@ impl Archive {
         ArchiveEntries {
             archive: self,
             next: 0,
+            names: self.header.files_info().map(FilesInfo::name_slices),
         }
     }
 
@@ -789,14 +800,45 @@ impl Archive {
         let methods = archive_method_names(streams)?;
         let blocks = streams
             .and_then(|streams| streams.unpack_info.as_ref())
-            .map(|unpack_info| unpack_info.num_folders_usize())
+            .map(crate::UnpackInfo::num_folders_usize)
             .unwrap_or(0);
         let solid = archive_is_solid(streams);
 
         let mut first_entry_for_folder = vec![true; blocks];
         let mut entries = Vec::with_capacity(self.num_files());
+        let files_info = self.header.files_info();
+        let data_stream_count = count_data_streams(files_info, self.num_files());
+        let mut names = files_info.map(FilesInfo::name_slices);
+        let unpack_info = streams.and_then(|streams| streams.unpack_info.as_ref());
+        let streams_per_folder = streams
+            .and_then(|streams| streams.substream_info.as_ref())
+            .map(|info| info.num_unpack_streams_per_folder.as_slice());
+        let pack_sizes = streams
+            .and_then(|streams| streams.pack_info.as_ref())
+            .map(|info| info.pack_size.as_slice())
+            .unwrap_or_default();
+        let mut folder_cursor = unpack_info.map(|info| {
+            FolderStreamCursor::new(info, streams_per_folder, pack_sizes, data_stream_count)
+        });
         for index in 0..self.num_files() {
-            entries.push(self.listing_entry(index, &mut first_entry_for_folder)?);
+            let name = names
+                .as_mut()
+                .and_then(Iterator::next)
+                .flatten()
+                .map(crate::files_info::decode_name);
+            let has_data_stream = files_info.is_some_and(|files| {
+                has_data_stream_flags(
+                    files.is_empty_stream(index),
+                    files.is_directory(index),
+                    files.is_anti(index),
+                )
+            });
+            let location = if has_data_stream {
+                Some(folder_cursor.as_mut().ok_or(R7zError::Parse)?.next()?)
+            } else {
+                None
+            };
+            entries.push(self.listing_entry(index, name, location, &mut first_entry_for_folder)?);
         }
 
         Ok(ArchiveListing {
@@ -833,14 +875,22 @@ impl Archive {
             checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
         let pack_sizes = pack_info
             .pack_size
-            .get(pack_stream_base..pack_stream_base + num_pack_streams)
+            .get(
+                pack_stream_base
+                    ..pack_stream_base
+                        .checked_add(num_pack_streams)
+                        .ok_or(R7zError::Parse)?,
+            )
             .ok_or(R7zError::Parse)?
             .to_vec();
+        ensure_packed_folder_buffer_limit(&pack_sizes)?;
+        let packed_buffer_limit =
+            u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES).map_err(|_| R7zError::Parse)?;
         let mut packed_streams = Vec::with_capacity(pack_sizes.len());
         for &pack_size in &pack_sizes {
             let stream_start = checked_add_u64(data_start, pack_offset)?;
             let range = checked_range_u64(self.source.len()?, stream_start, pack_size)?;
-            packed_streams.push(self.source.read_range_to_vec(range, u64::MAX)?);
+            packed_streams.push(self.source.read_range_to_vec(range, packed_buffer_limit)?);
             pack_offset = checked_add_u64(pack_offset, pack_size)?;
         }
 
@@ -1016,9 +1066,15 @@ impl Archive {
                 password,
             )?
         } else {
+            ensure_packed_ranges_buffer_limit(&location.packed_ranges)?;
+            let packed_buffer_limit = u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES)
+                .map_err(|_| R7zError::Parse)?;
             let mut packed_streams = Vec::with_capacity(location.packed_ranges.len());
             for range in &location.packed_ranges {
-                packed_streams.push(self.source.read_range_to_vec(range.clone(), u64::MAX)?);
+                packed_streams.push(
+                    self.source
+                        .read_range_to_vec(range.clone(), packed_buffer_limit)?,
+                );
             }
             codec::folder_reader_with_pack_streams(
                 &location.folder,
@@ -1127,44 +1183,182 @@ impl Archive {
     pub fn stream_files_with_password<F>(
         &self,
         password: Option<&str>,
+        callback: F,
+    ) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        self.stream_files_impl(None, password, callback)
+    }
+
+    /// Stream the selected file-like entries through `callback` in archive order,
+    /// decoding each selected solid folder at most once.
+    ///
+    /// Directory and anti entries are skipped. Regular files, symlink entries,
+    /// and zero-byte files are passed to the callback. If the callback does not
+    /// fully consume an entry, r7z drains the rest of it. A selected folder with
+    /// a folder CRC is drained and verified in full, including unselected entries
+    /// in that folder. Without a folder CRC, unselected trailing entries are not
+    /// decoded. Folders with no selected entries are never opened.
+    ///
+    /// Duplicate or out-of-range indices return [`R7zError::InvalidOptions`]
+    /// before any callback is invoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns archive parse, codec, password, CRC, resource-limit, and callback
+    /// errors.
+    pub fn stream_selected_files<F>(&self, indices: &[usize], callback: F) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        self.stream_selected_files_with_password(indices, None, callback)
+    }
+
+    /// Stream selected file-like entries, supplying a password for encrypted
+    /// archives. Entries are processed in archive order, regardless of the order
+    /// of `indices`.
+    ///
+    /// Returns [`R7zError::InvalidOptions`] for duplicate or out-of-range indices,
+    /// [`R7zError::PasswordRequired`] for encrypted data without a password,
+    /// [`R7zError::Crc`] for digest mismatches, [`R7zError::Decompression`] for
+    /// codec failures, or any error returned by the callback.
+    ///
+    /// # Errors
+    ///
+    /// Also returns [`R7zError::InvalidOptions`] for duplicate or out-of-range
+    /// indices and [`R7zError::ResourceLimitExceeded`] when a decoder budget is
+    /// exceeded.
+    pub fn stream_selected_files_with_password<F>(
+        &self,
+        indices: &[usize],
+        password: Option<&str>,
+        callback: F,
+    ) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        self.stream_files_impl(Some(indices), password, callback)
+    }
+
+    fn stream_files_impl<F>(
+        &self,
+        indices: Option<&[usize]>,
+        password: Option<&str>,
         mut callback: F,
     ) -> Result<(), R7zError>
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
+        let selected = if let Some(indices) = indices {
+            let mut selected = indices.to_vec();
+            if selected.iter().any(|&index| index >= self.num_files()) {
+                return Err(R7zError::InvalidOptions(
+                    "selected entry index out of bounds",
+                ));
+            }
+            selected.sort_unstable();
+            if selected.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(R7zError::InvalidOptions("duplicate selected entry index"));
+            }
+            Some(selected)
+        } else {
+            None
+        };
+        if selected.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(());
+        }
+
+        let files_info = self.header.files_info();
+        let data_stream_count = count_data_streams(files_info, self.num_files());
+        let streams = self.streams_info();
+        let unpack_info = streams.and_then(|streams| streams.unpack_info.as_ref());
+        let streams_per_folder = streams
+            .and_then(|streams| streams.substream_info.as_ref())
+            .map(|info| info.num_unpack_streams_per_folder.as_slice());
+        let pack_sizes = streams
+            .and_then(|streams| streams.pack_info.as_ref())
+            .map(|info| info.pack_size.as_slice())
+            .unwrap_or_default();
+        let mut names = files_info.map(FilesInfo::name_slices);
+        let mut folder_cursor = unpack_info.map(|info| {
+            FolderStreamCursor::new(info, streams_per_folder, pack_sizes, data_stream_count)
+        });
+        let mut selected_position = 0;
+
         let mut folder_state = None;
 
         for index in 0..self.num_files() {
-            let entry = self.entry_info(index);
-            if entry.is_directory() || entry.is_anti() {
-                continue;
-            }
-            if !entry.has_data_stream() {
-                let mut empty = std::io::empty();
-                callback(&entry, &mut empty)?;
+            let is_selected = selected.as_ref().is_none_or(|indices| {
+                if indices.get(selected_position) == Some(&index) {
+                    selected_position += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+            let raw_name = names.as_mut().and_then(|names| names.next()).flatten();
+            let entry = is_selected.then(|| {
+                self.entry_info_with_name(index, raw_name.map(crate::files_info::decode_name))
+            });
+            let has_data_stream = files_info.map_or_else(
+                || {
+                    entry
+                        .as_ref()
+                        .is_some_and(ArchiveEntryInfo::has_data_stream)
+                },
+                |files| {
+                    has_data_stream_flags(
+                        files.is_empty_stream(index),
+                        files.is_directory(index),
+                        files.is_anti(index),
+                    )
+                },
+            );
+
+            if !has_data_stream {
+                if let Some(entry) = entry {
+                    if !entry.is_directory() && !entry.is_anti() {
+                        let mut empty = std::io::empty();
+                        callback(&entry, &mut empty)?;
+                    }
+                }
                 continue;
             }
 
-            let (folder_idx, stream_in_folder) =
-                self.folder_stream_for_file(index)?.ok_or(R7zError::Parse)?;
+            let location = folder_cursor.as_mut().ok_or(R7zError::Parse)?.next()?;
+            if !is_selected {
+                continue;
+            }
 
-            let needs_new_folder = folder_state
-                .as_ref()
-                .is_none_or(|state: &FolderStreamReader<'_>| state.folder_idx != folder_idx);
+            let needs_new_folder =
+                folder_state
+                    .as_ref()
+                    .is_none_or(|state: &FolderStreamReader<'_>| {
+                        state.folder_idx != location.folder_idx
+                    });
             if needs_new_folder {
                 if let Some(mut state) = folder_state.take() {
-                    state.finish()?;
+                    if selected.is_some() {
+                        state.finish_selected()?;
+                    } else {
+                        state.finish()?;
+                    }
                 }
-                folder_state = Some(self.open_folder_stream(folder_idx, password)?);
+                folder_state = Some(self.open_folder_stream(location, password)?);
             }
 
             let state = folder_state.as_mut().ok_or(R7zError::Parse)?;
-            state.skip_to_stream(stream_in_folder)?;
-            state.read_current_stream(Some(&entry), &mut callback)?;
+            state.skip_to_stream(location.stream_in_folder)?;
+            state.read_current_stream(Some(&entry.ok_or(R7zError::Parse)?), &mut callback)?;
         }
 
         if let Some(mut state) = folder_state {
-            state.finish()?;
+            if selected.is_some() {
+                state.finish_selected()?;
+            } else {
+                state.finish()?;
+            }
         }
 
         Ok(())
@@ -1219,6 +1413,9 @@ impl Archive {
             .pack_size
             .get(pack_stream_base..pack_stream_base + num_pack_streams)
             .ok_or(R7zError::Parse)?;
+        if num_pack_streams > 1 {
+            ensure_packed_folder_buffer_limit(pack_sizes)?;
+        }
         let mut packed_ranges = Vec::with_capacity(num_pack_streams);
         for &pack_size in pack_sizes {
             let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
@@ -1258,29 +1455,35 @@ impl Archive {
 
     fn open_folder_stream(
         &self,
-        folder_idx: usize,
+        location: FolderStreamLocation,
         password: Option<&str>,
     ) -> Result<FolderStreamReader<'_>, R7zError> {
+        let FolderStreamLocation {
+            folder_idx,
+            pack_stream_base,
+            pack_byte_base,
+            coder_output_base,
+            substream_size_base,
+            substream_digest_base,
+            stream_count,
+            ..
+        } = location;
         let streams = self.streams_info().ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
         let substream_info = streams.substream_info.as_ref();
         let folder = unpack_info.parse_folder(folder_idx)?;
-        let pack_stream_base = folder_pack_stream_base(folder_idx, unpack_info)?;
         let num_pack_streams = folder_num_pack_streams(&folder)?;
-        let prior_pack_sizes = pack_info
-            .pack_size
-            .get(..pack_stream_base)
-            .ok_or(R7zError::Parse)?;
-        let mut pack_offset_u64 = prior_pack_sizes.iter().try_fold(0u64, |acc, &size| {
-            acc.checked_add(size).ok_or(R7zError::Parse)
-        })?;
+        let mut pack_offset_u64 = pack_byte_base;
         let data_start =
             checked_add_u64(checked_add_u64(self.base_offset, 32)?, pack_info.pack_pos)?;
         let pack_sizes = pack_info
             .pack_size
             .get(pack_stream_base..pack_stream_base + num_pack_streams)
             .ok_or(R7zError::Parse)?;
+        if num_pack_streams > 1 {
+            ensure_packed_folder_buffer_limit(pack_sizes)?;
+        }
         let mut packed_ranges = Vec::with_capacity(num_pack_streams);
         for &pack_size in pack_sizes {
             let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
@@ -1292,8 +1495,10 @@ impl Archive {
             pack_offset_u64 = checked_add_u64(pack_offset_u64, pack_size)?;
         }
 
-        let folder_unpack_size = folder_total_unpack_size(folder_idx, unpack_info, substream_info)?;
-        let coder_unpack_sizes = folder_coder_unpack_sizes(folder_idx, unpack_info)?;
+        let folder_unpack_size =
+            folder_total_unpack_size_at(coder_output_base, &folder, unpack_info)?;
+        let coder_unpack_sizes =
+            folder_coder_unpack_sizes_at(coder_output_base, &folder, unpack_info)?;
         let reader: Box<dyn Read> = if packed_ranges.len() == 1 {
             let packed = self.source.range_reader(packed_ranges[0].clone())?;
             codec::folder_reader_with_sizes_from_reader(
@@ -1305,8 +1510,13 @@ impl Archive {
             )?
         } else {
             let mut packed_streams = Vec::with_capacity(packed_ranges.len());
+            let packed_buffer_limit = u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES)
+                .map_err(|_| R7zError::Parse)?;
             for range in &packed_ranges {
-                packed_streams.push(self.source.read_range_to_vec(range.clone(), u64::MAX)?);
+                packed_streams.push(
+                    self.source
+                        .read_range_to_vec(range.clone(), packed_buffer_limit)?,
+                );
             }
             codec::folder_reader_with_pack_streams(
                 &folder,
@@ -1316,28 +1526,36 @@ impl Archive {
                 password,
             )?
         };
-        let n_streams = usize::try_from(
-            substream_info
-                .and_then(|s| s.num_unpack_streams_per_folder.get(folder_idx))
-                .copied()
-                .unwrap_or(1),
-        )
-        .map_err(|_| R7zError::Parse)?;
-        let mut stream_sizes = Vec::with_capacity(n_streams);
-        let mut stream_digests = Vec::with_capacity(n_streams);
+        let n_streams = stream_count;
+        let mut stream_sizes = Vec::new();
+        stream_sizes
+            .try_reserve_exact(n_streams)
+            .map_err(|_| R7zError::ResourceLimitExceeded {
+                resource: "folder substream metadata",
+                limit: n_streams,
+            })?;
+        let mut stream_digests = Vec::new();
+        stream_digests.try_reserve_exact(n_streams).map_err(|_| {
+            R7zError::ResourceLimitExceeded {
+                resource: "folder substream metadata",
+                limit: n_streams,
+            }
+        })?;
         for stream_idx in 0..n_streams {
-            stream_sizes.push(stream_size_at(
-                folder_idx,
+            stream_sizes.push(stream_size_at_base(
                 stream_idx,
+                n_streams,
+                substream_size_base,
+                folder_unpack_size,
                 substream_info,
-                unpack_info,
             )?);
-            stream_digests.push(stream_crc(
-                folder_idx,
-                stream_idx,
-                unpack_info,
-                substream_info,
-            ));
+            stream_digests.push(substream_info.and_then(|substreams| {
+                substreams
+                    .digests
+                    .get(substream_digest_base.checked_add(stream_idx)?)
+                    .copied()
+                    .flatten()
+            }));
         }
 
         Ok(FolderStreamReader {
@@ -1361,12 +1579,12 @@ impl Archive {
     fn listing_entry(
         &self,
         file_index: usize,
+        name: Option<String>,
+        location: Option<FolderStreamLocation>,
         first_entry_for_folder: &mut [bool],
     ) -> Result<ArchiveListingEntry, R7zError> {
         let fi = self.header.files_info();
-        let path = fi
-            .and_then(|files| files.name(file_index))
-            .unwrap_or_else(|| format!("unknown-{file_index}"));
+        let path = name.unwrap_or_else(|| format!("unknown-{file_index}"));
         let Some(files) = fi else {
             return Ok(ArchiveListingEntry {
                 index: file_index,
@@ -1402,7 +1620,7 @@ impl Archive {
         let attributes = files.attributes.get(file_index).copied().flatten();
 
         if matches!(kind, ListingEntryKind::Directory | ListingEntryKind::Anti)
-            || files.is_empty_file(file_index)
+            || files.is_empty_stream(file_index)
         {
             return Ok(ArchiveListingEntry {
                 index: file_index,
@@ -1423,9 +1641,8 @@ impl Archive {
             });
         }
 
-        let Some((folder_idx, stream_in_folder)) = self.folder_stream_for_file(file_index)? else {
-            return Err(R7zError::Parse);
-        };
+        let location = location.ok_or(R7zError::Parse)?;
+        let folder_idx = location.folder_idx;
         let streams = self.streams_info().ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
@@ -1433,12 +1650,15 @@ impl Archive {
         let folder = unpack_info.parse_folder(folder_idx)?;
         let methods = folder_method_names(&folder);
         let encrypted = folder_is_encrypted(&folder);
+        let folder_size =
+            folder_total_unpack_size_at(location.coder_output_base, &folder, unpack_info)?;
         let size = Some(
-            u64::try_from(stream_size_at(
-                folder_idx,
-                stream_in_folder,
+            u64::try_from(stream_size_at_base(
+                location.stream_in_folder,
+                location.stream_count,
+                location.substream_size_base,
+                folder_size,
                 substream_info,
-                unpack_info,
             )?)
             .map_err(|_| R7zError::Parse)?,
         );
@@ -1447,11 +1667,23 @@ impl Archive {
             .ok_or(R7zError::Parse)?;
         let packed_size = if *is_first_in_folder {
             *is_first_in_folder = false;
-            Some(folder_packed_size(folder_idx, pack_info, unpack_info)?)
+            Some(folder_packed_size_at(
+                location.pack_stream_base,
+                &folder,
+                pack_info,
+            )?)
         } else {
             None
         };
-        let crc = stream_crc(folder_idx, stream_in_folder, unpack_info, substream_info);
+        let digest_index = location
+            .substream_digest_base
+            .checked_add(location.stream_in_folder)
+            .ok_or(R7zError::Parse)?;
+        let crc = if let Some(substreams) = substream_info {
+            substreams.digests.get(digest_index).copied().flatten()
+        } else {
+            unpack_info.digests.get(folder_idx).copied().flatten()
+        };
 
         Ok(ArchiveListingEntry {
             index: file_index,
@@ -1470,9 +1702,12 @@ impl Archive {
 
     fn entry_info(&self, file_index: usize) -> ArchiveEntryInfo {
         let fi = self.header.files_info();
-        let name = fi
-            .and_then(|files| files.name(file_index))
-            .unwrap_or_else(|| format!("unknown-{file_index}"));
+        self.entry_info_with_name(file_index, fi.and_then(|files| files.name(file_index)))
+    }
+
+    fn entry_info_with_name(&self, file_index: usize, name: Option<String>) -> ArchiveEntryInfo {
+        let fi = self.header.files_info();
+        let name = name.unwrap_or_else(|| format!("unknown-{file_index}"));
         let entry_type = fi
             .map(|files| files.entry_type(file_index))
             .unwrap_or(EntryType::File);
@@ -1503,6 +1738,7 @@ impl Archive {
         Err(R7zError::EntryNotFound(name.to_string()))
     }
 
+    #[cfg(test)]
     fn folder_stream_for_file(
         &self,
         file_index: usize,
@@ -1525,7 +1761,7 @@ impl Archive {
     /// # Errors
     ///
     /// Returns [`R7zError::Io`] if a file or directory cannot be created, or any error
-    /// that [`extract_to_memory`](Self::extract_to_memory) can return.
+    /// that [`stream_files`](Self::stream_files) can return.
     pub fn extract_all(&self, dest: &Path) -> Result<(), R7zError> {
         self.extract_all_with_password(dest, None)
     }
@@ -1536,8 +1772,7 @@ impl Archive {
     ///
     /// Returns [`R7zError::Io`] if a file or directory cannot be created,
     /// [`R7zError::PasswordRequired`] if encrypted with no password, or any
-    /// error that [`extract_to_memory_with_password`](Self::extract_to_memory_with_password)
-    /// can return.
+    /// error that [`stream_files_with_password`](Self::stream_files_with_password) can return.
     pub fn extract_all_with_password(
         &self,
         dest: &Path,
@@ -1545,12 +1780,16 @@ impl Archive {
     ) -> Result<(), R7zError> {
         let num = self.num_files();
         let fi = self.header.files_info();
+        let mut names = fi.map(FilesInfo::name_slices);
 
         for i in 0..num {
-            let name_owned = fi.and_then(|f| f.name(i));
-            let name = name_owned.as_deref().unwrap_or("unknown");
-
-            let dest_path = dest.join(safe_archive_name(name)?);
+            let name = names
+                .as_mut()
+                .and_then(Iterator::next)
+                .flatten()
+                .map(crate::files_info::decode_name)
+                .unwrap_or_else(|| format!("unknown-{i}"));
+            let dest_path = dest.join(safe_archive_name(&name)?);
 
             if fi.is_some_and(|f| f.is_anti(i)) {
                 continue;
@@ -1558,22 +1797,19 @@ impl Archive {
 
             if fi.is_some_and(|f| f.is_directory(i)) {
                 std::fs::create_dir_all(&dest_path)?;
-            } else if fi.is_some_and(|f| f.is_empty_stream(i) && f.is_empty_file(i)) {
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::File::create(&dest_path)?;
-            } else {
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let file = std::fs::File::create(&dest_path)?;
-                let mut writer = BufWriter::new(file);
-                self.extract_to_writer_with_password(i, &mut writer, password)?;
-                writer.flush()?;
             }
         }
-        Ok(())
+
+        self.stream_files_with_password(password, |entry, reader| {
+            let dest_path = dest.join(safe_archive_name(&entry.name)?);
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent).map_err(R7zError::Io)?;
+            }
+            let file = std::fs::File::create(&dest_path).map_err(R7zError::Io)?;
+            let mut writer = BufWriter::new(file);
+            std::io::copy(reader, &mut writer).map_err(R7zError::Io)?;
+            writer.flush().map_err(R7zError::Io)
+        })
     }
 }
 
@@ -1670,7 +1906,16 @@ impl FolderStreamReader<'_> {
             self.read_current_stream(None, &mut callback)?;
         }
 
-        if self.decoded_len < self.folder_unpack_size {
+        if self.decoded_len != self.folder_unpack_size {
+            return Err(R7zError::Decompression);
+        }
+        let mut extra = [0u8; 1];
+        if self
+            .reader
+            .read(&mut extra)
+            .map_err(|_| R7zError::Decompression)?
+            != 0
+        {
             return Err(R7zError::Decompression);
         }
         if let Some(expected) = self.folder_digest {
@@ -1680,6 +1925,13 @@ impl FolderStreamReader<'_> {
             }
         }
 
+        Ok(())
+    }
+
+    fn finish_selected(&mut self) -> Result<(), R7zError> {
+        if self.folder_digest.is_some() || self.current_stream == self.stream_sizes.len() {
+            self.finish()?;
+        }
         Ok(())
     }
 }
@@ -1867,37 +2119,23 @@ fn folder_is_encrypted(folder: &crate::Folder) -> bool {
         .any(|coder| coder.codec_id.as_slice() == codec::CODEC_AES_256_SHA_256)
 }
 
-fn folder_packed_size(
-    folder_idx: usize,
+fn folder_packed_size_at(
+    pack_stream_base: usize,
+    folder: &crate::Folder,
     pack_info: &crate::PackInfo,
-    unpack_info: &crate::UnpackInfo,
 ) -> Result<u64, R7zError> {
-    let folder = unpack_info.parse_folder(folder_idx)?;
-    let pack_stream_base = folder_pack_stream_base(folder_idx, unpack_info)?;
-    let num_pack_streams = folder_num_pack_streams(&folder)?;
+    let num_pack_streams = folder_num_pack_streams(folder)?;
+    let end = pack_stream_base
+        .checked_add(num_pack_streams)
+        .ok_or(R7zError::Parse)?;
     pack_info
         .pack_size
-        .get(pack_stream_base..pack_stream_base + num_pack_streams)
+        .get(pack_stream_base..end)
         .ok_or(R7zError::Parse)?
         .iter()
         .try_fold(0u64, |acc, &size| {
             acc.checked_add(size).ok_or(R7zError::Parse)
         })
-}
-
-fn stream_crc(
-    folder_idx: usize,
-    stream_in_folder: usize,
-    unpack_info: &crate::UnpackInfo,
-    substream_info: Option<&crate::SubstreamInfo>,
-) -> Option<u32> {
-    if let Some(substreams) = substream_info {
-        if let Ok(crc_idx) = substream_global_index(folder_idx, stream_in_folder, substreams) {
-            return substreams.digests.get(crc_idx).copied().flatten();
-        }
-        return None;
-    }
-    unpack_info.digests.get(folder_idx).copied().flatten()
 }
 
 fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
@@ -1992,6 +2230,14 @@ fn folder_coder_unpack_sizes(
         global_base += unpack_info.parse_folder(i)?.total_out_streams();
     }
     let folder = unpack_info.parse_folder(folder_idx)?;
+    folder_coder_unpack_sizes_at(global_base, &folder, unpack_info)
+}
+
+fn folder_coder_unpack_sizes_at(
+    global_base: usize,
+    folder: &crate::Folder,
+    unpack_info: &crate::UnpackInfo,
+) -> Result<Vec<u64>, R7zError> {
     let num = folder.total_out_streams();
     unpack_info
         .unpack_sizes
@@ -2021,6 +2267,33 @@ fn folder_num_pack_streams(folder: &crate::Folder) -> Result<usize, R7zError> {
     let num_bind_pairs = u64::try_from(folder.bind_pairs.len()).map_err(|_| R7zError::Parse)?;
     let num_packed = num_in.checked_sub(num_bind_pairs).ok_or(R7zError::Parse)?;
     usize::try_from(num_packed).map_err(|_| R7zError::Parse)
+}
+
+fn ensure_packed_folder_buffer_limit(pack_sizes: &[u64]) -> Result<(), R7zError> {
+    let packed_bytes = pack_sizes.iter().try_fold(0u64, |total, &size| {
+        total.checked_add(size).ok_or(R7zError::Parse)
+    })?;
+    ensure_packed_bytes_limit(packed_bytes)
+}
+
+fn ensure_packed_ranges_buffer_limit(ranges: &[Range<u64>]) -> Result<(), R7zError> {
+    let packed_bytes = ranges.iter().try_fold(0u64, |total, range| {
+        let size = range.end.checked_sub(range.start).ok_or(R7zError::Parse)?;
+        total.checked_add(size).ok_or(R7zError::Parse)
+    })?;
+    ensure_packed_bytes_limit(packed_bytes)
+}
+
+fn ensure_packed_bytes_limit(packed_bytes: u64) -> Result<(), R7zError> {
+    let limit =
+        u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES).map_err(|_| R7zError::Parse)?;
+    if packed_bytes > limit {
+        return Err(R7zError::ResourceLimitExceeded {
+            resource: "packed folder buffers",
+            limit: codec::MAX_BUFFERED_PACKED_FOLDER_BYTES,
+        });
+    }
+    Ok(())
 }
 
 /// Normalize an archive entry name into a safe relative path.
@@ -2087,6 +2360,139 @@ fn file_to_data_stream(file_idx: usize, fi: Option<&FilesInfo>) -> Option<usize>
         }
     }
     None
+}
+
+fn has_data_stream_flags(is_empty_stream: bool, is_directory: bool, is_anti: bool) -> bool {
+    !is_empty_stream && !is_directory && !is_anti
+}
+
+fn count_data_streams(files_info: Option<&FilesInfo>, num_files: usize) -> usize {
+    files_info.map_or(num_files, |files| {
+        (0..num_files)
+            .filter(|&index| {
+                has_data_stream_flags(
+                    files.is_empty_stream(index),
+                    files.is_directory(index),
+                    files.is_anti(index),
+                )
+            })
+            .count()
+    })
+}
+
+struct FolderStreamCursor<'a> {
+    unpack_info: &'a crate::UnpackInfo,
+    streams_per_folder: Option<&'a [u64]>,
+    pack_sizes: &'a [u64],
+    max_data_streams: usize,
+    folder_idx: usize,
+    stream_in_folder: usize,
+    pack_stream_base: usize,
+    pack_byte_base: u64,
+    coder_output_base: usize,
+    substream_size_base: usize,
+    substream_digest_base: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FolderStreamLocation {
+    folder_idx: usize,
+    stream_in_folder: usize,
+    pack_stream_base: usize,
+    pack_byte_base: u64,
+    coder_output_base: usize,
+    substream_size_base: usize,
+    substream_digest_base: usize,
+    stream_count: usize,
+}
+
+impl<'a> FolderStreamCursor<'a> {
+    fn new(
+        unpack_info: &'a crate::UnpackInfo,
+        streams_per_folder: Option<&'a [u64]>,
+        pack_sizes: &'a [u64],
+        max_data_streams: usize,
+    ) -> Self {
+        Self {
+            unpack_info,
+            streams_per_folder,
+            pack_sizes,
+            max_data_streams,
+            folder_idx: 0,
+            stream_in_folder: 0,
+            pack_stream_base: 0,
+            pack_byte_base: 0,
+            coder_output_base: 0,
+            substream_size_base: 0,
+            substream_digest_base: 0,
+        }
+    }
+
+    fn next(&mut self) -> Result<FolderStreamLocation, R7zError> {
+        while self.folder_idx < self.unpack_info.num_folders_usize() {
+            let stream_count = match self.streams_per_folder {
+                Some(counts) => *counts.get(self.folder_idx).ok_or(R7zError::Parse)?,
+                None => 1,
+            };
+            if stream_count > u64::try_from(self.max_data_streams).map_err(|_| R7zError::Parse)? {
+                return Err(R7zError::Parse);
+            }
+            let stream_count = usize::try_from(stream_count).map_err(|_| R7zError::Parse)?;
+            if self.stream_in_folder < stream_count {
+                let location = FolderStreamLocation {
+                    folder_idx: self.folder_idx,
+                    stream_in_folder: self.stream_in_folder,
+                    pack_stream_base: self.pack_stream_base,
+                    pack_byte_base: self.pack_byte_base,
+                    coder_output_base: self.coder_output_base,
+                    substream_size_base: self.substream_size_base,
+                    substream_digest_base: self.substream_digest_base,
+                    stream_count,
+                };
+                self.stream_in_folder += 1;
+                return Ok(location);
+            }
+
+            let folder = self.unpack_info.parse_folder(self.folder_idx)?;
+            let pack_stream_count = folder_num_pack_streams(&folder)?;
+            let folder_pack_sizes = self
+                .pack_sizes
+                .get(
+                    self.pack_stream_base
+                        ..self
+                            .pack_stream_base
+                            .checked_add(pack_stream_count)
+                            .ok_or(R7zError::Parse)?,
+                )
+                .ok_or(R7zError::Parse)?;
+            let folder_packed_bytes = folder_pack_sizes.iter().try_fold(0u64, |total, &size| {
+                total.checked_add(size).ok_or(R7zError::Parse)
+            })?;
+            self.pack_byte_base = self
+                .pack_byte_base
+                .checked_add(folder_packed_bytes)
+                .ok_or(R7zError::Parse)?;
+            self.pack_stream_base = self
+                .pack_stream_base
+                .checked_add(pack_stream_count)
+                .ok_or(R7zError::Parse)?;
+            self.coder_output_base = self
+                .coder_output_base
+                .checked_add(folder.total_out_streams())
+                .ok_or(R7zError::Parse)?;
+            self.substream_size_base = self
+                .substream_size_base
+                .checked_add(stream_count.saturating_sub(1))
+                .ok_or(R7zError::Parse)?;
+            self.substream_digest_base = self
+                .substream_digest_base
+                .checked_add(stream_count)
+                .ok_or(R7zError::Parse)?;
+            self.folder_idx += 1;
+            self.stream_in_folder = 0;
+        }
+        Err(R7zError::Parse)
+    }
 }
 
 /// Map a global data-stream index to (`folder_idx`, `stream_within_folder`).
@@ -2204,6 +2610,42 @@ fn folder_total_unpack_size(
     Err(R7zError::Parse)
 }
 
+fn folder_total_unpack_size_at(
+    global_base: usize,
+    folder: &crate::Folder,
+    unpack_info: &crate::UnpackInfo,
+) -> Result<u64, R7zError> {
+    let num_out = folder.total_out_streams();
+    if num_out == 0 {
+        return Err(R7zError::Parse);
+    }
+    if num_out == 1 {
+        return unpack_info
+            .unpack_sizes
+            .get(global_base)
+            .copied()
+            .ok_or(R7zError::Parse);
+    }
+    for out_idx in 0..num_out {
+        let is_bound = folder
+            .bind_pairs
+            .iter()
+            .any(|&(_, bound_out)| bound_out == out_idx as u64);
+        if !is_bound {
+            return unpack_info
+                .unpack_sizes
+                .get(global_base + out_idx)
+                .copied()
+                .ok_or(R7zError::Parse);
+        }
+    }
+    unpack_info
+        .unpack_sizes
+        .get(global_base + num_out - 1)
+        .copied()
+        .ok_or(R7zError::Parse)
+}
+
 /// Byte offset of stream `stream_in_folder` within the decompressed folder data.
 fn stream_offset_in_folder(
     folder_idx: usize,
@@ -2239,6 +2681,46 @@ fn stream_offset_in_folder(
 }
 
 /// Size of stream `stream_in_folder` within the decompressed folder data.
+fn stream_size_at_base(
+    stream_in_folder: usize,
+    stream_count: usize,
+    unpack_size_base: usize,
+    folder_size: u64,
+    substream_info: Option<&crate::SubstreamInfo>,
+) -> Result<usize, R7zError> {
+    if stream_count == 1 {
+        return usize::try_from(folder_size).map_err(|_| R7zError::Parse);
+    }
+    let Some(substreams) = substream_info else {
+        return usize::try_from(folder_size).map_err(|_| R7zError::Parse);
+    };
+    let explicit_count = stream_count.checked_sub(1).ok_or(R7zError::Parse)?;
+    let explicit_end = unpack_size_base
+        .checked_add(explicit_count)
+        .ok_or(R7zError::Parse)?;
+    let explicit_sizes = substreams
+        .unpack_sizes
+        .get(unpack_size_base..explicit_end)
+        .ok_or(R7zError::Parse)?;
+    if stream_in_folder < explicit_count {
+        return usize::try_from(
+            *explicit_sizes
+                .get(stream_in_folder)
+                .ok_or(R7zError::Parse)?,
+        )
+        .map_err(|_| R7zError::Parse);
+    }
+    let explicit_sum = explicit_sizes.iter().try_fold(0u64, |total, &size| {
+        total.checked_add(size).ok_or(R7zError::Parse)
+    })?;
+    usize::try_from(
+        folder_size
+            .checked_sub(explicit_sum)
+            .ok_or(R7zError::Parse)?,
+    )
+    .map_err(|_| R7zError::Parse)
+}
+
 fn stream_size_at(
     folder_idx: usize,
     stream_in_folder: usize,
@@ -2324,4 +2806,340 @@ fn substream_global_index(
             acc.checked_add(n).ok_or(R7zError::Parse)
         })?;
     prior.checked_add(stream_in_folder).ok_or(R7zError::Parse)
+}
+
+#[cfg(test)]
+mod selected_stream_tests {
+    use super::*;
+    use crate::{ArchiveBuilder, ArchiveOptions, Codec, CompressionOptions, EntryMeta, SolidMode};
+    use std::num::NonZeroU64;
+
+    fn three_file_archive() -> Vec<u8> {
+        let options = ArchiveOptions {
+            codec: Codec::Copy,
+            compression: CompressionOptions {
+                solid: SolidMode::Limit {
+                    max_files: NonZeroU64::new(2),
+                    max_bytes: None,
+                },
+                ..CompressionOptions::default()
+            },
+            ..ArchiveOptions::default()
+        };
+        ArchiveBuilder::new()
+            .options(options)
+            .add_file("first.txt", b"first payload")
+            .add_file("second.txt", b"second payload")
+            .add_file("later.txt", b"later payload")
+            .build()
+            .unwrap()
+    }
+
+    fn archive_with_many_files(solid: SolidMode) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let options = ArchiveOptions {
+            codec: Codec::Copy,
+            compression: CompressionOptions {
+                solid,
+                ..CompressionOptions::default()
+            },
+            ..ArchiveOptions::default()
+        };
+        let (builder, expected) = (0..128).fold(
+            (ArchiveBuilder::new().options(options), Vec::new()),
+            |(builder, mut expected), index| {
+                let name = format!("entry-{index}.bin");
+                let data = format!("payload-{index}").into_bytes();
+                expected.push(data.clone());
+                (builder.add_file(&name, &data), expected)
+            },
+        );
+        (builder.build().unwrap(), expected)
+    }
+
+    fn corrupt_file_data(bytes: &mut [u8], file_index: usize) {
+        let archive = Archive::from_bytes(Bytes::copy_from_slice(bytes)).unwrap();
+        let range = archive
+            .extraction_location(file_index)
+            .unwrap()
+            .packed_ranges[0]
+            .clone();
+        drop(archive);
+        bytes[usize::try_from(range.start).unwrap()] ^= 0xff;
+    }
+
+    fn corrupt_stream_data(bytes: &mut [u8], file_index: usize) {
+        let archive = Archive::from_bytes(Bytes::copy_from_slice(bytes)).unwrap();
+        let location = archive.extraction_location(file_index).unwrap();
+        let offset = location.packed_ranges[0].start + location.stream_start as u64;
+        drop(archive);
+        bytes[usize::try_from(offset).unwrap()] ^= 0xff;
+    }
+
+    #[test]
+    fn selected_streams_batch_a_solid_folder_and_skip_unselected_later_folder() {
+        let mut bytes = three_file_archive();
+        let archive = Archive::from_bytes(Bytes::copy_from_slice(&bytes)).unwrap();
+        let folder_for = |index| archive.folder_stream_for_file(index).unwrap().unwrap().0;
+        assert_eq!(folder_for(0), folder_for(1));
+        assert_ne!(folder_for(1), folder_for(2));
+        drop(archive);
+
+        corrupt_file_data(&mut bytes, 2);
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let mut seen = Vec::new();
+
+        archive
+            .stream_selected_files(&[1, 0], |entry, reader| {
+                let mut first_byte = [0; 1];
+                reader.read_exact(&mut first_byte)?;
+                seen.push((entry.index, first_byte[0]));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen, vec![(0, b'f'), (1, b's')]);
+    }
+
+    #[test]
+    fn selected_stream_traversal_handles_many_folders_and_substreams() {
+        let modes = [
+            SolidMode::Limit {
+                max_files: NonZeroU64::new(1),
+                max_bytes: None,
+            },
+            SolidMode::Solid,
+        ];
+        for solid in modes {
+            let (bytes, expected) = archive_with_many_files(solid);
+            let archive = Archive::from_bytes(Bytes::from(bytes)).unwrap();
+            let mut indices = (0..expected.len()).collect::<Vec<_>>();
+            indices.reverse();
+            let mut seen = Vec::new();
+            archive
+                .stream_selected_files(&indices, |entry, reader| {
+                    let mut data = Vec::new();
+                    reader.read_to_end(&mut data).map_err(R7zError::Io)?;
+                    seen.push((entry.index, data));
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(seen.len(), expected.len());
+            for (index, data) in seen {
+                assert_eq!(data, expected[index]);
+            }
+
+            let listing = archive.listing(None).unwrap();
+            assert_eq!(listing.entries.len(), expected.len());
+            for (index, entry) in listing.entries.iter().enumerate() {
+                assert_eq!(entry.path, format!("entry-{index}.bin"));
+                assert_eq!(entry.size, Some(expected[index].len() as u64));
+            }
+
+            let names = archive
+                .entries()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), expected.len());
+            let destination = tempfile::tempdir().unwrap();
+            archive.extract_all(destination.path()).unwrap();
+            for (index, data) in expected.iter().enumerate() {
+                let path = destination.path().join(format!("entry-{index}.bin"));
+                assert_eq!(std::fs::read(path).unwrap(), *data);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_stream_symlink_does_not_advance_the_data_stream_cursor() {
+        let bytes = ArchiveBuilder::new()
+            .options(ArchiveOptions {
+                codec: Codec::Copy,
+                ..ArchiveOptions::default()
+            })
+            .add_empty_file("empty-link", EntryMeta::symlink())
+            .add_file("following.bin", b"payload")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(Bytes::from(bytes)).unwrap();
+        let files = archive.files_info().unwrap();
+        assert!(files.is_symlink(0));
+        assert!(files.is_empty_stream(0));
+
+        let mut seen = Vec::new();
+        archive
+            .stream_selected_files(&[0, 1], |entry, reader| {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).map_err(R7zError::Io)?;
+                seen.push((entry.index, bytes));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen, [(0, Vec::new()), (1, b"payload".to_vec())]);
+    }
+
+    #[test]
+    fn selected_stream_does_not_decode_unselected_tail_without_folder_crc() {
+        let mut bytes = three_file_archive();
+        let original = Archive::from_bytes(Bytes::copy_from_slice(&bytes)).unwrap();
+        let selected_index = 0;
+        let unselected_index = 1;
+        assert_eq!(
+            original
+                .folder_stream_for_file(selected_index)
+                .unwrap()
+                .unwrap()
+                .0,
+            original
+                .folder_stream_for_file(unselected_index)
+                .unwrap()
+                .unwrap()
+                .0
+        );
+        drop(original);
+        corrupt_stream_data(&mut bytes, unselected_index);
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+
+        let mut seen = Vec::new();
+        archive
+            .stream_selected_files(&[selected_index], |_entry, reader| {
+                let mut first_byte = [0; 1];
+                reader.read_exact(&mut first_byte)?;
+                seen.push(first_byte[0]);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen, vec![b'f']);
+    }
+
+    #[test]
+    fn selected_folder_finish_drains_unselected_tail_when_folder_crc_exists() {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(b"tail");
+        let mut state = FolderStreamReader {
+            folder_idx: 0,
+            reader: Box::new(std::io::Cursor::new(&b"tail"[..])),
+            stream_sizes: vec![4],
+            stream_digests: vec![None],
+            current_stream: 0,
+            folder_hasher: Some(crc32fast::Hasher::new()),
+            folder_digest: Some(hasher.finalize()),
+            decoded_len: 0,
+            folder_unpack_size: 4,
+        };
+
+        state.finish_selected().unwrap();
+        assert_eq!(state.decoded_len, 4);
+    }
+
+    #[test]
+    fn folder_finish_rejects_output_beyond_declared_size() {
+        let mut stream_hasher = crc32fast::Hasher::new();
+        stream_hasher.update(b"A");
+        let mut folder_hasher = crc32fast::Hasher::new();
+        folder_hasher.update(b"A");
+        let mut state = FolderStreamReader {
+            folder_idx: 0,
+            reader: Box::new(std::io::Cursor::new(&b"AB"[..])),
+            stream_sizes: vec![1],
+            stream_digests: vec![Some(stream_hasher.finalize())],
+            current_stream: 0,
+            folder_hasher: Some(crc32fast::Hasher::new()),
+            folder_digest: Some(folder_hasher.finalize()),
+            decoded_len: 0,
+            folder_unpack_size: 1,
+        };
+        state
+            .read_current_stream(None, &mut |_, reader| {
+                let mut byte = [0; 1];
+                reader.read_exact(&mut byte).map_err(R7zError::Io)
+            })
+            .unwrap();
+        assert!(matches!(state.finish(), Err(R7zError::Decompression)));
+    }
+
+    #[test]
+    fn selected_stream_validates_bounds_and_duplicates_before_callbacks() {
+        let archive = Archive::from_bytes(three_file_archive().into()).unwrap();
+        let mut calls = 0;
+        let mut callback = |_entry: &ArchiveEntryInfo, _reader: &mut dyn Read| {
+            calls += 1;
+            Ok(())
+        };
+
+        assert!(matches!(
+            archive.stream_selected_files(&[3], &mut callback),
+            Err(R7zError::InvalidOptions(
+                "selected entry index out of bounds"
+            ))
+        ));
+        assert!(matches!(
+            archive.stream_selected_files(&[1, 1], &mut callback),
+            Err(R7zError::InvalidOptions("duplicate selected entry index"))
+        ));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn folder_cursor_rejects_untrusted_substream_counts_before_allocation() {
+        let archive = Archive::from_bytes(three_file_archive().into()).unwrap();
+        let streams = archive.streams_info().unwrap();
+        let unpack_info = streams.unpack_info.as_ref().unwrap();
+        let pack_sizes = streams.pack_info.as_ref().unwrap().pack_size.as_slice();
+        let declared_counts = [u64::MAX];
+        let mut cursor =
+            FolderStreamCursor::new(unpack_info, Some(&declared_counts), pack_sizes, 1);
+
+        assert!(matches!(cursor.next(), Err(R7zError::Parse)));
+    }
+
+    #[test]
+    fn multi_pack_folder_buffer_budget_is_checked_before_reading_ranges() {
+        assert!(ensure_packed_folder_buffer_limit(&[256 * 1024 * 1024, 256 * 1024 * 1024]).is_ok());
+        assert!(matches!(
+            ensure_packed_folder_buffer_limit(&[256 * 1024 * 1024, 256 * 1024 * 1024 + 1]),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "packed folder buffers",
+                ..
+            })
+        ));
+        assert!(matches!(
+            ensure_packed_ranges_buffer_limit(&[
+                0..256 * 1024 * 1024,
+                256 * 1024 * 1024..512 * 1024 * 1024 + 1,
+            ]),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "packed folder buffers",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn selected_stream_preserves_empty_files_and_callback_draining() {
+        let bytes = ArchiveBuilder::new()
+            .add_file("first.txt", b"first payload")
+            .add_empty_file("empty.txt", crate::EntryMeta::default())
+            .add_file("last.txt", b"last payload")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let mut seen = Vec::new();
+
+        archive
+            .stream_selected_files(&[2, 1, 0], |entry, reader| {
+                let mut first_byte = [0; 1];
+                let n = reader.read(&mut first_byte)?;
+                seen.push((entry.index, first_byte[..n].to_vec()));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![(0, b"f".to_vec()), (1, Vec::new()), (2, b"l".to_vec())]
+        );
+    }
 }

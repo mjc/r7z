@@ -89,12 +89,24 @@ fn p7zip_lzma2_property_values_extract_with_r7z() {
 }
 
 #[test]
-fn lzma2_property_values_zero_through_forty_decode_empty_stream_without_panic() {
-    for prop in 0u8..=40 {
+fn lzma2_property_values_within_the_default_cap_decode_empty_stream() {
+    for prop in 0u8..=24 {
         let folder = single_lzma2_folder(&[prop]);
         let result = std::panic::catch_unwind(|| r7z::decompress_folder(&folder, &[0x00], 0));
         assert!(result.is_ok(), "LZMA2 property {prop} panicked");
         assert_eq!(result.unwrap().unwrap(), Vec::<u8>::new());
+    }
+
+    for prop in [33, 40] {
+        let folder = single_lzma2_folder(&[prop]);
+        let result = r7z::decompress_folder(&folder, &[0x00], 0);
+        assert!(matches!(
+            result,
+            Err(r7z::R7zError::ResourceLimitExceeded {
+                resource: "LZMA dictionary",
+                ..
+            })
+        ));
     }
 }
 
