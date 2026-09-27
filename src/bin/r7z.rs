@@ -272,7 +272,8 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         return Ok(());
     }
     if lower.starts_with("mmt") {
-        return Ok(());
+        let value = lower[3..].strip_prefix('=').unwrap_or(&lower[3..]);
+        return parse_threading_value(value, "-mmt");
     }
     if lower.starts_with("mx") {
         state.options.compression.level = parse_level(switch)?;
@@ -387,7 +388,7 @@ fn apply_method_spec(spec: &str, options: &mut ArchiveOptions) -> Result<(), Cli
             "mc" => {
                 options.compression.match_cycles = Some(parse_match_cycles(value)?);
             }
-            "mt" => parse_threading_value(value)?,
+            "mt" => parse_threading_value(value, "mt")?,
             _ => return Err(CliError::Usage(format!("unsupported method option: {key}"))),
         }
     }
@@ -465,12 +466,17 @@ fn parse_match_finder(value: &str) -> Result<MatchFinder, CliError> {
     }
 }
 
-fn parse_threading_value(value: &str) -> Result<(), CliError> {
+fn parse_threading_value(value: &str, option: &str) -> Result<(), CliError> {
     match value.to_ascii_lowercase().as_str() {
-        "on" | "off" | "yes" | "no" | "0" => Ok(()),
-        value if value.parse::<u64>().is_ok_and(|threads| threads > 0) => Ok(()),
+        "off" | "no" | "0" | "1" => Ok(()),
+        "" | "on" | "yes" => Err(CliError::Usage(format!(
+            "{option} requests automatic threading; r7z supports one encoder thread"
+        ))),
+        value if value.parse::<u64>().is_ok_and(|threads| threads > 1) => Err(CliError::Usage(
+            format!("{option} requests multiple encoder threads; r7z supports one"),
+        )),
         _ => Err(CliError::Usage(format!(
-            "invalid method threading value for mt: {value}"
+            "invalid threading value for {option}: {value}"
         ))),
     }
 }

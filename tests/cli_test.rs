@@ -663,22 +663,22 @@ fn cli_create_accepts_ppmd_method() {
 }
 
 #[test]
-fn cli_create_accepts_method_scoped_threading_as_noop() {
+fn cli_create_accepts_single_method_thread() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
     fs::create_dir_all(&input).unwrap();
     fs::write(input.join("payload.bin"), b"payload").unwrap();
-    let archive = tmp.path().join("method-threading.7z");
-
-    run_r7z(&[
-        "a".into(),
-        "-m0=LZMA2:mt=off".into(),
-        archive.display().to_string(),
-        input.join("payload.bin").display().to_string(),
-    ]);
-
-    let archive = r7z::Archive::open(&archive).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+    for (index, threads) in ["off", "1"].into_iter().enumerate() {
+        let archive = tmp.path().join(format!("method-threading-{index}.7z"));
+        run_r7z(&[
+            "a".into(),
+            format!("-m0=LZMA2:mt={threads}"),
+            archive.display().to_string(),
+            input.join("payload.bin").display().to_string(),
+        ]);
+        let archive = r7z::Archive::open(&archive).unwrap();
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+    }
 }
 
 #[test]
@@ -739,23 +739,53 @@ fn cli_create_accepts_p7zip_standalone_compression_options() {
 }
 
 #[test]
-fn cli_create_accepts_p7zip_threading_switch_as_noop() {
+fn cli_create_accepts_single_thread_switches() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
     fs::create_dir_all(&input).unwrap();
     fs::write(input.join("payload.bin"), b"payload").unwrap();
-    let archive = tmp.path().join("threading-noop.7z");
+    for (index, threads) in ["-mmt=off", "-mmt=1", "-mmt1"].into_iter().enumerate() {
+        let archive = tmp.path().join(format!("threading-{index}.7z"));
+        run_r7z(&[
+            "a".into(),
+            "-m0=Copy".into(),
+            threads.into(),
+            archive.display().to_string(),
+            input.join("payload.bin").display().to_string(),
+        ]);
+        let archive = r7z::Archive::open(&archive).unwrap();
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+    }
+}
 
-    run_r7z(&[
-        "a".into(),
-        "-m0=Copy".into(),
-        "-mmt=off".into(),
-        archive.display().to_string(),
-        input.join("payload.bin").display().to_string(),
-    ]);
+#[test]
+fn cli_rejects_unsupported_encoder_thread_counts() {
+    let tmp = tempdir().unwrap();
+    let payload = tmp.path().join("payload.bin");
+    fs::write(&payload, b"payload").unwrap();
 
-    let archive = r7z::Archive::open(&archive).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+    for (index, switch) in ["-mmt", "-mmt=on", "-mmt=2", "-mmt2", "-m0=LZMA2:mt=2"]
+        .into_iter()
+        .enumerate()
+    {
+        let archive = tmp.path().join(format!("unsupported-threads-{index}.7z"));
+        let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+            .args([
+                "a",
+                switch,
+                archive.to_str().unwrap(),
+                payload.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(7), "{switch}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("thread"),
+            "{switch}"
+        );
+        assert!(!archive.exists(), "{switch}");
+    }
 }
 
 #[test]
