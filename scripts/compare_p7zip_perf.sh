@@ -4,9 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R7Z_BIN="${R7Z_BIN:-$ROOT/target/release/r7z}"
 P7Z_BIN="${P7ZIP_BIN:-$("$ROOT/scripts/ensure_p7zip_oracle.sh")}"
-SIZES="${SIZES:-1K,4K,16K,64K,256K,1M,4M,16M,64M,256M,1G,5G}"
+SIZES="${SIZES:-1K,4K,16K,64K,256K,1M,4M,16M,64M,256M,1G}"
 RUNS="${RUNS:-5}"
 MX="${MX:-5}"
+P7ZIP_THREADS="${P7ZIP_THREADS:-1}"
 PATTERN="${PATTERN:-zero}"
 WORKDIR="${WORKDIR:-$(mktemp -d)}"
 KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
@@ -24,13 +25,14 @@ Benchmarks `r7z` against the pinned p7zip oracle for:
   - `t`  : read/decode/CRC validation without writing files
   - `a`  : archive creation
 
-Default size matrix spans 1 KiB through 5 GiB on a log scale:
-  1K,4K,16K,64K,256K,1M,4M,16M,64M,256M,1G,5G
+Default size matrix spans 1 KiB through 1 GiB on a log scale:
+  1K,4K,16K,64K,256K,1M,4M,16M,64M,256M,1G
 
 Options:
   --sizes CSV       Comma-separated sizes accepted by `truncate` (default: built-in matrix)
   --runs N          Number of timing runs per command (default: 5)
   --mx N            Compression level passed to both tools (default: 5)
+  --p7zip-threads N  Oracle thread count (default: 1; auto uses its default)
   --pattern MODE    `zero` (default), `random`, or `sparse-zero`
   --workdir DIR     Reuse a specific working directory
   --keep-workdir    Preserve generated payloads/archives
@@ -44,7 +46,7 @@ Options:
   --help            Show this text
 
 Notes:
-  - `zero` materializes full files, including 5G, for honest file-I/O benchmarking.
+  - `zero` materializes full files, including 1G, for honest file-I/O benchmarking.
   - `sparse-zero` is the fast shortcut when you only care about logical size.
   - `random` materializes the full input bytes and can be expensive above ~hundreds of MiB.
   - This script assumes `target/release/r7z` already exists; run `cargo build --release --bin r7z` first.
@@ -63,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mx)
       MX="$2"
+      shift 2
+      ;;
+    --p7zip-threads)
+      P7ZIP_THREADS="$2"
       shift 2
       ;;
     --pattern)
@@ -113,6 +119,18 @@ fi
 if [[ "$PATTERN" != "zero" && "$PATTERN" != "random" && "$PATTERN" != "sparse-zero" ]]; then
   echo "unsupported pattern: $PATTERN" >&2
   exit 2
+fi
+
+if [[ "$P7ZIP_THREADS" != "auto" && ! "$P7ZIP_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--p7zip-threads expects a positive integer or auto" >&2
+  exit 2
+fi
+
+p7zip_thread_args=()
+p7zip_thread_flag=""
+if [[ "$P7ZIP_THREADS" != "auto" ]]; then
+  p7zip_thread_args=("-mmt=$P7ZIP_THREADS")
+  p7zip_thread_flag="-mmt=$P7ZIP_THREADS"
 fi
 
 if [[ "$KEEP_WORKDIR" != "1" ]]; then
@@ -217,6 +235,7 @@ echo "- p7zip: $P7Z_BIN"
 echo "- sizes: $SIZES"
 echo "- runs per command: $RUNS"
 echo "- compression level: -mx=$MX"
+echo "- p7zip threads: $P7ZIP_THREADS"
 echo "- payload pattern: $PATTERN"
 echo "- workdir: $WORKDIR"
 if [[ "$FLAMEGRAPHS" == "1" ]]; then
@@ -234,7 +253,7 @@ for size in "${size_list[@]}"; do
   p7zip_archive="$WORKDIR/p7zip-$size.7z"
 
   materialize_payload "$size" "$payload"
-  "$P7Z_BIN" a -bd -bb0 "-mx=$MX" "$source_archive" "$payload" >/dev/null
+  "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$source_archive" "$payload" >/dev/null
 
   payload_q="$(shell_quote "$payload")"
   source_archive_q="$(shell_quote "$source_archive")"
@@ -260,7 +279,7 @@ for size in "${size_list[@]}"; do
   fi
 
   r7z_create="$(time_command "rm -f $r7z_archive_q" "$r7z_q a -mx=$MX $r7z_archive_q $payload_q >/dev/null")"
-  p7zip_create="$(time_command "rm -f $p7zip_archive_q" "$p7z_q a -bd -bb0 -mx=$MX $p7zip_archive_q $payload_q >/dev/null")"
+  p7zip_create="$(time_command "rm -f $p7zip_archive_q" "$p7z_q a -bd -bb0 $p7zip_thread_flag -mx=$MX $p7zip_archive_q $payload_q >/dev/null")"
   printf '| %s | a | %s | %s | %s |\n' \
     "$size" "$r7z_create" "$p7zip_create" "$(ratio_string "$r7z_create" "$p7zip_create")"
   if [[ "$FLAMEGRAPHS" == "1" ]] && op_selected "a"; then
