@@ -235,8 +235,11 @@ let archive = Archive::from_bytes(raw.into())?;
 | `archive.extract_to_writer_with_password(index, writer, password)` | `Result<u64, R7zError>` | Stream encrypted file data into a writer |
 | `archive.extract_by_name(name, writer)` | `Result<u64, R7zError>` | Stream file selected by exact or normalized safe name |
 | `archive.stream_files(callback)` | `Result<(), R7zError>` | Stream all file-like entries while decoding each solid folder once |
+| `archive.stream_selected_files(indices, callback)` | `Result<(), R7zError>` | Stream selected file-like entries in archive order, decoding each selected solid folder once |
 | `archive.extract_all(dest: &Path)` | `Result<(), R7zError>` | Extract all files; creates subdirectories as needed |
 | `archive.extract_all_with_password(dest, password)` | `Result<(), R7zError>` | Extract all files from an encrypted archive |
+
+`stream_selected_files` validates all indices (including duplicates) before invoking the callback. It skips unselected folders, drains partially consumed selected entries, verifies a selected folder's CRC across unselected entries in that same folder, and skips unselected tails when no folder CRC requires them. Multi-pack folders are capped at 512 MiB before packed data is buffered. Decoder safeguards reject `LZMA`/`LZMA2` dictionaries or `PPMd` memory above 256 MiB, cap decoder chains at 64 coders and the aggregate decoder working set at 512 MiB, cap each AES encrypted/decrypted buffer at 128 MiB, cap `BCJ2` output at 256 MiB and combined packed/intermediate/final buffers at 512 MiB, and include live decoder state in that `BCJ2` budget. APIs that materialize decompressed folder output share a 512 MiB budget with decoder state. `extract_to_memory` intentionally allocates the requested member and remains limited only by the caller's memory; use a writer/streaming API or impose an application-level output limit for untrusted archives.
 
 ### `FilesInfo` — Entry metadata helpers
 

@@ -2,6 +2,15 @@ use crate::{Property, parsers::bitmap_is_set, sevenzip_varuint64_decode};
 use bytes::Bytes;
 use nom::{IResult, bytes::complete::take};
 
+pub(crate) fn decode_name(data: &[u8]) -> String {
+    char::decode_utf16(
+        data.chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
+    )
+    .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect()
+}
+
 /// File listing metadata from the 7z `FilesInfo` block.
 #[derive(Debug, PartialEq)]
 pub struct FilesInfo {
@@ -38,42 +47,40 @@ pub enum EntryType {
     Symlink,
 }
 
+pub(crate) struct FilesInfoNameSlices<'a> {
+    data: &'a [u8],
+    count: usize,
+    position: usize,
+    index: usize,
+}
+
+impl<'a> Iterator for FilesInfoNameSlices<'a> {
+    type Item = Option<&'a [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.count {
+            return None;
+        }
+        self.index += 1;
+        if self.data.is_empty() || self.position + 1 >= self.data.len() {
+            return Some(None);
+        }
+        let start = self.position;
+        while self.position + 1 < self.data.len() {
+            let is_null = self.data[self.position] == 0 && self.data[self.position + 1] == 0;
+            self.position += 2;
+            if is_null {
+                return Some(Some(&self.data[start..self.position - 2]));
+            }
+        }
+        Some(None)
+    }
+}
+
 impl FilesInfo {
     /// Decode the name of entry `i` on demand (UTF-16LE, null-terminated).
     pub fn name(&self, i: usize) -> Option<String> {
-        let data = &self.name_data;
-        if data.is_empty() {
-            return None;
-        }
-        let mut pos = 0usize;
-        let mut idx = 0usize;
-        while pos + 1 < data.len() {
-            let start = pos;
-            // Scan to null terminator
-            loop {
-                if pos + 1 >= data.len() {
-                    break;
-                }
-                let is_null = data[pos] == 0 && data[pos + 1] == 0;
-                pos += 2;
-                if is_null {
-                    break;
-                }
-            }
-            if idx == i {
-                let end = pos - 2; // exclude null terminator
-                let s: String = char::decode_utf16(
-                    data[start..end]
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]])),
-                )
-                .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                .collect();
-                return Some(s);
-            }
-            idx += 1;
-        }
-        None
+        self.name_slices().nth(i)?.map(decode_name)
     }
 
     /// Iterator over all decoded names (in archive order).
@@ -82,8 +89,16 @@ impl FilesInfo {
     ///
     /// Panics if `num_files` exceeds `usize::MAX` (impossible in practice).
     pub fn names(&self) -> impl Iterator<Item = String> + '_ {
-        let n = usize::try_from(self.num_files).expect("num_files fits in usize");
-        (0..n).filter_map(move |i| self.name(i))
+        self.name_slices().filter_map(|name| name.map(decode_name))
+    }
+
+    pub(crate) fn name_slices(&self) -> FilesInfoNameSlices<'_> {
+        FilesInfoNameSlices {
+            data: &self.name_data,
+            count: usize::try_from(self.num_files).expect("num_files fits in usize"),
+            position: 0,
+            index: 0,
+        }
     }
 
     /// Returns `true` if entry `i` has no data stream (directory or zero-byte file).

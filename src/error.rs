@@ -54,4 +54,11 @@ pub enum R7zError {
     /// A configured safety limit was exceeded.
     #[error("{0} limit exceeded")]
     LimitExceeded(&'static str),
+
+    /// A decoder resource limit was exceeded.
+    #[error("{resource} resource limit exceeded ({limit} bytes)")]
+    ResourceLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
 }

@@ -7,11 +7,20 @@ use ppmd_rust::Ppmd7Decoder;
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
-// Cap how much encrypted data we buffer before AES-CBC decryption to avoid
-// unbounded memory growth on malicious or unexpectedly large inputs. Encrypted
-// pack streams larger than this fail to decode; if that becomes a compatibility
-// issue, this should become configurable or derived from validated metadata.
+const MAX_LZMA_DICTIONARY_BYTES: u32 = 256 * 1024 * 1024;
+const MAX_LZMA2_PROBABILITY_BYTES: usize = 24 * 1024;
+const MAX_PPMD_MEMORY_BYTES: u32 = 256 * 1024 * 1024;
+// AES decryption holds both encrypted and decrypted copies, each capped here.
 const MAX_BUFFERED_AES_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BCJ2_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
+const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
+const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
+const MAX_FOLDER_CODERS: usize = 64;
+// Sum of packed Vec capacities, intermediate Vec capacities, and final output.
+pub(crate) const MAX_BUFFERED_PACKED_FOLDER_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BCJ2_BUFFERED_BYTES: usize = MAX_BUFFERED_PACKED_FOLDER_BYTES;
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
 ///
@@ -60,9 +69,9 @@ pub const CODEC_COPY: &[u8] = &[0x00];
 pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 /// Codec ID for raw Deflate streams.
 pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
-/// Codec ID for BZip2 streams.
+/// Codec ID for `BZip2` streams.
 pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
-/// Codec ID for PPMd7 streams.
+/// Codec ID for `PPMd7` streams.
 pub const CODEC_PPMD: &[u8] = &[0x03, 0x04, 0x01];
 /// Codec ID for Deflate64 streams.
 pub const CODEC_DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
@@ -96,7 +105,10 @@ pub fn compress_lzma2(data: &[u8]) -> Result<(u8, Vec<u8>), R7zError> {
 /// and `u32::MAX` for p == 40 (meaning "as large as needed").
 fn lzma2_dict_size(props: Option<&[u8]>) -> Result<u32, R7zError> {
     let Some(props) = props else {
-        return Ok(u32::MAX);
+        return Err(resource_limit(
+            "LZMA dictionary",
+            MAX_LZMA_DICTIONARY_BYTES as usize,
+        ));
     };
     if props.len() != 1 {
         return Err(R7zError::Decompression);
@@ -105,8 +117,21 @@ fn lzma2_dict_size(props: Option<&[u8]>) -> Result<u32, R7zError> {
     let p = props[0];
     match p.cmp(&40) {
         std::cmp::Ordering::Greater => Err(R7zError::Decompression),
-        std::cmp::Ordering::Equal => Ok(u32::MAX),
-        std::cmp::Ordering::Less => Ok((2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11)),
+        std::cmp::Ordering::Equal => Err(resource_limit(
+            "LZMA dictionary",
+            MAX_LZMA_DICTIONARY_BYTES as usize,
+        )),
+        std::cmp::Ordering::Less => {
+            let dict_size = (2u32 | (u32::from(p) & 1)) << ((u32::from(p) >> 1) + 11);
+            if dict_size > MAX_LZMA_DICTIONARY_BYTES {
+                Err(resource_limit(
+                    "LZMA dictionary",
+                    MAX_LZMA_DICTIONARY_BYTES as usize,
+                ))
+            } else {
+                Ok(dict_size)
+            }
+        }
     }
 }
 
@@ -115,9 +140,11 @@ fn decompress_lzma2(properties: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, 
     let dict_size = lzma2_dict_size(properties)?;
     let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
     let mut output = Vec::new();
-    reader
-        .read_to_end(&mut output)
-        .map_err(|_| R7zError::Decompression)?;
+    let available = MAX_MATERIALIZED_OUTPUT_BYTES
+        .checked_sub(dict_size as usize)
+        .ok_or_else(|| resource_limit("decoder working set", MAX_MATERIALIZED_OUTPUT_BYTES))?;
+    let max_output = growth_safe_output_limit(available);
+    read_to_end_bounded(&mut reader, &mut output, max_output, "materialized output")?;
     Ok(output)
 }
 
@@ -162,6 +189,7 @@ pub fn decompress_folder_with_password_and_sizes(
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<Vec<u8>, R7zError> {
+    let decoder_memory = folder_decoder_memory_bytes(folder, packed_data.len())?;
     let mut reader = folder_reader_with_sizes(
         folder,
         packed_data,
@@ -169,10 +197,19 @@ pub fn decompress_folder_with_password_and_sizes(
         coder_unpack_sizes,
         password,
     )?;
-    let mut data = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
-    reader
-        .read_to_end(&mut data)
-        .map_err(|_| R7zError::Decompression)?;
+    let mut data = Vec::new();
+    read_to_end_bounded(
+        &mut reader,
+        &mut data,
+        growth_safe_output_limit(
+            MAX_MATERIALIZED_OUTPUT_BYTES
+                .checked_sub(decoder_memory)
+                .ok_or_else(|| {
+                    resource_limit("decoder working set", MAX_MATERIALIZED_OUTPUT_BYTES)
+                })?,
+        ),
+        "materialized output",
+    )?;
     Ok(data)
 }
 
@@ -189,6 +226,7 @@ pub(crate) fn folder_reader_with_sizes<'a>(
         unpack_size,
         coder_unpack_sizes,
         password,
+        packed_data.len(),
     )
 }
 
@@ -198,10 +236,28 @@ pub(crate) fn folder_reader_with_sizes_from_reader<'a>(
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
+    packed_input_bytes: usize,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
+    validate_decoder_working_set(folder, packed_input_bytes)?;
     let order = coder_execution_order(folder)?;
-    let mut reader = input;
+    build_decoder_chain(
+        folder,
+        input,
+        unpack_size,
+        coder_unpack_sizes,
+        password,
+        &order,
+    )
+}
 
+fn build_decoder_chain<'a>(
+    folder: &Folder,
+    mut reader: Box<dyn Read + 'a>,
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+    order: &[usize],
+) -> Result<Box<dyn Read + 'a>, R7zError> {
     // Multi-coder chain: resolve bind-pair ordering so that each coder's
     // output feeds the next one's input.
     //
@@ -229,10 +285,12 @@ pub(crate) fn folder_reader_with_pack_streams(
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<Box<dyn Read>, R7zError> {
+    let packed_input_bytes = total_buffered_len(&packed_streams)?;
+    validate_folder_coder_count(folder)?;
     if is_bcj2_folder(folder) {
         return bcj2_folder_reader(
             folder,
-            packed_streams,
+            &packed_streams,
             unpack_size,
             coder_unpack_sizes,
             password,
@@ -251,12 +309,13 @@ pub(crate) fn folder_reader_with_pack_streams(
         unpack_size,
         coder_unpack_sizes,
         password,
+        packed_input_bytes,
     )
 }
 
 fn coder_reader<'a>(
     coder: &crate::CoderInfo,
-    mut input: Box<dyn Read + 'a>,
+    input: Box<dyn Read + 'a>,
     unpack_size: u64,
     password: Option<&str>,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
@@ -271,6 +330,12 @@ fn coder_reader<'a>(
         }
         let props_byte = props[0];
         let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+        if dict_size > MAX_LZMA_DICTIONARY_BYTES {
+            return Err(resource_limit(
+                "LZMA dictionary",
+                MAX_LZMA_DICTIONARY_BYTES as usize,
+            ));
+        }
         let reader = LzmaReader::new_with_props(input, unpack_size, props_byte, dict_size, None)
             .map_err(|_| R7zError::Decompression)?;
         return Ok(Box::new(reader));
@@ -355,20 +420,35 @@ fn coder_reader<'a>(
     }
 
     if *coder.codec_id == *CODEC_AES_256_SHA_256 {
-        let pwd = password.ok_or(R7zError::PasswordRequired)?;
-        let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        let props = crate::aes::AesProperties::parse(props_bytes)?;
-        let key = crate::aes::derive_key(pwd, &props.salt, props.num_cycles_power)?;
-        let mut encrypted = Vec::new();
-        read_to_end_bounded(&mut input, &mut encrypted, MAX_BUFFERED_AES_BYTES)?;
-        let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
-        if unpack_size > 0 {
-            truncate_to(&mut decrypted, unpack_size)?;
-        }
-        return Ok(Box::new(Cursor::new(decrypted)));
+        return aes_coder_reader(coder, input, unpack_size, password);
     }
 
     Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
+}
+
+fn aes_coder_reader<'a>(
+    coder: &crate::CoderInfo,
+    mut input: Box<dyn Read + 'a>,
+    unpack_size: u64,
+    password: Option<&str>,
+) -> Result<Box<dyn Read + 'a>, R7zError> {
+    let password = password.ok_or(R7zError::PasswordRequired)?;
+    let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+    let props = crate::aes::AesProperties::parse(props_bytes)?;
+    let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
+    let mut encrypted = Vec::new();
+    read_to_end_bounded(
+        &mut input,
+        &mut encrypted,
+        MAX_BUFFERED_AES_BYTES,
+        "AES encrypted input",
+    )?;
+    drop(input);
+    let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
+    if unpack_size > 0 {
+        truncate_to(&mut decrypted, unpack_size)?;
+    }
+    Ok(Box::new(Cursor::new(decrypted)))
 }
 
 fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
@@ -378,7 +458,118 @@ fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
 
     let order = u32::from(props[0]);
     let mem_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+    if mem_size > MAX_PPMD_MEMORY_BYTES {
+        return Err(resource_limit(
+            "PPMd memory",
+            MAX_PPMD_MEMORY_BYTES as usize,
+        ));
+    }
     Ok((order, mem_size))
+}
+
+fn resource_limit(resource: &'static str, limit: usize) -> R7zError {
+    R7zError::ResourceLimitExceeded { resource, limit }
+}
+
+fn growth_safe_output_limit(available: usize) -> usize {
+    // Vec growth can briefly keep both the old and replacement allocations alive.
+    available / 2
+}
+
+fn coder_working_set_bytes(
+    coder: &crate::CoderInfo,
+    packed_input_bytes: usize,
+) -> Result<usize, R7zError> {
+    if coder.codec_id.as_slice() == CODEC_LZMA2 {
+        return (lzma2_dict_size(coder.properties.as_deref())? as usize)
+            .checked_add(MAX_LZMA2_PROBABILITY_BYTES)
+            .and_then(|size| size.checked_add(DECODER_OVERHEAD_BYTES))
+            .ok_or(R7zError::Decompression);
+    }
+    if coder.codec_id.as_slice() == CODEC_LZMA {
+        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        if props.len() != 5 {
+            return Err(R7zError::Decompression);
+        }
+        let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+        if dict_size > MAX_LZMA_DICTIONARY_BYTES {
+            return Err(resource_limit(
+                "LZMA dictionary",
+                MAX_LZMA_DICTIONARY_BYTES as usize,
+            ));
+        }
+        let memory_kib = lzma_rust2::lzma_get_memory_usage_by_props(dict_size, props[0])
+            .map_err(|_| R7zError::Decompression)?;
+        let memory = usize::try_from(memory_kib)
+            .ok()
+            .and_then(|memory| memory.checked_mul(1024))
+            .ok_or(R7zError::Decompression)?;
+        return memory
+            .checked_add(DECODER_OVERHEAD_BYTES)
+            .ok_or(R7zError::Decompression);
+    }
+    if coder.codec_id.as_slice() == CODEC_PPMD {
+        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
+        return (ppmd_properties(props)?.1 as usize)
+            .checked_add(DECODER_OVERHEAD_BYTES)
+            .ok_or(R7zError::Decompression);
+    }
+    if coder.codec_id.as_slice() == CODEC_AES_256_SHA_256 {
+        return packed_input_bytes
+            .min(MAX_BUFFERED_AES_BYTES)
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(DECODER_OVERHEAD_BYTES))
+            .ok_or(R7zError::Decompression);
+    }
+    if matches!(
+        coder.codec_id.as_slice(),
+        CODEC_COPY
+            | CODEC_BCJ_X86
+            | CODEC_BCJ_ARM
+            | CODEC_BCJ_ARM_THUMB
+            | CODEC_BCJ_IA64
+            | CODEC_BCJ_PPC
+            | CODEC_BCJ_SPARC
+            | CODEC_DELTA
+            | CODEC_SWAP2
+            | CODEC_SWAP4
+    ) {
+        return Ok(0);
+    }
+    Ok(OTHER_CODER_WORKING_SET_BYTES)
+}
+
+fn folder_decoder_memory_bytes(
+    folder: &crate::Folder,
+    packed_input_bytes: usize,
+) -> Result<usize, R7zError> {
+    folder.coders.iter().try_fold(0usize, |total, coder| {
+        total
+            .checked_add(coder_working_set_bytes(coder, packed_input_bytes)?)
+            .ok_or(R7zError::Decompression)
+    })
+}
+
+fn validate_decoder_working_set(
+    folder: &crate::Folder,
+    packed_input_bytes: usize,
+) -> Result<usize, R7zError> {
+    validate_folder_coder_count(folder)?;
+    let working_set = folder_decoder_memory_bytes(folder, packed_input_bytes)?;
+    if working_set > MAX_DECODER_WORKING_SET_BYTES {
+        return Err(resource_limit(
+            "decoder working set",
+            MAX_DECODER_WORKING_SET_BYTES,
+        ));
+    }
+    Ok(working_set)
+}
+
+fn validate_folder_coder_count(folder: &crate::Folder) -> Result<(), R7zError> {
+    if folder.coders.len() > MAX_FOLDER_CODERS {
+        return Err(R7zError::LimitExceeded("folder coder count"));
+    }
+    Ok(())
 }
 
 struct ExactSizeReader<R> {
@@ -426,7 +617,7 @@ fn is_bcj2_folder(folder: &Folder) -> bool {
 
 fn bcj2_folder_reader(
     folder: &Folder,
-    packed_streams: Vec<Vec<u8>>,
+    packed_streams: &[Vec<u8>],
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
@@ -441,31 +632,13 @@ fn bcj2_folder_reader(
         && folder.packed_indices.as_slice() == [0, 2, 3, 4]
         && folder.bind_pairs.as_slice() == [(1, 0)]
     {
-        let output_size = usize::try_from(unpack_size).map_err(|_| R7zError::Parse)?;
-        let main = decode_single_coder_to_vec(
-            &folder.coders[0],
-            packed_streams[0].clone(),
-            *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
+        return bcj2_single_predecoder(
+            folder,
+            packed_streams,
+            unpack_size,
+            coder_unpack_sizes,
             password,
-        )?;
-        if main
-            .len()
-            .checked_add(packed_streams[1].len())
-            .and_then(|len| len.checked_add(packed_streams[2].len()))
-            .ok_or(R7zError::Decompression)?
-            != output_size
-        {
-            return Err(R7zError::Decompression);
-        }
-
-        let decoded = crate::bcj2::decode(
-            &main,
-            &packed_streams[1],
-            &packed_streams[2],
-            &packed_streams[3],
-            output_size,
-        )?;
-        return Ok(Box::new(Cursor::new(decoded)));
+        );
     }
 
     if folder.coders.len() != 4
@@ -477,23 +650,108 @@ fn bcj2_folder_reader(
         return Err(R7zError::Parse);
     }
 
-    let output_size = usize::try_from(unpack_size).map_err(|_| R7zError::Parse)?;
+    bcj2_lzma_predecoders(
+        folder,
+        packed_streams,
+        unpack_size,
+        coder_unpack_sizes,
+        password,
+    )
+}
+
+fn bcj2_single_predecoder(
+    folder: &Folder,
+    packed_streams: &[Vec<u8>],
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Box<dyn Read>, R7zError> {
+    let output_size = bcj2_output_size(unpack_size)?;
+    let packed_bytes = total_buffered_len(packed_streams)?;
+    let decoder_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
+    let main_size = output_size
+        .checked_sub(packed_streams[1].len())
+        .and_then(|size| size.checked_sub(packed_streams[2].len()))
+        .ok_or(R7zError::Decompression)?;
+    let declared_main_size = *coder_unpack_sizes.first().ok_or(R7zError::Parse)?;
+    if usize::try_from(declared_main_size).map_err(|_| R7zError::Parse)? != main_size {
+        return Err(R7zError::Decompression);
+    }
+    ensure_bcj2_buffer_budget(packed_bytes, main_size, output_size, decoder_memory)?;
+    let main = decode_single_coder_to_vec(
+        &folder.coders[0],
+        &packed_streams[0],
+        declared_main_size,
+        main_size,
+        password,
+    )?;
+    if main
+        .len()
+        .checked_add(packed_streams[1].len())
+        .and_then(|len| len.checked_add(packed_streams[2].len()))
+        .ok_or(R7zError::Decompression)?
+        != output_size
+    {
+        return Err(R7zError::Decompression);
+    }
+
+    ensure_bcj2_buffer_budget(packed_bytes, main.capacity(), output_size, 0)?;
+    let decoded = crate::bcj2::decode(
+        &main,
+        &packed_streams[1],
+        &packed_streams[2],
+        &packed_streams[3],
+        output_size,
+    )?;
+    ensure_bcj2_buffer_budget(packed_bytes, main.capacity(), decoded.capacity(), 0)?;
+    Ok(Box::new(Cursor::new(decoded)))
+}
+
+fn bcj2_lzma_predecoders(
+    folder: &Folder,
+    packed_streams: &[Vec<u8>],
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+    password: Option<&str>,
+) -> Result<Box<dyn Read>, R7zError> {
+    let output_size = bcj2_output_size(unpack_size)?;
+    let packed_bytes = total_buffered_len(packed_streams)?;
+    let jump_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
+    let jump_limit = bcj2_intermediate_available(packed_bytes, output_size, 0, jump_memory)?;
+    let jump_limit = declared_or_fallback_limit(coder_unpack_sizes.first(), jump_limit);
     let jump = decode_single_coder_to_vec(
         &folder.coders[0],
-        packed_streams[3].clone(),
+        &packed_streams[3],
         *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
+        jump_limit,
         password,
     )?;
+    let call_memory = coder_working_set_bytes(&folder.coders[1], packed_bytes)?;
+    let call_limit =
+        bcj2_intermediate_available(packed_bytes, output_size, jump.capacity(), call_memory)?;
+    let call_limit = declared_or_fallback_limit(coder_unpack_sizes.get(1), call_limit);
     let call = decode_single_coder_to_vec(
         &folder.coders[1],
-        packed_streams[2].clone(),
+        &packed_streams[2],
         *coder_unpack_sizes.get(1).ok_or(R7zError::Parse)?,
+        call_limit,
         password,
     )?;
+    let main_memory = coder_working_set_bytes(&folder.coders[2], packed_bytes)?;
+    let main_limit = bcj2_intermediate_available(
+        packed_bytes,
+        output_size,
+        jump.capacity()
+            .checked_add(call.capacity())
+            .ok_or(R7zError::Decompression)?,
+        main_memory,
+    )?;
+    let main_limit = declared_or_fallback_limit(coder_unpack_sizes.get(2), main_limit);
     let main = decode_single_coder_to_vec(
         &folder.coders[2],
-        packed_streams[0].clone(),
+        &packed_streams[0],
         *coder_unpack_sizes.get(2).ok_or(R7zError::Parse)?,
+        main_limit,
         password,
     )?;
 
@@ -507,14 +765,22 @@ fn bcj2_folder_reader(
         return Err(R7zError::Decompression);
     }
 
+    let intermediate_bytes = jump
+        .capacity()
+        .checked_add(call.capacity())
+        .and_then(|len| len.checked_add(main.capacity()))
+        .ok_or(R7zError::Decompression)?;
+    ensure_bcj2_buffer_budget(packed_bytes, intermediate_bytes, output_size, 0)?;
     let decoded = crate::bcj2::decode(&main, &call, &jump, &packed_streams[1], output_size)?;
+    ensure_bcj2_buffer_budget(packed_bytes, intermediate_bytes, decoded.capacity(), 0)?;
     Ok(Box::new(Cursor::new(decoded)))
 }
 
 fn decode_single_coder_to_vec(
     coder: &crate::CoderInfo,
-    packed_stream: Vec<u8>,
+    packed_stream: &[u8],
     unpack_size: u64,
+    max_output: usize,
     password: Option<&str>,
 ) -> Result<Vec<u8>, R7zError> {
     let mut reader = coder_reader(
@@ -523,17 +789,30 @@ fn decode_single_coder_to_vec(
         unpack_size,
         password,
     )?;
-    let mut output = Vec::with_capacity(usize::try_from(unpack_size).unwrap_or(0));
-    reader
-        .read_to_end(&mut output)
-        .map_err(|_| R7zError::Decompression)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(max_output)
+        .map_err(|_| resource_limit("BCJ2 intermediate", max_output))?;
+    if output.capacity() > max_output {
+        return Err(resource_limit("BCJ2 intermediate", max_output));
+    }
+    read_to_end_bounded(&mut reader, &mut output, max_output, "BCJ2 intermediate")?;
     Ok(output)
+}
+
+fn declared_or_fallback_limit(declared_size: Option<&u64>, available: usize) -> usize {
+    let fallback = growth_safe_output_limit(available);
+    declared_size
+        .and_then(|size| usize::try_from(*size).ok())
+        .filter(|size| *size <= available)
+        .unwrap_or(fallback)
 }
 
 fn read_to_end_bounded(
     input: &mut dyn Read,
     output: &mut Vec<u8>,
     max_len: usize,
+    resource: &'static str,
 ) -> Result<(), R7zError> {
     let mut buf = [0u8; 8192];
     loop {
@@ -543,10 +822,103 @@ fn read_to_end_bounded(
         }
         let new_len = output.len().checked_add(n).ok_or(R7zError::Decompression)?;
         if new_len > max_len {
-            return Err(R7zError::Decompression);
+            return Err(resource_limit(resource, max_len));
+        }
+        if new_len > output.capacity() {
+            let target_capacity = output
+                .capacity()
+                .max(buf.len())
+                .saturating_mul(2)
+                .max(new_len)
+                .min(max_len);
+            output
+                .try_reserve_exact(target_capacity - output.len())
+                .map_err(|_| resource_limit(resource, max_len))?;
+        }
+        if output.capacity() > max_len {
+            return Err(resource_limit(resource, max_len));
         }
         output.extend_from_slice(&buf[..n]);
     }
+}
+
+#[cfg(test)]
+mod bounded_reader_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_grows_geometrically_for_large_outputs() {
+        let input = vec![0x5a; 4 * 1024 * 1024];
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        read_to_end_bounded(&mut reader, &mut output, input.len(), "test output").unwrap();
+
+        assert_eq!(output, input);
+        assert!(output.capacity() <= 4 * 1024 * 1024);
+    }
+}
+
+fn bcj2_output_size(unpack_size: u64) -> Result<usize, R7zError> {
+    let output_size = usize::try_from(unpack_size).map_err(|_| R7zError::Parse)?;
+    if output_size > MAX_BCJ2_OUTPUT_BYTES {
+        return Err(resource_limit("BCJ2 output", MAX_BCJ2_OUTPUT_BYTES));
+    }
+    Ok(output_size)
+}
+
+fn total_buffered_len(buffers: &[Vec<u8>]) -> Result<usize, R7zError> {
+    buffers.iter().try_fold(0usize, |total, buffer| {
+        total
+            .checked_add(buffer.capacity())
+            .ok_or(R7zError::Decompression)
+    })
+}
+
+fn bcj2_intermediate_limit(
+    packed_bytes: usize,
+    output_size: usize,
+    intermediate_bytes: usize,
+    decoder_memory: usize,
+) -> Result<usize, R7zError> {
+    Ok(growth_safe_output_limit(bcj2_intermediate_available(
+        packed_bytes,
+        output_size,
+        intermediate_bytes,
+        decoder_memory,
+    )?))
+}
+
+fn bcj2_intermediate_available(
+    packed_bytes: usize,
+    output_size: usize,
+    intermediate_bytes: usize,
+    decoder_memory: usize,
+) -> Result<usize, R7zError> {
+    let committed = packed_bytes
+        .checked_add(output_size)
+        .and_then(|total| total.checked_add(intermediate_bytes))
+        .and_then(|total| total.checked_add(decoder_memory))
+        .ok_or(R7zError::Decompression)?;
+    let available = MAX_BCJ2_BUFFERED_BYTES
+        .checked_sub(committed)
+        .ok_or_else(|| resource_limit("BCJ2 working buffers", MAX_BCJ2_BUFFERED_BYTES))?;
+    Ok(available)
+}
+
+fn ensure_bcj2_buffer_budget(
+    packed_bytes: usize,
+    intermediate_bytes: usize,
+    output_size: usize,
+    decoder_memory: usize,
+) -> Result<(), R7zError> {
+    bcj2_intermediate_limit(
+        packed_bytes,
+        output_size,
+        intermediate_bytes,
+        decoder_memory,
+    )
+    .map(|_| ())
 }
 
 fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
@@ -678,12 +1050,48 @@ mod tests {
         assert_eq!(lzma2_dict_size(Some(&[16])).unwrap(), 1024 * 1024);
         assert_eq!(lzma2_dict_size(Some(&[24])).unwrap(), 16 * 1024 * 1024);
         assert_eq!(lzma2_dict_size(Some(&[28])).unwrap(), 64 * 1024 * 1024);
-        assert_eq!(lzma2_dict_size(Some(&[40])).unwrap(), u32::MAX);
+        assert!(matches!(
+            lzma2_dict_size(Some(&[40])),
+            Err(R7zError::ResourceLimitExceeded { .. })
+        ));
     }
 
     #[test]
-    fn lzma2_property_values_zero_through_forty_decode_empty_stream() {
-        for prop in 0u8..=40 {
+    fn lzma2_dictionary_properties_above_the_resource_cap_are_rejected() {
+        assert_eq!(lzma2_dict_size(Some(&[32])).unwrap(), 256 * 1024 * 1024);
+        assert!(matches!(
+            lzma2_dict_size(Some(&[40])),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "LZMA dictionary",
+                ..
+            })
+        ));
+        assert!(matches!(
+            lzma2_dict_size(Some(&[33])),
+            Err(R7zError::ResourceLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            lzma2_dict_size(None),
+            Err(R7zError::ResourceLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn aes_working_set_uses_packed_size_and_allows_more_than_128_mib() {
+        let aes = crate::CoderInfo::parse(&[0x04, 0x06, 0xF1, 0x07, 0x01])
+            .unwrap()
+            .1;
+        let packed_size = 129 * 1024 * 1024;
+        assert_eq!(
+            super::coder_working_set_bytes(&aes, packed_size).unwrap(),
+            packed_size * 2 + super::DECODER_OVERHEAD_BYTES
+        );
+        assert_eq!(super::MAX_BUFFERED_AES_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn lzma2_property_values_zero_through_twenty_four_decode_empty_stream() {
+        for prop in 0u8..=24 {
             let decoded = decompress_lzma2(Some(&[prop]), &[0x00]).unwrap();
             assert!(decoded.is_empty(), "property {prop} decoded non-empty data");
         }
@@ -715,6 +1123,125 @@ mod tests {
             let err = ppmd_properties(props).unwrap_err();
             assert!(matches!(err, R7zError::Decompression));
         }
+    }
+
+    #[test]
+    fn ppmd_memory_properties_above_the_resource_cap_are_rejected() {
+        let props = [6, 0, 0, 0, 0x40]; // 1 GiB
+        assert!(matches!(
+            ppmd_properties(&props),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "PPMd memory",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn coder_reader_rejects_oversized_lzma_and_ppmd_properties_before_decode() {
+        let lzma =
+            crate::CoderInfo::parse(&[0x23, 0x03, 0x01, 0x01, 5, 0x5d, 0xff, 0xff, 0xff, 0xff])
+                .unwrap()
+                .1;
+        assert!(matches!(
+            super::coder_reader(&lzma, Box::new(Cursor::new(&[][..])), 0, None),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "LZMA dictionary",
+                ..
+            })
+        ));
+
+        let lzma2 = crate::CoderInfo::parse(&[0x21, 0x21, 1, 40]).unwrap().1;
+        assert!(matches!(
+            super::coder_reader(&lzma2, Box::new(Cursor::new(&[][..])), 0, None),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "LZMA dictionary",
+                ..
+            })
+        ));
+
+        let ppmd = crate::CoderInfo::parse(&[0x23, 0x03, 0x04, 0x01, 5, 6, 0, 0, 0, 0x40])
+            .unwrap()
+            .1;
+        assert!(matches!(
+            super::coder_reader(&ppmd, Box::new(Cursor::new(&[][..])), 0, None),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "PPMd memory",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn actual_intermediate_growth_is_bounded_despite_dishonest_unpack_size() {
+        let copy = crate::CoderInfo::parse(&[1, 0]).unwrap().1;
+        let err = super::decode_single_coder_to_vec(&copy, b"more than allowed", u64::MAX, 4, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            R7zError::ResourceLimitExceeded {
+                resource: "BCJ2 intermediate",
+                limit: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn bcj2_declared_final_output_is_capped_before_allocation() {
+        let err = super::bcj2_output_size(u64::MAX).unwrap_err();
+        assert!(matches!(
+            err,
+            R7zError::ResourceLimitExceeded {
+                resource: "BCJ2 output",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bcj2_budget_counts_packed_intermediate_and_final_buffers() {
+        assert_eq!(
+            super::bcj2_intermediate_limit(400, 100, 20, 30).unwrap(),
+            (512 * 1024 * 1024 - 550) / 2
+        );
+        assert!(matches!(
+            super::bcj2_intermediate_limit(512 * 1024 * 1024, 1, 0, 0),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "BCJ2 working buffers",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bcj2_declared_intermediate_uses_exact_available_budget() {
+        let packed = 45 * 1024 * 1024;
+        let output = 150 * 1024 * 1024;
+        let decoder = 64 * 1024 * 1024;
+        let available = super::bcj2_intermediate_available(packed, output, 0, decoder).unwrap();
+        let declared = 150 * 1024 * 1024;
+
+        assert_eq!(
+            super::declared_or_fallback_limit(Some(&(declared as u64)), available),
+            declared
+        );
+    }
+
+    #[test]
+    fn chained_decoder_state_is_aggregated_before_construction() {
+        let lzma2 = || crate::CoderInfo::parse(&[0x21, 0x21, 1, 32]).unwrap().1;
+        let folder = crate::Folder {
+            coders: vec![lzma2(), lzma2(), lzma2()].into(),
+            bind_pairs: smallvec::SmallVec::default(),
+            packed_indices: smallvec::SmallVec::default(),
+        };
+        assert!(matches!(
+            super::validate_decoder_working_set(&folder, 0),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "decoder working set",
+                ..
+            })
+        ));
     }
 
     #[test]

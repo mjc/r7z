@@ -86,13 +86,25 @@ pub fn sevenzip_varuint64_decode(input: &[u8]) -> IResult<&[u8], u64> {
 pub(crate) fn scan_digests(input: &[u8], num: usize) -> IResult<&[u8], ()> {
     let (input, all_defined) = le_u8(input)?;
     if all_defined != 0 {
-        let (input, _) = take(num * 4)(input)?;
+        let crc_bytes = num.checked_mul(4).ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+        let (input, _) = take(crc_bytes)(input)?;
         return Ok((input, ()));
     }
     let num_bytes = num.div_ceil(8);
     let (input, bitmap) = take(num_bytes)(input)?;
     let num_defined = (0..num).filter(|&i| bitmap_is_set(bitmap, i)).count();
-    let (input, _) = take(num_defined * 4)(input)?;
+    let crc_bytes = num_defined.checked_mul(4).ok_or_else(|| {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+    let (input, _) = take(crc_bytes)(input)?;
     Ok((input, ()))
 }
 

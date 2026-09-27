@@ -2,7 +2,10 @@ use crate::pack_info::{scan_pack_info, scan_unpack_info};
 use crate::parsers::{bitmap_is_set, scan_digests};
 use crate::{PackInfo, Property, UnpackInfo, sevenzip_varuint64_decode};
 use bytes::Bytes;
-use nom::{IResult, ToUsize, number::complete::le_u8};
+use nom::{IResult, number::complete::le_u8};
+
+// Keep a single substream digest table within the default 64 MiB metadata budget.
+const MAX_SUBSTREAM_DIGESTS: usize = (64 * 1024 * 1024) / std::mem::size_of::<Option<u32>>();
 
 /// Per-file stream metadata within a solid (multi-file) folder.
 #[derive(Debug, PartialEq)]
@@ -24,10 +27,6 @@ impl SubstreamInfo {
     /// Returns a nom error if the input is truncated or does not start with the
     /// `SubStreamsInfo` property tag.
     ///
-    /// # Panics
-    ///
-    /// Panics if `num_unpack_streams_per_folder` values exceed `usize::MAX`
-    /// (impossible in practice).
     pub fn parse(input: &[u8], num_folders: usize) -> IResult<&[u8], SubstreamInfo> {
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
@@ -59,14 +58,20 @@ impl SubstreamInfo {
                 Property::Size => {
                     // For each folder, store NumUnpackStreams-1 sizes explicitly;
                     // the last stream's size is: folder_unpack_size - sum(explicit_sizes)
-                    let sizes_to_read: usize = num_unpack_streams_per_folder
-                        .iter()
-                        .map(|&n| {
-                            usize::try_from(n)
-                                .expect("num_unpack_streams_per_folder fits in usize")
-                                .saturating_sub(1)
-                        })
-                        .sum();
+                    let sizes_to_read =
+                        checked_substream_size_count(input, &num_unpack_streams_per_folder)?;
+                    if sizes_to_read > input.len() {
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::Eof,
+                        )));
+                    }
+                    unpack_sizes.try_reserve(sizes_to_read).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
                     for _ in 0..sizes_to_read {
                         let (i, size) = sevenzip_varuint64_decode(input)?;
                         unpack_sizes.push(size);
@@ -74,10 +79,13 @@ impl SubstreamInfo {
                     }
                 }
                 Property::CRC => {
-                    let total: usize = num_unpack_streams_per_folder
-                        .iter()
-                        .map(|&n| n.to_usize())
-                        .sum();
+                    let total = checked_substream_total(input, &num_unpack_streams_per_folder)?;
+                    if total > MAX_SUBSTREAM_DIGESTS {
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        )));
+                    }
                     let (i, crcs) = parse_stream_digests(input, total)?;
                     digests = crcs;
                     input = i;
@@ -107,6 +115,48 @@ impl SubstreamInfo {
     }
 }
 
+fn checked_substream_total<'a>(
+    input: &'a [u8],
+    counts: &[u64],
+) -> Result<usize, nom::Err<nom::error::Error<&'a [u8]>>> {
+    counts.iter().try_fold(0usize, |total, &count| {
+        let count = usize::try_from(count).map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+        total.checked_add(count).ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })
+    })
+}
+
+fn checked_substream_size_count<'a>(
+    input: &'a [u8],
+    counts: &[u64],
+) -> Result<usize, nom::Err<nom::error::Error<&'a [u8]>>> {
+    counts.iter().try_fold(0usize, |total, &count| {
+        let count = usize::try_from(count)
+            .map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?
+            .saturating_sub(1);
+        total.checked_add(count).ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })
+    })
+}
+
 fn parse_stream_digests(input: &[u8], num: usize) -> IResult<&[u8], Vec<Option<u32>>> {
     use nom::number::complete::le_u32;
 
@@ -120,21 +170,45 @@ fn parse_stream_digests(input: &[u8], num: usize) -> IResult<&[u8], Vec<Option<u
         (&[][..], input)
     };
 
-    let is_defined = |i: usize| -> bool { all_defined != 0 || bitmap_is_set(bitmap, i) };
+    let num_defined = if all_defined != 0 {
+        num
+    } else {
+        (0..num).filter(|&i| bitmap_is_set(bitmap, i)).count()
+    };
+    let crc_bytes = num_defined
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+    if crc_bytes > input.len() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Eof,
+        )));
+    }
 
-    (0..num).try_fold(
-        (input, Vec::with_capacity(num.min(input.len()))),
-        |(input, mut crcs), i| {
-            if is_defined(i) {
-                let (input, crc) = le_u32(input)?;
-                crcs.push(Some(crc));
-                Ok((input, crcs))
-            } else {
-                crcs.push(None);
-                Ok((input, crcs))
-            }
-        },
-    )
+    let is_defined = |i: usize| -> bool { all_defined != 0 || bitmap_is_set(bitmap, i) };
+    let mut crcs = Vec::new();
+    crcs.try_reserve_exact(num).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+
+    (0..num).try_fold((input, crcs), |(input, mut crcs), i| {
+        if is_defined(i) {
+            let (input, crc) = le_u32(input)?;
+            crcs.push(Some(crc));
+            Ok((input, crcs))
+        } else {
+            crcs.push(None);
+            Ok((input, crcs))
+        }
+    })
 }
 
 /// Ties together [`PackInfo`], [`UnpackInfo`], and optional [`SubstreamInfo`].
@@ -251,13 +325,37 @@ fn scan_substream_info(input: &[u8], num_folders: usize) -> IResult<&[u8], ()> {
                 total_streams = 0;
                 for _ in 0..num_folders {
                     let (i, n) = sevenzip_varuint64_decode(input)?;
-                    let nu = n.to_usize();
-                    sizes_to_read += nu.saturating_sub(1);
-                    total_streams += nu;
+                    let nu = usize::try_from(n).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    sizes_to_read =
+                        sizes_to_read
+                            .checked_add(nu.saturating_sub(1))
+                            .ok_or_else(|| {
+                                nom::Err::Error(nom::error::Error::new(
+                                    input,
+                                    nom::error::ErrorKind::TooLarge,
+                                ))
+                            })?;
+                    total_streams = total_streams.checked_add(nu).ok_or_else(|| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
                     input = i;
                 }
             }
             Property::Size => {
+                if sizes_to_read > input.len() {
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Eof,
+                    )));
+                }
                 for _ in 0..sizes_to_read {
                     let (i, _) = sevenzip_varuint64_decode(input)?;
                     input = i;
@@ -338,7 +436,7 @@ pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_stream_info, scan_substream_info};
+    use super::{MAX_SUBSTREAM_DIGESTS, SubstreamInfo, scan_stream_info, scan_substream_info};
 
     // ── scan_substream_info ────────────────────────────────────────────────────
 
@@ -359,6 +457,33 @@ mod tests {
         let input = [0x08u8, 0x0D, 0x02, 0x01, 0x09, 0x64, 0x00];
         let (rem, ()) = scan_substream_info(&input, 2).unwrap();
         assert!(rem.is_empty());
+    }
+
+    #[test]
+    fn substream_parsers_reject_untrusted_size_counts_without_iterating() {
+        let mut input = vec![0x08, 0x0D];
+        input.extend(crate::sevenzip_varuint64_encode(u64::MAX));
+        input.extend([0x09, 0x00]);
+
+        assert!(SubstreamInfo::parse(&input, 1).is_err());
+        assert!(scan_substream_info(&input, 1).is_err());
+    }
+
+    #[test]
+    fn substream_parser_caps_sparse_digest_expansion() {
+        let mut input = vec![0x08, 0x0D];
+        input.extend(crate::sevenzip_varuint64_encode(
+            u64::try_from(MAX_SUBSTREAM_DIGESTS + 1).unwrap(),
+        ));
+        input.extend([0x0A, 0x00]);
+
+        assert!(matches!(
+            SubstreamInfo::parse(&input, 1),
+            Err(nom::Err::Error(nom::error::Error {
+                code: nom::error::ErrorKind::TooLarge,
+                ..
+            }))
+        ));
     }
 
     /// Wrong opening tag returns a hard Failure.
