@@ -39,3 +39,6 @@ by the same nice-length limit, while retaining the original tree updates.
 word/match boundaries and dictionary wraps. Dependency `lz::` tests check tree
 links at buffer ends and normalization at the 2 GiB position boundary; CI runs
 them with and without the `optimization` feature.
+
+The encoder memory estimate converts the LZ buffer from bytes to KiB and counts
+all three hash tables. R7Z uses this corrected estimate for worker admission.

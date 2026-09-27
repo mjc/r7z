@@ -104,7 +104,9 @@ impl LzEncoder {
             extra_size_before,
             extra_size_after,
             match_len_max,
-        ) + mf.get_memory_usage(dict_size)
+        )
+        .div_ceil(1024)
+            + mf.get_memory_usage(dict_size)
     }
 
     pub(crate) fn new_hc4(
