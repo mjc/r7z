@@ -89,23 +89,13 @@ impl Bt4 {
 
             let mut len = len0.min(len1);
 
-            if encoder.get_byte_by_pos(encoder.read_pos + len - delta)
-                == encoder.get_byte_by_pos(encoder.read_pos + len)
-            {
-                // No need to look for longer matches than niceLenLimit
-                // because we only are updating the tree, not returning
-                // matches found to the caller.
-                loop {
-                    len += 1;
-                    if len == nice_len_limit {
-                        self.tree[ptr1 as usize] = self.tree[pair as usize];
-                        self.tree[ptr0 as usize] = self.tree[pair as usize + 1];
-                        return;
-                    }
-                    if encoder.get_byte(len as _, delta as _) != encoder.get_byte(len as _, 0) {
-                        break;
-                    }
-                }
+            // Tree maintenance needs only the nice-length prefix. Reuse the
+            // word scanner instead of checking both buffer bounds per byte.
+            len = extend_match(&encoder.buf, encoder.read_pos, len, delta, nice_len_limit);
+            if len == nice_len_limit {
+                self.tree[ptr1 as usize] = self.tree[pair as usize];
+                self.tree[ptr0 as usize] = self.tree[pair as usize + 1];
+                return;
             }
 
             if encoder.get_byte(len as _, delta) < encoder.get_byte(len as _, 0) {
@@ -287,6 +277,50 @@ impl MatchFind for Bt4 {
             self.hash.update_tables(self.lz_pos);
 
             self.skip(encoder, nice_len_limit, current_match);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_preserves_tree_links_at_word_and_nice_length_boundaries() {
+        let mut encoder = LzEncoder::new_bt4(4096, 0, 0, 32, 273, 1);
+        let mut finder = Bt4::new(4096, 32, 1);
+        for limit in [4, 7, 8, 9, 31, 32, 33, 273] {
+            for mismatch in 0..=limit {
+                for previous_byte in [b'l', b'n'] {
+                    // End the buffer exactly at the comparison limit. Position
+                    // zero in the cyclic tree forces the prior node to wrap.
+                    encoder.data.buf = vec![b'm'; 2 * limit];
+                    encoder.data.read_pos = limit as i32;
+                    if mismatch < limit {
+                        encoder.data.buf[mismatch] = previous_byte;
+                    }
+                    finder.tree.fill(0);
+                    finder.cyclic_pos = 0;
+                    finder.lz_pos = finder.cyclic_size;
+                    let current_match = finder.lz_pos - limit as i32;
+                    let pair = current_match as usize * 2;
+                    finder.tree[pair] = 21;
+                    finder.tree[pair + 1] = 22;
+                    finder.skip(&mut encoder.data, limit as i32, current_match);
+                    let expected = if mismatch == limit {
+                        [21, 22]
+                    } else if previous_byte < b'm' {
+                        [current_match, 0]
+                    } else {
+                        [0, current_match]
+                    };
+                    assert_eq!(
+                        finder.tree[..2],
+                        expected,
+                        "limit={limit}, mismatch={mismatch}, previous={previous_byte}"
+                    );
+                }
+            }
         }
     }
 }

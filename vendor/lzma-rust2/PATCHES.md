@@ -1,8 +1,8 @@
 # Local lzma-rust2 patch
 
-Based on the published `lzma-rust2` 0.16.2 crate, upstream revision
-`4398f2a1fc016eb64a9f98a0f6b88da0db8f1c10`. The registry package checksum is
-`47bb1e988e6fb779cf720ad431242d3f03167c1b3f2b1aae7f1a94b2495b36ae`.
+Based on the published `lzma-rust2` 0.21.0 crate, upstream revision
+`7405a770f86e4cb28623d2b53be24324aada44dd`. The registry package checksum is
+`fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b`.
 The original Apache-2.0 license, source, README, changelog, and manifest are
 retained. The local manifest omits upstream examples, benchmarks, fixture-based
 integration tests, and their development dependencies.
@@ -27,3 +27,15 @@ Run the patch's unit regressions with
 and the public API regressions with `cargo nextest run --test lzma_mt_test`.
 Upstream BCJ unit tests require external fixtures omitted from the published
 crate, so the dependency command selects the affected pool and queue tests.
+
+Rebased on 0.21.0, retaining its worker scheduling and decoder fixes. The
+upstream blocking flush behavior uses the local `wait_for_result` method so
+flush waits for all submitted output without closing the pool. Panic reporting
+already overlaps upstream; local spawning additionally returns OS spawn errors.
+
+The BT4 skip path uses the existing word-at-a-time `extend_match` helper, bounded
+by the same nice-length limit, while retaining the original tree updates.
+`tests/lzma_bt4_test.rs` compares compressed hashes with unmodified 0.21.0 over
+word/match boundaries and dictionary wraps. Dependency `lz::` tests check tree
+links at buffer ends and normalization at the 2 GiB position boundary; CI runs
+them with and without the `optimization` feature.

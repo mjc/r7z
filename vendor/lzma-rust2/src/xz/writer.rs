@@ -2,22 +2,21 @@ use alloc::{boxed::Box, vec::Vec};
 use core::num::NonZeroU64;
 
 use super::{
-    CheckType, ChecksumCalculator, FilterConfig, FilterType, IndexRecord, add_padding,
-    write_xz_block_header, write_xz_index, write_xz_stream_footer, write_xz_stream_header,
+    CheckType, ChecksumCalculator, IndexRecord, add_padding, write_xz_block_header, write_xz_index,
+    write_xz_stream_footer, write_xz_stream_header,
 };
 use crate::{
     AutoFinish, AutoFinisher, CountingWriter, Lzma2Options, Result, Write,
     enc::{Lzma2Writer, LzmaOptions},
     error_invalid_data, error_invalid_input,
-    filter::{bcj::BcjWriter, delta::DeltaWriter},
+    filter::{FilterConfig, FilterType, bcj::BcjWriter, delta::DeltaWriter},
 };
 
-#[allow(clippy::large_enum_variant)]
 enum FilterWriter<W: Write> {
     Counting(CountingWriter<W>),
-    Lzma2(Lzma2Writer<Box<FilterWriter<W>>>),
-    Delta(DeltaWriter<Box<FilterWriter<W>>>),
-    Bcj(BcjWriter<Box<FilterWriter<W>>>),
+    Lzma2(Box<Lzma2Writer<Box<FilterWriter<W>>>>),
+    Delta(Box<DeltaWriter<Box<FilterWriter<W>>>>),
+    Bcj(Box<BcjWriter<Box<FilterWriter<W>>>>),
     Dummy,
 }
 
@@ -44,6 +43,18 @@ impl<W: Write> Write for FilterWriter<W> {
 }
 
 impl<W: Write> FilterWriter<W> {
+    fn lzma2(writer: Lzma2Writer<Box<FilterWriter<W>>>) -> Self {
+        FilterWriter::Lzma2(Box::new(writer))
+    }
+
+    fn delta(writer: DeltaWriter<Box<FilterWriter<W>>>) -> Self {
+        FilterWriter::Delta(Box::new(writer))
+    }
+
+    fn bcj(writer: BcjWriter<Box<FilterWriter<W>>>) -> Self {
+        FilterWriter::Bcj(Box::new(writer))
+    }
+
     fn create_filter_chain(
         inner: CountingWriter<W>,
         filters: &[FilterConfig],
@@ -55,49 +66,49 @@ impl<W: Write> FilterWriter<W> {
             chain_writer = match filter_config.filter_type {
                 FilterType::Delta => {
                     let distance = filter_config.property as usize;
-                    FilterWriter::Delta(DeltaWriter::new(Box::new(chain_writer), distance))
+                    FilterWriter::delta(DeltaWriter::new(Box::new(chain_writer), distance))
                 }
                 FilterType::BcjX86 => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_x86(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_x86(Box::new(chain_writer), start_offset))
                 }
                 FilterType::BcjPpc => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_ppc(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_ppc(Box::new(chain_writer), start_offset))
                 }
                 FilterType::BcjIa64 => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_ia64(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_ia64(Box::new(chain_writer), start_offset))
                 }
                 FilterType::BcjArm => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_arm(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_arm(Box::new(chain_writer), start_offset))
                 }
                 FilterType::BcjArmThumb => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_arm_thumb(
+                    FilterWriter::bcj(BcjWriter::new_arm_thumb(
                         Box::new(chain_writer),
                         start_offset,
                     ))
                 }
                 FilterType::BcjSparc => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_sparc(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_sparc(Box::new(chain_writer), start_offset))
                 }
                 FilterType::BcjArm64 => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_arm64(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_arm64(Box::new(chain_writer), start_offset))
                 }
                 FilterType::BcjRiscv => {
                     let start_offset = filter_config.property as usize;
-                    FilterWriter::Bcj(BcjWriter::new_riscv(Box::new(chain_writer), start_offset))
+                    FilterWriter::bcj(BcjWriter::new_riscv(Box::new(chain_writer), start_offset))
                 }
                 FilterType::Lzma2 => {
                     let options = Lzma2Options {
                         lzma_options: lzma_options.clone(),
                         ..Default::default()
                     };
-                    FilterWriter::Lzma2(Lzma2Writer::new(Box::new(chain_writer), options))
+                    FilterWriter::lzma2(Lzma2Writer::new(Box::new(chain_writer), options))
                 }
             };
         }
@@ -241,6 +252,7 @@ pub struct XzWriter<W: Write> {
     total_uncompressed_pos: u64,
     current_block_start_pos: u64,
     current_block_header_size: u64,
+    current_block_open: bool,
 }
 
 impl<W: Write> XzWriter<W> {
@@ -280,6 +292,7 @@ impl<W: Write> XzWriter<W> {
             total_uncompressed_pos: 0,
             current_block_start_pos: 0,
             current_block_header_size: 0,
+            current_block_open: false,
         })
     }
 
@@ -338,6 +351,7 @@ impl<W: Write> XzWriter<W> {
         )?;
 
         self.block_uncompressed_size = 0;
+        self.current_block_open = true;
 
         Ok(())
     }
@@ -351,6 +365,10 @@ impl<W: Write> XzWriter<W> {
     }
 
     fn finish_current_block(&mut self) -> Result<()> {
+        if !self.current_block_open {
+            return Ok(());
+        }
+
         // Finish the filter chain and get back to the counting writer.
         let writer = core::mem::replace(&mut self.writer, FilterWriter::Dummy);
         let counting_writer = writer.finish()?;
@@ -376,6 +394,9 @@ impl<W: Write> XzWriter<W> {
         });
 
         self.block_uncompressed_size = 0;
+        self.current_block_start_pos = 0;
+        self.current_block_header_size = 0;
+        self.current_block_open = false;
 
         Ok(())
     }

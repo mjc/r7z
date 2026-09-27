@@ -17,30 +17,12 @@ with untrusted input.
 
 Deactivating the `optimization` feature will result in 100% standard Rust code.
 
-## Performance
-
-The following part is strictly about single threaded performance. It supports multithreaded encoding and decoding
-through the `Lzma2WriterMt` and `Lzma2ReaderMt` structs though.
-
-When compared against the `liblzma` crate, which uses the C library of the same name, this crate has improved decoding
-speed.
-
-![Decompression Speed LZMA2](./assets/decompression_lzma2.svg)
-![Decompression Speed LZMA](./assets/decompression_lzma.svg)
-
-Encoding is also well optimized and is surpassing `liblzma` for level 0 to 3 and matches it for level 4 to 9.
-
-![Compression Speed LZMA2](./assets/compression_lzma2.svg)
-![Compression Speed LZMA](./assets/compression_lzma.svg)
-
-Data was assembled using lzma-rust2 v0.4.0 and liblzma v0.4.2.
-
 ## no_std Support
 
 This crate supports `no_std` environments by disabling the default `std` feature.
 
-When used in `no_std` mode, the crate provides custom `Read`, `Write`, and `Error` types
-(defined in `no_std.rs`) that are compatible with `no_std` environments. These types offer
+When used in `no_std` mode, the crate provides custom `Read`, `Write`, and `Error` types (defined in `no_std.rs`) that
+are compatible with `no_std` environments. These types offer
 similar functionality to their `std::io` counterparts but are implemented using only `core`
 and `alloc`.
 

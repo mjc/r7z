@@ -81,6 +81,40 @@ fn bounded_lzma2_writer_round_trips_empty_partial_and_many_blocks() {
 }
 
 #[test]
+fn lzma2_flush_publishes_pending_data_without_finishing_the_stream() {
+    let input = payload(5 * BLOCK_SIZE + 137);
+    let mut writer = Lzma2WriterMt::new(Vec::new(), options(), 2).unwrap();
+    writer.write_all(&input).unwrap();
+    writer.flush().unwrap();
+    // into_inner does not finish or drain the encoder. Everything submitted
+    // before flush must already be present; only the stream-end byte is missing.
+    let mut compressed = writer.into_inner();
+    compressed.push(0);
+    assert_eq!(
+        decode(Lzma2Reader::new(
+            compressed.as_slice(),
+            BLOCK_SIZE as u32,
+            None
+        )),
+        input
+    );
+
+    let mut writer = Lzma2WriterMt::new(Vec::new(), options(), 2).unwrap();
+    writer.write_all(&input).unwrap();
+    writer.flush().unwrap();
+    writer.write_all(&input).unwrap();
+    let compressed = writer.finish().unwrap();
+    assert_eq!(
+        decode(Lzma2Reader::new(
+            compressed.as_slice(),
+            BLOCK_SIZE as u32,
+            None
+        )),
+        input.repeat(2)
+    );
+}
+
+#[test]
 fn shared_pool_lzip_writer_and_reader_round_trip_many_members() {
     let input = payload(32 * BLOCK_SIZE + 73);
     let mut options = LzipOptions::with_preset(1);

@@ -12,7 +12,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::io::{self, Seek, SeekFrom};
 
-pub use reader::XzReader;
+pub use reader::{XzReader, XzStream};
 #[cfg(feature = "std")]
 pub use reader_mt::XzReaderMt;
 use sha2::Digest;
@@ -24,10 +24,11 @@ pub use writer_mt::XzWriterMt;
 use crate::{
     ByteReader, Read,
     crc::{Crc32, Crc64},
-    error_invalid_data, error_invalid_input,
+    error_invalid_data, error_invalid_input, error_unsupported,
+    filter::FilterType,
 };
 #[cfg(feature = "encoder")]
-use crate::{ByteWriter, Write};
+use crate::{ByteWriter, Write, filter::FilterConfig};
 #[cfg(feature = "std")]
 use crate::{
     Lzma2Reader,
@@ -36,7 +37,7 @@ use crate::{
 
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 
-const XZ_FOOTER_MAGIC: [u8; 2] = [b'Y', b'Z'];
+const XZ_FOOTER_MAGIC: [u8; 2] = *b"YZ";
 
 #[derive(Debug, Clone)]
 struct IndexRecord {
@@ -77,89 +78,6 @@ struct Block {
     uncompressed_size: u64,
 }
 
-/// Configuration for a filter in the XZ filter chain.
-#[derive(Debug, Clone)]
-pub struct FilterConfig {
-    /// Filter type to use.
-    pub filter_type: FilterType,
-    /// Property to use.
-    pub property: u32,
-}
-
-impl FilterConfig {
-    /// Creates a new delta filter configuration.
-    pub fn new_delta(distance: u32) -> Self {
-        Self {
-            filter_type: FilterType::Delta,
-            property: distance,
-        }
-    }
-
-    /// Creates a new BCJ x86 filter configuration.
-    pub fn new_bcj_x86(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjX86,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ ARM filter configuration.
-    pub fn new_bcj_arm(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjArm,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ ARM Thumb filter configuration.
-    pub fn new_bcj_arm_thumb(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjArmThumb,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ ARM64 filter configuration.
-    pub fn new_bcj_arm64(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjArm64,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ IA64 filter configuration.
-    pub fn new_bcj_ia64(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjIa64,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ PPC filter configuration.
-    pub fn new_bcj_ppc(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjPpc,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ SPARC filter configuration.
-    pub fn new_bcj_sparc(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjSparc,
-            property: start_pos,
-        }
-    }
-
-    /// Creates a new BCJ RISC-V filter configuration.
-    pub fn new_bcj_risc_v(start_pos: u32) -> Self {
-        Self {
-            filter_type: FilterType::BcjRiscv,
-            property: start_pos,
-        }
-    }
-}
-
 /// Supported checksum types in XZ format.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckType {
@@ -181,7 +99,7 @@ impl CheckType {
             0x01 => Ok(CheckType::Crc32),
             0x04 => Ok(CheckType::Crc64),
             0x0A => Ok(CheckType::Sha256),
-            _ => Err(error_invalid_data("unsupported XZ check type")),
+            _ => Err(error_unsupported("unsupported XZ check type")),
         }
     }
 
@@ -192,51 +110,6 @@ impl CheckType {
             CheckType::Crc32 => 4,
             CheckType::Crc64 => 8,
             CheckType::Sha256 => 32,
-        }
-    }
-}
-
-/// Supported filter types in XZ format.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum FilterType {
-    /// Delta filter
-    Delta,
-    /// BCJ x86 filter
-    BcjX86,
-    /// BCJ PowerPC filter
-    BcjPpc,
-    /// BCJ IA64 filter
-    BcjIa64,
-    /// BCJ ARM filter
-    BcjArm,
-    /// BCJ ARM Thumb
-    BcjArmThumb,
-    /// BCJ SPARC filter
-    BcjSparc,
-    /// BCJ ARM64 filter
-    BcjArm64,
-    /// BCJ RISC-V filter
-    BcjRiscv,
-    /// LZMA2 filter
-    Lzma2,
-}
-
-impl TryFrom<u64> for FilterType {
-    type Error = ();
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        match value {
-            0x03 => Ok(FilterType::Delta),
-            0x04 => Ok(FilterType::BcjX86),
-            0x05 => Ok(FilterType::BcjPpc),
-            0x06 => Ok(FilterType::BcjIa64),
-            0x07 => Ok(FilterType::BcjArm),
-            0x08 => Ok(FilterType::BcjArmThumb),
-            0x09 => Ok(FilterType::BcjSparc),
-            0x0A => Ok(FilterType::BcjArm64),
-            0x0B => Ok(FilterType::BcjRiscv),
-            0x21 => Ok(FilterType::Lzma2),
-            _ => Err(()),
         }
     }
 }
@@ -346,7 +219,28 @@ impl BlockHeader {
         let mut header_data = vec![0u8; header_size - 1];
         reader.read_exact(&mut header_data)?;
 
+        // The header carries its own checksum. It is verified first. A corrupt
+        // header is reported as corrupt and not as unsupported.
+        let crc_offset = header_data.len() - 4;
+        let expected_crc = u32::from_le_bytes([
+            header_data[crc_offset],
+            header_data[crc_offset + 1],
+            header_data[crc_offset + 2],
+            header_data[crc_offset + 3],
+        ]);
+        let mut crc = Crc32::new();
+        crc.update(&[header_size_encoded]);
+        crc.update(&header_data[..crc_offset]);
+        if expected_crc != crc.finalize() {
+            return Err(error_invalid_data("XZ block header CRC32 mismatch"));
+        }
+
         let block_flags = header_data[0];
+        // Bits 2-5 are reserved. A set bit means the header has an unknown
+        // field. It should not be parsed.
+        if block_flags & 0x3C != 0 {
+            return Err(error_unsupported("reserved block flag bits are set"));
+        }
         let num_filters = ((block_flags & 0x03) + 1) as usize;
         let has_compressed_size = (block_flags & 0x40) != 0;
         let has_uncompressed_size = (block_flags & 0x80) != 0;
@@ -526,6 +420,9 @@ impl BlockHeader {
                 "XZ block's last filter must be a LZMA2 filter",
             ));
         }
+        if filters[..num_filters - 1].contains(&Some(FilterType::Lzma2)) {
+            return Err(error_invalid_data("LZMA2 must be the last XZ block filter"));
+        }
 
         // Header must be padded so that the total header size matches the declared size.
         // We need to pad until: 1 (size byte) + offset + 4 (CRC32) == header_size
@@ -540,22 +437,6 @@ impl BlockHeader {
         // Last 4 bytes should be CRC32 of the header (excluding the CRC32 itself).
         if offset + 4 != header_data.len() {
             return Err(error_invalid_data("invalid XZ block header CRC32 position"));
-        }
-
-        let expected_crc = u32::from_le_bytes([
-            header_data[offset],
-            header_data[offset + 1],
-            header_data[offset + 2],
-            header_data[offset + 3],
-        ]);
-
-        // Calculate CRC32 of header size byte + header data (excluding CRC32).
-        let mut crc = Crc32::new();
-        crc.update(&[header_size_encoded]);
-        crc.update(&header_data[..offset]);
-
-        if expected_crc != crc.finalize() {
-            return Err(error_invalid_data("XZ block header CRC32 mismatch"));
         }
 
         Ok(Some(BlockHeader {
@@ -586,6 +467,11 @@ impl BlockHeader {
 
         let header_data = &block_data[1..header_size];
         let block_flags = header_data[0];
+        // Bits 2-5 are reserved. A set bit means the header has an unknown
+        // field. It should not be parsed.
+        if block_flags & 0x3C != 0 {
+            return Err(error_unsupported("reserved block flag bits are set"));
+        }
         let num_filters = ((block_flags & 0x03) + 1) as usize;
         let has_compressed_size = (block_flags & 0x40) != 0;
         let has_uncompressed_size = (block_flags & 0x80) != 0;
@@ -730,6 +616,15 @@ impl BlockHeader {
             properties[i] = property;
         }
 
+        if filters.iter().filter_map(|x| *x).next_back() != Some(FilterType::Lzma2) {
+            return Err(error_invalid_data(
+                "XZ block's last filter must be a LZMA2 filter",
+            ));
+        }
+        if filters[..num_filters - 1].contains(&Some(FilterType::Lzma2)) {
+            return Err(error_invalid_data("LZMA2 must be the last XZ block filter"));
+        }
+
         Ok((filters, properties, header_size))
     }
 }
@@ -842,17 +737,20 @@ impl StreamHeader {
         let mut flags = [0u8; 2];
         reader.read_exact(&mut flags)?;
 
-        if flags[0] != 0 {
-            return Err(error_invalid_data("invalid XZ stream flags"));
-        }
-
-        let check_type = CheckType::from_byte(flags[1])?;
-
         let expected_crc = reader.read_u32()?;
 
         if expected_crc != Crc32::checksum(&flags) {
             return Err(error_invalid_data("XZ stream header CRC32 mismatch"));
         }
+
+        // The first byte and the upper nibble of the second byte are reserved.
+        // The checksum check comes first. A corrupt header is reported as
+        // corrupt and not as unsupported.
+        if flags[0] != 0 || flags[1] & 0xF0 != 0 {
+            return Err(error_unsupported("invalid XZ stream flags"));
+        }
+
+        let check_type = CheckType::from_byte(flags[1])?;
 
         Ok(StreamHeader { check_type })
     }

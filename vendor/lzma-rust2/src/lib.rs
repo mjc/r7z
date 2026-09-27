@@ -63,6 +63,7 @@ mod lzma2_reader;
 mod lzma_reader;
 mod range_dec;
 mod state;
+mod stream;
 #[cfg(feature = "std")]
 mod work_queue;
 #[cfg(feature = "xz")]
@@ -91,20 +92,21 @@ pub(crate) use std::io::Write;
 
 #[cfg(feature = "encoder")]
 pub use enc::*;
+pub use filter::{FilterConfig, FilterType};
 pub use lz::MfType;
-#[cfg(feature = "lzip")]
-pub use lzip::LzipReader;
 #[cfg(all(feature = "lzip", feature = "std"))]
 pub use lzip::LzipReaderMt;
 #[cfg(all(feature = "lzip", feature = "encoder", feature = "std"))]
 pub use lzip::LzipWriterMt;
 #[cfg(all(feature = "lzip", feature = "encoder"))]
 pub use lzip::{LzipOptions, LzipWriter};
+#[cfg(feature = "lzip")]
+pub use lzip::{LzipReader, LzipStream};
 pub use lzma_reader::{
-    LzmaReader, get_memory_usage as lzma_get_memory_usage,
+    LzmaReader, LzmaStream, get_memory_usage as lzma_get_memory_usage,
     get_memory_usage_by_props as lzma_get_memory_usage_by_props,
 };
-pub use lzma2_reader::{Lzma2Reader, get_memory_usage as lzma2_get_memory_usage};
+pub use lzma2_reader::{Lzma2Reader, Lzma2Stream, get_memory_usage as lzma2_get_memory_usage};
 #[cfg(feature = "std")]
 pub use lzma2_reader_mt::Lzma2ReaderMt;
 #[cfg(not(feature = "std"))]
@@ -114,12 +116,13 @@ pub use no_std::Read;
 #[cfg(not(feature = "std"))]
 pub use no_std::Write;
 use state::*;
+pub use stream::{Action, Status, StreamResult};
 #[cfg(all(feature = "xz", feature = "std"))]
 pub use xz::XzReaderMt;
 #[cfg(all(feature = "xz", feature = "encoder", feature = "std"))]
 pub use xz::XzWriterMt;
 #[cfg(feature = "xz")]
-pub use xz::{CheckType, FilterConfig, FilterType, XzReader};
+pub use xz::{CheckType, XzReader, XzStream};
 #[cfg(all(feature = "xz", feature = "encoder"))]
 pub use xz::{XzOptions, XzWriter};
 
@@ -184,6 +187,7 @@ fn set_error(
     shutdown_flag.store(true, std::sync::atomic::Ordering::Release);
 }
 
+#[derive(Clone)]
 pub(crate) struct LzmaCoder {
     pub(crate) pos_mask: u32,
     pub(crate) reps: [i32; REPS],
@@ -267,6 +271,7 @@ pub(crate) fn init_probs(probs: &mut [u16]) {
     probs.fill(PROB_INIT);
 }
 
+#[derive(Clone)]
 pub(crate) struct LiteralCoder {
     lc: u32,
     literal_pos_mask: u32,
@@ -303,6 +308,7 @@ impl LiteralCoder {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct LengthCoder {
     choice: [u16; 2],
     low: [[u16; LOW_SYMBOLS]; POS_STATES_MAX],
@@ -424,8 +430,8 @@ impl<T: Write> ByteWriter for T {
 
 #[cfg(feature = "std")]
 #[inline(always)]
-fn error_eof() -> Error {
-    Error::new(std::io::ErrorKind::UnexpectedEof, "unexpected EOF")
+fn error_eof(msg: &'static str) -> Error {
+    Error::new(std::io::ErrorKind::UnexpectedEof, msg)
 }
 
 #[cfg(feature = "std")]
@@ -466,7 +472,7 @@ fn copy_error(error: &Error) -> Error {
 
 #[cfg(not(feature = "std"))]
 #[inline(always)]
-fn error_eof() -> Error {
+fn error_eof(_msg: &'static str) -> Error {
     Error::Eof
 }
 
@@ -504,6 +510,54 @@ fn error_unsupported(msg: &'static str) -> Error {
 #[inline(always)]
 fn copy_error(error: &Error) -> Error {
     *error
+}
+
+/// A read error that every later call has to report again.
+///
+/// It keeps the parts of the error rather than the error itself. A
+/// `std::io::Error` cannot be cloned, and holding one would cost every reader
+/// that holds it the unwind safety the crate guarantees. The kind, the message
+/// and the operating system code carry over, a payload of the source's own does
+/// not.
+#[cfg(feature = "std")]
+struct StickyError {
+    kind: std::io::ErrorKind,
+    message: alloc::string::String,
+    os_code: Option<i32>,
+}
+
+#[cfg(feature = "std")]
+impl StickyError {
+    fn new(error: Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+            os_code: error.raw_os_error(),
+        }
+    }
+
+    fn report(&self) -> Error {
+        match self.os_code {
+            Some(code) => Error::from_raw_os_error(code),
+            None => Error::new(self.kind, self.message.clone()),
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+struct StickyError {
+    error: Error,
+}
+
+#[cfg(not(feature = "std"))]
+impl StickyError {
+    fn new(error: Error) -> Self {
+        Self { error }
+    }
+
+    fn report(&self) -> Error {
+        self.error
+    }
 }
 
 struct CountingReader<R> {

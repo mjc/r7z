@@ -312,7 +312,7 @@ impl LzEncoderData {
             let old_pending = self.pending_size;
             self.pending_size = 0;
             match_finder.skip(self, old_pending as _);
-            debug_assert!(self.pending_size < old_pending)
+            debug_assert!(self.pending_size <= old_pending);
         }
     }
 
@@ -468,11 +468,15 @@ fn get_buf_size(
     keep_size_before + keep_size_after + reserve_size
 }
 
+/// Positions not newer than `norm_offset` must clamp to `0` (the "no position"
+/// marker). `saturating_sub` would saturate at [`i32::MIN`] instead, and the
+/// distance calculations in the match finders would then overflow into
+/// out-of-bounds buffer indices.
 #[inline(always)]
 fn normalize_scalar(positions: &mut [i32], norm_offset: i32) {
     positions
         .iter_mut()
-        .for_each(|p| *p = p.saturating_sub(norm_offset));
+        .for_each(|p| *p = (*p).max(norm_offset) - norm_offset);
 }
 
 /// Normalization implementation using ARM NEON for 128-bit SIMD processing.
@@ -567,5 +571,37 @@ unsafe fn normalize_sse41(positions: &mut [i32], norm_offset: i32) {
         }
 
         normalize_scalar(suffix, norm_offset);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalization_preserves_empty_and_expired_positions() {
+        let offset = i32::MAX - 4097;
+        let values = [0, 1, offset - 1, offset, offset + 1, i32::MAX];
+        // Exercise vector-sized chunks and scalar tails, including empty slots
+        // near the 2 GiB position rollover without constructing a huge stream.
+        for size in [0, 1, 3, 4, 7, 8, 9, 17, 33] {
+            let original = values.into_iter().cycle().take(size).collect::<Vec<_>>();
+            let expected = original
+                .iter()
+                .map(|&position| {
+                    if position <= offset {
+                        0
+                    } else {
+                        position - offset
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut scalar = original.clone();
+            normalize_scalar(&mut scalar, offset);
+            assert_eq!(scalar, expected);
+            let mut optimized = original;
+            LzEncoder::normalize(&mut optimized, offset);
+            assert_eq!(optimized, expected);
+        }
     }
 }
