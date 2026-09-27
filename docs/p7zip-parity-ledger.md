@@ -14,13 +14,16 @@ check out the pinned commit, build `CPP/7zip/Bundles/Alone2`, and record
 - Encoder: Copy, LZMA, LZMA2, PPMd, BCJ+LZMA2, 7zAES content/header encryption.
 - CLI: `r7z l`, `x`, `e`, `t`, `a`, `d`, `u` with attached switches
   `-oDIR`, `-pPASS`, `-m0=...`, `-mx`, `-ms`, `-mf`, `-mhe`, `-v`,
-  `-aoa`, `-aos`, `-y`, and no-op compatibility for `-mmt`, `-bd`, and `-bb`.
+  `-aoa`, `-aos`, `-y`, and no-op compatibility for `-bd` and `-bb`.
 - CLI solid mode: `-ms=on`, `-ms=off`, file-count limits such as `-ms=1f`, and byte limits such as `-ms=8k`.
 - CLI method grammar:
   `-m0=METHOD:d=SIZE:fb=N:lc=N:lp=N:pb=N:a=0|1:mc=N:c=SIZE:mt=N`,
   `-m0=METHOD:mf=bt4|hc4`, `-md=SIZE`, `-mfb=N`, `-mlc=N`, `-mlp=N`,
   `-mpb=N`, `-ma=0|1`, `-mmc=N`, `-mc=SIZE`, and `-mmf=bt4|hc4` for
-  supported codecs; method-scoped `mt` is accepted as a no-op.
+  supported codecs. `-mmt=off|1` and method-scoped `mt=off|1` select the
+  single-threaded encoder; higher or automatic thread requests are rejected.
+- CLI normal LZMA2 level (`-mx=5`): 16 MiB dictionary, 32 fast bytes, and BT4,
+  matching the pinned p7zip oracle's level-five settings.
 - CLI selection: `*` and `?` wildcard matching for list/test/extract/delete
   archive operands and create/update disk path operands.
 - CLI listing: `l` and `l -slt` report p7zip-like stable body fields and

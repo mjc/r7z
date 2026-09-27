@@ -489,15 +489,18 @@ plus match-finder options such as `-m0=LZMA:mf=bt4` or `-mmf=hc4`, alongside
 algorithm and match-cycle options such as `-m0=LZMA:a=0:mc=16` or
 `-ma=1 -mmc=32`, LZMA2 chunk-size options such as `-m0=LZMA2:c=1m` or
 `-mc=1m`, dictionary, fast-bytes, solid, and threading compatibility switches.
+Normal LZMA2 (`-mx=5`) uses a 16 MiB dictionary, 32 fast bytes, and BT4.
+`-mmt=off`, `-mmt=1`, and method-scoped `mt=off|1` select the supported
+single-threaded encoder; other thread counts are rejected.
 
 ## Development
 
-### Setup (NixOS / Nix Flakes)
+### Setup (NixOS / devenv)
 
-With `nix flake` support, `direnv`, and the flake:
+Enter the development environment:
 
 ```bash
-direnv allow
+devenv shell
 ```
 
 This loads the dev shell with:
@@ -505,7 +508,8 @@ This loads the dev shell with:
 - **Profiling**: `perf`, `cargo-flamegraph`, `valgrind`
 - **Build**: `cargo-nextest`, `gnuplot`, `hyperfine`
 
-Running `cargo flamegraph --bin build_n64 -- /mnt/emulation/n64 /tmp/n64_build.7z` will build a 7z archive from a directory tree and profile the codepath.
+Use `cargo flamegraph --profile profiling --bin r7z -- a archive.7z input`
+to profile archive creation with full debug symbols.
 
 ### Without Nix
 
@@ -520,10 +524,10 @@ cargo clippy --all-targets --all-features -- -D clippy::pedantic
 cargo bench
 
 # CLI comparison against the pinned p7zip oracle across a size matrix
-nix develop -c bash scripts/compare_p7zip_perf.sh --sizes 1K,1M,64M,1G,5G --runs 3
+devenv shell -- bash scripts/compare_p7zip_perf.sh --sizes 1K,1M,64M,1G --runs 3 --p7zip-threads 1
 
 # Generate r7z flamegraphs for selected CLI ops during the same sweep
-nix develop -c bash scripts/compare_p7zip_perf.sh --sizes 1M,64M --runs 1 --flamegraphs --flamegraph-ops l,t,a
+devenv shell -- bash scripts/compare_p7zip_perf.sh --sizes 1M,64M --runs 1 --flamegraphs --flamegraph-ops l,t,a
 
 # Manual large-file regression tests; CI excludes the large_ tag
 cargo test large_ -- --ignored --nocapture
@@ -536,11 +540,11 @@ cargo doc --no-deps --open
 
 **CI** runs on GitHub Actions: format check → clippy → p7zip interop tests → rustdoc.
 
-The CLI comparison script defaults to materialized zero-filled payloads so large
-sizes like `5G` exercise real file I/O. Use `--pattern sparse-zero` only when
-you explicitly want a faster sparse-file shortcut instead. For flamegraphs, use
-`nix develop -c bash ...`; avoid `bash -lc` because login shells can reset the
-dev-shell `PATH` and hide `perf`.
+The CLI comparison script defaults to materialized zero-filled payloads, one
+p7zip encoder thread, and a size matrix ending at 1 GiB. `--sizes` can select
+larger files when useful. Use `--pattern sparse-zero` only when you explicitly
+want a sparse-file shortcut. `--p7zip-threads auto` restores p7zip's default
+thread selection.
 
 CI runs `cargo test --no-fail-fast -- --skip large_`. Tests whose names start
 with `large_` must also use `#[ignore = "large"]` and are manual-only.
