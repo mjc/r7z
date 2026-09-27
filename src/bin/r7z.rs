@@ -271,8 +271,8 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.options.compression.position_bits = Some(parse_lzma_property_bits(value, "pb")?);
         return Ok(());
     }
-    if lower.starts_with("mmt") {
-        let value = lower[3..].strip_prefix('=').unwrap_or(&lower[3..]);
+    if let Some(thread_value) = lower.strip_prefix("mmt") {
+        let value = thread_value.strip_prefix('=').unwrap_or(thread_value);
         return parse_threading_value(value, "-mmt");
     }
     if lower.starts_with("mx") {
