@@ -417,6 +417,9 @@ fn encode_header_stream(
 
 pub(crate) fn lzma_options(compression: &CompressionOptions) -> LzmaOptions {
     let mut options = LzmaOptions::with_preset(compression_level_preset(compression.level));
+    if compression.level == CompressionLevel::Normal {
+        options.dict_size = 16 << 20;
+    }
     if let Some(dict_size) = compression.dictionary_size {
         options.dict_size = dict_size;
     }
@@ -478,7 +481,7 @@ fn compression_level_preset(level: CompressionLevel) -> u32 {
         CompressionLevel::Store => 0,
         CompressionLevel::Fastest => 1,
         CompressionLevel::Fast => 3,
-        CompressionLevel::Normal => 6,
+        CompressionLevel::Normal => 5,
         CompressionLevel::Maximum => 7,
         CompressionLevel::Ultra => 9,
     }
@@ -650,6 +653,16 @@ fn signature_bytes(next_header_offset: u64, next_header: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_lzma2_options_match_p7zip_level_five() {
+        let options = lzma2_options(&CompressionOptions::default()).lzma_options;
+
+        assert_eq!(options.dict_size, 16 << 20);
+        assert_eq!(options.nice_len, 32);
+        assert!(matches!(options.mf, MfType::Bt4));
+        assert!(matches!(options.mode, EncodeMode::Normal));
+    }
 
     #[test]
     fn lzma2_options_uses_bounded_default_chunk_size() {
