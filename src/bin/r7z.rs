@@ -24,7 +24,13 @@ const EXIT_COMMAND_LINE: u8 = 7;
 const MAX_LZMA2_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
 fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| is_help(arg)) {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
+
+    match run(args) {
         Ok(code) => ExitCode::from(code),
         Err(CliError::Usage(msg)) => {
             eprintln!("Command Line Error: {msg}");
@@ -94,7 +100,7 @@ struct Cli {
 
 impl Cli {
     fn parse(mut args: Vec<String>) -> Result<Self, CliError> {
-        if args.is_empty() || is_help(&args[0]) {
+        if args.is_empty() {
             return Err(CliError::Usage(usage()));
         }
 
@@ -1637,7 +1643,7 @@ fn is_help(text: &str) -> bool {
 
 fn usage() -> String {
     "usage: r7z <l|x|e|t|a|d|u> [switches] <archive.7z> [files...]\n\
-     switches: -oDIR -pPASS -m0=METHOD -mx=N -ms=on|off -mf=BCJ -mhe=on|off -vSIZE -aoa|-aos -slt"
+     switches: -oDIR -pPASS -m0=METHOD -mx=N -ms=on|off -mf=BCJ -mhe=on|off -vSIZE -aoa|-aos -slt -mmt=off|1"
         .to_string()
 }
 

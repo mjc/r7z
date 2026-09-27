@@ -17,6 +17,17 @@ fn run_r7z(args: &[String]) -> std::process::Output {
 }
 
 #[test]
+fn cli_help_describes_single_thread_encoder_limit() {
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .arg("--help")
+        .output()
+        .expect("r7z binary should run");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(help.contains("-mmt=off|1"), "{help}");
+}
+
+#[test]
 fn cli_create_list_test_extract_update_delete() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
