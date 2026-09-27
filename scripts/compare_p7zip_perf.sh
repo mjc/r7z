@@ -224,7 +224,10 @@ generate_flamegraph() {
     cd "$ROOT"
     cargo "${cargo_args[@]}" >/dev/null
   )
-  rm -f "$ROOT/perf.data" "$ROOT/perf.data.old"
+  if [[ -f "$ROOT/perf.data" ]]; then
+    mv "$ROOT/perf.data" "$FLAMEGRAPH_DIR/$label.perf.data"
+  fi
+  rm -f "$ROOT/perf.data.old"
 }
 
 echo "# r7z vs p7zip CLI performance"
