@@ -192,6 +192,10 @@ impl<'a> PackedFolder<'a> {
 }
 
 impl<'a> DecodedFolder<'a> {
+    pub(crate) fn as_bytes(&self) -> &Bytes {
+        &self.state.0
+    }
+
     fn streams(self) -> impl Iterator<Item = Result<DecodedSubstream, R7zError>> + 'a {
         self.layout.ranges().map(move |(range, digest)| {
             let stream = self.state.0.slice(range);
@@ -219,6 +223,59 @@ struct FolderPlans<'a> {
 pub(crate) struct PackedFolders<'a> {
     plans: FolderPlans<'a>,
     stream_count: usize,
+}
+
+impl<'a> PackedFolders<'a> {
+    pub(crate) fn new(
+        pack: &'a PackInfo,
+        unpack: &'a UnpackInfo,
+        substream_info: Option<&'a SubstreamInfo>,
+        metadata_limit: u64,
+    ) -> Result<Self, R7zError> {
+        let packed_bytes = pack.pack_size.iter().try_fold(0u64, |total, &size| {
+            total.checked_add(size).ok_or(R7zError::Parse)
+        })?;
+        if packed_bytes > metadata_limit {
+            return Err(R7zError::LimitExceeded("metadata"));
+        }
+        let plans = FolderPlans {
+            pack_info: pack,
+            unpack_info: unpack,
+            substream_info,
+            folder_index: 0,
+            pack_index: 0,
+            output_base: 0,
+            pack_offset: 0,
+            stream_size_base: 0,
+            stream_digest_base: 0,
+        };
+        let mut preflight = plans.clone();
+        let mut output_size = 0u64;
+        let mut stream_count = 0usize;
+        for folder in preflight.by_ref() {
+            let folder = folder?;
+            stream_count = stream_count
+                .checked_add(folder.layout.len())
+                .ok_or(R7zError::Parse)?;
+            output_size = output_size
+                .checked_add(folder.state.unpack_size)
+                .ok_or(R7zError::Parse)?;
+            if output_size > metadata_limit {
+                return Err(R7zError::LimitExceeded("metadata"));
+            }
+        }
+        let substreams_complete = substream_info.is_none_or(|info| {
+            info.unpack_sizes.len() == preflight.stream_size_base
+                && (info.digests.is_empty() || info.digests.len() == stream_count)
+        });
+        if preflight.pack_index != pack.pack_size.len() || !substreams_complete {
+            return Err(R7zError::Parse);
+        }
+        Ok(PackedFolders {
+            plans,
+            stream_count,
+        })
+    }
 }
 
 impl PackedFolders<'_> {
@@ -626,49 +683,7 @@ impl StreamInfo {
         metadata_limit: u64,
     ) -> Result<PackedFolders<'_>, R7zError> {
         let (pack, unpack) = self.packed_folders()?;
-        let packed_bytes = pack.pack_size.iter().try_fold(0u64, |total, &size| {
-            total.checked_add(size).ok_or(R7zError::Parse)
-        })?;
-        if packed_bytes > metadata_limit {
-            return Err(R7zError::LimitExceeded("metadata"));
-        }
-        let plans = FolderPlans {
-            pack_info: pack,
-            unpack_info: unpack,
-            substream_info: self.substream_info.as_ref(),
-            folder_index: 0,
-            pack_index: 0,
-            output_base: 0,
-            pack_offset: 0,
-            stream_size_base: 0,
-            stream_digest_base: 0,
-        };
-        let mut preflight = plans.clone();
-        let mut output_size = 0u64;
-        let mut stream_count = 0usize;
-        for folder in preflight.by_ref() {
-            let folder = folder?;
-            stream_count = stream_count
-                .checked_add(folder.layout.len())
-                .ok_or(R7zError::Parse)?;
-            output_size = output_size
-                .checked_add(folder.state.unpack_size)
-                .ok_or(R7zError::Parse)?;
-            if output_size > metadata_limit {
-                return Err(R7zError::LimitExceeded("metadata"));
-            }
-        }
-        let substreams_complete = self.substream_info.as_ref().is_none_or(|info| {
-            info.unpack_sizes.len() == preflight.stream_size_base
-                && (info.digests.is_empty() || info.digests.len() == stream_count)
-        });
-        if preflight.pack_index != pack.pack_size.len() || !substreams_complete {
-            return Err(R7zError::Parse);
-        }
-        Ok(PackedFolders {
-            plans,
-            stream_count,
-        })
+        PackedFolders::new(pack, unpack, self.substream_info.as_ref(), metadata_limit)
     }
 
     /// Parse a `StreamInfo` block from the header stream.

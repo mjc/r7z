@@ -639,27 +639,28 @@ impl Archive {
         if crc32fast::hash(&next_header) != signature.next_header_crc {
             return Err(R7zError::Crc);
         }
-        let (header_bytes, encoded_header) = match NextHeader::parse(&next_header)? {
-            NextHeader::Plain => (next_header, None),
-            NextHeader::Encoded(encoded) => {
-                let bytes = decode_encoded_header(
+        let (header, encoded_header) = match NextHeader::parse(&next_header)? {
+            NextHeader::Plain => (
+                parse_header_with_external_data(
                     &source,
-                    source_len,
+                    base_offset,
+                    &next_header,
+                    options.max_metadata_bytes,
+                    password,
+                )?,
+                None,
+            ),
+            NextHeader::Encoded(encoded) => {
+                let header = decode_encoded_header(
+                    &source,
                     base_offset,
                     &encoded,
                     password,
                     options.max_metadata_bytes,
                 )?;
-                (bytes, Some(*encoded))
+                (header, Some(*encoded))
             }
         };
-        let header = parse_header_with_external_data(
-            &source,
-            base_offset,
-            &header_bytes,
-            options.max_metadata_bytes,
-            password,
-        )?;
         Ok(Archive {
             source,
             base_offset,
@@ -1795,30 +1796,26 @@ fn verify_source_crc(
 
 fn decode_encoded_header(
     source: &ArchiveSource,
-    source_len: u64,
     base_offset: u64,
     encoded: &EncodedHeader,
     password: Option<&str>,
     metadata_limit: u64,
-) -> Result<Bytes, R7zError> {
-    let stream = encoded.stream()?;
-    let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, stream.pack_pos)?;
-    if stream.packed_size > metadata_limit || stream.unpack_size > metadata_limit {
-        return Err(R7zError::LimitExceeded("metadata"));
-    }
-    let data_range = checked_range_u64(source_len, data_start, stream.packed_size)?;
-    if let Some(expected_crc) = stream.packed_crc {
-        verify_source_crc(source, data_range.clone(), expected_crc)?;
-    }
-    let packed = source.read_range_to_vec(data_range, metadata_limit)?;
-    let decompressed = codec::decompress_folder_with_password_and_sizes(
-        &stream.folder,
-        &packed,
-        stream.unpack_size,
-        stream.coder_unpack_sizes,
-        password,
+) -> Result<Header, R7zError> {
+    let folder = encoded.folder(metadata_limit)?;
+    let packs = MetadataPackReader::new(
+        source,
+        base_offset,
+        encoded.pack_info.pack_pos,
+        metadata_limit,
     )?;
-    Ok(Bytes::from(decompressed))
+    let decoded = decode_metadata_folder(&packs, folder, password)?;
+    parse_header_with_external_data(
+        source,
+        base_offset,
+        decoded.as_bytes(),
+        metadata_limit,
+        password,
+    )
 }
 
 fn parse_header_with_external_data(
@@ -1858,7 +1855,7 @@ fn decode_additional_folder_data(
     let mut output = ExternalFolderData::reserve(folders.stream_count(), metadata_limit)?;
     for folder in folders {
         let folder = folder?;
-        let decoded = decode_additional_folder(&packs, folder, password)?;
+        let decoded = decode_metadata_folder(&packs, folder, password)?;
         output.append(decoded)?;
     }
 
@@ -1907,7 +1904,7 @@ impl<'a> MetadataPackReader<'a> {
     }
 }
 
-fn decode_additional_folder<'a>(
+fn decode_metadata_folder<'a>(
     packs: &MetadataPackReader<'_>,
     folder: PackedFolder<'a>,
     password: Option<&str>,
