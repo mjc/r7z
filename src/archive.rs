@@ -649,6 +649,9 @@ impl Archive {
                     return Err(R7zError::LimitExceeded("metadata"));
                 }
                 let data_range = checked_range_u64(source_len, data_start, pack_size)?;
+                if let Some(Some(expected_crc)) = pi.digests.first() {
+                    verify_source_crc(&source, data_range.clone(), *expected_crc)?;
+                }
                 let packed = source.read_range_to_vec(data_range, options.max_metadata_bytes)?;
                 let folder = ui.parse_folder(0)?;
 
@@ -691,6 +694,7 @@ impl Archive {
                 let decompressed = Bytes::from(decompressed);
 
                 let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
+                verify_additional_stream_crcs(&source, base_offset, &header)?;
 
                 Ok(Archive {
                     source,
@@ -704,6 +708,7 @@ impl Archive {
                 // Header is stored uncompressed at next_header_offset (the raw bytes
                 // include the 0x01 tag, so we slice from header_start, not header_start+1)
                 let (_, header) = Header::parse(&next_header).map_err(|_| R7zError::Parse)?;
+                verify_additional_stream_crcs(&source, base_offset, &header)?;
 
                 Ok(Archive {
                     source,
@@ -731,6 +736,11 @@ impl Archive {
     #[must_use]
     pub fn files_info(&self) -> Option<&FilesInfo> {
         self.header.files_info()
+    }
+
+    /// Fallible file metadata access for callers that need malformed-header errors.
+    pub fn try_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
+        self.header.try_files_info()
     }
 
     /// Return high-level metadata for entry `index`.
@@ -776,6 +786,11 @@ impl Archive {
         self.header.streams_info()
     }
 
+    /// Fallible stream metadata access for callers that need malformed-header errors.
+    pub fn try_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
+        self.header.try_streams_info()
+    }
+
     /// Build p7zip-style listing metadata without extracting file contents.
     ///
     /// `physical_size` should be the on-disk archive size when known. When it is
@@ -786,7 +801,7 @@ impl Archive {
     /// Returns [`R7zError::Parse`] when stream metadata is inconsistent.
     pub fn listing(&self, physical_size: Option<u64>) -> Result<ArchiveListing, R7zError> {
         let physical_size = physical_size.or_else(|| self.source.len().ok());
-        let streams = self.streams_info();
+        let streams = self.try_streams_info()?;
         let pack_total = streams
             .and_then(|streams| streams.pack_info.as_ref())
             .map(|pack_info| {
@@ -806,7 +821,7 @@ impl Archive {
 
         let mut first_entry_for_folder = vec![true; blocks];
         let mut entries = Vec::with_capacity(self.num_files());
-        let files_info = self.header.files_info();
+        let files_info = self.try_files_info()?;
         let data_stream_count = count_data_streams(files_info, self.num_files());
         let mut names = files_info.map(FilesInfo::name_slices);
         let unpack_info = streams.and_then(|streams| streams.unpack_info.as_ref());
@@ -854,7 +869,7 @@ impl Archive {
 
     #[doc(hidden)]
     pub fn raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {
-        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
         if folder_index >= unpack_info.num_folders_usize() {
@@ -887,9 +902,17 @@ impl Archive {
         let packed_buffer_limit =
             u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES).map_err(|_| R7zError::Parse)?;
         let mut packed_streams = Vec::with_capacity(pack_sizes.len());
-        for &pack_size in &pack_sizes {
+        for (stream_index, &pack_size) in pack_sizes.iter().enumerate() {
             let stream_start = checked_add_u64(data_start, pack_offset)?;
             let range = checked_range_u64(self.source.len()?, stream_start, pack_size)?;
+            if let Some(expected_crc) = pack_info
+                .digests
+                .get(pack_stream_base + stream_index)
+                .copied()
+                .flatten()
+            {
+                verify_source_crc(&self.source, range.clone(), expected_crc)?;
+            }
             packed_streams.push(self.source.read_range_to_vec(range, packed_buffer_limit)?);
             pack_offset = checked_add_u64(pack_offset, pack_size)?;
         }
@@ -1045,7 +1068,7 @@ impl Archive {
             return Err(R7zError::Parse);
         }
 
-        let fi = self.header.files_info();
+        let fi = self.try_files_info()?;
         if fi.is_some_and(|f| f.is_anti(file_index) || f.is_directory(file_index)) {
             return Err(R7zError::Directory);
         }
@@ -1054,6 +1077,11 @@ impl Archive {
         }
 
         let location = self.extraction_location(file_index)?;
+        for (range, digest) in location.packed_ranges.iter().zip(&location.packed_digests) {
+            if let Some(expected_crc) = digest {
+                verify_source_crc(&self.source, range.clone(), *expected_crc)?;
+            }
+        }
         let mut reader: Box<dyn Read> = if location.packed_ranges.len() == 1 {
             let packed = self
                 .source
@@ -1276,9 +1304,9 @@ impl Archive {
             return Ok(());
         }
 
-        let files_info = self.header.files_info();
+        let files_info = self.try_files_info()?;
         let data_stream_count = count_data_streams(files_info, self.num_files());
-        let streams = self.streams_info();
+        let streams = self.try_streams_info()?;
         let unpack_info = streams.and_then(|streams| streams.unpack_info.as_ref());
         let streams_per_folder = streams
             .and_then(|streams| streams.substream_info.as_ref())
@@ -1372,7 +1400,7 @@ impl Archive {
     }
 
     pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
-        let Some(fi) = self.files_info() else {
+        let Some(fi) = self.try_files_info()? else {
             return Ok(None);
         };
         if !fi.is_symlink(file_index) {
@@ -1385,8 +1413,8 @@ impl Archive {
     }
 
     fn extraction_location(&self, file_index: usize) -> Result<ExtractionLocation, R7zError> {
-        let fi = self.header.files_info();
-        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let fi = self.try_files_info()?;
+        let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
         let substream_info = streams.substream_info.as_ref();
@@ -1423,6 +1451,11 @@ impl Archive {
             .pack_size
             .get(pack_stream_base..pack_stream_end)
             .ok_or(R7zError::Parse)?;
+        let packed_digests = pack_info
+            .digests
+            .get(pack_stream_base..pack_stream_end)
+            .ok_or(R7zError::Parse)?
+            .to_vec();
         if num_pack_streams > 1 {
             ensure_packed_folder_buffer_limit(pack_sizes)?;
         }
@@ -1454,6 +1487,7 @@ impl Archive {
         Ok(ExtractionLocation {
             folder,
             packed_ranges,
+            packed_digests,
             folder_unpack_size,
             coder_unpack_sizes,
             stream_start,
@@ -1478,7 +1512,7 @@ impl Archive {
             stream_count,
             ..
         } = location;
-        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
         let substream_info = streams.substream_info.as_ref();
@@ -1494,17 +1528,21 @@ impl Archive {
             .pack_size
             .get(pack_stream_base..pack_stream_end)
             .ok_or(R7zError::Parse)?;
+        let packed_digests = pack_info
+            .digests
+            .get(pack_stream_base..pack_stream_end)
+            .ok_or(R7zError::Parse)?;
         if num_pack_streams > 1 {
             ensure_packed_folder_buffer_limit(pack_sizes)?;
         }
         let mut packed_ranges = Vec::with_capacity(num_pack_streams);
-        for &pack_size in pack_sizes {
+        for (stream_index, &pack_size) in pack_sizes.iter().enumerate() {
             let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
-            packed_ranges.push(checked_range_u64(
-                self.source.len()?,
-                stream_start,
-                pack_size,
-            )?);
+            let range = checked_range_u64(self.source.len()?, stream_start, pack_size)?;
+            if let Some(expected_crc) = packed_digests[stream_index] {
+                verify_source_crc(&self.source, range.clone(), expected_crc)?;
+            }
+            packed_ranges.push(range);
             pack_offset_u64 = checked_add_u64(pack_offset_u64, pack_size)?;
         }
 
@@ -1603,7 +1641,7 @@ impl Archive {
         location: Option<FolderStreamLocation>,
         first_entry_for_folder: &mut [bool],
     ) -> Result<ArchiveListingEntry, R7zError> {
-        let fi = self.header.files_info();
+        let fi = self.try_files_info()?;
         let path = name.unwrap_or_else(|| format!("unknown-{file_index}"));
         let Some(files) = fi else {
             return Ok(ArchiveListingEntry {
@@ -1616,7 +1654,7 @@ impl Archive {
                 attributes: None,
                 crc: None,
                 encrypted: false,
-                methods: archive_method_names(self.streams_info())?,
+                methods: archive_method_names(self.try_streams_info()?)?,
                 block: None,
             });
         };
@@ -1663,7 +1701,7 @@ impl Archive {
 
         let location = location.ok_or(R7zError::Parse)?;
         let folder_idx = location.folder_idx;
-        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
         let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
         let substream_info = streams.substream_info.as_ref();
@@ -1767,7 +1805,7 @@ impl Archive {
         let Some(data_stream_idx) = file_to_data_stream(file_index, fi) else {
             return Ok(None);
         };
-        let streams = self.streams_info().ok_or(R7zError::Parse)?;
+        let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
         let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
         Ok(data_stream_to_folder(
             data_stream_idx,
@@ -1799,7 +1837,7 @@ impl Archive {
         password: Option<&str>,
     ) -> Result<(), R7zError> {
         let num = self.num_files();
-        let fi = self.header.files_info();
+        let fi = self.try_files_info()?;
         let mut names = fi.map(FilesInfo::name_slices);
 
         for i in 0..num {
@@ -1838,12 +1876,59 @@ impl Archive {
 struct ExtractionLocation {
     folder: crate::Folder,
     packed_ranges: Vec<Range<u64>>,
+    packed_digests: Vec<Option<u32>>,
     folder_unpack_size: u64,
     coder_unpack_sizes: Vec<u64>,
     stream_start: usize,
     stream_size: usize,
     folder_digest: Option<u32>,
     substream_digest: Option<u32>,
+}
+
+fn verify_source_crc(
+    source: &ArchiveSource,
+    range: Range<u64>,
+    expected: u32,
+) -> Result<(), R7zError> {
+    let mut reader = source.range_reader(range)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer).map_err(R7zError::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    if hasher.finalize() == expected {
+        Ok(())
+    } else {
+        Err(R7zError::Crc)
+    }
+}
+
+fn verify_additional_stream_crcs(
+    source: &ArchiveSource,
+    base_offset: u64,
+    header: &Header,
+) -> Result<(), R7zError> {
+    let Some(streams) = header.try_additional_streams_info()? else {
+        return Ok(());
+    };
+    let Some(pack_info) = streams.pack_info.as_ref() else {
+        return Ok(());
+    };
+    let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
+    let mut pack_offset = 0u64;
+    for (index, &pack_size) in pack_info.pack_size.iter().enumerate() {
+        let start = checked_add_u64(data_start, pack_offset)?;
+        let range = checked_range_u64(source.len()?, start, pack_size)?;
+        if let Some(expected_crc) = pack_info.digests.get(index).copied().flatten() {
+            verify_source_crc(source, range, expected_crc)?;
+        }
+        pack_offset = checked_add_u64(pack_offset, pack_size)?;
+    }
+    Ok(())
 }
 
 impl ExtractionLocation {

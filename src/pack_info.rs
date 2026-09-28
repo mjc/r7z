@@ -18,6 +18,8 @@ pub struct PackInfo {
     /// Compressed size of each packed stream in bytes.
     /// Nearly always length 1; stays on the stack for the common case.
     pub pack_size: SmallVec<[u64; 4]>,
+    /// Optional CRC32 digest per packed stream.
+    pub digests: SmallVec<[Option<u32>; 4]>,
 }
 
 impl PackInfo {
@@ -55,6 +57,7 @@ impl PackInfo {
             input = sliced;
         }
 
+        let mut digests = SmallVec::new();
         loop {
             let (i, tag) = Property::parse(input)?;
             input = i;
@@ -67,7 +70,8 @@ impl PackInfo {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) = scan_digests(input, num_pack_streams)?;
+                    let (i, crcs) = parse_digests(input, num_pack_streams)?;
+                    digests = crcs;
                     input = i;
                 }
                 _ => {
@@ -84,12 +88,17 @@ impl PackInfo {
             }
         }
 
+        if digests.is_empty() {
+            digests.resize(pack_size.len(), None);
+        }
+
         Ok((
             input,
             PackInfo {
                 pack_pos,
                 num_pack_streams,
                 pack_size,
+                digests,
             },
         ))
     }
@@ -490,6 +499,27 @@ mod tests {
         assert_eq!(pack_info.pack_pos, 0);
         assert_eq!(pack_info.num_pack_streams, 2);
         assert_eq!(pack_info.pack_size.as_slice(), &[86, 362]);
+        assert_eq!(
+            pack_info.digests.as_slice(),
+            &[
+                Some(u32::from_le_bytes([0xA3, 0x52, 0x01, 0x40])),
+                Some(u32::from_le_bytes([0x5C, 0x5F, 0x6E, 0x3E])),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_pack_info_with_sparse_crcs() {
+        let input = [
+            0x06u8, 0x00, 0x03, 0x09, 0x01, 0x01, 0x01, 0x0A, 0x00, 0xA0, 0xA0, 0xA1, 0xA2, 0xA3,
+            0xB0, 0xB1, 0xB2, 0xB3, 0x00,
+        ];
+        let (rem, pack_info) = PackInfo::parse(&input).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(
+            pack_info.digests.as_slice(),
+            &[Some(0xA3A2_A1A0), None, Some(0xB3B2_B1B0)]
+        );
     }
 
     #[test]
