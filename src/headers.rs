@@ -60,30 +60,49 @@ impl EncodedHeader {
     }
 }
 
-pub(crate) fn parse_additional_streams_info(
-    backing: &Bytes,
-) -> Result<Option<StreamInfo>, R7zError> {
+pub(crate) enum HeaderResolution {
+    Complete(Box<Header>),
+    RequiresExternalFolders(Box<StreamInfo>),
+}
+
+fn external_folder_requirement(backing: &Bytes) -> Result<Option<StreamInfo>, R7zError> {
     let input: &[u8] = backing;
     let (mut input, tag) = Property::parse(input).map_err(|_| R7zError::Parse)?;
     if tag != Property::Header {
         return Err(R7zError::Parse);
     }
+    let mut additional = None;
     loop {
+        let property_input = input;
         let (i, tag) = Property::parse(input).map_err(|_| R7zError::Parse)?;
         input = i;
         match tag {
-            Property::END | Property::MainStreamsInfo => return Ok(None),
+            Property::END => return Ok(None),
+            Property::MainStreamsInfo => {
+                let (_, uses_external) =
+                    StreamInfo::uses_external_folder_data(input).map_err(|_| R7zError::Parse)?;
+                return match (uses_external, additional) {
+                    (true, Some(bytes)) => match StreamInfo::parse(bytes, backing) {
+                        Ok(([], streams)) => Ok(Some(streams)),
+                        _ => Err(R7zError::Parse),
+                    },
+                    (true, None) => Err(R7zError::Parse),
+                    (false, _) => Ok(None),
+                };
+            }
             Property::AdditionalStreamsInfo => {
-                let (_, streams) =
-                    StreamInfo::parse(input, backing).map_err(|_| R7zError::Parse)?;
-                return Ok(Some(streams));
+                let (i, ()) =
+                    scan_stream_info_with_external(input, &[]).map_err(|_| R7zError::Parse)?;
+                let length = input.len() - i.len();
+                additional = input.get(..length);
+                input = i;
             }
             Property::ArchiveProperties => {
                 let (i, ()) = scan_archive_properties(input).map_err(|_| R7zError::Parse)?;
                 input = i;
             }
             Property::FilesInfo => {
-                let (i, _) = scan_files_info(input).map_err(|_| R7zError::Parse)?;
+                let (i, _) = scan_files_info(property_input).map_err(|_| R7zError::Parse)?;
                 input = i;
             }
             _ => {
@@ -140,6 +159,27 @@ impl std::fmt::Debug for Header {
 }
 
 impl Header {
+    pub(crate) fn resolve_archive(backing: &Bytes) -> Result<HeaderResolution, R7zError> {
+        match external_folder_requirement(backing)? {
+            Some(additional) => Ok(HeaderResolution::RequiresExternalFolders(Box::new(
+                additional,
+            ))),
+            None => Self::parse_exact(backing, Vec::new())
+                .map(Box::new)
+                .map(HeaderResolution::Complete),
+        }
+    }
+
+    pub(crate) fn parse_exact(
+        backing: &Bytes,
+        external_folder_data: Vec<Bytes>,
+    ) -> Result<Self, R7zError> {
+        match Self::parse_with_external(backing, external_folder_data) {
+            Ok(([], header)) => Ok(header),
+            _ => Err(R7zError::Parse),
+        }
+    }
+
     /// Returns the number of file entries in the archive.
     ///
     /// This is extracted during the initial scan and does not trigger
@@ -224,6 +264,12 @@ impl Header {
             })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
+    }
+
+    pub(crate) fn additional_pack_info(&self) -> Result<Option<&PackInfo>, R7zError> {
+        Ok(self
+            .try_additional_streams_info()?
+            .and_then(|streams| streams.pack_info.as_ref()))
     }
 
     /// Parse and validate a decompressed 7z header block.
@@ -361,7 +407,7 @@ impl Header {
 
 #[cfg(test)]
 mod tests {
-    use super::{Header, scan_archive_properties};
+    use super::{Header, HeaderResolution, scan_archive_properties};
     use crate::R7zError;
     use bytes::Bytes;
 
@@ -389,6 +435,10 @@ mod tests {
 
         assert!(rem.is_empty());
         assert_eq!(parsed.num_files(), 0);
+        assert!(matches!(
+            Header::resolve_archive(&header),
+            Ok(HeaderResolution::Complete(_))
+        ));
     }
 
     #[test]
@@ -433,6 +483,10 @@ mod tests {
         let external_folder = vec![Bytes::from_static(&[0x01, 0x01, 0x00])];
 
         assert!(Header::parse(&bytes).is_err());
+        assert!(matches!(
+            Header::resolve_archive(&bytes),
+            Ok(HeaderResolution::RequiresExternalFolders(_))
+        ));
         let (rest, header) = Header::parse_with_external(&bytes, external_folder).unwrap();
         assert_eq!(rest, b"");
         let streams = header.try_streams_info().unwrap().unwrap();
@@ -443,6 +497,35 @@ mod tests {
             .parse_folder(0)
             .unwrap();
         assert_eq!(folder.coders.len(), 1);
+    }
+
+    #[test]
+    fn archive_resolution_rejects_trailing_bytes_and_missing_additional_streams() {
+        let trailing = Bytes::from_static(&[0x01, 0x00, 0xff]);
+        assert!(matches!(
+            Header::resolve_archive(&trailing),
+            Err(R7zError::Parse)
+        ));
+
+        let missing_additional = Bytes::from_static(&[
+            0x01, 0x04, // Header, MainStreamsInfo
+            0x07, 0x0b, 0x01, 0x01, 0x00, // one external folder, buffer index zero
+            0x0c, 0x03, 0x00, 0x00, // unpack size, end of MainStreamsInfo
+            0x00, // end of Header
+        ]);
+        assert!(matches!(
+            Header::resolve_archive(&missing_additional),
+            Err(R7zError::Parse)
+        ));
+    }
+
+    #[test]
+    fn archive_resolution_accepts_empty_file_listing() {
+        let header = Bytes::from_static(&[0x01, 0x05, 0x00, 0x11, 0x01, 0x00, 0x00, 0x00]);
+        assert!(matches!(
+            Header::resolve_archive(&header),
+            Ok(HeaderResolution::Complete(_))
+        ));
     }
 }
 

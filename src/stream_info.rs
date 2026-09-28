@@ -1,6 +1,8 @@
-use crate::pack_info::{scan_pack_info, scan_unpack_info_with_external};
+use crate::pack_info::{
+    FolderLocation, parse_folder_declaration, scan_pack_info, scan_unpack_info_with_external,
+};
 use crate::parsers::{bitmap_is_set, scan_digests};
-use crate::{PackInfo, Property, UnpackInfo, sevenzip_varuint64_decode};
+use crate::{PackInfo, Property, R7zError, UnpackInfo, sevenzip_varuint64_decode};
 use bytes::Bytes;
 use nom::{IResult, number::complete::le_u8};
 
@@ -225,6 +227,51 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    pub(crate) fn uses_external_folder_data(mut input: &[u8]) -> IResult<&[u8], bool> {
+        loop {
+            let (after_tag, tag) = Property::parse(input)?;
+            match tag {
+                Property::END => return Ok((after_tag, false)),
+                Property::UnPackInfo => {
+                    let (remaining, (_, location)) = parse_folder_declaration(input)?;
+                    return Ok((remaining, matches!(location, FolderLocation::External(_))));
+                }
+                Property::PackInfo => input = scan_pack_info(input)?.0,
+                Property::SubStreamsInfo => input = scan_substream_info(input, 0)?.0,
+                _ => {
+                    let (remaining, size) = sevenzip_varuint64_decode(after_tag)?;
+                    let size = usize::try_from(size).map_err(|_| {
+                        nom::Err::Failure(nom::error::Error::new(
+                            remaining,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    input = nom::bytes::complete::take(size)(remaining)?.0;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn packed_folders(&self) -> Result<(&PackInfo, &UnpackInfo), R7zError> {
+        match (&self.pack_info, &self.unpack_info) {
+            (Some(pack), Some(unpack)) => Ok((pack, unpack)),
+            _ => Err(R7zError::Parse),
+        }
+    }
+
+    pub(crate) fn checked_packed_folders(&self) -> Result<(&PackInfo, &UnpackInfo), R7zError> {
+        let (pack, unpack) = self.packed_folders()?;
+        let stream_count = (0..unpack.num_folders_usize()).try_fold(0usize, |count, index| {
+            let (_, graph) = unpack.parse_folder_with_graph(index)?;
+            let folder_count = graph.packed_stream_count();
+            count.checked_add(folder_count).ok_or(R7zError::Parse)
+        })?;
+        match stream_count == pack.pack_size.len() {
+            true => Ok((pack, unpack)),
+            false => Err(R7zError::Parse),
+        }
+    }
+
     /// Parse a `StreamInfo` block from the header stream.
     ///
     /// # Errors

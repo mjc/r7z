@@ -1,3 +1,4 @@
+use crate::headers::HeaderResolution;
 use crate::{
     EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
     codec, find_next_property_id,
@@ -859,12 +860,7 @@ impl Archive {
     #[doc(hidden)]
     pub fn raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {
         let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
-        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
-        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
-        if folder_index >= unpack_info.num_folders_usize() {
-            return Err(R7zError::Parse);
-        }
-
+        let (pack_info, unpack_info) = streams.packed_folders()?;
         let folder = unpack_info.parse_folder(folder_index)?;
         let pack_stream_base = folder_pack_stream_base(folder_index, unpack_info)?;
         let num_pack_streams = folder_num_pack_streams(&folder)?;
@@ -1404,8 +1400,7 @@ impl Archive {
     fn extraction_location(&self, file_index: usize) -> Result<ExtractionLocation, R7zError> {
         let fi = self.try_files_info()?;
         let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
-        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
-        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        let (pack_info, unpack_info) = streams.packed_folders()?;
         let substream_info = streams.substream_info.as_ref();
 
         // Map file_index → (data_stream_index) by skipping empty files
@@ -1502,8 +1497,7 @@ impl Archive {
             ..
         } = location;
         let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
-        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
-        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        let (pack_info, unpack_info) = streams.packed_folders()?;
         let substream_info = streams.substream_info.as_ref();
         let folder = unpack_info.parse_folder(folder_idx)?;
         let num_pack_streams = folder_num_pack_streams(&folder)?;
@@ -1691,8 +1685,7 @@ impl Archive {
         let location = location.ok_or(R7zError::Parse)?;
         let folder_idx = location.folder_idx;
         let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
-        let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
-        let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+        let (pack_info, unpack_info) = streams.packed_folders()?;
         let substream_info = streams.substream_info.as_ref();
         let folder = unpack_info.parse_folder(folder_idx)?;
         let methods = folder_method_names(&folder);
@@ -1903,24 +1896,22 @@ fn parse_header_with_external_data(
     metadata_limit: u64,
     password: Option<&str>,
 ) -> Result<Header, R7zError> {
-    if let Ok((rest, header)) = Header::parse(bytes)
-        && rest.is_empty()
-    {
-        verify_additional_stream_crcs(source, base_offset, &header)?;
-        return Ok(header);
+    match Header::resolve_archive(bytes)? {
+        HeaderResolution::Complete(header) => {
+            verify_additional_stream_crcs(source, base_offset, &header)?;
+            Ok(*header)
+        }
+        HeaderResolution::RequiresExternalFolders(additional) => {
+            let external_data = decode_additional_folder_data(
+                source,
+                base_offset,
+                &additional,
+                metadata_limit,
+                password,
+            )?;
+            Header::parse_exact(bytes, external_data)
+        }
     }
-
-    let Some(additional) = crate::headers::parse_additional_streams_info(bytes)? else {
-        return Err(R7zError::Parse);
-    };
-    let external_data =
-        decode_additional_folder_data(source, base_offset, &additional, metadata_limit, password)?;
-    let (rest, header) =
-        Header::parse_with_external(bytes, external_data).map_err(|_| R7zError::Parse)?;
-    if !rest.is_empty() {
-        return Err(R7zError::Parse);
-    }
-    Ok(header)
 }
 
 fn decode_additional_folder_data(
@@ -1930,8 +1921,7 @@ fn decode_additional_folder_data(
     metadata_limit: u64,
     password: Option<&str>,
 ) -> Result<Vec<Bytes>, R7zError> {
-    let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
-    let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
+    let (pack_info, unpack_info) = streams.checked_packed_folders()?;
     let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
     let mut packed_offset = 0u64;
     let mut packed_index = 0usize;
@@ -1940,8 +1930,7 @@ fn decode_additional_folder_data(
     let mut output_base = 0usize;
 
     for folder_idx in 0..unpack_info.num_folders_usize() {
-        let folder = unpack_info.parse_folder(folder_idx)?;
-        let graph = folder.graph()?;
+        let (folder, graph) = unpack_info.parse_folder_with_graph(folder_idx)?;
         let mut packed_streams = Vec::with_capacity(graph.packed_stream_count());
         for _ in 0..graph.packed_stream_count() {
             let size = *pack_info
@@ -2003,9 +1992,6 @@ fn decode_additional_folder_data(
             .ok_or(R7zError::Parse)?;
     }
 
-    if packed_index != pack_info.pack_size.len() {
-        return Err(R7zError::Parse);
-    }
     Ok(output)
 }
 
@@ -2032,12 +2018,16 @@ fn verify_additional_stream_crcs(
     base_offset: u64,
     header: &Header,
 ) -> Result<(), R7zError> {
-    let Some(streams) = header.try_additional_streams_info()? else {
-        return Ok(());
-    };
-    let Some(pack_info) = streams.pack_info.as_ref() else {
-        return Ok(());
-    };
+    header.additional_pack_info()?.map_or(Ok(()), |pack_info| {
+        verify_additional_pack_crcs(source, base_offset, pack_info)
+    })
+}
+
+fn verify_additional_pack_crcs(
+    source: &ArchiveSource,
+    base_offset: u64,
+    pack_info: &crate::PackInfo,
+) -> Result<(), R7zError> {
     let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
     let mut pack_offset = 0u64;
     for (index, &pack_size) in pack_info.pack_size.iter().enumerate() {
