@@ -1,5 +1,5 @@
 use crate::files_info::scan_files_info;
-use crate::stream_info::scan_stream_info_with_external;
+use crate::stream_info::{ExternalFolderData, scan_stream_info_with_external};
 use crate::{FilesInfo, Folder, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
 use bytes::Bytes;
 use nom::IResult;
@@ -190,7 +190,7 @@ pub struct Header {
     /// Byte range containing `AdditionalStreamsInfo` when present.
     additional_streams_range: Option<std::ops::Range<u32>>,
     /// Decoded additional data streams, indexed by external folder references.
-    external_folder_data: Vec<Bytes>,
+    external_folder_data: ExternalFolderData,
     /// Number of file entries (extracted during scan; avoids a lazy parse just
     /// to read the count).
     num_files: u64,
@@ -221,7 +221,7 @@ impl Header {
             Some(additional) => Ok(HeaderResolution::RequiresExternalFolders(Box::new(
                 additional,
             ))),
-            None => Self::parse_exact(backing, Vec::new())
+            None => Self::parse_exact(backing, ExternalFolderData::default())
                 .map(Box::new)
                 .map(HeaderResolution::Complete),
         }
@@ -229,9 +229,9 @@ impl Header {
 
     pub(crate) fn parse_exact(
         backing: &Bytes,
-        external_folder_data: Vec<Bytes>,
+        external_folder_data: ExternalFolderData,
     ) -> Result<Self, R7zError> {
-        match Self::parse_with_external(backing, external_folder_data) {
+        match Self::parse_with_external_data(backing, external_folder_data) {
             Ok(([], header)) => Ok(header),
             _ => Err(R7zError::Parse),
         }
@@ -265,11 +265,15 @@ impl Header {
             let start = range.start as usize;
             let end = range.end as usize;
             self.data.get(start..end).ok_or(()).and_then(|slice| {
-                StreamInfo::parse_with_external(slice, &self.data, &self.external_folder_data)
-                    .ok()
-                    .filter(|(rest, _)| rest.is_empty())
-                    .map(|(_, value)| value)
-                    .ok_or(())
+                StreamInfo::parse_with_external(
+                    slice,
+                    &self.data,
+                    self.external_folder_data.as_slice(),
+                )
+                .ok()
+                .filter(|(rest, _)| rest.is_empty())
+                .map(|(_, value)| value)
+                .ok_or(())
             })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
@@ -343,7 +347,7 @@ impl Header {
     /// Returns a nom error if the input is truncated, malformed, or does not start with
     /// the `Header` property tag.
     pub fn parse(backing: &Bytes) -> IResult<&[u8], Header> {
-        Self::parse_with_external(backing, Vec::new())
+        Self::parse_with_external_data(backing, ExternalFolderData::default())
     }
 
     /// Parse a header with decoded external folder definition bytes.
@@ -355,6 +359,16 @@ impl Header {
     pub fn parse_with_external(
         backing: &Bytes,
         external_folder_data: Vec<Bytes>,
+    ) -> IResult<&[u8], Header> {
+        Self::parse_with_external_data(
+            backing,
+            ExternalFolderData::from_supplied(external_folder_data),
+        )
+    }
+
+    fn parse_with_external_data(
+        backing: &Bytes,
+        external_folder_data: ExternalFolderData,
     ) -> IResult<&[u8], Header> {
         let input: &[u8] = backing;
         let orig_input = input;
@@ -388,7 +402,8 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) = scan_stream_info_with_external(input, &external_folder_data)?;
+                    let (i, ()) =
+                        scan_stream_info_with_external(input, external_folder_data.as_slice())?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -403,7 +418,8 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) = scan_stream_info_with_external(input, &external_folder_data)?;
+                    let (i, ()) =
+                        scan_stream_info_with_external(input, external_folder_data.as_slice())?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
