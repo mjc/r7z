@@ -1,3 +1,4 @@
+use crate::file_streams::{FileStreams, FolderIndex, StreamLocation};
 use crate::folder_decode::{
     ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderPlan, FolderLayout, FolderLayouts,
     MetadataBudget, PackedStream, VerifiedExternalData,
@@ -770,34 +771,17 @@ impl Archive {
             .unwrap_or(0);
         let solid = archive_is_solid(streams);
 
-        let mut first_entry_for_folder = vec![true; blocks];
         let mut entries = Vec::with_capacity(self.num_files());
         let files_info = self.try_files_info()?;
-        let data_stream_count = count_data_streams(files_info, self.num_files());
         let mut names = files_info.map(FilesInfo::name_slices);
-        let mut folder_cursor = streams
-            .filter(|streams| streams.unpack_info.is_some())
-            .map(|streams| FolderStreamCursor::new(streams, data_stream_count))
-            .transpose()?;
-        for index in 0..self.num_files() {
+        let mut files = FileStreams::new(files_info, self.num_files(), streams)?;
+        while let Some(file) = files.next()? {
             let name = names
                 .as_mut()
                 .and_then(Iterator::next)
                 .flatten()
                 .map(crate::files_info::decode_name);
-            let has_data_stream = files_info.is_some_and(|files| {
-                has_data_stream_flags(
-                    files.is_empty_stream(index),
-                    files.is_directory(index),
-                    files.is_anti(index),
-                )
-            });
-            let location = if has_data_stream {
-                Some(folder_cursor.as_mut().ok_or(R7zError::Parse)?.next()?)
-            } else {
-                None
-            };
-            entries.push(self.listing_entry(index, name, location, &mut first_entry_for_folder)?);
+            entries.push(self.listing_entry(file.index, name, file.location)?);
         }
 
         Ok(ArchiveListing {
@@ -1125,7 +1109,6 @@ impl Archive {
         }
 
         let files_info = self.try_files_info()?;
-        let data_stream_count = count_data_streams(files_info, self.num_files());
         let streams = self.try_streams_info()?;
         let mut names = files_info.map(FilesInfo::name_slices);
         let mut selected_position = 0;
@@ -1134,20 +1117,14 @@ impl Archive {
         } else {
             CompletionMode::WholeFolder
         };
-        let mut session = streams
-            .filter(|streams| streams.unpack_info.is_some())
-            .map(|streams| {
-                FolderSession::new(
-                    &self.source,
-                    self.base_offset,
-                    streams,
-                    data_stream_count,
-                    mode,
-                )
-            })
-            .transpose()?;
-
-        for index in 0..self.num_files() {
+        let mut files = FileStreams::new(files_info, self.num_files(), streams)?;
+        let mut decoder = FolderDecoder {
+            source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
+            current: None,
+            mode,
+        };
+        while let Some(file) = files.next()? {
+            let index = file.index;
             let is_selected = selected.as_ref().is_none_or(|indices| {
                 if indices.get(selected_position) == Some(&index) {
                     selected_position += 1;
@@ -1156,41 +1133,22 @@ impl Archive {
                     false
                 }
             });
-            let raw_name = names.as_mut().and_then(|names| names.next()).flatten();
-            let entry = is_selected.then(|| {
-                self.entry_info_with_name(index, raw_name.map(crate::files_info::decode_name))
-            });
-            let has_data_stream = files_info.map_or_else(
-                || {
-                    entry
-                        .as_ref()
-                        .is_some_and(ArchiveEntryInfo::has_data_stream)
-                },
-                |files| {
-                    has_data_stream_flags(
-                        files.is_empty_stream(index),
-                        files.is_directory(index),
-                        files.is_anti(index),
-                    )
-                },
-            );
-
-            if !has_data_stream {
-                if let Some(entry) = entry {
-                    if !entry.is_directory() && !entry.is_anti() {
-                        let mut empty = std::io::empty();
-                        callback(&entry, &mut empty)?;
+            let raw_name = names.as_mut().and_then(Iterator::next).flatten();
+            if is_selected {
+                let entry =
+                    self.entry_info_with_name(index, raw_name.map(crate::files_info::decode_name));
+                match file.location {
+                    Some(location) => {
+                        decoder = decoder.read(location, &entry, password, &mut callback)?
                     }
+                    None if !entry.is_directory() && !entry.is_anti() => {
+                        callback(&entry, &mut std::io::empty())?
+                    }
+                    None => {}
                 }
-                continue;
             }
-
-            let state = session.take().ok_or(R7zError::Parse)?;
-            session = Some(state.visit(entry.as_ref(), password, &mut callback)?);
         }
-        if let Some(session) = session {
-            session.finish()?;
-        }
+        decoder.finish()?;
 
         Ok(())
     }
@@ -1212,8 +1170,7 @@ impl Archive {
         &self,
         file_index: usize,
         name: Option<String>,
-        location: Option<FolderStreamLocation<'_>>,
-        first_entry_for_folder: &mut [bool],
+        location: Option<StreamLocation<'_, '_>>,
     ) -> Result<ArchiveListingEntry, R7zError> {
         let fi = self.try_files_info()?;
         let path = name.unwrap_or_else(|| format!("unknown-{file_index}"));
@@ -1274,15 +1231,14 @@ impl Archive {
         }
 
         let location = location.ok_or(R7zError::Parse)?;
-        let folder_idx = location.folder_idx;
-        let methods = folder_method_names(location.folder);
-        let encrypted = folder_is_encrypted(location.folder);
+        let folder_idx = location.folder_index.get();
+        let methods = folder_method_names(location.folder.folder());
+        let encrypted = folder_is_encrypted(location.folder.folder());
         let size = Some(location.stream.range.end - location.stream.range.start);
-        let is_first_in_folder = first_entry_for_folder
-            .get_mut(folder_idx)
-            .ok_or(R7zError::Parse)?;
-        let packed_size = is_first_in_folder.then_some(location.packed_size);
-        *is_first_in_folder = false;
+        let packed_size = location
+            .stream_index
+            .is_first()
+            .then(|| location.folder.packed_size());
         let crc = location.stream.digest;
 
         Ok(ArchiveListingEntry {
@@ -1343,27 +1299,17 @@ impl Archive {
         &self,
         file_index: usize,
     ) -> Result<Option<(usize, usize)>, R7zError> {
-        let fi = self.header.files_info();
-        let has_stream = |index| {
-            fi.is_none_or(|files| {
-                has_data_stream_flags(
-                    files.is_empty_stream(index),
-                    files.is_directory(index),
-                    files.is_anti(index),
-                )
-            })
-        };
-        if !has_stream(file_index) {
-            return Ok(None);
-        }
-        let mut remaining = (0..file_index).filter(|&index| has_stream(index)).count();
-        let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
-        for (index, folder) in FolderLayouts::for_streams(streams)?.enumerate() {
-            let count = folder?.stream_count();
-            if remaining < count {
-                return Ok(Some((index, remaining)));
+        let mut files = FileStreams::new(
+            self.try_files_info()?,
+            self.num_files(),
+            self.try_streams_info()?,
+        )?;
+        while let Some(file) = files.next()? {
+            if file.index == file_index {
+                return Ok(file
+                    .location
+                    .map(|location| (location.folder_index.get(), location.stream_index.get())));
             }
-            remaining -= count;
         }
         Ok(None)
     }
@@ -1522,112 +1468,43 @@ impl<'a> PackedSource<'a> {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one stack-resident folder cursor avoids a per-folder allocation"
-)]
-enum FolderReadState<'a> {
-    Pending(FolderLayout<'a>),
-    Active(ActiveFolder<'a, 'a>),
-}
-
-struct FolderVisit<'a> {
-    state: FolderReadState<'a>,
-    assigned: usize,
-    total: usize,
-}
-
-impl FolderVisit<'_> {
-    fn finish(self, mode: CompletionMode) -> Result<(), R7zError> {
-        if let FolderReadState::Active(active) = self.state {
-            let _completion = active.finish(mode)?;
-        }
-        Ok(())
-    }
-}
-
-/// Associates file entries with the shared folder list while opening only selected folders.
-struct FolderSession<'a> {
-    folders: FolderLayouts<'a>,
+/// Keeps the active decoder for mapped entries selected by the caller.
+struct FolderDecoder<'a> {
     source: PackedSource<'a>,
-    current: Option<FolderVisit<'a>>,
-    max_streams: usize,
+    current: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
     mode: CompletionMode,
 }
 
-impl<'a> FolderSession<'a> {
-    fn new(
-        source: &'a ArchiveSource,
-        base_offset: u64,
-        streams: &'a StreamInfo,
-        max_streams: usize,
-        mode: CompletionMode,
-    ) -> Result<Self, R7zError> {
-        let folders = FolderLayouts::for_streams(streams)?;
-        let source = PackedSource::new(source, base_offset, folders.pack_pos())?;
-        Ok(Self {
-            folders,
-            source,
-            current: None,
-            max_streams,
-            mode,
-        })
-    }
-
-    fn next_folder(&mut self) -> Result<FolderVisit<'a>, R7zError> {
-        for folder in self.folders.by_ref() {
-            let folder = folder?;
-            let total = folder.stream_count();
-            if total > self.max_streams {
-                return Err(R7zError::Parse);
-            }
-            if total != 0 {
-                return Ok(FolderVisit {
-                    state: FolderReadState::Pending(folder),
-                    assigned: 0,
-                    total,
-                });
-            }
-        }
-        Err(R7zError::Parse)
-    }
-
-    fn visit(
+impl<'a> FolderDecoder<'a> {
+    fn read(
         mut self,
-        entry: Option<&ArchiveEntryInfo>,
+        location: StreamLocation<'_, 'a>,
+        entry: &ArchiveEntryInfo,
         password: Option<&str>,
         callback: &mut impl FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<Self, R7zError> {
-        let mut visit = match self.current.take() {
-            Some(visit) if visit.assigned < visit.total => visit,
+        let active = match self.current.take() {
+            Some((index, active)) if index == location.folder_index => active,
             previous => {
-                if let Some(previous) = previous {
-                    previous.finish(self.mode)?;
+                if let Some((_, previous)) = previous {
+                    let _completion = previous.finish(self.mode)?;
                 }
-                self.next_folder()?
+                location
+                    .folder
+                    .bind(|stream| self.source.reader(&stream))?
+                    .start(password)?
             }
         };
-        if let Some(entry) = entry {
-            let active = match visit.state {
-                FolderReadState::Pending(folder) => folder
-                    .bind(|stream| self.source.reader(&stream))?
-                    .start(password)?,
-                FolderReadState::Active(active) => active,
-            };
-            visit.state = FolderReadState::Active(
-                active
-                    .skip_to(visit.assigned)?
-                    .read_stream(|reader| callback(entry, reader))?,
-            );
-        }
-        visit.assigned += 1;
-        self.current = Some(visit);
+        let active = active
+            .skip_to(location.stream_index.get())?
+            .read_stream(|reader| callback(entry, reader))?;
+        self.current = Some((location.folder_index, active));
         Ok(self)
     }
 
     fn finish(self) -> Result<(), R7zError> {
-        if let Some(visit) = self.current {
-            visit.finish(self.mode)?;
+        if let Some((_, active)) = self.current {
+            let _completion = active.finish(self.mode)?;
         }
         Ok(())
     }
@@ -1950,81 +1827,6 @@ fn has_windows_prefix(name: &str) -> bool {
         || name.starts_with("\\\\")
 }
 
-/// Map a `FilesInfo` index to a data-stream index (skipping empty-stream entries).
-fn has_data_stream_flags(is_empty_stream: bool, is_directory: bool, is_anti: bool) -> bool {
-    !is_empty_stream && !is_directory && !is_anti
-}
-
-fn count_data_streams(files_info: Option<&FilesInfo>, num_files: usize) -> usize {
-    files_info.map_or(num_files, |files| {
-        (0..num_files)
-            .filter(|&index| {
-                has_data_stream_flags(
-                    files.is_empty_stream(index),
-                    files.is_directory(index),
-                    files.is_anti(index),
-                )
-            })
-            .count()
-    })
-}
-
-struct FolderStreamCursor<'a> {
-    folders: std::iter::Enumerate<FolderLayouts<'a>>,
-    current: Option<(
-        usize,
-        FolderLayout<'a>,
-        crate::folder_decode::Substreams<'a>,
-    )>,
-    max_streams: usize,
-    inherit_crc: bool,
-}
-
-struct FolderStreamLocation<'a> {
-    folder_idx: usize,
-    folder: &'a crate::Folder,
-    stream: crate::folder_decode::Substream,
-    packed_size: u64,
-}
-
-impl<'a> FolderStreamCursor<'a> {
-    fn new(streams: &'a StreamInfo, max_streams: usize) -> Result<Self, R7zError> {
-        Ok(Self {
-            folders: FolderLayouts::for_streams(streams)?.enumerate(),
-            current: None,
-            max_streams,
-            inherit_crc: streams.substream_info.is_none(),
-        })
-    }
-
-    fn next(&mut self) -> Result<FolderStreamLocation<'_>, R7zError> {
-        while self
-            .current
-            .as_ref()
-            .is_none_or(|(_, _, streams)| streams.len() == 0)
-        {
-            let (index, folder) = self.folders.next().ok_or(R7zError::Parse)?;
-            let folder = folder?;
-            if folder.stream_count() > self.max_streams {
-                return Err(R7zError::Parse);
-            }
-            let streams = folder.substreams();
-            self.current = Some((index, folder, streams));
-        }
-        let (index, folder, streams) = self.current.as_mut().ok_or(R7zError::Parse)?;
-        let mut stream = streams.next().ok_or(R7zError::Parse)?;
-        if self.inherit_crc {
-            stream.digest = folder.crc();
-        }
-        Ok(FolderStreamLocation {
-            folder_idx: *index,
-            folder: folder.folder(),
-            stream,
-            packed_size: folder.packed_size(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod selected_stream_tests {
     use super::*;
@@ -2290,6 +2092,11 @@ mod selected_stream_tests {
             .unwrap();
 
         assert_eq!(seen, [(0, Vec::new()), (1, b"payload".to_vec())]);
+        let listing = archive.listing(None).unwrap();
+        assert_eq!(listing.entries[0].block, None);
+        assert_eq!(listing.entries[1].block, Some(0));
+        assert_eq!(listing.entries[1].size, Some(7));
+        assert_eq!(listing.entries[1].packed_size, Some(7));
     }
 
     #[test]
@@ -2350,10 +2157,10 @@ mod selected_stream_tests {
     }
 
     #[test]
-    fn folder_cursor_rejects_untrusted_substream_counts_before_allocation() {
+    fn file_stream_mapping_rejects_unmatched_file_count_before_traversal() {
         let archive = Archive::from_bytes(three_file_archive().into()).unwrap();
-        let cursor = FolderStreamCursor::new(archive.streams_info().unwrap(), 0);
-        assert!(matches!(cursor.unwrap().next(), Err(R7zError::Parse)));
+        let cursor = FileStreams::new(archive.files_info(), 0, archive.streams_info());
+        assert!(matches!(cursor, Err(R7zError::Parse)));
     }
 
     #[test]

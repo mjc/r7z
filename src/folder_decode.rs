@@ -291,12 +291,9 @@ impl<'a> FolderLayout<'a> {
         self.layout.streams()
     }
 
-    pub(crate) fn stream_count(&self) -> usize {
-        self.layout.len()
-    }
-
+    /// Bind a decoder while retaining the immutable layout for file traversal.
     pub(crate) fn bind<R>(
-        self,
+        &self,
         mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
     ) -> Result<ReadyFolder<'a, R>, R7zError> {
         let plan = codec::DecoderPlan::compile(
@@ -590,20 +587,23 @@ impl<'a> FolderPlans<'a> {
             .stream_digest_base
             .checked_add(stream_count)
             .ok_or(R7zError::Parse)?;
-        let stream_digests = self
-            .substream_info
-            .filter(|info| !info.digests.is_empty())
-            .map(|info| {
-                info.digests
-                    .get(self.stream_digest_base..stream_digest_end)
-                    .ok_or(R7zError::Parse)
-            })
-            .transpose()?;
+        let stream_digests = match self.substream_info {
+            Some(info) if !info.digests.is_empty() => info
+                .digests
+                .get(self.stream_digest_base..stream_digest_end)
+                .ok_or(R7zError::Parse),
+            Some(_) => Ok(&[][..]),
+            None => Ok(self
+                .unpack_info
+                .digests
+                .get(self.folder_index..self.folder_index + 1)
+                .unwrap_or_default()),
+        }?;
         let layout = FolderStreamLayout::new(
             unpack_size,
             stream_count,
             explicit_stream_sizes,
-            stream_digests.unwrap_or_default(),
+            stream_digests,
         )?;
 
         let pack_offset = pack_sizes
@@ -909,6 +909,22 @@ mod tests {
             0x08, 0x00, 0x00, // one substream
         ]);
         crate::StreamInfo::parse(&bytes, &bytes).unwrap().1
+    }
+
+    #[test]
+    fn implicit_substream_inherits_folder_crc_in_the_layout() {
+        let mut streams = copy_streams();
+        let digest = crc32fast::hash(b"abc");
+        streams.unpack_info.as_mut().unwrap().digests = smallvec::smallvec![Some(digest)];
+        streams.substream_info = None;
+        let folder = FolderLayouts::for_streams(&streams)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let stream = folder.substreams().next().unwrap();
+        assert_eq!(stream.range, 0..3);
+        assert_eq!(stream.digest, Some(digest));
     }
 
     #[test]

@@ -66,6 +66,7 @@ mod codec;
 mod coder_info;
 mod delta;
 mod error;
+mod file_streams;
 mod files_info;
 mod folder;
 mod folder_decode;
