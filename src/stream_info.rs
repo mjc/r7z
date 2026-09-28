@@ -5,6 +5,7 @@ use crate::parsers::{bitmap_is_set, scan_digests};
 use crate::{Folder, PackInfo, Property, R7zError, UnpackInfo, sevenzip_varuint64_decode};
 use bytes::Bytes;
 use nom::{IResult, number::complete::le_u8};
+use smallvec::SmallVec;
 use std::ops::Range;
 
 // Keep a single substream digest table within the default 64 MiB metadata budget.
@@ -32,7 +33,7 @@ enum FolderStreamLayout<'a> {
 
 pub(crate) struct PackedFolder<'a> {
     pub(crate) folder: Folder,
-    pub(crate) streams: Vec<PackedStream>,
+    pub(crate) streams: SmallVec<[PackedStream; 1]>,
     pub(crate) coder_sizes: &'a [u64],
     pub(crate) unpack_size: u64,
     pub(crate) decoded_len: usize,
@@ -224,7 +225,7 @@ impl<'a> PackedFolders<'a> {
             }
         };
 
-        let mut streams = Vec::with_capacity(pack_sizes.len());
+        let mut streams = SmallVec::with_capacity(pack_sizes.len());
         for (index, &size) in pack_sizes.iter().enumerate() {
             let end = self.pack_offset.checked_add(size).ok_or(R7zError::Parse)?;
             streams.push(PackedStream {
@@ -857,7 +858,7 @@ mod tests {
                 bind_pairs: Default::default(),
                 packed_indices: Default::default(),
             },
-            streams: Vec::new(),
+            streams: Default::default(),
             coder_sizes: &[],
             unpack_size: decoded_len as u64,
             decoded_len,
