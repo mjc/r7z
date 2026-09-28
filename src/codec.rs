@@ -267,7 +267,7 @@ impl FolderReader<'_> {
     }
 }
 
-fn prepare_folder_decoder<R>(
+fn prepare_folder_decoder<R: Read>(
     folder: &Folder,
     packed_streams: SmallVec<[PackedInput<R>; 4]>,
     unpack_size: u64,

@@ -292,7 +292,7 @@ impl<'a> FolderLayout<'a> {
     }
 
     /// Bind a decoder while retaining the immutable layout for file traversal.
-    pub(crate) fn bind<R>(
+    pub(crate) fn bind<R: Read>(
         &self,
         mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
     ) -> Result<ReadyFolder<'a, R>, R7zError> {

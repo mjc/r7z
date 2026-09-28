@@ -2,9 +2,10 @@ use super::*;
 use crate::folder::FolderGraph;
 
 /// An executable topology with parsed codec properties and admitted memory usage.
-pub(crate) struct DecoderPlan {
+pub(crate) struct DecoderPlan<'a> {
     topology: Topology,
     memory: WorkingSet,
+    inputs: PackedLayout<'a>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,13 +43,13 @@ enum Topology {
         main: CoderPlan,
         call: Option<CoderPlan>,
         jump: Option<CoderPlan>,
-        order: [usize; 4],
+        slots: Bcj2Slots,
         output_size: usize,
     },
 }
 
 pub(crate) struct ReadyDecoder<R> {
-    topology: BoundTopology<R>,
+    topology: BoundTopology<std::io::Take<R>>,
     memory: WorkingSet,
 }
 
@@ -71,13 +72,70 @@ struct BoundInput<R> {
     coder: Option<CoderPlan>,
 }
 
-impl DecoderPlan {
+/// An ordinal in the folder's packed-input list, independent of coder indexes.
+#[derive(Clone, Copy)]
+struct PackedInputSlot(usize);
+
+struct Bcj2Slots {
+    main: PackedInputSlot,
+    call: PackedInputSlot,
+    jump: PackedInputSlot,
+    control: PackedInputSlot,
+}
+
+struct PackedLayout<'a> {
+    sizes: &'a [u64],
+}
+
+/// Readers checked against the planned list and bounded to its byte lengths.
+struct BoundInputs<R>(SmallVec<[Option<std::io::Take<R>>; 4]>);
+
+impl PackedLayout<'_> {
+    fn size(&self, slot: PackedInputSlot) -> Result<usize, R7zError> {
+        usize::try_from(*self.sizes.get(slot.0).ok_or(R7zError::InvalidFolderGraph)?)
+            .map_err(|_| R7zError::Parse)
+    }
+
+    fn bind<R: Read>(
+        self,
+        inputs: SmallVec<[PackedInput<R>; 4]>,
+    ) -> Result<BoundInputs<R>, R7zError> {
+        if inputs.len() != self.sizes.len() {
+            return Err(R7zError::InvalidFolderGraph);
+        }
+        if inputs
+            .iter()
+            .zip(self.sizes)
+            .any(|(input, &size)| input.size as u64 != size)
+        {
+            return Err(R7zError::Parse);
+        }
+        Ok(BoundInputs(
+            inputs
+                .into_iter()
+                .zip(self.sizes)
+                .map(|(input, &size)| Some(input.reader.take(size)))
+                .collect(),
+        ))
+    }
+}
+
+impl<R> BoundInputs<R> {
+    fn take(&mut self, slot: PackedInputSlot) -> Result<std::io::Take<R>, R7zError> {
+        self.0
+            .get_mut(slot.0)
+            .and_then(Option::take)
+            .ok_or(R7zError::InvalidFolderGraph)
+    }
+}
+
+impl<'a> DecoderPlan<'a> {
     pub(crate) fn compile(
         folder: &Folder,
         graph: &FolderGraph,
         unpack_size: u64,
         sizes: &[u64],
-        packed_sizes: &[u64],
+        packed_sizes: &'a [u64],
     ) -> Result<Self, R7zError> {
         validate_folder_coder_count(folder)?;
         if graph.packed_stream_count() != packed_sizes.len()
@@ -85,11 +143,15 @@ impl DecoderPlan {
         {
             return Err(R7zError::InvalidFolderGraph);
         }
+        let inputs = PackedLayout {
+            sizes: packed_sizes,
+        };
         match DecoderTopology::from_folder(folder)? {
             DecoderTopology::Chain => {
-                let packed_size =
-                    usize::try_from(*packed_sizes.first().ok_or(R7zError::InvalidFolderGraph)?)
-                        .map_err(|_| R7zError::Parse)?;
+                let [_] = packed_sizes else {
+                    return Err(R7zError::InvalidFolderGraph);
+                };
+                let packed_size = inputs.size(PackedInputSlot(0))?;
                 let steps = graph
                     .execution_order()
                     .map(|index| {
@@ -112,11 +174,12 @@ impl DecoderPlan {
                 Ok(Self {
                     topology: Topology::Chain(steps),
                     memory,
+                    inputs,
                 })
             }
             DecoderTopology::Bcj2 => {
                 let output_size = bcj2_output_size(unpack_size)?;
-                let (main, call, jump, order) = match (
+                let (main, call, jump, slots) = match (
                     folder.coders.as_slice(),
                     folder.packed_indices.as_slice(),
                     folder.bind_pairs.as_slice(),
@@ -137,7 +200,17 @@ impl DecoderPlan {
                         if declared != unpack_size {
                             return Err(R7zError::Decompression);
                         }
-                        ((main, *main_size), None, None, [0, 1, 2, 3])
+                        (
+                            (main, *main_size),
+                            None,
+                            None,
+                            Bcj2Slots {
+                                main: PackedInputSlot(0),
+                                call: PackedInputSlot(1),
+                                jump: PackedInputSlot(2),
+                                control: PackedInputSlot(3),
+                            },
+                        )
                     }
                     (
                         [jump, call, main, _],
@@ -149,7 +222,12 @@ impl DecoderPlan {
                         (main, *main_size),
                         Some((call, *call_size)),
                         Some((jump, *jump_size)),
-                        [0, 2, 3, 1],
+                        Bcj2Slots {
+                            main: PackedInputSlot(0),
+                            call: PackedInputSlot(2),
+                            jump: PackedInputSlot(3),
+                            control: PackedInputSlot(1),
+                        },
                     ),
                     _ => return Err(R7zError::Parse),
                 };
@@ -161,22 +239,14 @@ impl DecoderPlan {
                     .map(|(coder, size)| CoderPlan::compile(coder, size))
                     .transpose()?;
                 let memory = [
-                    (Some(&main), order[0]),
-                    (call.as_ref(), order[1]),
-                    (jump.as_ref(), order[2]),
+                    (Some(&main), slots.main),
+                    (call.as_ref(), slots.call),
+                    (jump.as_ref(), slots.jump),
                 ]
                 .into_iter()
                 .try_fold(WorkingSet::default(), |total, (coder, index)| {
                     let memory = coder
-                        .map(|coder| {
-                            let packed = usize::try_from(
-                                *packed_sizes
-                                    .get(index)
-                                    .ok_or(R7zError::InvalidFolderGraph)?,
-                            )
-                            .map_err(|_| R7zError::Parse)?;
-                            coder.working_set(packed)
-                        })
+                        .map(|coder| coder.working_set(inputs.size(index)?))
                         .transpose()?
                         .unwrap_or_default();
                     total.add(memory)
@@ -187,64 +257,48 @@ impl DecoderPlan {
                         main,
                         call,
                         jump,
-                        order,
+                        slots,
                         output_size,
                     },
                     memory,
+                    inputs,
                 })
             }
         }
     }
 
-    pub(crate) fn bind<R>(
+    pub(crate) fn bind<R: Read>(
         self,
         inputs: SmallVec<[PackedInput<R>; 4]>,
     ) -> Result<ReadyDecoder<R>, R7zError> {
-        let mut inputs = inputs
-            .into_iter()
-            .map(|input| Some(input.reader))
-            .collect::<SmallVec<[_; 4]>>();
+        let mut inputs = self.inputs.bind(inputs)?;
         let bound = match self.topology {
-            Topology::Chain(steps) => match inputs.as_mut_slice() {
-                [input] => BoundTopology::Chain {
-                    steps,
-                    input: input.take().ok_or(R7zError::InvalidFolderGraph)?,
-                },
-                _ => return Err(R7zError::InvalidFolderGraph),
+            Topology::Chain(steps) => BoundTopology::Chain {
+                steps,
+                input: inputs.take(PackedInputSlot(0))?,
             },
             Topology::Bcj2 {
                 main,
                 call,
                 jump,
-                order,
+                slots,
                 output_size,
-            } => {
-                if inputs.len() != 4 {
-                    return Err(R7zError::InvalidFolderGraph);
-                }
-                let mut take = |index| {
-                    inputs
-                        .get_mut(index)
-                        .and_then(Option::take)
-                        .ok_or(R7zError::InvalidFolderGraph)
-                };
-                BoundTopology::Bcj2 {
-                    main: BoundInput {
-                        input: take(order[0])?,
-                        coder: Some(main),
-                    },
-                    call: BoundInput {
-                        input: take(order[1])?,
-                        coder: call,
-                    },
-                    jump: BoundInput {
-                        input: take(order[2])?,
-                        coder: jump,
-                    },
-                    control: take(order[3])?,
-                    output_size,
-                }
-            }
+            } => BoundTopology::Bcj2 {
+                main: BoundInput {
+                    input: inputs.take(slots.main)?,
+                    coder: Some(main),
+                },
+                call: BoundInput {
+                    input: inputs.take(slots.call)?,
+                    coder: call,
+                },
+                jump: BoundInput {
+                    input: inputs.take(slots.jump)?,
+                    coder: jump,
+                },
+                control: inputs.take(slots.control)?,
+                output_size,
+            },
         };
         Ok(ReadyDecoder {
             topology: bound,
@@ -490,6 +544,134 @@ impl LzmaProperties {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Unreadable(usize);
+
+    impl Read for Unreadable {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("binding must not read input {}", self.0);
+        }
+    }
+
+    #[test]
+    fn binding_rejects_counts_and_sizes_before_reading() {
+        let folder = Folder::parse(&[1, 1, 0]).unwrap().1;
+        let graph = folder.graph().unwrap();
+        for sizes in [&[][..], &[3, 3][..], &[2][..], &[4][..]] {
+            let plan = DecoderPlan::compile(&folder, &graph, 3, &[3], &[3]).unwrap();
+            let inputs = sizes
+                .iter()
+                .enumerate()
+                .map(|(index, &size)| PackedInput {
+                    reader: Unreadable(index),
+                    size,
+                })
+                .collect();
+            let result = plan.bind(inputs);
+            match sizes.len() {
+                1 => assert!(matches!(result, Err(R7zError::Parse))),
+                _ => assert!(matches!(result, Err(R7zError::InvalidFolderGraph))),
+            }
+        }
+    }
+
+    #[test]
+    fn binding_bounds_readers_to_the_admitted_bytes() {
+        let folder = Folder::parse(&[1, 1, 0]).unwrap().1;
+        let graph = folder.graph().unwrap();
+        let plan = DecoderPlan::compile(&folder, &graph, 3, &[3], &[3]).unwrap();
+        let mut input = Cursor::new(b"abcEXTRA");
+        let output = plan
+            .bind(smallvec::smallvec![PackedInput {
+                reader: &mut input,
+                size: 3
+            }])
+            .unwrap()
+            .materialize(None)
+            .unwrap();
+        assert_eq!(output, b"abc");
+        assert_eq!(input.position(), 3);
+
+        let plan = DecoderPlan::compile(&folder, &graph, 0, &[0], &[0]).unwrap();
+        let output = plan
+            .bind(smallvec::smallvec![PackedInput {
+                reader: Unreadable(0),
+                size: 0
+            }])
+            .unwrap()
+            .materialize(None)
+            .unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn bcj2_binding_preserves_named_slots_and_checks_every_size() {
+        let copy = || coder(&[1, 0]);
+        let bcj2 = || coder(&[0x14, 3, 3, 1, 0x1b, 4, 1]);
+        let layouts = [
+            (
+                Folder {
+                    coders: smallvec::smallvec![copy(), bcj2()],
+                    packed_indices: smallvec::smallvec![0, 2, 3, 4],
+                    bind_pairs: smallvec::smallvec![(1, 0)],
+                },
+                vec![1, 5],
+                [1, 4, 0, 5],
+                [0, 1, 2, 3],
+            ),
+            (
+                Folder {
+                    coders: smallvec::smallvec![copy(), copy(), copy(), bcj2()],
+                    packed_indices: smallvec::smallvec![2, 6, 1, 0],
+                    bind_pairs: smallvec::smallvec![(5, 0), (4, 1), (3, 2)],
+                },
+                vec![0, 4, 1, 5],
+                [1, 5, 4, 0],
+                [0, 2, 3, 1],
+            ),
+        ];
+        for (folder, outputs, packed, expected) in layouts {
+            let graph = folder.graph().unwrap();
+            let inputs = |bad_slot| {
+                packed
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &size)| PackedInput {
+                        reader: Unreadable(index),
+                        size: size as usize + usize::from(bad_slot == Some(index)),
+                    })
+                    .collect()
+            };
+            for slot in 0..4 {
+                let plan = DecoderPlan::compile(&folder, &graph, 5, &outputs, &packed).unwrap();
+                assert!(matches!(
+                    plan.bind(inputs(Some(slot))),
+                    Err(R7zError::Parse)
+                ));
+            }
+            let plan = DecoderPlan::compile(&folder, &graph, 5, &outputs, &packed).unwrap();
+            let ready = plan.bind(inputs(None)).unwrap();
+            let BoundTopology::Bcj2 {
+                main,
+                call,
+                jump,
+                control,
+                ..
+            } = ready.topology
+            else {
+                panic!("BCJ2 plan must bind BCJ2 channels");
+            };
+            assert_eq!(
+                [
+                    main.input.get_ref().0,
+                    call.input.get_ref().0,
+                    jump.input.get_ref().0,
+                    control.get_ref().0
+                ],
+                expected
+            );
+        }
+    }
 
     fn coder(bytes: &[u8]) -> crate::CoderInfo {
         crate::CoderInfo::parse(bytes).unwrap().1
