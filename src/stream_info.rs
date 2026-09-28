@@ -360,13 +360,43 @@ impl StreamInfo {
         }
     }
 
-    pub(crate) fn checked_packed_folders(&self) -> Result<PackedFolders<'_>, R7zError> {
+    pub(crate) fn checked_packed_folders(
+        &self,
+        metadata_limit: u64,
+    ) -> Result<PackedFolders<'_>, R7zError> {
         let (pack, unpack) = self.packed_folders()?;
-        let stream_count = (0..unpack.num_folders_usize()).try_fold(0usize, |count, index| {
-            let (_, graph) = unpack.parse_folder_with_graph(index)?;
-            let folder_count = graph.packed_stream_count();
-            count.checked_add(folder_count).ok_or(R7zError::Parse)
+        let packed_bytes = pack.pack_size.iter().try_fold(0u64, |total, &size| {
+            total.checked_add(size).ok_or(R7zError::Parse)
         })?;
+        if packed_bytes > metadata_limit {
+            return Err(R7zError::LimitExceeded("metadata"));
+        }
+        let (stream_count, _, _) = (0..unpack.num_folders_usize()).try_fold(
+            (0usize, 0usize, 0u64),
+            |(stream_count, output_base, output_size), index| {
+                let (folder, graph) = unpack.parse_folder_with_graph(index)?;
+                let stream_count = stream_count
+                    .checked_add(graph.packed_stream_count())
+                    .ok_or(R7zError::Parse)?;
+                let output_end = output_base
+                    .checked_add(folder.total_out_streams())
+                    .ok_or(R7zError::Parse)?;
+                let coder_sizes = unpack
+                    .unpack_sizes
+                    .get(output_base..output_end)
+                    .ok_or(R7zError::Parse)?;
+                let unpack_size = *coder_sizes
+                    .get(graph.final_output().get())
+                    .ok_or(R7zError::Parse)?;
+                let output_size = output_size
+                    .checked_add(unpack_size)
+                    .ok_or(R7zError::Parse)?;
+                if output_size > metadata_limit {
+                    return Err(R7zError::LimitExceeded("metadata"));
+                }
+                Ok::<_, R7zError>((stream_count, output_end, output_size))
+            },
+        )?;
         match stream_count == pack.pack_size.len() {
             true => Ok(PackedFolders {
                 pack_info: pack,

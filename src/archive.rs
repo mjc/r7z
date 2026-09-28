@@ -1,4 +1,5 @@
 use crate::headers::{HeaderResolution, NextHeader};
+use crate::stream_info::PackedFolder;
 use crate::{
     EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
     codec, find_next_property_id,
@@ -1892,65 +1893,66 @@ fn decode_additional_folder_data(
     metadata_limit: u64,
     password: Option<&str>,
 ) -> Result<Vec<Bytes>, R7zError> {
-    let folders = streams.checked_packed_folders()?;
+    let folders = streams.checked_packed_folders(metadata_limit)?;
     let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, folders.pack_pos())?;
     let mut output = reserve_decoded_folder_slots(folders.len(), metadata_limit)?;
-    let mut output_size = 0u64;
-
     for folder in folders {
-        let folder = folder?;
-        let mut packed_streams = Vec::with_capacity(folder.streams.len());
-        for stream in folder.streams {
-            if stream.range.end > metadata_limit {
-                return Err(R7zError::LimitExceeded("metadata"));
-            }
-            let start = checked_add_u64(data_start, stream.range.start)?;
-            let size = stream.range.end - stream.range.start;
-            let range = checked_range_u64(source.len()?, start, size)?;
-            if let Some(expected) = stream.crc {
-                verify_source_crc(source, range.clone(), expected)?;
-            }
-            packed_streams.push(source.read_range_to_vec(range, metadata_limit)?);
-        }
-
-        let next_output_len = output_size
-            .checked_add(folder.unpack_size)
-            .ok_or(R7zError::Parse)?;
-        if next_output_len > metadata_limit {
-            return Err(R7zError::LimitExceeded("metadata"));
-        }
-        let mut reader = codec::folder_reader_with_pack_streams(
-            &folder.folder,
-            packed_streams,
-            folder.unpack_size,
-            folder.coder_sizes,
+        output.push(decode_additional_folder(
+            source,
+            data_start,
+            folder?,
+            metadata_limit,
             password,
-        )?;
-        let read_limit = usize::try_from(folder.unpack_size)
-            .map_err(|_| R7zError::LimitExceeded("metadata"))?
-            .checked_add(1)
-            .ok_or(R7zError::LimitExceeded("metadata"))?;
-        let mut folder_output = Vec::with_capacity(read_limit.min(64 * 1024));
-        reader
-            .by_ref()
-            .take(u64::try_from(read_limit).map_err(|_| R7zError::Parse)?)
-            .read_to_end(&mut folder_output)
-            .map_err(R7zError::Io)?;
-        if folder_output.len()
-            != usize::try_from(folder.unpack_size).map_err(|_| R7zError::Parse)?
-        {
-            return Err(R7zError::Decompression);
-        }
-        if let Some(expected) = folder.crc {
-            if crc32fast::hash(&folder_output) != expected {
-                return Err(R7zError::Crc);
-            }
-        }
-        output.push(Bytes::from(folder_output));
-        output_size = next_output_len;
+        )?);
     }
 
     Ok(output)
+}
+
+fn decode_additional_folder(
+    source: &ArchiveSource,
+    data_start: u64,
+    folder: PackedFolder<'_>,
+    metadata_limit: u64,
+    password: Option<&str>,
+) -> Result<Bytes, R7zError> {
+    let mut packed_streams = Vec::with_capacity(folder.streams.len());
+    for stream in folder.streams {
+        let start = checked_add_u64(data_start, stream.range.start)?;
+        let size = stream.range.end - stream.range.start;
+        let range = checked_range_u64(source.len()?, start, size)?;
+        if let Some(expected) = stream.crc {
+            verify_source_crc(source, range.clone(), expected)?;
+        }
+        packed_streams.push(source.read_range_to_vec(range, metadata_limit)?);
+    }
+
+    let mut reader = codec::folder_reader_with_pack_streams(
+        &folder.folder,
+        packed_streams,
+        folder.unpack_size,
+        folder.coder_sizes,
+        password,
+    )?;
+    let read_limit = usize::try_from(folder.unpack_size)
+        .map_err(|_| R7zError::LimitExceeded("metadata"))?
+        .checked_add(1)
+        .ok_or(R7zError::LimitExceeded("metadata"))?;
+    let mut folder_output = Vec::with_capacity(read_limit.min(64 * 1024));
+    reader
+        .by_ref()
+        .take(u64::try_from(read_limit).map_err(|_| R7zError::Parse)?)
+        .read_to_end(&mut folder_output)
+        .map_err(R7zError::Io)?;
+    if folder_output.len() != usize::try_from(folder.unpack_size).map_err(|_| R7zError::Parse)? {
+        return Err(R7zError::Decompression);
+    }
+    if let Some(expected) = folder.crc {
+        if crc32fast::hash(&folder_output) != expected {
+            return Err(R7zError::Crc);
+        }
+    }
+    Ok(Bytes::from(folder_output))
 }
 
 fn reserve_decoded_folder_slots(
