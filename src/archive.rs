@@ -1024,40 +1024,19 @@ impl Archive {
                 verify_source_crc(&self.source, range.clone(), *expected_crc)?;
             }
         }
-        let mut reader = if location.packed_ranges.len() == 1 {
-            let packed = self
-                .source
-                .range_reader(location.packed_ranges[0].clone())?;
-            codec::FolderReader::Stream(codec::folder_reader_with_sizes_from_reader(
-                &location.folder,
-                Box::new(packed),
-                location.folder_unpack_size,
-                &location.coder_unpack_sizes,
-                password,
-                usize::try_from(
-                    location.packed_ranges[0]
-                        .end
-                        .checked_sub(location.packed_ranges[0].start)
-                        .ok_or(R7zError::Parse)?,
-                )
-                .map_err(|_| R7zError::Parse)?,
-            )?)
-        } else {
-            ensure_packed_ranges_buffer_limit(&location.packed_ranges)?;
-            let packed_streams = location
-                .packed_ranges
-                .iter()
-                .cloned()
-                .map(|range| self.source.packed_input(range))
-                .collect::<Result<SmallVec<[_; 4]>, _>>()?;
-            codec::folder_reader_with_pack_streams(
-                &location.folder,
-                packed_streams,
-                location.folder_unpack_size,
-                &location.coder_unpack_sizes,
-                password,
-            )?
-        };
+        let packed_streams = location
+            .packed_ranges
+            .iter()
+            .cloned()
+            .map(|range| self.source.packed_input(range))
+            .collect::<Result<SmallVec<[_; 4]>, _>>()?;
+        let mut reader = codec::folder_reader_with_pack_streams(
+            &location.folder,
+            packed_streams,
+            location.folder_unpack_size,
+            &location.coder_unpack_sizes,
+            password,
+        )?;
 
         let mut folder_hasher = location.folder_digest.map(|_| crc32fast::Hasher::new());
         let mut stream_hasher = location.substream_digest.map(|_| crc32fast::Hasher::new());
@@ -1394,9 +1373,6 @@ impl Archive {
             .get(pack_stream_base..pack_stream_end)
             .ok_or(R7zError::Parse)?
             .to_vec();
-        if num_pack_streams > 1 {
-            ensure_packed_folder_buffer_limit(pack_sizes)?;
-        }
         let mut packed_ranges = Vec::with_capacity(num_pack_streams);
         for &pack_size in pack_sizes {
             let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
@@ -1469,9 +1445,6 @@ impl Archive {
             .digests
             .get(pack_stream_base..pack_stream_end)
             .ok_or(R7zError::Parse)?;
-        if num_pack_streams > 1 {
-            ensure_packed_folder_buffer_limit(pack_sizes)?;
-        }
         let mut packed_ranges = Vec::with_capacity(num_pack_streams);
         for (stream_index, &pack_size) in pack_sizes.iter().enumerate() {
             let stream_start = checked_add_u64(data_start, pack_offset_u64)?;
@@ -1487,36 +1460,17 @@ impl Archive {
             folder_total_unpack_size_at(coder_output_base, &folder, unpack_info)?;
         let coder_unpack_sizes =
             folder_coder_unpack_sizes_at(coder_output_base, &folder, unpack_info)?;
-        let reader = if packed_ranges.len() == 1 {
-            let packed = self.source.range_reader(packed_ranges[0].clone())?;
-            codec::FolderReader::Stream(codec::folder_reader_with_sizes_from_reader(
-                &folder,
-                Box::new(packed),
-                folder_unpack_size,
-                &coder_unpack_sizes,
-                password,
-                usize::try_from(
-                    packed_ranges[0]
-                        .end
-                        .checked_sub(packed_ranges[0].start)
-                        .ok_or(R7zError::Parse)?,
-                )
-                .map_err(|_| R7zError::Parse)?,
-            )?)
-        } else {
-            let packed_streams = packed_ranges
-                .iter()
-                .cloned()
-                .map(|range| self.source.packed_input(range))
-                .collect::<Result<SmallVec<[_; 4]>, _>>()?;
-            codec::folder_reader_with_pack_streams(
-                &folder,
-                packed_streams,
-                folder_unpack_size,
-                &coder_unpack_sizes,
-                password,
-            )?
-        };
+        let packed_streams = packed_ranges
+            .into_iter()
+            .map(|range| self.source.packed_input(range))
+            .collect::<Result<SmallVec<[_; 4]>, _>>()?;
+        let reader = codec::folder_reader_with_pack_streams(
+            &folder,
+            packed_streams,
+            folder_unpack_size,
+            &coder_unpack_sizes,
+            password,
+        )?;
         let n_streams = stream_count;
         let mut stream_sizes = Vec::new();
         stream_sizes
@@ -2465,14 +2419,6 @@ fn ensure_packed_folder_buffer_limit(pack_sizes: &[u64]) -> Result<(), R7zError>
     ensure_packed_bytes_limit(packed_bytes)
 }
 
-fn ensure_packed_ranges_buffer_limit(ranges: &[Range<u64>]) -> Result<(), R7zError> {
-    let packed_bytes = ranges.iter().try_fold(0u64, |total, range| {
-        let size = range.end.checked_sub(range.start).ok_or(R7zError::Parse)?;
-        total.checked_add(size).ok_or(R7zError::Parse)
-    })?;
-    ensure_packed_bytes_limit(packed_bytes)
-}
-
 fn ensure_packed_bytes_limit(packed_bytes: u64) -> Result<(), R7zError> {
     let limit =
         u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES).map_err(|_| R7zError::Parse)?;
@@ -3334,20 +3280,10 @@ mod selected_stream_tests {
     }
 
     #[test]
-    fn multi_pack_folder_buffer_budget_is_checked_before_reading_ranges() {
+    fn raw_folder_buffer_budget_is_checked_before_reading() {
         assert!(ensure_packed_folder_buffer_limit(&[256 * 1024 * 1024, 256 * 1024 * 1024]).is_ok());
         assert!(matches!(
             ensure_packed_folder_buffer_limit(&[256 * 1024 * 1024, 256 * 1024 * 1024 + 1]),
-            Err(R7zError::ResourceLimitExceeded {
-                resource: "packed folder buffers",
-                ..
-            })
-        ));
-        assert!(matches!(
-            ensure_packed_ranges_buffer_limit(&[
-                0..256 * 1024 * 1024,
-                256 * 1024 * 1024..512 * 1024 * 1024 + 1,
-            ]),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "packed folder buffers",
                 ..
