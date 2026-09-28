@@ -235,14 +235,18 @@ impl StreamInfo {
     ///
     /// Panics if `num_folders` exceeds `usize::MAX` (impossible in practice).
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], StreamInfo> {
-        Self::parse_with_external(input, backing, None)
+        Self::parse_with_external(input, backing, &[])
     }
 
     /// Parse a stream descriptor with decoded external folder definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the descriptor or a referenced folder definition is malformed.
     pub fn parse_with_external<'a>(
         input: &'a [u8],
         backing: &Bytes,
-        external_data: Option<&'a [Bytes]>,
+        external_data: &[Bytes],
     ) -> IResult<&'a [u8], StreamInfo> {
         let mut pack_info = None;
         let mut unpack_info = None;
@@ -402,12 +406,12 @@ fn scan_substream_info(input: &[u8], num_folders: usize) -> IResult<&[u8], ()> {
 /// Returns a nom error if the input is truncated or malformed.
 #[cfg(test)]
 pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
-    scan_stream_info_with_external(input, None)
+    scan_stream_info_with_external(input, &[])
 }
 
 pub(crate) fn scan_stream_info_with_external<'a>(
     input: &'a [u8],
-    external_data: Option<&[Bytes]>,
+    external_data: &[Bytes],
 ) -> IResult<&'a [u8], ()> {
     let mut num_folders = 0usize;
     let mut input = input;

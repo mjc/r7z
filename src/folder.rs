@@ -1,24 +1,279 @@
-use crate::{CoderInfo, SevenZMethod, method_from_id, sevenzip_varuint64_decode, usize_cap};
+use crate::{CoderInfo, R7zError, method_from_id, sevenzip_varuint64_decode, usize_cap};
 use nom::IResult;
 use smallvec::SmallVec;
 
-const MAX_FOLDER_STREAMS: u64 = 16_384;
+const MAX_FOLDER_STREAMS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct CoderIndex(pub usize);
+pub(crate) struct CoderIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct InputStreamIndex(pub usize);
+pub(crate) struct InputStreamIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct OutputStreamIndex(pub usize);
+pub(crate) struct OutputStreamIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct PackedStreamIndex(pub usize);
+struct PackedStreamIndex(usize);
 
 /// A validated view of a folder's global input/output stream graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FolderGraph {
-    pub execution_order: SmallVec<[CoderIndex; 4]>,
-    pub packed_inputs: SmallVec<[(PackedStreamIndex, InputStreamIndex); 4]>,
-    pub final_output: OutputStreamIndex,
+pub(crate) struct FolderGraph {
+    execution_order: SmallVec<[CoderIndex; 4]>,
+    packed_inputs: SmallVec<[(PackedStreamIndex, InputStreamIndex); 4]>,
+    final_output: OutputStreamIndex,
+}
+
+impl CoderIndex {
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl InputStreamIndex {
+    fn from_raw(raw: u64, total: usize) -> Result<Self, R7zError> {
+        let index = usize::try_from(raw).map_err(|_| R7zError::InvalidFolderGraph)?;
+        (index < total)
+            .then_some(Self(index))
+            .ok_or(R7zError::InvalidFolderGraph)
+    }
+}
+
+impl OutputStreamIndex {
+    fn from_raw(raw: u64, total: usize) -> Result<Self, R7zError> {
+        let index = usize::try_from(raw).map_err(|_| R7zError::InvalidFolderGraph)?;
+        (index < total)
+            .then_some(Self(index))
+            .ok_or(R7zError::InvalidFolderGraph)
+    }
+
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl FolderGraph {
+    pub(crate) fn execution_order(&self) -> impl Iterator<Item = CoderIndex> + '_ {
+        self.execution_order.iter().copied()
+    }
+
+    pub(crate) fn packed_stream_count(&self) -> usize {
+        self.packed_inputs.len()
+    }
+
+    pub(crate) const fn final_output(&self) -> OutputStreamIndex {
+        self.final_output
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StreamArity {
+    inputs: usize,
+    outputs: usize,
+}
+
+impl TryFrom<&CoderInfo> for StreamArity {
+    type Error = R7zError;
+
+    fn try_from(coder: &CoderInfo) -> Result<Self, Self::Error> {
+        let actual = (coder.num_in_streams, coder.num_out_streams);
+        match method_from_id(&coder.codec_id).map(crate::SevenZMethod::stream_arity) {
+            Some(expected) if actual != expected => Err(R7zError::InvalidFolderGraph),
+            _ => {
+                let inputs = usize::try_from(actual.0).map_err(|_| R7zError::InvalidFolderGraph)?;
+                let outputs =
+                    usize::try_from(actual.1).map_err(|_| R7zError::InvalidFolderGraph)?;
+                match (inputs, outputs) {
+                    (1..=MAX_FOLDER_STREAMS, 1..=MAX_FOLDER_STREAMS) => {
+                        Ok(Self { inputs, outputs })
+                    }
+                    _ => Err(R7zError::InvalidFolderGraph),
+                }
+            }
+        }
+    }
+}
+
+struct StreamOwners {
+    inputs: Vec<CoderIndex>,
+    outputs: Vec<CoderIndex>,
+}
+
+impl StreamOwners {
+    fn from_coders(coders: &[CoderInfo]) -> Result<Self, R7zError> {
+        let arities = coders
+            .iter()
+            .map(StreamArity::try_from)
+            .collect::<Result<SmallVec<[_; 4]>, _>>()?;
+        let totals = arities.iter().try_fold((0usize, 0usize), |totals, arity| {
+            let inputs = totals
+                .0
+                .checked_add(arity.inputs)
+                .filter(|&count| count <= MAX_FOLDER_STREAMS)
+                .ok_or(R7zError::InvalidFolderGraph)?;
+            let outputs = totals
+                .1
+                .checked_add(arity.outputs)
+                .filter(|&count| count <= MAX_FOLDER_STREAMS)
+                .ok_or(R7zError::InvalidFolderGraph)?;
+            Ok::<_, R7zError>((inputs, outputs))
+        })?;
+
+        let mut inputs = Vec::with_capacity(totals.0);
+        let mut outputs = Vec::with_capacity(totals.1);
+        for (index, arity) in arities.into_iter().enumerate() {
+            inputs.extend(std::iter::repeat_n(CoderIndex(index), arity.inputs));
+            outputs.extend(std::iter::repeat_n(CoderIndex(index), arity.outputs));
+        }
+        Ok(Self { inputs, outputs })
+    }
+}
+
+struct Bindings {
+    bound_inputs: Vec<bool>,
+    bound_outputs: Vec<bool>,
+    edges: Vec<SmallVec<[CoderIndex; 2]>>,
+    indegree: Vec<usize>,
+}
+
+impl Bindings {
+    fn new(
+        pairs: &[(u64, u64)],
+        owners: &StreamOwners,
+        coder_count: usize,
+    ) -> Result<Self, R7zError> {
+        let expected_pairs = owners
+            .outputs
+            .len()
+            .checked_sub(1)
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        if pairs.len() != expected_pairs {
+            return Err(R7zError::InvalidFolderGraph);
+        }
+
+        let mut bindings = Self {
+            bound_inputs: vec![false; owners.inputs.len()],
+            bound_outputs: vec![false; owners.outputs.len()],
+            edges: vec![SmallVec::new(); coder_count],
+            indegree: vec![0; coder_count],
+        };
+        for &(input, output) in pairs {
+            bindings.bind(input, output, owners)?;
+        }
+        Ok(bindings)
+    }
+
+    fn bind(&mut self, input: u64, output: u64, owners: &StreamOwners) -> Result<(), R7zError> {
+        let input = InputStreamIndex::from_raw(input, owners.inputs.len())?;
+        let output = OutputStreamIndex::from_raw(output, owners.outputs.len())?;
+        let input_bound = self
+            .bound_inputs
+            .get_mut(input.0)
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        let output_bound = self
+            .bound_outputs
+            .get_mut(output.0)
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        if *input_bound || *output_bound {
+            return Err(R7zError::InvalidFolderGraph);
+        }
+
+        let source = *owners
+            .outputs
+            .get(output.0)
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        let target = *owners
+            .inputs
+            .get(input.0)
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        if source == target {
+            return Err(R7zError::InvalidFolderGraph);
+        }
+        *input_bound = true;
+        *output_bound = true;
+        self.edges
+            .get_mut(source.0)
+            .ok_or(R7zError::InvalidFolderGraph)?
+            .push(target);
+        *self
+            .indegree
+            .get_mut(target.0)
+            .ok_or(R7zError::InvalidFolderGraph)? += 1;
+        Ok(())
+    }
+
+    fn final_output(&self) -> Result<OutputStreamIndex, R7zError> {
+        let mut outputs = self
+            .bound_outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &bound)| (!bound).then_some(OutputStreamIndex(index)));
+        match (outputs.next(), outputs.next()) {
+            (Some(output), None) => Ok(output),
+            _ => Err(R7zError::InvalidFolderGraph),
+        }
+    }
+
+    fn packed_inputs(
+        &self,
+        explicit: &[u64],
+    ) -> Result<SmallVec<[(PackedStreamIndex, InputStreamIndex); 4]>, R7zError> {
+        let unbound = self
+            .bound_inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &bound)| (!bound).then_some(InputStreamIndex(index)))
+            .collect::<SmallVec<[_; 4]>>();
+        match explicit {
+            [] => match unbound.as_slice() {
+                [input] => Ok(smallvec::smallvec![(PackedStreamIndex(0), *input)]),
+                _ => Err(R7zError::InvalidFolderGraph),
+            },
+            indices if indices.len() == unbound.len() => {
+                let mut seen = vec![false; self.bound_inputs.len()];
+                indices
+                    .iter()
+                    .enumerate()
+                    .map(|(packed, &raw)| {
+                        let input = InputStreamIndex::from_raw(raw, self.bound_inputs.len())?;
+                        let is_unbound = self.bound_inputs.get(input.0) == Some(&false);
+                        let is_new = seen
+                            .get_mut(input.0)
+                            .map(|seen| !std::mem::replace(seen, true))
+                            .unwrap_or(false);
+                        (is_unbound && is_new)
+                            .then_some((PackedStreamIndex(packed), input))
+                            .ok_or(R7zError::InvalidFolderGraph)
+                    })
+                    .collect()
+            }
+            _ => Err(R7zError::InvalidFolderGraph),
+        }
+    }
+
+    fn execution_order(mut self) -> Result<SmallVec<[CoderIndex; 4]>, R7zError> {
+        let mut ready = self
+            .indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &degree)| (degree == 0).then_some(CoderIndex(index)))
+            .collect::<SmallVec<[_; 4]>>();
+        let mut order = SmallVec::with_capacity(self.indegree.len());
+        while let Some(node) = ready.pop() {
+            order.push(node);
+            for &next in self.edges.get(node.0).ok_or(R7zError::InvalidFolderGraph)? {
+                let degree = self
+                    .indegree
+                    .get_mut(next.0)
+                    .ok_or(R7zError::InvalidFolderGraph)?;
+                *degree = degree.checked_sub(1).ok_or(R7zError::InvalidFolderGraph)?;
+                if *degree == 0 {
+                    ready.push(next);
+                }
+            }
+        }
+        match order.len() == self.indegree.len() {
+            true => Ok(order),
+            false => Err(R7zError::InvalidFolderGraph),
+        }
+    }
 }
 
 /// Validate a single folder's bytes without allocating, returning
@@ -34,7 +289,7 @@ pub struct FolderGraph {
 pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
     let (mut input, num_coders) = sevenzip_varuint64_decode(input)?;
 
-    if num_coders == 0 || num_coders > MAX_FOLDER_STREAMS {
+    if num_coders == 0 || num_coders > MAX_FOLDER_STREAMS as u64 {
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
             nom::error::ErrorKind::TooLarge,
@@ -66,7 +321,7 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
         num_out_total = num_out_total.checked_add(n_out).ok_or_else(|| {
             nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
         })?;
-        if num_in_total > MAX_FOLDER_STREAMS || num_out_total > MAX_FOLDER_STREAMS {
+        if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
             return Err(nom::Err::Failure(nom::error::Error::new(
                 i,
                 nom::error::ErrorKind::TooLarge,
@@ -149,138 +404,17 @@ impl Folder {
             .sum()
     }
 
-    /// Validate coder arities and bind pairs, returning the coder execution graph.
-    pub fn checked_graph(&self) -> Result<FolderGraph, crate::R7zError> {
-        let invalid = || crate::R7zError::InvalidFolderGraph;
-        if self.coders.is_empty() || self.coders.len() > MAX_FOLDER_STREAMS as usize {
-            return Err(invalid());
-        }
-
-        let mut in_bases = Vec::with_capacity(self.coders.len());
-        let mut out_bases = Vec::with_capacity(self.coders.len());
-        let mut total_in = 0usize;
-        let mut total_out = 0usize;
-        for coder in &self.coders {
-            in_bases.push(total_in);
-            out_bases.push(total_out);
-            let expected = match method_from_id(&coder.codec_id) {
-                Some(SevenZMethod::Bcj2) => Some((4, 1)),
-                Some(_) => Some((1, 1)),
-                None => None,
-            };
-            if expected
-                .is_some_and(|(i, o)| coder.num_in_streams != i || coder.num_out_streams != o)
-            {
-                return Err(invalid());
-            }
-            total_in = total_in
-                .checked_add(usize::try_from(coder.num_in_streams).map_err(|_| invalid())?)
-                .filter(|&n| n <= MAX_FOLDER_STREAMS as usize)
-                .ok_or_else(invalid)?;
-            total_out = total_out
-                .checked_add(usize::try_from(coder.num_out_streams).map_err(|_| invalid())?)
-                .filter(|&n| n <= MAX_FOLDER_STREAMS as usize)
-                .ok_or_else(invalid)?;
-        }
-        if total_in == 0 || total_out == 0 || self.bind_pairs.len() != total_out - 1 {
-            return Err(invalid());
-        }
-
-        let mut input_owners = vec![0usize; total_in];
-        let mut output_owners = vec![0usize; total_out];
-        for (coder_idx, coder) in self.coders.iter().enumerate() {
-            let in_start = in_bases[coder_idx];
-            let in_end = in_start + usize::try_from(coder.num_in_streams).map_err(|_| invalid())?;
-            input_owners[in_start..in_end].fill(coder_idx);
-            let out_start = out_bases[coder_idx];
-            let out_end =
-                out_start + usize::try_from(coder.num_out_streams).map_err(|_| invalid())?;
-            output_owners[out_start..out_end].fill(coder_idx);
-        }
-        let mut bound_inputs = vec![false; total_in];
-        let mut bound_outputs = vec![false; total_out];
-        let mut edges = vec![SmallVec::<[usize; 2]>::new(); self.coders.len()];
-        let mut indegree = vec![0usize; self.coders.len()];
-        for &(input, output) in &self.bind_pairs {
-            let input = usize::try_from(input).map_err(|_| invalid())?;
-            let output = usize::try_from(output).map_err(|_| invalid())?;
-            if input >= total_in
-                || output >= total_out
-                || bound_inputs[input]
-                || bound_outputs[output]
-            {
-                return Err(invalid());
-            }
-            bound_inputs[input] = true;
-            bound_outputs[output] = true;
-            let source = output_owners[output];
-            let target = input_owners[input];
-            if source == target {
-                return Err(invalid());
-            }
-            edges[source].push(target);
-            indegree[target] += 1;
-        }
-
-        let finals: SmallVec<[OutputStreamIndex; 2]> = bound_outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, bound)| (!bound).then_some(OutputStreamIndex(i)))
-            .collect();
-        if finals.len() != 1 {
-            return Err(invalid());
-        }
-        let unbound_inputs: SmallVec<[InputStreamIndex; 4]> = bound_inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, bound)| (!bound).then_some(InputStreamIndex(i)))
-            .collect();
-        let explicit = !self.packed_indices.is_empty();
-        let packed_inputs: SmallVec<[(PackedStreamIndex, InputStreamIndex); 4]> = if explicit {
-            if self.packed_indices.len() != unbound_inputs.len() {
-                return Err(invalid());
-            }
-            let mut seen = vec![false; total_in];
-            self.packed_indices
-                .iter()
-                .enumerate()
-                .map(|(packed_idx, &raw)| {
-                    let idx = usize::try_from(raw).map_err(|_| invalid())?;
-                    if idx >= total_in || bound_inputs[idx] || seen[idx] {
-                        return Err(invalid());
-                    }
-                    seen[idx] = true;
-                    Ok((PackedStreamIndex(packed_idx), InputStreamIndex(idx)))
-                })
-                .collect::<Result<_, _>>()?
-        } else {
-            if unbound_inputs.len() != 1 {
-                return Err(invalid());
-            }
-            smallvec::smallvec![(PackedStreamIndex(0), unbound_inputs[0])]
-        };
-
-        let mut ready: SmallVec<[CoderIndex; 4]> = (0..self.coders.len())
-            .filter(|&i| indegree[i] == 0)
-            .map(CoderIndex)
-            .collect();
-        let mut order = SmallVec::with_capacity(self.coders.len());
-        while let Some(CoderIndex(node)) = ready.pop() {
-            order.push(CoderIndex(node));
-            for &next in &edges[node] {
-                indegree[next] -= 1;
-                if indegree[next] == 0 {
-                    ready.push(CoderIndex(next));
-                }
-            }
-        }
-        if order.len() != self.coders.len() {
-            return Err(invalid());
-        }
+    /// Resolve the coder graph into the information required by a decoder.
+    pub(crate) fn graph(&self) -> Result<FolderGraph, R7zError> {
+        let owners = StreamOwners::from_coders(&self.coders)?;
+        let bindings = Bindings::new(&self.bind_pairs, &owners, self.coders.len())?;
+        let final_output = bindings.final_output()?;
+        let packed_inputs = bindings.packed_inputs(&self.packed_indices)?;
+        let execution_order = bindings.execution_order()?;
         Ok(FolderGraph {
-            execution_order: order,
+            execution_order,
             packed_inputs,
-            final_output: finals[0],
+            final_output,
         })
     }
 
@@ -318,7 +452,7 @@ impl Folder {
                     nom::error::ErrorKind::TooLarge,
                 ))
             })?;
-        if num_in_total > MAX_FOLDER_STREAMS || num_out_total > MAX_FOLDER_STREAMS {
+        if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
             return Err(nom::Err::Failure(nom::error::Error::new(
                 input,
                 nom::error::ErrorKind::TooLarge,
@@ -453,8 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_graph_resolves_global_streams_for_both_coder_orders() {
-        let normal = simple_chain(&[(1, 0)]).checked_graph().unwrap();
+    fn graph_resolves_global_streams_for_both_coder_orders() {
+        let normal = simple_chain(&[(1, 0)]).graph().unwrap();
         let normal_order: SmallVec<[CoderIndex; 4]> = smallvec![CoderIndex(0), CoderIndex(1)];
         assert_eq!(normal.execution_order, normal_order);
         let one_packed: SmallVec<[(PackedStreamIndex, InputStreamIndex); 4]> =
@@ -462,32 +596,32 @@ mod tests {
         assert_eq!(normal.packed_inputs, one_packed);
         assert_eq!(normal.final_output, OutputStreamIndex(1));
 
-        let reversed = simple_chain(&[(0, 1)]).checked_graph().unwrap();
+        let reversed = simple_chain(&[(0, 1)]).graph().unwrap();
         let reversed_order: SmallVec<[CoderIndex; 4]> = smallvec![CoderIndex(1), CoderIndex(0)];
         assert_eq!(reversed.execution_order, reversed_order);
         assert_eq!(reversed.final_output, OutputStreamIndex(0));
     }
 
     #[test]
-    fn checked_graph_rejects_cycles_duplicate_connections_and_bad_indices() {
+    fn graph_rejects_cycles_duplicate_connections_and_bad_indices() {
         let mut cycle = Folder {
             coders: smallvec![copy_coder(), copy_coder(), copy_coder()],
             bind_pairs: smallvec![(1, 0), (0, 1)],
             packed_indices: SmallVec::new(),
         };
-        assert!(cycle.checked_graph().is_err());
+        assert!(cycle.graph().is_err());
 
         cycle.bind_pairs = smallvec![(0, 0), (0, 1)];
         cycle.packed_indices = smallvec![1, 2];
-        assert!(cycle.checked_graph().is_err());
+        assert!(cycle.graph().is_err());
 
         let mut bad_index = simple_chain(&[(1, 0)]);
         bad_index.bind_pairs[0] = (1, 2);
-        assert!(bad_index.checked_graph().is_err());
+        assert!(bad_index.graph().is_err());
     }
 
     #[test]
-    fn checked_graph_checks_known_coder_arities() {
+    fn graph_checks_known_coder_arities() {
         let mut bcj2 = copy_coder();
         bcj2.codec_id = ArrayVec::from_iter(SevenZMethod::Bcj2.id().iter().copied());
         bcj2.num_in_streams = 1;
@@ -497,6 +631,6 @@ mod tests {
             bind_pairs: SmallVec::new(),
             packed_indices: SmallVec::new(),
         };
-        assert!(folder.checked_graph().is_err());
+        assert!(folder.graph().is_err());
     }
 }

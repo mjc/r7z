@@ -655,32 +655,11 @@ impl Archive {
                 let packed = source.read_range_to_vec(data_range, options.max_metadata_bytes)?;
                 let folder = ui.parse_folder(0)?;
 
-                // Find the final output stream's unpack size.
-                // For a single coder it's just unpack_sizes[0].
-                // For multi-coder (e.g. AES+LZMA2) we need the stream that
-                // is NOT bound as an output in any bind pair.
-                let unpack_size = {
-                    let num_out = folder.total_out_streams();
-                    if num_out <= 1 {
-                        ui.unpack_sizes.first().copied().ok_or(R7zError::Parse)?
-                    } else {
-                        let mut final_idx = num_out - 1;
-                        for out_idx in 0..num_out {
-                            let is_bound = folder
-                                .bind_pairs
-                                .iter()
-                                .any(|&(_, bound_out)| bound_out == out_idx as u64);
-                            if !is_bound {
-                                final_idx = out_idx;
-                                break;
-                            }
-                        }
-                        ui.unpack_sizes
-                            .get(final_idx)
-                            .copied()
-                            .ok_or(R7zError::Parse)?
-                    }
-                };
+                let unpack_size = ui
+                    .unpack_sizes
+                    .get(folder.graph()?.final_output().get())
+                    .copied()
+                    .ok_or(R7zError::Parse)?;
                 if unpack_size > options.max_metadata_bytes {
                     return Err(R7zError::LimitExceeded("metadata"));
                 }
@@ -1937,7 +1916,7 @@ fn parse_header_with_external_data(
     let external_data =
         decode_additional_folder_data(source, base_offset, &additional, metadata_limit, password)?;
     let (rest, header) =
-        Header::parse_with_external(bytes, Some(external_data)).map_err(|_| R7zError::Parse)?;
+        Header::parse_with_external(bytes, external_data).map_err(|_| R7zError::Parse)?;
     if !rest.is_empty() {
         return Err(R7zError::Parse);
     }
@@ -1951,24 +1930,20 @@ fn decode_additional_folder_data(
     metadata_limit: u64,
     password: Option<&str>,
 ) -> Result<Vec<Bytes>, R7zError> {
-    let Some(pack_info) = streams.pack_info.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let Some(unpack_info) = streams.unpack_info.as_ref() else {
-        return Ok(Vec::new());
-    };
+    let pack_info = streams.pack_info.as_ref().ok_or(R7zError::Parse)?;
+    let unpack_info = streams.unpack_info.as_ref().ok_or(R7zError::Parse)?;
     let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
     let mut packed_offset = 0u64;
     let mut packed_index = 0usize;
-    let mut output = Vec::with_capacity(unpack_info.num_folders_usize());
+    let mut output = reserve_decoded_folder_slots(unpack_info.num_folders_usize(), metadata_limit)?;
     let mut output_size = 0u64;
     let mut output_base = 0usize;
 
     for folder_idx in 0..unpack_info.num_folders_usize() {
         let folder = unpack_info.parse_folder(folder_idx)?;
-        let graph = folder.checked_graph()?;
-        let mut packed_streams = Vec::with_capacity(graph.packed_inputs.len());
-        for _ in &graph.packed_inputs {
+        let graph = folder.graph()?;
+        let mut packed_streams = Vec::with_capacity(graph.packed_stream_count());
+        for _ in 0..graph.packed_stream_count() {
             let size = *pack_info
                 .pack_size
                 .get(packed_index)
@@ -1988,7 +1963,7 @@ fn decode_additional_folder_data(
 
         let coder_sizes = folder_coder_unpack_sizes_at(output_base, &folder, unpack_info)?;
         let unpack_size = *coder_sizes
-            .get(graph.final_output.0)
+            .get(graph.final_output().get())
             .ok_or(R7zError::Parse)?;
         let next_output_len = output_size
             .checked_add(unpack_size)
@@ -2031,6 +2006,24 @@ fn decode_additional_folder_data(
     if packed_index != pack_info.pack_size.len() {
         return Err(R7zError::Parse);
     }
+    Ok(output)
+}
+
+fn reserve_decoded_folder_slots(
+    folder_count: usize,
+    metadata_limit: u64,
+) -> Result<Vec<Bytes>, R7zError> {
+    let slot_bytes = folder_count
+        .checked_mul(std::mem::size_of::<Bytes>())
+        .ok_or(R7zError::LimitExceeded("metadata"))?;
+    if u64::try_from(slot_bytes).map_err(|_| R7zError::LimitExceeded("metadata"))? > metadata_limit
+    {
+        return Err(R7zError::LimitExceeded("metadata"));
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(folder_count)
+        .map_err(|_| R7zError::LimitExceeded("metadata"))?;
     Ok(output)
 }
 
@@ -2493,12 +2486,7 @@ fn folder_pack_stream_base(
 }
 
 fn folder_num_pack_streams(folder: &crate::Folder) -> Result<usize, R7zError> {
-    let num_in = folder.coders.iter().try_fold(0u64, |acc, coder| {
-        acc.checked_add(coder.num_in_streams).ok_or(R7zError::Parse)
-    })?;
-    let num_bind_pairs = u64::try_from(folder.bind_pairs.len()).map_err(|_| R7zError::Parse)?;
-    let num_packed = num_in.checked_sub(num_bind_pairs).ok_or(R7zError::Parse)?;
-    usize::try_from(num_packed).map_err(|_| R7zError::Parse)
+    folder.graph().map(|graph| graph.packed_stream_count())
 }
 
 fn ensure_packed_folder_buffer_limit(pack_sizes: &[u64]) -> Result<(), R7zError> {
@@ -3100,6 +3088,20 @@ mod selected_stream_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn decoded_folder_slots_obey_metadata_budget() {
+        let slot_size = std::mem::size_of::<Bytes>() as u64;
+        assert!(reserve_decoded_folder_slots(2, slot_size * 2).is_ok());
+        assert!(matches!(
+            reserve_decoded_folder_slots(3, slot_size * 2),
+            Err(R7zError::LimitExceeded("metadata"))
+        ));
+        assert!(matches!(
+            reserve_decoded_folder_slots(usize::MAX, u64::MAX),
+            Err(R7zError::LimitExceeded("metadata"))
+        ));
     }
 
     fn archive_with_many_files(solid: SolidMode) -> (Vec<u8>, Vec<Vec<u8>>) {

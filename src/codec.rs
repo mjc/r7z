@@ -6,7 +6,6 @@ use lzma_rust2::{
     Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter, filter::bcj::BcjReader,
 };
 use ppmd_rust::Ppmd7Decoder;
-use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
 const MAX_LZMA_DICTIONARY_BYTES: u32 = 256 * 1024 * 1024;
@@ -257,15 +256,15 @@ pub(crate) fn folder_reader_with_sizes_from_reader<'a>(
     password: Option<&str>,
     packed_input_bytes: usize,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
+    let graph = folder.graph()?;
     validate_decoder_working_set(folder, packed_input_bytes)?;
-    let order = coder_execution_order(folder)?;
     build_decoder_chain(
         folder,
         input,
         unpack_size,
         coder_unpack_sizes,
         password,
-        &order,
+        &graph,
     )
 }
 
@@ -275,7 +274,7 @@ fn build_decoder_chain<'a>(
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-    order: &[usize],
+    graph: &crate::folder::FolderGraph,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
     // Multi-coder chain: resolve bind-pair ordering so that each coder's
     // output feeds the next one's input.
@@ -286,12 +285,22 @@ fn build_decoder_chain<'a>(
     //
     // We build a topological order by figuring out which coder receives the
     // packed stream (starts first) and following the bind pairs.
-    for (i, &coder_idx) in order.iter().enumerate() {
-        let coder = &folder.coders[coder_idx];
-        let size = coder_unpack_sizes
+    let coder_count = graph.execution_order().count();
+    for (position, coder_idx) in graph.execution_order().enumerate() {
+        let coder_idx = coder_idx.get();
+        let coder = folder
+            .coders
             .get(coder_idx)
-            .copied()
-            .unwrap_or(if i == order.len() - 1 { unpack_size } else { 0 });
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        let size =
+            coder_unpack_sizes
+                .get(coder_idx)
+                .copied()
+                .unwrap_or(if position + 1 == coder_count {
+                    unpack_size
+                } else {
+                    0
+                });
         reader = coder_reader(coder, reader, size, password)?;
     }
     Ok(reader)
@@ -306,37 +315,41 @@ pub(crate) fn folder_reader_with_pack_streams(
 ) -> Result<Box<dyn Read>, R7zError> {
     let packed_input_bytes = total_buffered_len(&packed_streams)?;
     validate_folder_coder_count(folder)?;
-    folder.checked_graph()?;
-    if is_bcj2_folder(folder) {
-        return bcj2_folder_reader(
+    let graph = folder.graph()?;
+    if graph.packed_stream_count() != packed_streams.len() {
+        return Err(R7zError::InvalidFolderGraph);
+    }
+    match (is_bcj2_folder(folder), packed_streams.as_slice()) {
+        (true, _) => bcj2_folder_reader(
             folder,
             &packed_streams,
             unpack_size,
             coder_unpack_sizes,
             password,
-        );
+        ),
+        (false, [_]) => {
+            validate_decoder_working_set(folder, packed_input_bytes)?;
+            build_decoder_chain(
+                folder,
+                Box::new(Cursor::new(
+                    packed_streams.into_iter().next().ok_or(R7zError::Parse)?,
+                )),
+                unpack_size,
+                coder_unpack_sizes,
+                password,
+                &graph,
+            )
+        }
+        (false, _) => {
+            let unsupported = folder
+                .coders
+                .iter()
+                .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
+            Err(unsupported.map_or(R7zError::InvalidFolderGraph, |coder| {
+                R7zError::UnsupportedCodec(coder.codec_id.to_vec())
+            }))
+        }
     }
-
-    if packed_streams.len() != 1 {
-        let unsupported = folder
-            .coders
-            .iter()
-            .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
-        return Err(unsupported.map_or(R7zError::Parse, |coder| {
-            R7zError::UnsupportedCodec(coder.codec_id.to_vec())
-        }));
-    }
-
-    folder_reader_with_sizes_from_reader(
-        folder,
-        Box::new(Cursor::new(
-            packed_streams.into_iter().next().ok_or(R7zError::Parse)?,
-        )),
-        unpack_size,
-        coder_unpack_sizes,
-        password,
-        packed_input_bytes,
-    )
 }
 
 fn coder_reader<'a>(
@@ -964,19 +977,6 @@ fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
     }
     data.truncate(size);
     Ok(())
-}
-
-/// Determine the order in which coders should be executed for decompression.
-///
-/// The packed (compressed) stream enters one coder first, its output feeds the
-/// next via bind pairs, and so on.  We return coder indices in execution order.
-fn coder_execution_order(folder: &crate::Folder) -> Result<SmallVec<[usize; 4]>, R7zError> {
-    let graph = folder.checked_graph()?;
-    graph
-        .execution_order
-        .into_iter()
-        .map(|index| Ok(index.0))
-        .collect()
 }
 
 #[cfg(test)]

@@ -100,9 +100,9 @@ pub(crate) fn parse_additional_streams_info(
 
 /// The fully decoded 7z archive header containing stream and file metadata.
 ///
-/// Metadata is validated eagerly during [`parse`](Header::parse) via
-/// zero-allocation scanners, but the full [`StreamInfo`] and [`FilesInfo`]
-/// structs are constructed lazily on first access.
+/// Metadata byte layouts are checked during [`parse`](Header::parse) via
+/// zero-allocation scanners. [`StreamInfo`] and [`FilesInfo`] are constructed
+/// on first access, and folder graphs are validated when parsed.
 pub struct Header {
     /// Decompressed header bytes (cheap `Arc`-backed clone of the decode buffer).
     data: Bytes,
@@ -114,7 +114,7 @@ pub struct Header {
     files_info_range: Option<std::ops::Range<u32>>,
     /// Byte range containing `AdditionalStreamsInfo` when present.
     additional_streams_range: Option<std::ops::Range<u32>>,
-    external_folder_data: Option<Vec<Bytes>>,
+    external_folder_data: Vec<Bytes>,
     /// Number of file entries (extracted during scan; avoids a lazy parse just
     /// to read the count).
     num_files: u64,
@@ -168,15 +168,11 @@ impl Header {
             let start = range.start as usize;
             let end = range.end as usize;
             self.data.get(start..end).ok_or(()).and_then(|slice| {
-                StreamInfo::parse_with_external(
-                    slice,
-                    &self.data,
-                    self.external_folder_data.as_deref(),
-                )
-                .ok()
-                .filter(|(rest, _)| rest.is_empty())
-                .map(|(_, value)| value)
-                .ok_or(())
+                StreamInfo::parse_with_external(slice, &self.data, &self.external_folder_data)
+                    .ok()
+                    .filter(|(rest, _)| rest.is_empty())
+                    .map(|(_, value)| value)
+                    .ok_or(())
             })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
@@ -244,13 +240,17 @@ impl Header {
     /// Returns a nom error if the input is truncated, malformed, or does not start with
     /// the `Header` property tag.
     pub fn parse(backing: &Bytes) -> IResult<&[u8], Header> {
-        Self::parse_with_external(backing, None)
+        Self::parse_with_external(backing, Vec::new())
     }
 
     /// Parse a header with decoded external folder definition bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the header or a referenced folder definition is malformed.
     pub fn parse_with_external(
         backing: &Bytes,
-        external_folder_data: Option<Vec<Bytes>>,
+        external_folder_data: Vec<Bytes>,
     ) -> IResult<&[u8], Header> {
         let input: &[u8] = backing;
         let orig_input = input;
@@ -284,8 +284,7 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) =
-                        scan_stream_info_with_external(input, external_folder_data.as_deref())?;
+                    let (i, ()) = scan_stream_info_with_external(input, &external_folder_data)?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -300,8 +299,7 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) =
-                        scan_stream_info_with_external(input, external_folder_data.as_deref())?;
+                    let (i, ()) = scan_stream_info_with_external(input, &external_folder_data)?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -435,7 +433,7 @@ mod tests {
         let external_folder = vec![Bytes::from_static(&[0x01, 0x01, 0x00])];
 
         assert!(Header::parse(&bytes).is_err());
-        let (rest, header) = Header::parse_with_external(&bytes, Some(external_folder)).unwrap();
+        let (rest, header) = Header::parse_with_external(&bytes, external_folder).unwrap();
         assert_eq!(rest, b"");
         let streams = header.try_streams_info().unwrap().unwrap();
         let folder = streams
