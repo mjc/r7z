@@ -128,14 +128,13 @@ impl Header {
         let parsed = self.streams_cache.get_or_init(|| {
             let start = range.start as usize;
             let end = range.end as usize;
-            let result = self.data.get(start..end).ok_or(()).and_then(|slice| {
+            self.data.get(start..end).ok_or(()).and_then(|slice| {
                 StreamInfo::parse(slice, &self.data)
                     .ok()
                     .filter(|(rest, _)| rest.is_empty())
                     .map(|(_, value)| value)
                     .ok_or(())
-            });
-            result
+            })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
     }
@@ -158,14 +157,13 @@ impl Header {
         let parsed = self.files_cache.get_or_init(|| {
             let start = range.start as usize;
             let end = range.end as usize;
-            let result = self.data.get(start..end).ok_or(()).and_then(|slice| {
+            self.data.get(start..end).ok_or(()).and_then(|slice| {
                 FilesInfo::parse(slice, &self.data)
                     .ok()
                     .filter(|(rest, info)| rest.is_empty() && info.num_files == self.num_files)
                     .map(|(_, value)| value)
                     .ok_or(())
-            });
-            result
+            })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
     }
