@@ -114,7 +114,7 @@ pub struct Header {
     files_info_range: Option<std::ops::Range<u32>>,
     /// Byte range containing `AdditionalStreamsInfo` when present.
     additional_streams_range: Option<std::ops::Range<u32>>,
-    external_folder_data: Option<Bytes>,
+    external_folder_data: Option<Vec<Bytes>>,
     /// Number of file entries (extracted during scan; avoids a lazy parse just
     /// to read the count).
     num_files: u64,
@@ -171,7 +171,7 @@ impl Header {
                 StreamInfo::parse_with_external(
                     slice,
                     &self.data,
-                    self.external_folder_data.as_ref(),
+                    self.external_folder_data.as_deref(),
                 )
                 .ok()
                 .filter(|(rest, _)| rest.is_empty())
@@ -250,7 +250,7 @@ impl Header {
     /// Parse a header with decoded external folder definition bytes.
     pub fn parse_with_external(
         backing: &Bytes,
-        external_folder_data: Option<Bytes>,
+        external_folder_data: Option<Vec<Bytes>>,
     ) -> IResult<&[u8], Header> {
         let input: &[u8] = backing;
         let orig_input = input;
@@ -285,7 +285,7 @@ impl Header {
                         ))
                     })?;
                     let (i, ()) =
-                        scan_stream_info_with_external(input, external_folder_data.as_ref())?;
+                        scan_stream_info_with_external(input, external_folder_data.as_deref())?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -301,7 +301,7 @@ impl Header {
                         ))
                     })?;
                     let (i, ()) =
-                        scan_stream_info_with_external(input, external_folder_data.as_ref())?;
+                        scan_stream_info_with_external(input, external_folder_data.as_deref())?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -432,7 +432,7 @@ mod tests {
             0x05, 0x00, 0x00, // empty FilesInfo
             0x00, // end Header
         ]);
-        let external_folder = Bytes::from_static(&[0x01, 0x01, 0x00]);
+        let external_folder = vec![Bytes::from_static(&[0x01, 0x01, 0x00])];
 
         assert!(Header::parse(&bytes).is_err());
         let (rest, header) = Header::parse_with_external(&bytes, Some(external_folder)).unwrap();

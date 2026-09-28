@@ -16,29 +16,37 @@ fn build_archive_with_external_folder_definition(name: &str, data: &[u8]) -> Vec
         .unwrap();
     header.splice(
         folder_pos..folder_pos + inline_folder.len(),
-        [0x07, 0x0b, 0x01, 0x01, 0x00],
+        [0x07, 0x0b, 0x01, 0x01, 0x01],
     );
 
-    let folder_data = [0x01, 0x01, 0x00];
-    let folder_crc = crc32fast::hash(&folder_data);
+    let folder_data: [&[u8]; 2] = [&[0x01, 0x01, 0x00, 0xff], &[0x01, 0x01, 0x00]];
+    let folder_crcs = folder_data.map(crc32fast::hash);
     let mut additional = vec![0x03, 0x06]; // AdditionalStreamsInfo, PackInfo
     additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(2));
     additional.push(0x09);
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(folder_data.len() as u64));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(4));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(3));
     additional.extend_from_slice(&[0x0a, 0x01]);
-    additional.extend_from_slice(&folder_crc.to_le_bytes());
+    for crc in folder_crcs {
+        additional.extend_from_slice(&crc.to_le_bytes());
+    }
     additional.push(0x00);
-    additional.extend_from_slice(&[0x07, 0x0b, 0x01, 0x00]); // one inline Copy folder
-    additional.extend_from_slice(&folder_data);
+    additional.extend_from_slice(&[0x07, 0x0b, 0x02, 0x00]); // two inline Copy folders
+    additional.extend_from_slice(&[0x01, 0x01, 0x00]);
+    additional.extend_from_slice(&[0x01, 0x01, 0x00]);
     additional.push(0x0c);
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(folder_data.len() as u64));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(4));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(3));
     additional.extend_from_slice(&[0x0a, 0x01]);
-    additional.extend_from_slice(&folder_crc.to_le_bytes());
+    for crc in folder_crcs {
+        additional.extend_from_slice(&crc.to_le_bytes());
+    }
     additional.extend_from_slice(&[0x00, 0x00]); // UnpackInfo and StreamInfo end
     header.splice(1..1, additional);
 
-    let next_header_offset = (data.len() + folder_data.len()) as u64;
+    let next_header_offset =
+        (data.len() + folder_data.iter().map(|bytes| bytes.len()).sum::<usize>()) as u64;
     let next_header_size = header.len() as u64;
     let next_header_crc = crc32fast::hash(&header);
     let mut start_header = [0u8; 20];
@@ -51,7 +59,9 @@ fn build_archive_with_external_folder_definition(name: &str, data: &[u8]) -> Vec
     archive.extend_from_slice(&crc32fast::hash(&start_header).to_le_bytes());
     archive.extend_from_slice(&start_header);
     archive.extend_from_slice(data);
-    archive.extend_from_slice(&folder_data);
+    for bytes in folder_data {
+        archive.extend_from_slice(bytes);
+    }
     archive.extend_from_slice(&header);
     archive
 }

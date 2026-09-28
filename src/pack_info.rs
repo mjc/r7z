@@ -182,7 +182,7 @@ impl UnpackInfo {
     pub fn parse_with_external<'a>(
         input: &'a [u8],
         backing: &Bytes,
-        external_data: Option<&'a Bytes>,
+        external_data: Option<&'a [Bytes]>,
     ) -> IResult<&'a [u8], UnpackInfo> {
         let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
@@ -246,15 +246,16 @@ impl UnpackInfo {
                 let data = external_data.ok_or_else(|| {
                     nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
                 })?;
-                let offset = usize::try_from(data_stream_index).map_err(|_| {
+                let index = usize::try_from(data_stream_index).map_err(|_| {
                     nom::Err::Failure(nom::error::Error::new(
                         input,
                         nom::error::ErrorKind::TooLarge,
                     ))
                 })?;
-                let folder_start = data.get(offset..).ok_or_else(|| {
+                let folder_data = data.get(index).ok_or_else(|| {
                     nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Eof))
                 })?;
+                let folder_start: &[u8] = folder_data;
                 let mut folders = folder_start;
                 for _ in 0..num_folders {
                     let offset =
@@ -287,7 +288,7 @@ impl UnpackInfo {
                         nom::error::ErrorKind::TooLarge,
                     ))
                 })?;
-                (data, folder_start, end)
+                (folder_data, folder_start, end)
             }
             _ => {
                 return Err(nom::Err::Failure(nom::error::Error::new(
@@ -434,7 +435,7 @@ pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
 
 pub(crate) fn scan_unpack_info_with_external<'a>(
     input: &'a [u8],
-    external_data: Option<&Bytes>,
+    external_data: Option<&[Bytes]>,
 ) -> IResult<&'a [u8], usize> {
     let orig = input;
     let (input, tag) = Property::parse(input)?;
@@ -478,13 +479,13 @@ pub(crate) fn scan_unpack_info_with_external<'a>(
                     nom::error::ErrorKind::Verify,
                 )));
             };
-            let offset = usize::try_from(data_stream_index).map_err(|_| {
+            let index = usize::try_from(data_stream_index).map_err(|_| {
                 nom::Err::Failure(nom::error::Error::new(
                     input,
                     nom::error::ErrorKind::TooLarge,
                 ))
             })?;
-            let mut folders = data.get(offset..).ok_or_else(|| {
+            let mut folders: &[u8] = data.get(index).ok_or_else(|| {
                 nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Eof))
             })?;
             for _ in 0..num_folders {
@@ -649,7 +650,10 @@ mod tests {
     fn parse_unpack_info_external_folder_definitions() {
         let input = [0x07u8, 0x0b, 0x01, 0x01, 0x01, 0x0c, 0x03, 0x00];
         let backing = Bytes::copy_from_slice(&input);
-        let external = Bytes::from_static(&[0xff, 0x01, 0x01, 0x00]);
+        let external = [
+            Bytes::from_static(&[0xff]),
+            Bytes::from_static(&[0x01, 0x01, 0x00]),
+        ];
         let (rest, unpack) =
             UnpackInfo::parse_with_external(&input, &backing, Some(&external)).unwrap();
         assert!(rest.is_empty());
@@ -663,7 +667,7 @@ mod tests {
         let input = [0x07u8, 0x0b, 0x01, 0x01, 0x01, 0x09, 0x0c, 0x03, 0x00];
         let backing = Bytes::copy_from_slice(&input);
         assert!(UnpackInfo::parse(&input, &backing).is_err());
-        let external = Bytes::from_static(&[0x01, 0x01, 0x00]);
+        let external = [Bytes::from_static(&[0x01, 0x01, 0x00])];
         assert!(UnpackInfo::parse_with_external(&input, &backing, Some(&external)).is_err());
     }
 

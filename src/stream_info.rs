@@ -242,7 +242,7 @@ impl StreamInfo {
     pub fn parse_with_external<'a>(
         input: &'a [u8],
         backing: &Bytes,
-        external_data: Option<&'a Bytes>,
+        external_data: Option<&'a [Bytes]>,
     ) -> IResult<&'a [u8], StreamInfo> {
         let mut pack_info = None;
         let mut unpack_info = None;
@@ -407,7 +407,7 @@ pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
 
 pub(crate) fn scan_stream_info_with_external<'a>(
     input: &'a [u8],
-    external_data: Option<&Bytes>,
+    external_data: Option<&[Bytes]>,
 ) -> IResult<&'a [u8], ()> {
     let mut num_folders = 0usize;
     let mut input = input;

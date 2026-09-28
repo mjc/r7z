@@ -1950,17 +1950,18 @@ fn decode_additional_folder_data(
     streams: &StreamInfo,
     metadata_limit: u64,
     password: Option<&str>,
-) -> Result<Bytes, R7zError> {
+) -> Result<Vec<Bytes>, R7zError> {
     let Some(pack_info) = streams.pack_info.as_ref() else {
-        return Ok(Bytes::new());
+        return Ok(Vec::new());
     };
     let Some(unpack_info) = streams.unpack_info.as_ref() else {
-        return Ok(Bytes::new());
+        return Ok(Vec::new());
     };
     let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
     let mut packed_offset = 0u64;
     let mut packed_index = 0usize;
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(unpack_info.num_folders_usize());
+    let mut output_size = 0u64;
     let mut output_base = 0usize;
 
     for folder_idx in 0..unpack_info.num_folders_usize() {
@@ -1989,8 +1990,7 @@ fn decode_additional_folder_data(
         let unpack_size = *coder_sizes
             .get(graph.final_output.0)
             .ok_or(R7zError::Parse)?;
-        let next_output_len = u64::try_from(output.len())
-            .map_err(|_| R7zError::Parse)?
+        let next_output_len = output_size
             .checked_add(unpack_size)
             .ok_or(R7zError::Parse)?;
         if next_output_len > metadata_limit {
@@ -2021,7 +2021,8 @@ fn decode_additional_folder_data(
                 return Err(R7zError::Crc);
             }
         }
-        output.extend_from_slice(&folder_output);
+        output.push(Bytes::from(folder_output));
+        output_size = next_output_len;
         output_base = output_base
             .checked_add(folder.total_out_streams())
             .ok_or(R7zError::Parse)?;
@@ -2030,7 +2031,7 @@ fn decode_additional_folder_data(
     if packed_index != pack_info.pack_size.len() {
         return Err(R7zError::Parse);
     }
-    Ok(Bytes::from(output))
+    Ok(output)
 }
 
 fn verify_additional_stream_crcs(
