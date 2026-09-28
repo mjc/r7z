@@ -1,4 +1,3 @@
-use crate::folder_decode::FolderLayouts;
 use crate::pack_info::{
     FolderLocation, parse_folder_declaration, scan_pack_info, scan_unpack_info_with_external,
 };
@@ -258,14 +257,6 @@ impl StreamInfo {
             (Some(pack), Some(unpack)) => Ok((pack, unpack)),
             _ => Err(R7zError::Parse),
         }
-    }
-
-    pub(crate) fn checked_packed_folders(
-        &self,
-        metadata_limit: u64,
-    ) -> Result<FolderLayouts<'_>, R7zError> {
-        let (pack, unpack) = self.packed_folders()?;
-        FolderLayouts::new(pack, unpack, self.substream_info.as_ref(), metadata_limit)
     }
 
     /// Parse a `StreamInfo` block from the header stream.

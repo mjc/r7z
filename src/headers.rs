@@ -568,23 +568,19 @@ mod tests {
                 panic!("external definitions must suspend the scan");
             };
             pending.resolve_with(|additional| {
-                let folders = additional.checked_packed_folders(1024)?;
-                let mut output = crate::folder_decode::ExternalFolderData::reserve(
-                    folders.stream_count(),
-                    1024,
-                )?;
-                for folder in folders {
-                    let decoded = folder?
-                        .bind(|_| {
-                            Ok(crate::codec::PackedInput {
-                                reader: std::io::Cursor::new([1, 1, 0]),
-                                size: 3,
-                            })
-                        })?
-                        .collect(None, 1024)?;
-                    output = output.append(decoded)?;
-                }
-                output.finish()
+                crate::folder_decode::ExternalFolderPlan::new(
+                    additional,
+                    crate::folder_decode::MetadataBudget::new(1024),
+                )?
+                .decode(
+                    |_| {
+                        Ok(crate::codec::PackedInput {
+                            reader: std::io::Cursor::new([1, 1, 0]),
+                            size: 3,
+                        })
+                    },
+                    None,
+                )
             })
         };
         let header = resolve(&bytes).unwrap();

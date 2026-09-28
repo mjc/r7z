@@ -5,6 +5,67 @@ use smallvec::SmallVec;
 use std::io::Read;
 use std::ops::Range;
 
+/// Remaining capacity for retained header bytes and external metadata.
+pub(crate) struct MetadataBudget(u64);
+
+impl MetadataBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self(limit)
+    }
+
+    pub(crate) fn charge(self, bytes: u64) -> Result<Self, R7zError> {
+        self.0
+            .checked_sub(bytes)
+            .map(Self)
+            .ok_or(R7zError::LimitExceeded("metadata"))
+    }
+
+    pub(crate) fn remaining(&self) -> u64 {
+        self.0
+    }
+}
+
+/// External folders whose decoded bytes and stream slots fit the remaining budget.
+pub(crate) struct ExternalFolderPlan<'a> {
+    folders: FolderLayouts<'a>,
+}
+
+impl<'a> ExternalFolderPlan<'a> {
+    pub(crate) fn new(
+        streams: &'a crate::StreamInfo,
+        budget: MetadataBudget,
+    ) -> Result<Self, R7zError> {
+        let (pack, unpack) = streams.packed_folders()?;
+        let folders = FolderLayouts::new(
+            pack,
+            unpack,
+            streams.substream_info.as_ref(),
+            budget.remaining(),
+        )?;
+        let slot_bytes = external_slot_bytes(folders.stream_count())?;
+        let _remaining = budget.charge(slot_bytes)?.charge(folders.output_size)?;
+        Ok(Self { folders })
+    }
+
+    pub(crate) fn pack_pos(&self) -> u64 {
+        self.folders.pack_pos()
+    }
+
+    pub(crate) fn decode<R: Read>(
+        self,
+        mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
+        password: Option<&str>,
+    ) -> Result<VerifiedExternalData, R7zError> {
+        let output_limit = self.folders.output_size;
+        let mut output = ExternalFolderData::reserve(self.folders.stream_count())?;
+        for folder in self.folders {
+            let decoded = folder?.bind(&mut open)?.collect(password, output_limit)?;
+            output = output.append(decoded)?;
+        }
+        output.finish()
+    }
+}
+
 pub(crate) struct PackedStream {
     pub(crate) range: Range<u64>,
     pub(crate) crc: Option<u32>,
@@ -38,7 +99,7 @@ impl PackedStreams<'_> {
 #[derive(Default)]
 pub(crate) struct ExternalFolderData(Vec<Bytes>);
 
-pub(crate) struct ExternalFolderCollector {
+struct ExternalFolderCollector {
     data: ExternalFolderData,
     remaining: usize,
 }
@@ -53,17 +114,7 @@ impl VerifiedExternalData {
 }
 
 impl ExternalFolderData {
-    pub(crate) fn reserve(
-        stream_count: usize,
-        metadata_limit: u64,
-    ) -> Result<ExternalFolderCollector, R7zError> {
-        let slot_bytes = stream_count
-            .checked_mul(std::mem::size_of::<Bytes>())
-            .and_then(|size| u64::try_from(size).ok())
-            .ok_or(R7zError::LimitExceeded("metadata"))?;
-        if slot_bytes > metadata_limit {
-            return Err(R7zError::LimitExceeded("metadata"));
-        }
+    fn reserve(stream_count: usize) -> Result<ExternalFolderCollector, R7zError> {
         let mut streams = Vec::new();
         streams
             .try_reserve_exact(stream_count)
@@ -82,6 +133,13 @@ impl ExternalFolderData {
     pub(crate) fn as_slice(&self) -> &[Bytes] {
         &self.0
     }
+}
+
+fn external_slot_bytes(stream_count: usize) -> Result<u64, R7zError> {
+    stream_count
+        .checked_mul(std::mem::size_of::<Bytes>())
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or(R7zError::LimitExceeded("metadata"))
 }
 
 impl ExternalFolderCollector {
@@ -368,6 +426,7 @@ struct FolderPlans<'a> {
 pub(crate) struct FolderLayouts<'a> {
     plans: FolderPlans<'a>,
     stream_count: usize,
+    output_size: u64,
 }
 
 impl<'a> FolderLayouts<'a> {
@@ -441,6 +500,7 @@ impl<'a> FolderLayouts<'a> {
         Ok(FolderLayouts {
             plans,
             stream_count,
+            output_size,
         })
     }
 }
@@ -852,6 +912,41 @@ mod tests {
     }
 
     #[test]
+    fn external_plan_admits_bytes_and_slots_together() {
+        let mut streams = copy_streams();
+        let substreams = streams.substream_info.as_mut().unwrap();
+        substreams.num_unpack_streams_per_folder[0] = 2;
+        substreams.unpack_sizes = vec![1];
+        substreams.digests.clear();
+        let required = 3 + 2 * std::mem::size_of::<Bytes>() as u64;
+        assert!(matches!(
+            ExternalFolderPlan::new(&streams, MetadataBudget::new(required - 1)),
+            Err(R7zError::LimitExceeded("metadata"))
+        ));
+        let plan = ExternalFolderPlan::new(&streams, MetadataBudget::new(required)).unwrap();
+        let data = plan
+            .decode(
+                |_| {
+                    Ok(codec::PackedInput {
+                        reader: std::io::Cursor::new(b"abc"),
+                        size: 3,
+                    })
+                },
+                None,
+            )
+            .unwrap()
+            .into_data();
+        assert_eq!(
+            data.as_slice(),
+            [Bytes::from_static(b"a"), Bytes::from_static(b"bc")]
+        );
+        assert!(matches!(
+            external_slot_bytes(usize::MAX),
+            Err(R7zError::LimitExceeded("metadata"))
+        ));
+    }
+
+    #[test]
     fn folder_layout_rejects_unmatched_tables_before_opening_sources() {
         let mut streams = copy_streams();
         streams
@@ -909,14 +1004,14 @@ mod tests {
     #[test]
     fn external_collection_requires_all_streams_and_shares_decoded_storage() {
         assert!(matches!(
-            ExternalFolderData::reserve(1, 1024).unwrap().finish(),
+            ExternalFolderData::reserve(1).unwrap().finish(),
             Err(R7zError::Parse)
         ));
         let bytes = Bytes::from_static(b"abcde");
         let decoded = packed_folder(5, None, FolderStreamLayout::new(5, 2, &[2], &[]).unwrap())
             .verify_decoded(bytes.clone())
             .unwrap();
-        let data = ExternalFolderData::reserve(2, 1024)
+        let data = ExternalFolderData::reserve(2)
             .unwrap()
             .append(decoded)
             .unwrap()
@@ -960,7 +1055,7 @@ mod tests {
         let decoded = folder()
             .verify_decoded(Bytes::from_static(b"abcde"))
             .unwrap();
-        let streams = ExternalFolderData::reserve(2, 1024)
+        let streams = ExternalFolderData::reserve(2)
             .unwrap()
             .append(decoded)
             .unwrap();
@@ -973,9 +1068,7 @@ mod tests {
             .verify_decoded(Bytes::from_static(b"abXde"))
             .unwrap();
         assert!(matches!(
-            ExternalFolderData::reserve(2, 1024)
-                .unwrap()
-                .append(decoded),
+            ExternalFolderData::reserve(2).unwrap().append(decoded),
             Err(R7zError::Crc)
         ));
     }

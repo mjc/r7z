@@ -1,6 +1,6 @@
 use crate::folder_decode::{
-    ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderData, FolderLayout, FolderLayouts,
-    PackedStream, VerifiedExternalData,
+    ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderPlan, FolderLayout, FolderLayouts,
+    MetadataBudget, PackedStream, VerifiedExternalData,
 };
 use crate::headers::{HeaderResolution, NextHeader};
 use crate::{
@@ -15,10 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Maximum decompressed size accepted for the compressed archive header (metadata only).
-/// A malicious archive could declare an enormous `unpack_size` to cause OOM during header
-/// decompression; this cap bounds the allocation to a sane limit. File data extracted
-/// via [`Archive::extract_to_memory`] is not subject to this limit.
+/// Budget for retained header buffers, decoded external metadata, and stream slots.
+/// Extracted file data and decoder working memory have separate limits.
 const DEFAULT_MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const SEVEN_Z_MAGIC: &[u8; 6] = b"7z\xbc\xaf'\x1c";
 const SIGNATURE_SCAN_CHUNK: usize = 64 * 1024;
@@ -31,6 +29,8 @@ pub enum ArchiveStorageMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchiveOpenOptions {
+    /// Combined limit for header buffers, decoded external metadata, and its stream slots.
+    /// Decoder working memory and parsed metadata tables are bounded separately.
     pub max_metadata_bytes: u64,
     pub storage_mode: ArchiveStorageMode,
 }
@@ -647,7 +647,7 @@ impl Archive {
                     &source,
                     base_offset,
                     &next_header,
-                    options.max_metadata_bytes,
+                    MetadataBudget::new(options.max_metadata_bytes),
                     password,
                 )?,
                 None,
@@ -658,7 +658,8 @@ impl Archive {
                     base_offset,
                     &encoded,
                     password,
-                    options.max_metadata_bytes,
+                    MetadataBudget::new(options.max_metadata_bytes)
+                        .charge(next_header.len() as u64)?,
                 )?;
                 (header, Some(*encoded))
             }
@@ -1453,34 +1454,29 @@ fn decode_encoded_header(
     base_offset: u64,
     encoded: &EncodedHeader,
     password: Option<&str>,
-    metadata_limit: u64,
+    budget: MetadataBudget,
 ) -> Result<Header, R7zError> {
-    let folder = encoded.folder(metadata_limit)?;
+    let folder = encoded.folder(budget.remaining())?;
     let packs = PackedSource::new(source, base_offset, encoded.pack_info.pack_pos)?;
-    let decoded = decode_metadata_folder(&packs, folder, password, metadata_limit)?;
-    parse_header_with_external_data(
-        source,
-        base_offset,
-        decoded.as_bytes(),
-        metadata_limit,
-        password,
-    )
+    let decoded = decode_metadata_folder(&packs, folder, password, budget.remaining())?;
+    parse_header_with_external_data(source, base_offset, decoded.as_bytes(), budget, password)
 }
 
 fn parse_header_with_external_data(
     source: &ArchiveSource,
     base_offset: u64,
     bytes: &Bytes,
-    metadata_limit: u64,
+    budget: MetadataBudget,
     password: Option<&str>,
 ) -> Result<Header, R7zError> {
+    let budget = budget.charge(bytes.len() as u64)?;
     match Header::resolve_archive(bytes)? {
         HeaderResolution::Complete(header) => {
             verify_additional_stream_crcs(source, base_offset, &header)?;
             Ok(*header)
         }
         HeaderResolution::RequiresExternalFolders(pending) => pending.resolve_with(|additional| {
-            decode_additional_folder_data(source, base_offset, additional, metadata_limit, password)
+            decode_additional_folder_data(source, base_offset, additional, budget, password)
         }),
     }
 }
@@ -1489,19 +1485,12 @@ fn decode_additional_folder_data(
     source: &ArchiveSource,
     base_offset: u64,
     streams: &StreamInfo,
-    metadata_limit: u64,
+    budget: MetadataBudget,
     password: Option<&str>,
 ) -> Result<VerifiedExternalData, R7zError> {
-    let folders = streams.checked_packed_folders(metadata_limit)?;
-    let packs = PackedSource::new(source, base_offset, folders.pack_pos())?;
-    let mut output = ExternalFolderData::reserve(folders.stream_count(), metadata_limit)?;
-    for folder in folders {
-        let folder = folder?;
-        let decoded = decode_metadata_folder(&packs, folder, password, metadata_limit)?;
-        output = output.append(decoded)?;
-    }
-
-    output.finish()
+    let plan = ExternalFolderPlan::new(streams, budget)?;
+    let packs = PackedSource::new(source, base_offset, plan.pack_pos())?;
+    plan.decode(|stream| packs.reader(&stream), password)
 }
 
 struct PackedSource<'a> {
@@ -2065,6 +2054,22 @@ mod selected_stream_tests {
 
     #[test]
     fn decodes_additional_streams_used_for_external_folder_definitions() {
+        let (bytes, _) = archive_with_external_folder_metadata(false);
+        let parsed = Archive::from_bytes(bytes).unwrap();
+        let main = parsed.header.try_streams_info().unwrap().unwrap();
+        assert_eq!(
+            main.unpack_info
+                .as_ref()
+                .unwrap()
+                .parse_folder(0)
+                .unwrap()
+                .coders
+                .len(),
+            1
+        );
+    }
+
+    fn archive_with_external_folder_metadata(encoded: bool) -> (Bytes, u64) {
         let header = Bytes::from_static(&[
             0x01, 0x03, // Header + AdditionalStreamsInfo
             0x06, 0x00, 0x01, 0x09, 0x03, 0x00, // one packed stream
@@ -2079,37 +2084,60 @@ mod selected_stream_tests {
         archive[7] = 4;
         archive.extend_from_slice(&[0x01, 0x01, 0x00]);
         archive.extend_from_slice(&header);
-        archive[12..20].copy_from_slice(&3u64.to_le_bytes());
-        archive[20..28].copy_from_slice(&u64::try_from(header.len()).unwrap().to_le_bytes());
-        archive[28..32].copy_from_slice(&crc32fast::hash(&header).to_le_bytes());
+        let mut retained = header.len() as u64 + 3 + std::mem::size_of::<Bytes>() as u64;
+        let (next_header, offset) = if encoded {
+            let size = u8::try_from(header.len()).unwrap();
+            assert!(size < 128);
+            let descriptor = Bytes::from(vec![
+                0x17, // EncodedHeader
+                0x06, 0x03, 0x01, 0x09, size, 0x00, // packed header after external bytes
+                0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, size, 0x00, // copy
+                0x00,
+            ]);
+            retained += descriptor.len() as u64;
+            archive.extend_from_slice(&descriptor);
+            (descriptor, 3 + header.len() as u64)
+        } else {
+            (header, 3)
+        };
+        archive[12..20].copy_from_slice(&offset.to_le_bytes());
+        archive[20..28].copy_from_slice(&(next_header.len() as u64).to_le_bytes());
+        archive[28..32].copy_from_slice(&crc32fast::hash(&next_header).to_le_bytes());
         let start_crc = crc32fast::hash(&archive[12..32]);
         archive[8..12].copy_from_slice(&start_crc.to_le_bytes());
-        let parsed = Archive::from_bytes(Bytes::from(archive)).unwrap();
-        let main = parsed.header.try_streams_info().unwrap().unwrap();
-        assert_eq!(
-            main.unpack_info
-                .as_ref()
-                .unwrap()
-                .parse_folder(0)
-                .unwrap()
-                .coders
-                .len(),
-            1
-        );
+        (Bytes::from(archive), retained)
     }
 
     #[test]
-    fn decoded_stream_slots_obey_metadata_budget() {
-        let slot_size = std::mem::size_of::<Bytes>() as u64;
-        assert!(ExternalFolderData::reserve(2, slot_size * 2).is_ok());
-        assert!(matches!(
-            ExternalFolderData::reserve(3, slot_size * 2),
-            Err(R7zError::LimitExceeded("metadata"))
-        ));
-        assert!(matches!(
-            ExternalFolderData::reserve(usize::MAX, u64::MAX),
-            Err(R7zError::LimitExceeded("metadata"))
-        ));
+    fn metadata_budget_is_shared_by_headers_external_bytes_and_slots() {
+        for encoded in [false, true] {
+            let (bytes, required) = archive_with_external_folder_metadata(encoded);
+            for seekable in [false, true] {
+                let open = |limit| {
+                    let source = if seekable {
+                        ArchiveSource::from_reader(std::io::Cursor::new(bytes.clone())).unwrap()
+                    } else {
+                        ArchiveSource::Bytes(bytes.clone())
+                    };
+                    Archive::from_source_with_password(
+                        source,
+                        None,
+                        ArchiveOpenOptions {
+                            max_metadata_bytes: limit,
+                            ..ArchiveOpenOptions::default()
+                        },
+                    )
+                };
+                assert!(
+                    open(required).is_ok(),
+                    "encoded={encoded}, seekable={seekable}"
+                );
+                assert!(
+                    matches!(open(required - 1), Err(R7zError::LimitExceeded("metadata"))),
+                    "encoded={encoded}, seekable={seekable}"
+                );
+            }
+        }
     }
 
     fn archive_with_many_files(solid: SolidMode) -> (Vec<u8>, Vec<Vec<u8>>) {
