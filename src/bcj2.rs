@@ -1,4 +1,5 @@
 use crate::R7zError;
+use std::io::Read;
 
 const STREAM_CALL: usize = 1;
 const STREAM_JUMP: usize = 2;
@@ -7,26 +8,23 @@ const NUM_MODEL_BITS: u32 = 11;
 const BIT_MODEL_TOTAL: u16 = 1 << NUM_MODEL_BITS;
 const NUM_MOVE_BITS: u32 = 5;
 
-pub(crate) fn decode(
-    main: &[u8],
-    call: &[u8],
-    jump: &[u8],
-    rc: &[u8],
+pub(crate) fn decode<'a>(
+    main: Box<dyn Read + 'a>,
+    call: Box<dyn Read + 'a>,
+    jump: Box<dyn Read + 'a>,
+    rc: Box<dyn Read + 'a>,
     output_size: usize,
 ) -> Result<Vec<u8>, R7zError> {
-    if call.len() & 3 != 0 || jump.len() & 3 != 0 || rc.len() < 5 || rc[0] != 0 {
-        return Err(R7zError::Decompression);
-    }
-
     let mut streams = [
         StreamCursor::new(main),
         StreamCursor::new(call),
         StreamCursor::new(jump),
         StreamCursor::new(rc),
     ];
-    streams[3].pos = 5;
-
-    let mut code = u32::from_be_bytes([rc[1], rc[2], rc[3], rc[4]]);
+    if streams[3].read_byte()? != 0 {
+        return Err(R7zError::Decompression);
+    }
+    let mut code = streams[3].read_u32_be()?;
     if code == 0xFFFF_FFFF {
         return Err(R7zError::Decompression);
     }
@@ -82,16 +80,16 @@ pub(crate) fn decode(
         output.extend_from_slice(&relative);
         prev = relative[3];
 
-        if range < TOP_VALUE && !streams[3].is_empty() {
+        if range < TOP_VALUE && streams[3].has_more()? {
             normalize(&mut range, &mut code, &mut streams[3])?;
         }
     }
 
     if output.len() != output_size
-        || !streams[0].is_empty()
-        || !streams[1].is_empty()
-        || !streams[2].is_empty()
-        || !streams[3].is_empty()
+        || streams[0].has_more()?
+        || streams[1].has_more()?
+        || streams[2].has_more()?
+        || streams[3].has_more()?
         || code != 0
     {
         return Err(R7zError::Decompression);
@@ -114,7 +112,7 @@ fn copy_until_branch_opcode(
     mut prev: u8,
 ) -> Result<Option<(u8, u8)>, R7zError> {
     while output.len() < output_size {
-        let Some(opcode) = main.read_byte_optional() else {
+        let Some(opcode) = main.read_byte_optional()? else {
             return Ok(None);
         };
         output.push(opcode);
@@ -135,36 +133,49 @@ fn copy_until_branch_opcode(
 }
 
 struct StreamCursor<'a> {
-    data: &'a [u8],
+    reader: Box<dyn Read + 'a>,
+    buffer: [u8; 8192],
     pos: usize,
+    len: usize,
 }
 
 impl<'a> StreamCursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+    fn new(reader: Box<dyn Read + 'a>) -> Self {
+        Self {
+            reader,
+            buffer: [0; 8192],
+            pos: 0,
+            len: 0,
+        }
     }
 
-    fn is_empty(&self) -> bool {
-        self.pos == self.data.len()
+    fn has_more(&mut self) -> Result<bool, R7zError> {
+        if self.pos == self.len {
+            self.len = self.reader.read(&mut self.buffer).map_err(R7zError::Io)?;
+            self.pos = 0;
+        }
+        Ok(self.pos < self.len)
     }
 
     fn read_byte(&mut self) -> Result<u8, R7zError> {
-        self.read_byte_optional().ok_or(R7zError::Decompression)
+        self.read_byte_optional()?.ok_or(R7zError::Decompression)
     }
 
-    fn read_byte_optional(&mut self) -> Option<u8> {
-        let byte = *self.data.get(self.pos)?;
+    fn read_byte_optional(&mut self) -> Result<Option<u8>, R7zError> {
+        if !self.has_more()? {
+            return Ok(None);
+        }
+        let byte = self.buffer[self.pos];
         self.pos += 1;
-        Some(byte)
+        Ok(Some(byte))
     }
 
     fn read_u32_be(&mut self) -> Result<u32, R7zError> {
-        let end = self.pos.checked_add(4).ok_or(R7zError::Decompression)?;
-        let bytes = self
-            .data
-            .get(self.pos..end)
-            .ok_or(R7zError::Decompression)?;
-        self.pos = end;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        Ok(u32::from_be_bytes([
+            self.read_byte()?,
+            self.read_byte()?,
+            self.read_byte()?,
+            self.read_byte()?,
+        ]))
     }
 }

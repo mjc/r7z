@@ -6,6 +6,7 @@ use crate::{
 };
 use bytes::Bytes;
 use memmap2::Mmap;
+use smallvec::SmallVec;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -179,6 +180,18 @@ impl ArchiveSource {
             source: self,
             pos: range.start,
             end: range.end,
+        })
+    }
+
+    fn packed_input(
+        &self,
+        range: Range<u64>,
+    ) -> Result<codec::PackedInput<ArchiveRangeReader<'_>>, R7zError> {
+        let size = usize::try_from(checked_sub_u64(range.end, range.start)?)
+            .map_err(|_| R7zError::Parse)?;
+        Ok(codec::PackedInput {
+            reader: self.range_reader(range)?,
+            size,
         })
     }
 
@@ -1031,15 +1044,12 @@ impl Archive {
             )?
         } else {
             ensure_packed_ranges_buffer_limit(&location.packed_ranges)?;
-            let packed_buffer_limit = u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES)
-                .map_err(|_| R7zError::Parse)?;
-            let mut packed_streams = Vec::with_capacity(location.packed_ranges.len());
-            for range in &location.packed_ranges {
-                packed_streams.push(
-                    self.source
-                        .read_range_to_vec(range.clone(), packed_buffer_limit)?,
-                );
-            }
+            let packed_streams = location
+                .packed_ranges
+                .iter()
+                .cloned()
+                .map(|range| self.source.packed_input(range))
+                .collect::<Result<SmallVec<[_; 4]>, _>>()?;
             codec::folder_reader_with_pack_streams(
                 &location.folder,
                 packed_streams,
@@ -1494,15 +1504,11 @@ impl Archive {
                 .map_err(|_| R7zError::Parse)?,
             )?
         } else {
-            let mut packed_streams = Vec::with_capacity(packed_ranges.len());
-            let packed_buffer_limit = u64::try_from(codec::MAX_BUFFERED_PACKED_FOLDER_BYTES)
-                .map_err(|_| R7zError::Parse)?;
-            for range in &packed_ranges {
-                packed_streams.push(
-                    self.source
-                        .read_range_to_vec(range.clone(), packed_buffer_limit)?,
-                );
-            }
+            let packed_streams = packed_ranges
+                .iter()
+                .cloned()
+                .map(|range| self.source.packed_input(range))
+                .collect::<Result<SmallVec<[_; 4]>, _>>()?;
             codec::folder_reader_with_pack_streams(
                 &folder,
                 packed_streams,
@@ -1939,13 +1945,11 @@ impl<'a> MetadataPackReader<'a> {
         Ok(range)
     }
 
-    fn reader(&self, stream: &PackedStream) -> Result<ArchiveRangeReader<'_>, R7zError> {
-        self.source.range_reader(self.range(stream)?)
-    }
-
-    fn read(&self, stream: &PackedStream) -> Result<Vec<u8>, R7zError> {
-        self.source
-            .read_range_to_vec(self.range(stream)?, self.limit)
+    fn reader(
+        &self,
+        stream: &PackedStream,
+    ) -> Result<codec::PackedInput<ArchiveRangeReader<'_>>, R7zError> {
+        self.source.packed_input(self.range(stream)?)
     }
 }
 
@@ -1954,29 +1958,18 @@ fn decode_additional_folder(
     folder: &PackedFolder<'_>,
     password: Option<&str>,
 ) -> Result<DecodedFolder, R7zError> {
-    let reader = match folder.streams.as_slice() {
-        [stream] => codec::folder_reader_with_sizes_from_reader(
-            &folder.folder,
-            Box::new(packs.reader(stream)?),
-            folder.unpack_size,
-            folder.coder_sizes,
-            password,
-            usize::try_from(stream.range.end - stream.range.start).map_err(|_| R7zError::Parse)?,
-        )?,
-        streams => {
-            let packed_streams = streams
-                .iter()
-                .map(|stream| packs.read(stream))
-                .collect::<Result<Vec<_>, _>>()?;
-            codec::folder_reader_with_pack_streams(
-                &folder.folder,
-                packed_streams,
-                folder.unpack_size,
-                folder.coder_sizes,
-                password,
-            )?
-        }
-    };
+    let packed_streams = folder
+        .streams
+        .iter()
+        .map(|stream| packs.reader(stream))
+        .collect::<Result<SmallVec<[_; 4]>, _>>()?;
+    let reader = codec::folder_reader_with_pack_streams(
+        &folder.folder,
+        packed_streams,
+        folder.unpack_size,
+        folder.coder_sizes,
+        password,
+    )?;
     let mut folder_output = Vec::with_capacity(folder.decoded_len.min(64 * 1024));
     reader
         .take(folder.read_limit)

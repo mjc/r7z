@@ -6,6 +6,7 @@ use lzma_rust2::{
     Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter, filter::bcj::BcjReader,
 };
 use ppmd_rust::Ppmd7Decoder;
+use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
 const MAX_LZMA_DICTIONARY_BYTES: u32 = 256 * 1024 * 1024;
@@ -19,9 +20,9 @@ const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
 const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
 const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
 const MAX_FOLDER_CODERS: usize = 64;
-// Sum of packed Vec capacities, intermediate Vec capacities, and final output.
+// Remaining buffered paths use this cap for packed folder bytes.
 pub(crate) const MAX_BUFFERED_PACKED_FOLDER_BYTES: usize = 512 * 1024 * 1024;
-const MAX_BCJ2_BUFFERED_BYTES: usize = MAX_BUFFERED_PACKED_FOLDER_BYTES;
+const MAX_BCJ2_WORKING_BYTES: usize = 512 * 1024 * 1024;
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
 ///
@@ -306,34 +307,49 @@ fn build_decoder_chain<'a>(
     Ok(reader)
 }
 
-pub(crate) fn folder_reader_with_pack_streams(
+pub(crate) struct PackedInput<R> {
+    pub(crate) reader: R,
+    pub(crate) size: usize,
+}
+
+pub(crate) fn folder_reader_with_pack_streams<'a, R: Read + 'a>(
     folder: &Folder,
-    packed_streams: Vec<Vec<u8>>,
+    packed_streams: SmallVec<[PackedInput<R>; 4]>,
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
-    let packed_input_bytes = total_buffered_len(&packed_streams)?;
+) -> Result<Box<dyn Read + 'a>, R7zError> {
     validate_folder_coder_count(folder)?;
     let graph = folder.graph()?;
     if graph.packed_stream_count() != packed_streams.len() {
         return Err(R7zError::InvalidFolderGraph);
     }
     match (is_bcj2_folder(folder), packed_streams.as_slice()) {
-        (true, _) => bcj2_folder_reader(
-            folder,
-            &packed_streams,
-            unpack_size,
-            coder_unpack_sizes,
-            password,
-        ),
+        (true, _) => {
+            if packed_streams.len() != 4 {
+                return Err(R7zError::Parse);
+            }
+            let mut packed_streams = packed_streams.into_iter();
+            let packed_streams = [
+                packed_streams.next().ok_or(R7zError::Parse)?,
+                packed_streams.next().ok_or(R7zError::Parse)?,
+                packed_streams.next().ok_or(R7zError::Parse)?,
+                packed_streams.next().ok_or(R7zError::Parse)?,
+            ];
+            bcj2_folder_reader(
+                folder,
+                packed_streams,
+                unpack_size,
+                coder_unpack_sizes,
+                password,
+            )
+        }
         (false, [_]) => {
-            validate_decoder_working_set(folder, packed_input_bytes)?;
+            let stream = packed_streams.into_iter().next().ok_or(R7zError::Parse)?;
+            validate_decoder_working_set(folder, stream.size)?;
             build_decoder_chain(
                 folder,
-                Box::new(Cursor::new(
-                    packed_streams.into_iter().next().ok_or(R7zError::Parse)?,
-                )),
+                Box::new(stream.reader),
                 unpack_size,
                 coder_unpack_sizes,
                 password,
@@ -664,17 +680,13 @@ fn is_bcj2_folder(folder: &Folder) -> bool {
         .is_some_and(|coder| coder.codec_id.as_slice() == CODEC_BCJ2)
 }
 
-fn bcj2_folder_reader(
+fn bcj2_folder_reader<'a, R: Read + 'a>(
     folder: &Folder,
-    packed_streams: &[Vec<u8>],
+    packed_streams: [PackedInput<R>; 4],
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
-    if packed_streams.len() != 4 {
-        return Err(R7zError::Parse);
-    }
-
+) -> Result<Box<dyn Read + 'a>, R7zError> {
     if folder.coders.len() == 2
         && folder.coders[1].num_in_streams == 4
         && folder.coders[1].num_out_streams == 1
@@ -708,153 +720,78 @@ fn bcj2_folder_reader(
     )
 }
 
-fn bcj2_single_predecoder(
+fn bcj2_single_predecoder<'a, R: Read + 'a>(
     folder: &Folder,
-    packed_streams: &[Vec<u8>],
+    packed_streams: [PackedInput<R>; 4],
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
+) -> Result<Box<dyn Read + 'a>, R7zError> {
     let output_size = bcj2_output_size(unpack_size)?;
-    let packed_bytes = total_buffered_len(packed_streams)?;
-    let decoder_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
+    let [main, call, jump, rc] = packed_streams;
+    let decoder_memory = coder_working_set_bytes(&folder.coders[0], main.size)?;
     let main_size = output_size
-        .checked_sub(packed_streams[1].len())
-        .and_then(|size| size.checked_sub(packed_streams[2].len()))
+        .checked_sub(call.size)
+        .and_then(|size| size.checked_sub(jump.size))
         .ok_or(R7zError::Decompression)?;
     let declared_main_size = *coder_unpack_sizes.first().ok_or(R7zError::Parse)?;
     if usize::try_from(declared_main_size).map_err(|_| R7zError::Parse)? != main_size {
         return Err(R7zError::Decompression);
     }
-    ensure_bcj2_buffer_budget(packed_bytes, main_size, output_size, decoder_memory)?;
-    let main = decode_single_coder_to_vec(
+    ensure_bcj2_working_budget(output_size, decoder_memory)?;
+    let main = coder_reader(
         &folder.coders[0],
-        &packed_streams[0],
+        Box::new(main.reader),
         declared_main_size,
-        main_size,
         password,
     )?;
-    if main
-        .len()
-        .checked_add(packed_streams[1].len())
-        .and_then(|len| len.checked_add(packed_streams[2].len()))
-        .ok_or(R7zError::Decompression)?
-        != output_size
-    {
-        return Err(R7zError::Decompression);
-    }
-
-    ensure_bcj2_buffer_budget(packed_bytes, main.capacity(), output_size, 0)?;
     let decoded = crate::bcj2::decode(
-        &main,
-        &packed_streams[1],
-        &packed_streams[2],
-        &packed_streams[3],
+        main,
+        Box::new(call.reader),
+        Box::new(jump.reader),
+        Box::new(rc.reader),
         output_size,
     )?;
-    ensure_bcj2_buffer_budget(packed_bytes, main.capacity(), decoded.capacity(), 0)?;
     Ok(Box::new(Cursor::new(decoded)))
 }
 
-fn bcj2_lzma_predecoders(
+fn bcj2_lzma_predecoders<'a, R: Read + 'a>(
     folder: &Folder,
-    packed_streams: &[Vec<u8>],
+    packed_streams: [PackedInput<R>; 4],
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
+) -> Result<Box<dyn Read + 'a>, R7zError> {
     let output_size = bcj2_output_size(unpack_size)?;
-    let packed_bytes = total_buffered_len(packed_streams)?;
-    let jump_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
-    let jump_limit = bcj2_intermediate_available(packed_bytes, output_size, 0, jump_memory)?;
-    let jump_limit = declared_or_fallback_limit(coder_unpack_sizes.first(), jump_limit);
-    let jump = decode_single_coder_to_vec(
-        &folder.coders[0],
-        &packed_streams[3],
-        *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
-        jump_limit,
-        password,
-    )?;
-    let call_memory = coder_working_set_bytes(&folder.coders[1], packed_bytes)?;
-    let call_limit =
-        bcj2_intermediate_available(packed_bytes, output_size, jump.capacity(), call_memory)?;
-    let call_limit = declared_or_fallback_limit(coder_unpack_sizes.get(1), call_limit);
-    let call = decode_single_coder_to_vec(
-        &folder.coders[1],
-        &packed_streams[2],
-        *coder_unpack_sizes.get(1).ok_or(R7zError::Parse)?,
-        call_limit,
-        password,
-    )?;
-    let main_memory = coder_working_set_bytes(&folder.coders[2], packed_bytes)?;
-    let main_limit = bcj2_intermediate_available(
-        packed_bytes,
-        output_size,
-        jump.capacity()
-            .checked_add(call.capacity())
-            .ok_or(R7zError::Decompression)?,
-        main_memory,
-    )?;
-    let main_limit = declared_or_fallback_limit(coder_unpack_sizes.get(2), main_limit);
-    let main = decode_single_coder_to_vec(
+    let [main, rc, call, jump] = packed_streams;
+    let decoder_memory = [(0, jump.size), (1, call.size), (2, main.size)]
+        .into_iter()
+        .try_fold(0usize, |total, (index, packed_size)| {
+            total
+                .checked_add(coder_working_set_bytes(&folder.coders[index], packed_size)?)
+                .ok_or(R7zError::Decompression)
+        })?;
+    ensure_bcj2_working_budget(output_size, decoder_memory)?;
+    let main = coder_reader(
         &folder.coders[2],
-        &packed_streams[0],
+        Box::new(main.reader),
         *coder_unpack_sizes.get(2).ok_or(R7zError::Parse)?,
-        main_limit,
         password,
     )?;
-
-    if main
-        .len()
-        .checked_add(call.len())
-        .and_then(|len| len.checked_add(jump.len()))
-        .ok_or(R7zError::Decompression)?
-        != output_size
-    {
-        return Err(R7zError::Decompression);
-    }
-
-    let intermediate_bytes = jump
-        .capacity()
-        .checked_add(call.capacity())
-        .and_then(|len| len.checked_add(main.capacity()))
-        .ok_or(R7zError::Decompression)?;
-    ensure_bcj2_buffer_budget(packed_bytes, intermediate_bytes, output_size, 0)?;
-    let decoded = crate::bcj2::decode(&main, &call, &jump, &packed_streams[1], output_size)?;
-    ensure_bcj2_buffer_budget(packed_bytes, intermediate_bytes, decoded.capacity(), 0)?;
+    let call = coder_reader(
+        &folder.coders[1],
+        Box::new(call.reader),
+        *coder_unpack_sizes.get(1).ok_or(R7zError::Parse)?,
+        password,
+    )?;
+    let jump = coder_reader(
+        &folder.coders[0],
+        Box::new(jump.reader),
+        *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
+        password,
+    )?;
+    let decoded = crate::bcj2::decode(main, call, jump, Box::new(rc.reader), output_size)?;
     Ok(Box::new(Cursor::new(decoded)))
-}
-
-fn decode_single_coder_to_vec(
-    coder: &crate::CoderInfo,
-    packed_stream: &[u8],
-    unpack_size: u64,
-    max_output: usize,
-    password: Option<&str>,
-) -> Result<Vec<u8>, R7zError> {
-    let mut reader = coder_reader(
-        coder,
-        Box::new(Cursor::new(packed_stream)),
-        unpack_size,
-        password,
-    )?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(max_output)
-        .map_err(|_| resource_limit("BCJ2 intermediate", max_output))?;
-    if output.capacity() > max_output {
-        return Err(resource_limit("BCJ2 intermediate", max_output));
-    }
-    read_to_end_bounded(&mut reader, &mut output, max_output, "BCJ2 intermediate")?;
-    Ok(output)
-}
-
-fn declared_or_fallback_limit(declared_size: Option<&u64>, available: usize) -> usize {
-    let fallback = growth_safe_output_limit(available);
-    declared_size
-        .and_then(|size| usize::try_from(*size).ok())
-        .filter(|size| *size <= available)
-        .unwrap_or(fallback)
 }
 
 fn read_to_end_bounded(
@@ -916,58 +853,17 @@ fn bcj2_output_size(unpack_size: u64) -> Result<usize, R7zError> {
     Ok(output_size)
 }
 
-fn total_buffered_len(buffers: &[Vec<u8>]) -> Result<usize, R7zError> {
-    buffers.iter().try_fold(0usize, |total, buffer| {
-        total
-            .checked_add(buffer.capacity())
-            .ok_or(R7zError::Decompression)
-    })
-}
-
-fn bcj2_intermediate_limit(
-    packed_bytes: usize,
-    output_size: usize,
-    intermediate_bytes: usize,
-    decoder_memory: usize,
-) -> Result<usize, R7zError> {
-    Ok(growth_safe_output_limit(bcj2_intermediate_available(
-        packed_bytes,
-        output_size,
-        intermediate_bytes,
-        decoder_memory,
-    )?))
-}
-
-fn bcj2_intermediate_available(
-    packed_bytes: usize,
-    output_size: usize,
-    intermediate_bytes: usize,
-    decoder_memory: usize,
-) -> Result<usize, R7zError> {
-    let committed = packed_bytes
-        .checked_add(output_size)
-        .and_then(|total| total.checked_add(intermediate_bytes))
-        .and_then(|total| total.checked_add(decoder_memory))
+fn ensure_bcj2_working_budget(output_size: usize, decoder_memory: usize) -> Result<(), R7zError> {
+    let committed = output_size
+        .checked_add(decoder_memory)
         .ok_or(R7zError::Decompression)?;
-    let available = MAX_BCJ2_BUFFERED_BYTES
-        .checked_sub(committed)
-        .ok_or_else(|| resource_limit("BCJ2 working buffers", MAX_BCJ2_BUFFERED_BYTES))?;
-    Ok(available)
-}
-
-fn ensure_bcj2_buffer_budget(
-    packed_bytes: usize,
-    intermediate_bytes: usize,
-    output_size: usize,
-    decoder_memory: usize,
-) -> Result<(), R7zError> {
-    bcj2_intermediate_limit(
-        packed_bytes,
-        output_size,
-        intermediate_bytes,
-        decoder_memory,
-    )
-    .map(|_| ())
+    if committed > MAX_BCJ2_WORKING_BYTES {
+        return Err(resource_limit(
+            "BCJ2 working buffers",
+            MAX_BCJ2_WORKING_BYTES,
+        ));
+    }
+    Ok(())
 }
 
 fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
@@ -1122,20 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn actual_intermediate_growth_is_bounded_despite_dishonest_unpack_size() {
-        let copy = crate::CoderInfo::parse(&[1, 0]).unwrap().1;
-        let err = super::decode_single_coder_to_vec(&copy, b"more than allowed", u64::MAX, 4, None)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            R7zError::ResourceLimitExceeded {
-                resource: "BCJ2 intermediate",
-                limit: 4
-            }
-        ));
-    }
-
-    #[test]
     fn bcj2_declared_final_output_is_capped_before_allocation() {
         let err = super::bcj2_output_size(u64::MAX).unwrap_err();
         assert!(matches!(
@@ -1148,32 +1030,15 @@ mod tests {
     }
 
     #[test]
-    fn bcj2_budget_counts_packed_intermediate_and_final_buffers() {
-        assert_eq!(
-            super::bcj2_intermediate_limit(400, 100, 20, 30).unwrap(),
-            (512 * 1024 * 1024 - 550) / 2
-        );
+    fn bcj2_budget_counts_output_and_live_decoders() {
+        assert!(super::ensure_bcj2_working_budget(400, 100).is_ok());
         assert!(matches!(
-            super::bcj2_intermediate_limit(512 * 1024 * 1024, 1, 0, 0),
+            super::ensure_bcj2_working_budget(512 * 1024 * 1024, 1),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "BCJ2 working buffers",
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn bcj2_declared_intermediate_uses_exact_available_budget() {
-        let packed = 45 * 1024 * 1024;
-        let output = 150 * 1024 * 1024;
-        let decoder = 64 * 1024 * 1024;
-        let available = super::bcj2_intermediate_available(packed, output, 0, decoder).unwrap();
-        let declared = 150 * 1024 * 1024;
-
-        assert_eq!(
-            super::declared_or_fallback_limit(Some(&(declared as u64)), available),
-            declared
-        );
     }
 
     #[test]
