@@ -90,7 +90,9 @@ pub use codec::{
 pub use coder_info::CoderInfo;
 pub use error::R7zError;
 pub use files_info::{EntryType, FilesInfo};
-pub use folder::Folder;
+pub use folder::{
+    CoderIndex, Folder, FolderGraph, InputStreamIndex, OutputStreamIndex, PackedStreamIndex,
+};
 pub use headers::{EncodedHeader, Header, SignatureHeader};
 pub use method::{
     ALL_METHODS, MethodKind, P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name,

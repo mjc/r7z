@@ -1,5 +1,5 @@
 use crate::files_info::scan_files_info;
-use crate::stream_info::scan_stream_info;
+use crate::stream_info::scan_stream_info_with_external;
 use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
 use bytes::Bytes;
 use nom::IResult;
@@ -60,6 +60,44 @@ impl EncodedHeader {
     }
 }
 
+pub(crate) fn parse_additional_streams_info(
+    backing: &Bytes,
+) -> Result<Option<StreamInfo>, R7zError> {
+    let input: &[u8] = backing;
+    let (mut input, tag) = Property::parse(input).map_err(|_| R7zError::Parse)?;
+    if tag != Property::Header {
+        return Err(R7zError::Parse);
+    }
+    loop {
+        let (i, tag) = Property::parse(input).map_err(|_| R7zError::Parse)?;
+        input = i;
+        match tag {
+            Property::END | Property::MainStreamsInfo => return Ok(None),
+            Property::AdditionalStreamsInfo => {
+                let (_, streams) =
+                    StreamInfo::parse(input, backing).map_err(|_| R7zError::Parse)?;
+                return Ok(Some(streams));
+            }
+            Property::ArchiveProperties => {
+                let (i, ()) = scan_archive_properties(input).map_err(|_| R7zError::Parse)?;
+                input = i;
+            }
+            Property::FilesInfo => {
+                let (i, _) = scan_files_info(input).map_err(|_| R7zError::Parse)?;
+                input = i;
+            }
+            _ => {
+                let (i, size) =
+                    crate::sevenzip_varuint64_decode(input).map_err(|_| R7zError::Parse)?;
+                let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
+                let (i, _) = nom::bytes::complete::take::<_, _, nom::error::Error<_>>(size)(i)
+                    .map_err(|_| R7zError::Parse)?;
+                input = i;
+            }
+        }
+    }
+}
+
 /// The fully decoded 7z archive header containing stream and file metadata.
 ///
 /// Metadata is validated eagerly during [`parse`](Header::parse) via
@@ -76,6 +114,7 @@ pub struct Header {
     files_info_range: Option<std::ops::Range<u32>>,
     /// Byte range containing `AdditionalStreamsInfo` when present.
     additional_streams_range: Option<std::ops::Range<u32>>,
+    external_folder_data: Option<Bytes>,
     /// Number of file entries (extracted during scan; avoids a lazy parse just
     /// to read the count).
     num_files: u64,
@@ -129,11 +168,15 @@ impl Header {
             let start = range.start as usize;
             let end = range.end as usize;
             self.data.get(start..end).ok_or(()).and_then(|slice| {
-                StreamInfo::parse(slice, &self.data)
-                    .ok()
-                    .filter(|(rest, _)| rest.is_empty())
-                    .map(|(_, value)| value)
-                    .ok_or(())
+                StreamInfo::parse_with_external(
+                    slice,
+                    &self.data,
+                    self.external_folder_data.as_ref(),
+                )
+                .ok()
+                .filter(|(rest, _)| rest.is_empty())
+                .map(|(_, value)| value)
+                .ok_or(())
             })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
@@ -201,6 +244,14 @@ impl Header {
     /// Returns a nom error if the input is truncated, malformed, or does not start with
     /// the `Header` property tag.
     pub fn parse(backing: &Bytes) -> IResult<&[u8], Header> {
+        Self::parse_with_external(backing, None)
+    }
+
+    /// Parse a header with decoded external folder definition bytes.
+    pub fn parse_with_external(
+        backing: &Bytes,
+        external_folder_data: Option<Bytes>,
+    ) -> IResult<&[u8], Header> {
         let input: &[u8] = backing;
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
@@ -233,7 +284,8 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) = scan_stream_info(input)?;
+                    let (i, ()) =
+                        scan_stream_info_with_external(input, external_folder_data.as_ref())?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -248,7 +300,8 @@ impl Header {
                             nom::error::ErrorKind::TooLarge,
                         ))
                     })?;
-                    let (i, ()) = scan_stream_info(input)?;
+                    let (i, ()) =
+                        scan_stream_info_with_external(input, external_folder_data.as_ref())?;
                     let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
                         nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
                     })?;
@@ -298,6 +351,7 @@ impl Header {
                 streams_info_range,
                 files_info_range,
                 additional_streams_range,
+                external_folder_data,
                 num_files,
                 streams_cache: OnceCell::new(),
                 files_cache: OnceCell::new(),
@@ -362,6 +416,35 @@ mod tests {
         let (rem, header) = Header::parse(&bytes).unwrap();
         assert!(rem.is_empty());
         assert_eq!(header.try_files_info().unwrap().unwrap().num_files, 1);
+    }
+
+    #[test]
+    fn main_streams_info_reads_folder_definition_from_additional_streams() {
+        let bytes = Bytes::from_static(&[
+            0x01, // Header
+            0x03, // AdditionalStreamsInfo
+            0x06, 0x00, 0x01, 0x09, 0x03, 0x00, // one packed stream, size 3
+            0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00, // copy folder
+            0x08, 0x00, 0x00, // SubStreamsInfo and end of AdditionalStreamsInfo
+            0x04, // MainStreamsInfo
+            0x07, 0x0b, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00, // external folder index 0
+            0x00, // end MainStreamsInfo
+            0x05, 0x00, 0x00, // empty FilesInfo
+            0x00, // end Header
+        ]);
+        let external_folder = Bytes::from_static(&[0x01, 0x01, 0x00]);
+
+        assert!(Header::parse(&bytes).is_err());
+        let (rest, header) = Header::parse_with_external(&bytes, Some(external_folder)).unwrap();
+        assert_eq!(rest, b"");
+        let streams = header.try_streams_info().unwrap().unwrap();
+        let folder = streams
+            .unpack_info
+            .as_ref()
+            .unwrap()
+            .parse_folder(0)
+            .unwrap();
+        assert_eq!(folder.coders.len(), 1);
     }
 }
 

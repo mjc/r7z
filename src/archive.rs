@@ -693,8 +693,13 @@ impl Archive {
                 )?;
                 let decompressed = Bytes::from(decompressed);
 
-                let (_, header) = Header::parse(&decompressed).map_err(|_| R7zError::Parse)?;
-                verify_additional_stream_crcs(&source, base_offset, &header)?;
+                let header = parse_header_with_external_data(
+                    &source,
+                    base_offset,
+                    &decompressed,
+                    options.max_metadata_bytes,
+                    password,
+                )?;
 
                 Ok(Archive {
                     source,
@@ -707,8 +712,13 @@ impl Archive {
             Property::Header => {
                 // Header is stored uncompressed at next_header_offset (the raw bytes
                 // include the 0x01 tag, so we slice from header_start, not header_start+1)
-                let (_, header) = Header::parse(&next_header).map_err(|_| R7zError::Parse)?;
-                verify_additional_stream_crcs(&source, base_offset, &header)?;
+                let header = parse_header_with_external_data(
+                    &source,
+                    base_offset,
+                    &next_header,
+                    options.max_metadata_bytes,
+                    password,
+                )?;
 
                 Ok(Archive {
                     source,
@@ -1907,6 +1917,122 @@ fn verify_source_crc(
     }
 }
 
+fn parse_header_with_external_data(
+    source: &ArchiveSource,
+    base_offset: u64,
+    bytes: &Bytes,
+    metadata_limit: u64,
+    password: Option<&str>,
+) -> Result<Header, R7zError> {
+    if let Ok((rest, header)) = Header::parse(bytes)
+        && rest.is_empty()
+    {
+        verify_additional_stream_crcs(source, base_offset, &header)?;
+        return Ok(header);
+    }
+
+    let Some(additional) = crate::headers::parse_additional_streams_info(bytes)? else {
+        return Err(R7zError::Parse);
+    };
+    let external_data =
+        decode_additional_folder_data(source, base_offset, &additional, metadata_limit, password)?;
+    let (rest, header) =
+        Header::parse_with_external(bytes, Some(external_data)).map_err(|_| R7zError::Parse)?;
+    if !rest.is_empty() {
+        return Err(R7zError::Parse);
+    }
+    Ok(header)
+}
+
+fn decode_additional_folder_data(
+    source: &ArchiveSource,
+    base_offset: u64,
+    streams: &StreamInfo,
+    metadata_limit: u64,
+    password: Option<&str>,
+) -> Result<Bytes, R7zError> {
+    let Some(pack_info) = streams.pack_info.as_ref() else {
+        return Ok(Bytes::new());
+    };
+    let Some(unpack_info) = streams.unpack_info.as_ref() else {
+        return Ok(Bytes::new());
+    };
+    let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
+    let mut packed_offset = 0u64;
+    let mut packed_index = 0usize;
+    let mut output = Vec::new();
+    let mut output_base = 0usize;
+
+    for folder_idx in 0..unpack_info.num_folders_usize() {
+        let folder = unpack_info.parse_folder(folder_idx)?;
+        let graph = folder.checked_graph()?;
+        let mut packed_streams = Vec::with_capacity(graph.packed_inputs.len());
+        for _ in &graph.packed_inputs {
+            let size = *pack_info
+                .pack_size
+                .get(packed_index)
+                .ok_or(R7zError::Parse)?;
+            packed_offset = packed_offset.checked_add(size).ok_or(R7zError::Parse)?;
+            if packed_offset > metadata_limit {
+                return Err(R7zError::LimitExceeded("metadata"));
+            }
+            let start = checked_add_u64(data_start, packed_offset - size)?;
+            let range = checked_range_u64(source.len()?, start, size)?;
+            if let Some(expected) = pack_info.digests.get(packed_index).copied().flatten() {
+                verify_source_crc(source, range.clone(), expected)?;
+            }
+            packed_streams.push(source.read_range_to_vec(range, metadata_limit)?);
+            packed_index += 1;
+        }
+
+        let coder_sizes = folder_coder_unpack_sizes_at(output_base, &folder, unpack_info)?;
+        let unpack_size = *coder_sizes
+            .get(graph.final_output.0)
+            .ok_or(R7zError::Parse)?;
+        let next_output_len = u64::try_from(output.len())
+            .map_err(|_| R7zError::Parse)?
+            .checked_add(unpack_size)
+            .ok_or(R7zError::Parse)?;
+        if next_output_len > metadata_limit {
+            return Err(R7zError::LimitExceeded("metadata"));
+        }
+        let mut reader = codec::folder_reader_with_pack_streams(
+            &folder,
+            packed_streams,
+            unpack_size,
+            &coder_sizes,
+            password,
+        )?;
+        let read_limit = usize::try_from(unpack_size)
+            .map_err(|_| R7zError::LimitExceeded("metadata"))?
+            .checked_add(1)
+            .ok_or(R7zError::LimitExceeded("metadata"))?;
+        let mut folder_output = Vec::with_capacity(read_limit.min(64 * 1024));
+        reader
+            .by_ref()
+            .take(u64::try_from(read_limit).map_err(|_| R7zError::Parse)?)
+            .read_to_end(&mut folder_output)
+            .map_err(R7zError::Io)?;
+        if folder_output.len() != usize::try_from(unpack_size).map_err(|_| R7zError::Parse)? {
+            return Err(R7zError::Decompression);
+        }
+        if let Some(Some(expected)) = unpack_info.digests.get(folder_idx) {
+            if crc32fast::hash(&folder_output) != *expected {
+                return Err(R7zError::Crc);
+            }
+        }
+        output.extend_from_slice(&folder_output);
+        output_base = output_base
+            .checked_add(folder.total_out_streams())
+            .ok_or(R7zError::Parse)?;
+    }
+
+    if packed_index != pack_info.pack_size.len() {
+        return Err(R7zError::Parse);
+    }
+    Ok(Bytes::from(output))
+}
+
 fn verify_additional_stream_crcs(
     source: &ArchiveSource,
     base_offset: u64,
@@ -2938,6 +3064,41 @@ mod selected_stream_tests {
             .add_file("later.txt", b"later payload")
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn decodes_additional_streams_used_for_external_folder_definitions() {
+        let header = Bytes::from_static(&[
+            0x01, 0x03, // Header + AdditionalStreamsInfo
+            0x06, 0x00, 0x01, 0x09, 0x03, 0x00, // one packed stream
+            0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00, // copy folder
+            0x08, 0x00, 0x00, // SubStreamsInfo and AdditionalStreamsInfo end
+            0x04, 0x07, 0x0b, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00, 0x00, // main external ref
+            0x05, 0x00, 0x00, 0x00, // empty FilesInfo and Header end
+        ]);
+        let mut archive = vec![0u8; 32];
+        archive[..6].copy_from_slice(b"7z\xbc\xaf'\x1c");
+        archive[6] = 0;
+        archive[7] = 4;
+        archive.extend_from_slice(&[0x01, 0x01, 0x00]);
+        archive.extend_from_slice(&header);
+        archive[12..20].copy_from_slice(&3u64.to_le_bytes());
+        archive[20..28].copy_from_slice(&u64::try_from(header.len()).unwrap().to_le_bytes());
+        archive[28..32].copy_from_slice(&crc32fast::hash(&header).to_le_bytes());
+        let start_crc = crc32fast::hash(&archive[12..32]);
+        archive[8..12].copy_from_slice(&start_crc.to_le_bytes());
+        let parsed = Archive::from_bytes(Bytes::from(archive)).unwrap();
+        let main = parsed.header.try_streams_info().unwrap().unwrap();
+        assert_eq!(
+            main.unpack_info
+                .as_ref()
+                .unwrap()
+                .parse_folder(0)
+                .unwrap()
+                .coders
+                .len(),
+            1
+        );
     }
 
     fn archive_with_many_files(solid: SolidMode) -> (Vec<u8>, Vec<Vec<u8>>) {

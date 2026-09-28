@@ -306,6 +306,7 @@ pub(crate) fn folder_reader_with_pack_streams(
 ) -> Result<Box<dyn Read>, R7zError> {
     let packed_input_bytes = total_buffered_len(&packed_streams)?;
     validate_folder_coder_count(folder)?;
+    folder.checked_graph()?;
     if is_bcj2_folder(folder) {
         return bcj2_folder_reader(
             folder,
@@ -317,7 +318,13 @@ pub(crate) fn folder_reader_with_pack_streams(
     }
 
     if packed_streams.len() != 1 {
-        return Err(R7zError::Parse);
+        let unsupported = folder
+            .coders
+            .iter()
+            .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
+        return Err(unsupported.map_or(R7zError::Parse, |coder| {
+            R7zError::UnsupportedCodec(coder.codec_id.to_vec())
+        }));
     }
 
     folder_reader_with_sizes_from_reader(
@@ -964,99 +971,12 @@ fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
 /// The packed (compressed) stream enters one coder first, its output feeds the
 /// next via bind pairs, and so on.  We return coder indices in execution order.
 fn coder_execution_order(folder: &crate::Folder) -> Result<SmallVec<[usize; 4]>, R7zError> {
-    let n = folder.coders.len();
-    if n <= 1 {
-        return Ok((0..n).collect());
-    }
-
-    if folder
-        .coders
-        .iter()
-        .any(|coder| coder.num_in_streams != 1 || coder.num_out_streams != 1)
-    {
-        return Err(R7zError::Parse);
-    }
-
-    if folder.bind_pairs.len() != n - 1 {
-        return Err(R7zError::Parse);
-    }
-
-    // Find which coder's input stream is NOT bound to any other coder's output.
-    // That coder receives the packed data and runs first.
-    //
-    // Bind pairs: (in_index, out_index) — in_index is a global input stream
-    // index, out_index is a global output stream index.
-    //
-    // For a 2-coder folder:
-    //   coder 0: in_stream 0, out_stream 0
-    //   coder 1: in_stream 1, out_stream 1
-    //   bind_pair (1, 0) means: in_stream 1 ← out_stream 0
-    //   So coder 1's input comes from coder 0's output.
-    //   The packed data goes to the stream NOT appearing as any bind_pair's in_index.
-    //   Stream 0 (coder 0) is not bound as input → coder 0 runs first.
-
-    // Build a set of bound input streams.
-    let bound_in: SmallVec<[u64; 4]> = folder
-        .bind_pairs
-        .iter()
-        .map(|&(in_idx, _)| in_idx)
-        .collect();
-
-    for &(in_idx, out_idx) in &folder.bind_pairs {
-        if in_idx >= n as u64 || out_idx >= n as u64 {
-            return Err(R7zError::Parse);
-        }
-    }
-
-    let start_stream = if folder.packed_indices.is_empty() {
-        let starts: SmallVec<[u64; 2]> = (0..n as u64)
-            .filter(|stream| !bound_in.contains(stream))
-            .collect();
-        if starts.len() != 1 {
-            return Err(R7zError::Parse);
-        }
-        starts[0]
-    } else if folder.packed_indices.len() == 1 {
-        let start = folder.packed_indices[0];
-        if start >= n as u64 || bound_in.contains(&start) {
-            return Err(R7zError::Parse);
-        }
-        start
-    } else {
-        return Err(R7zError::Parse);
-    };
-
-    // Map global stream index → coder index
-    // For simple 1-in/1-out coders: stream i belongs to coder i.
-    // For complex coders we'd need cumulative sums, but 7z BCJ uses simple coders.
-    let mut order = SmallVec::with_capacity(n);
-
-    // Find the first coder (the one whose input stream is not bound)
-    let mut current_stream = start_stream;
-    order.push(usize::try_from(start_stream).map_err(|_| R7zError::Parse)?);
-
-    // Follow the chain: find bind pair where out_index == current_stream,
-    // then the coder that owns in_index is next.
-    while order.len() < n {
-        let matches: SmallVec<[(u64, u64); 2]> = folder
-            .bind_pairs
-            .iter()
-            .copied()
-            .filter(|&(_, out_idx)| out_idx == current_stream)
-            .collect();
-        if matches.len() != 1 {
-            return Err(R7zError::Parse);
-        }
-        let (in_idx, _) = matches[0];
-        let coder_idx = usize::try_from(in_idx).map_err(|_| R7zError::Parse)?;
-        if order.contains(&coder_idx) {
-            return Err(R7zError::Parse);
-        }
-        order.push(coder_idx);
-        current_stream = in_idx;
-    }
-
-    Ok(order)
+    let graph = folder.checked_graph()?;
+    graph
+        .execution_order
+        .into_iter()
+        .map(|index| Ok(index.0))
+        .collect()
 }
 
 #[cfg(test)]

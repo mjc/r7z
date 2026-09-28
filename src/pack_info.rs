@@ -146,6 +146,7 @@ impl UnpackInfo {
     pub fn parse_folder(&self, idx: usize) -> Result<Folder, crate::R7zError> {
         let bytes = self.folder_bytes(idx)?;
         let (_, folder) = Folder::parse(bytes).map_err(|_| crate::R7zError::Parse)?;
+        folder.checked_graph()?;
         Ok(folder)
     }
 
@@ -173,6 +174,16 @@ impl UnpackInfo {
     ///
     /// Returns a nom error if the input is truncated or does not start with the `UnPackInfo` tag.
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], UnpackInfo> {
+        Self::parse_with_external(input, backing, None)
+    }
+
+    /// Parse an `UnpackInfo` block whose folder definitions may be stored in
+    /// decoded `AdditionalStreamsInfo` data.
+    pub fn parse_with_external<'a>(
+        input: &'a [u8],
+        backing: &Bytes,
+        external_data: Option<&'a Bytes>,
+    ) -> IResult<&'a [u8], UnpackInfo> {
         let orig_input = input;
         let (input, property_id) = Property::parse(input)?;
         if property_id != Property::UnPackInfo {
@@ -191,42 +202,102 @@ impl UnpackInfo {
         }
         let (input, num_folders) = sevenzip_varuint64_decode(input)?;
         let (input, is_external) = le_u8(input)?;
-
-        let input = if is_external != 0 {
-            let (input, _data_stream_index) = sevenzip_varuint64_decode(input)?;
-            input
-        } else {
-            input
-        };
-
         // Scan and validate each folder — record byte offsets and total_out_streams
         // without building Folder structs.
-        let folder_start = input;
         let mut folder_offsets: Vec<u32> =
             Vec::with_capacity(usize_cap(num_folders, input.len()) + 1);
         let mut total_out_streams: usize = 0;
         let mut input = input;
-        for _ in 0..num_folders {
-            let offset = u32::try_from(folder_start.len() - input.len()).map_err(|_| {
-                nom::Err::Error(nom::error::Error::new(
+        let (folder_backing, folder_start, end_offset) = match is_external {
+            0 => {
+                let folder_start = input;
+                let mut folders = folder_start;
+                for _ in 0..num_folders {
+                    let offset =
+                        u32::try_from(folder_start.len() - folders.len()).map_err(|_| {
+                            nom::Err::Error(nom::error::Error::new(
+                                folders,
+                                nom::error::ErrorKind::TooLarge,
+                            ))
+                        })?;
+                    folder_offsets.push(offset);
+                    let (i, out_streams) = scan_folder(folders)?;
+                    total_out_streams =
+                        total_out_streams.checked_add(out_streams).ok_or_else(|| {
+                            nom::Err::Failure(nom::error::Error::new(
+                                i,
+                                nom::error::ErrorKind::TooLarge,
+                            ))
+                        })?;
+                    folders = i;
+                    input = i;
+                }
+                let end = u32::try_from(folder_start.len() - folders.len()).map_err(|_| {
+                    nom::Err::Error(nom::error::Error::new(
+                        folders,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                (backing, folder_start, end)
+            }
+            1 => {
+                let (i, data_stream_index) = sevenzip_varuint64_decode(input)?;
+                input = i;
+                let data = external_data.ok_or_else(|| {
+                    nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+                })?;
+                let offset = usize::try_from(data_stream_index).map_err(|_| {
+                    nom::Err::Failure(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                let folder_start = data.get(offset..).ok_or_else(|| {
+                    nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Eof))
+                })?;
+                let mut folders = folder_start;
+                for _ in 0..num_folders {
+                    let offset =
+                        u32::try_from(folder_start.len() - folders.len()).map_err(|_| {
+                            nom::Err::Failure(nom::error::Error::new(
+                                input,
+                                nom::error::ErrorKind::TooLarge,
+                            ))
+                        })?;
+                    folder_offsets.push(offset);
+                    let (i, out_streams) = scan_folder(folders).map_err(|error| {
+                        let kind = match error {
+                            nom::Err::Error(error) | nom::Err::Failure(error) => error.code,
+                            nom::Err::Incomplete(_) => nom::error::ErrorKind::Eof,
+                        };
+                        nom::Err::Failure(nom::error::Error::new(input, kind))
+                    })?;
+                    total_out_streams =
+                        total_out_streams.checked_add(out_streams).ok_or_else(|| {
+                            nom::Err::Failure(nom::error::Error::new(
+                                input,
+                                nom::error::ErrorKind::TooLarge,
+                            ))
+                        })?;
+                    folders = i;
+                }
+                let end = u32::try_from(folder_start.len() - folders.len()).map_err(|_| {
+                    nom::Err::Failure(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::TooLarge,
+                    ))
+                })?;
+                (data, folder_start, end)
+            }
+            _ => {
+                return Err(nom::Err::Failure(nom::error::Error::new(
                     input,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-            folder_offsets.push(offset);
-            let (i, out_streams) = scan_folder(input)?;
-            total_out_streams += out_streams;
-            input = i;
-        }
-        // Sentinel offset marking end of last folder
-        let end_offset = u32::try_from(folder_start.len() - input.len()).map_err(|_| {
-            nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::TooLarge,
-            ))
-        })?;
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+        };
         folder_offsets.push(end_offset);
-        let folder_data = backing.slice_ref(&folder_start[..end_offset as usize]);
+        let folder_data = folder_backing.slice_ref(&folder_start[..end_offset as usize]);
 
         // Property-tag loop for CodersUnPackSize and CRC
         let mut unpack_sizes: SmallVec<[u64; 4]> =
@@ -356,7 +427,15 @@ pub(crate) fn scan_pack_info(input: &[u8]) -> IResult<&[u8], ()> {
 ///
 /// Returns a nom error if the input is truncated or does not start with the
 /// `UnPackInfo` tag.
+#[cfg(test)]
 pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
+    scan_unpack_info_with_external(input, None)
+}
+
+pub(crate) fn scan_unpack_info_with_external<'a>(
+    input: &'a [u8],
+    external_data: Option<&Bytes>,
+) -> IResult<&'a [u8], usize> {
     let orig = input;
     let (input, tag) = Property::parse(input)?;
     if tag != Property::UnPackInfo {
@@ -374,21 +453,64 @@ pub(crate) fn scan_unpack_info(input: &[u8]) -> IResult<&[u8], usize> {
         )));
     }
     let (input, num_folders) = sevenzip_varuint64_decode(input)?;
-    let (input, is_external) = le_u8(input)?;
-
-    let input = if is_external != 0 {
-        let (input, _) = sevenzip_varuint64_decode(input)?;
-        input
-    } else {
-        input
-    };
-
+    let (mut input, is_external) = le_u8(input)?;
     let mut total_out_streams: usize = 0;
-    let mut input = input;
-    for _ in 0..num_folders {
-        let (i, out_streams) = scan_folder(input)?;
-        total_out_streams += out_streams;
-        input = i;
+    match is_external {
+        0 => {
+            for _ in 0..num_folders {
+                let (i, out_streams) = scan_folder(input)?;
+                total_out_streams =
+                    total_out_streams.checked_add(out_streams).ok_or_else(|| {
+                        nom::Err::Failure(nom::error::Error::new(
+                            i,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                input = i;
+            }
+        }
+        1 => {
+            let (i, data_stream_index) = sevenzip_varuint64_decode(input)?;
+            input = i;
+            let Some(data) = external_data else {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Verify,
+                )));
+            };
+            let offset = usize::try_from(data_stream_index).map_err(|_| {
+                nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            let mut folders = data.get(offset..).ok_or_else(|| {
+                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Eof))
+            })?;
+            for _ in 0..num_folders {
+                let (i, out_streams) = scan_folder(folders).map_err(|error| {
+                    let kind = match error {
+                        nom::Err::Error(error) | nom::Err::Failure(error) => error.code,
+                        nom::Err::Incomplete(_) => nom::error::ErrorKind::Eof,
+                    };
+                    nom::Err::Failure(nom::error::Error::new(input, kind))
+                })?;
+                total_out_streams =
+                    total_out_streams.checked_add(out_streams).ok_or_else(|| {
+                        nom::Err::Failure(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                folders = i;
+            }
+        }
+        _ => {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
     }
 
     let nf = usize::try_from(num_folders).map_err(|_| {
@@ -464,7 +586,8 @@ fn parse_digests(input: &[u8], num_streams: usize) -> IResult<&[u8], SmallVec<[O
 
 #[cfg(test)]
 mod tests {
-    use super::{PackInfo, scan_pack_info, scan_unpack_info};
+    use super::{PackInfo, UnpackInfo, scan_pack_info, scan_unpack_info};
+    use bytes::Bytes;
 
     // ── scan_pack_info ──────────────────────────────────────────────
 
@@ -520,6 +643,28 @@ mod tests {
             pack_info.digests.as_slice(),
             &[Some(0xA3A2_A1A0), None, Some(0xB3B2_B1B0)]
         );
+    }
+
+    #[test]
+    fn parse_unpack_info_external_folder_definitions() {
+        let input = [0x07u8, 0x0b, 0x01, 0x01, 0x01, 0x0c, 0x03, 0x00];
+        let backing = Bytes::copy_from_slice(&input);
+        let external = Bytes::from_static(&[0xff, 0x01, 0x01, 0x00]);
+        let (rest, unpack) =
+            UnpackInfo::parse_with_external(&input, &backing, Some(&external)).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(unpack.unpack_sizes.as_slice(), &[3]);
+        assert_eq!(unpack.folder_bytes(0).unwrap(), &[0x01, 0x01, 0x00]);
+        assert_eq!(unpack.parse_folder(0).unwrap().coders.len(), 1);
+    }
+
+    #[test]
+    fn parse_unpack_info_rejects_missing_or_out_of_range_external_data() {
+        let input = [0x07u8, 0x0b, 0x01, 0x01, 0x01, 0x09, 0x0c, 0x03, 0x00];
+        let backing = Bytes::copy_from_slice(&input);
+        assert!(UnpackInfo::parse(&input, &backing).is_err());
+        let external = Bytes::from_static(&[0x01, 0x01, 0x00]);
+        assert!(UnpackInfo::parse_with_external(&input, &backing, Some(&external)).is_err());
     }
 
     #[test]
