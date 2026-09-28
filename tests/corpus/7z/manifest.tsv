@@ -13,6 +13,10 @@ tests/corpus/7z/generated/swap4_lzma2.7z	-	extract	3
 tests/corpus/7z/generated/bcj_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/bcj2_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/arm_lzma2.7z	-	extract	1
+tests/corpus/7z/generated/arm64.7z	-	extract	1
+tests/corpus/7z/generated/arm64_offset4.7z	-	extract	1
+tests/corpus/7z/generated/riscv.7z	-	extract	1
+tests/corpus/7z/generated/riscv_offset2.7z	-	extract	1
 tests/corpus/7z/generated/armt_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/ia64_lzma2.7z	-	extract	1
 tests/corpus/7z/generated/ppc_lzma2.7z	-	extract	1

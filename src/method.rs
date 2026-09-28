@@ -24,10 +24,12 @@ pub enum SevenZMethod {
     Bcj,
     Bcj2,
     Arm,
+    Arm64,
     ArmThumb,
     Ia64,
     Ppc,
     Sparc,
+    Riscv,
     Delta,
     Swap2,
     Swap4,
@@ -56,10 +58,12 @@ impl SevenZMethod {
             Self::Bcj => &[0x03, 0x03, 0x01, 0x03],
             Self::Bcj2 => &[0x03, 0x03, 0x01, 0x1B],
             Self::Arm => &[0x03, 0x03, 0x05, 0x01],
+            Self::Arm64 => &[0x0A],
             Self::ArmThumb => &[0x03, 0x03, 0x07, 0x01],
             Self::Ia64 => &[0x03, 0x03, 0x04, 0x01],
             Self::Ppc => &[0x03, 0x03, 0x02, 0x05],
             Self::Sparc => &[0x03, 0x03, 0x08, 0x05],
+            Self::Riscv => &[0x0B],
             Self::Delta => &[0x03],
             Self::Swap2 => &[0x02, 0x03, 0x02],
             Self::Swap4 => &[0x02, 0x03, 0x04],
@@ -87,10 +91,12 @@ impl SevenZMethod {
             Self::Bcj => "BCJ",
             Self::Bcj2 => "BCJ2",
             Self::Arm => "ARM",
+            Self::Arm64 => "ARM64",
             Self::ArmThumb => "ARMT",
             Self::Ia64 => "IA64",
             Self::Ppc => "PPC",
             Self::Sparc => "SPARC",
+            Self::Riscv => "RISCV",
             Self::Delta => "Delta",
             Self::Swap2 => "Swap2",
             Self::Swap4 => "Swap4",
@@ -112,10 +118,12 @@ impl SevenZMethod {
             Self::Bcj
             | Self::Bcj2
             | Self::Arm
+            | Self::Arm64
             | Self::ArmThumb
             | Self::Ia64
             | Self::Ppc
             | Self::Sparc
+            | Self::Riscv
             | Self::Delta
             | Self::Swap2
             | Self::Swap4 => MethodKind::Filter,
@@ -138,10 +146,12 @@ impl SevenZMethod {
                 | Self::Bcj
                 | Self::Bcj2
                 | Self::Arm
+                | Self::Arm64
                 | Self::ArmThumb
                 | Self::Ia64
                 | Self::Ppc
                 | Self::Sparc
+                | Self::Riscv
                 | Self::Delta
                 | Self::Swap2
                 | Self::Swap4
@@ -185,10 +195,12 @@ pub const ALL_METHODS: &[SevenZMethod] = &[
     SevenZMethod::Bcj,
     SevenZMethod::Bcj2,
     SevenZMethod::Arm,
+    SevenZMethod::Arm64,
     SevenZMethod::ArmThumb,
     SevenZMethod::Ia64,
     SevenZMethod::Ppc,
     SevenZMethod::Sparc,
+    SevenZMethod::Riscv,
     SevenZMethod::Delta,
     SevenZMethod::Swap2,
     SevenZMethod::Swap4,

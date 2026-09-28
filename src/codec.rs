@@ -2,7 +2,9 @@ use crate::{Folder, R7zError};
 use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
 use flate2::read::DeflateDecoder;
-use lzma_rust2::{Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter};
+use lzma_rust2::{
+    Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter, filter::bcj::BcjReader,
+};
 use ppmd_rust::Ppmd7Decoder;
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
@@ -55,6 +57,8 @@ pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
 pub const CODEC_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
 /// Codec ID for the ARM branch filter.
 pub const CODEC_BCJ_ARM: &[u8] = &[0x03, 0x03, 0x05, 0x01];
+/// Codec ID for the ARM64 branch filter.
+pub const CODEC_BCJ_ARM64: &[u8] = &[0x0A];
 /// Codec ID for the ARM Thumb branch filter.
 pub const CODEC_BCJ_ARM_THUMB: &[u8] = &[0x03, 0x03, 0x07, 0x01];
 /// Codec ID for the IA-64 branch filter.
@@ -63,6 +67,8 @@ pub const CODEC_BCJ_IA64: &[u8] = &[0x03, 0x03, 0x04, 0x01];
 pub const CODEC_BCJ_PPC: &[u8] = &[0x03, 0x03, 0x02, 0x05];
 /// Codec ID for the SPARC branch filter.
 pub const CODEC_BCJ_SPARC: &[u8] = &[0x03, 0x03, 0x08, 0x05];
+/// Codec ID for the RISC-V branch filter.
+pub const CODEC_BCJ_RISCV: &[u8] = &[0x0B];
 /// Codec ID for the no-op copy codec (uncompressed).
 pub const CODEC_COPY: &[u8] = &[0x00];
 /// Codec ID for AES-256-SHA-256 encryption (7zAES).
@@ -133,6 +139,19 @@ fn lzma2_dict_size(props: Option<&[u8]>) -> Result<u32, R7zError> {
             }
         }
     }
+}
+
+fn branch_start_pos(props: Option<&[u8]>, alignment: u32) -> Result<usize, R7zError> {
+    let props = props.unwrap_or_default();
+    let pos = match props {
+        [] => 0,
+        [a, b, c, d] => u32::from_le_bytes([*a, *b, *c, *d]),
+        _ => return Err(R7zError::Decompression),
+    };
+    if pos % alignment != 0 {
+        return Err(R7zError::Decompression);
+    }
+    Ok(pos as usize)
 }
 
 #[cfg(test)]
@@ -355,6 +374,16 @@ fn coder_reader<'a>(
             input,
             crate::bcj::BranchFilter::Arm,
         )));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_ARM64 {
+        let pos = branch_start_pos(coder.properties.as_deref(), 4)?;
+        return Ok(Box::new(BcjReader::new_arm64(input, pos)));
+    }
+
+    if *coder.codec_id == *CODEC_BCJ_RISCV {
+        let pos = branch_start_pos(coder.properties.as_deref(), 2)?;
+        return Ok(Box::new(BcjReader::new_riscv(input, pos)));
     }
 
     if *coder.codec_id == *CODEC_BCJ_ARM_THUMB {

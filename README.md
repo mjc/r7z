@@ -424,6 +424,8 @@ These are public but primarily used for building advanced tooling:
 | Delta filter + compression | Read |
 | Swap2 / Swap4 filters + compression | Read |
 | ARM / ARMT / IA64 / PPC / SPARC filters + compression | Read |
+| ARM64 filter (method `0A`) + compression | Read; write unsupported |
+| RISC-V filter (method `0B`) + compression | Read; write unsupported |
 | BCJ x86 filter + LZMA2 | Read + Write |
 | BCJ2 x86 filter + LZMA2 | Read |
 | EncodedHeader archives (p7zip default) | Read + Write |
