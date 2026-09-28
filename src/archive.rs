@@ -1892,53 +1892,41 @@ fn decode_additional_folder_data(
     metadata_limit: u64,
     password: Option<&str>,
 ) -> Result<Vec<Bytes>, R7zError> {
-    let (pack_info, unpack_info) = streams.checked_packed_folders()?;
-    let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pack_info.pack_pos)?;
-    let mut packed_offset = 0u64;
-    let mut packed_index = 0usize;
-    let mut output = reserve_decoded_folder_slots(unpack_info.num_folders_usize(), metadata_limit)?;
+    let folders = streams.checked_packed_folders()?;
+    let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, folders.pack_pos())?;
+    let mut output = reserve_decoded_folder_slots(folders.len(), metadata_limit)?;
     let mut output_size = 0u64;
-    let mut output_base = 0usize;
 
-    for folder_idx in 0..unpack_info.num_folders_usize() {
-        let (folder, graph) = unpack_info.parse_folder_with_graph(folder_idx)?;
-        let mut packed_streams = Vec::with_capacity(graph.packed_stream_count());
-        for _ in 0..graph.packed_stream_count() {
-            let size = *pack_info
-                .pack_size
-                .get(packed_index)
-                .ok_or(R7zError::Parse)?;
-            packed_offset = packed_offset.checked_add(size).ok_or(R7zError::Parse)?;
-            if packed_offset > metadata_limit {
+    for folder in folders {
+        let folder = folder?;
+        let mut packed_streams = Vec::with_capacity(folder.streams.len());
+        for stream in folder.streams {
+            if stream.range.end > metadata_limit {
                 return Err(R7zError::LimitExceeded("metadata"));
             }
-            let start = checked_add_u64(data_start, packed_offset - size)?;
+            let start = checked_add_u64(data_start, stream.range.start)?;
+            let size = stream.range.end - stream.range.start;
             let range = checked_range_u64(source.len()?, start, size)?;
-            if let Some(expected) = pack_info.digests.get(packed_index).copied().flatten() {
+            if let Some(expected) = stream.crc {
                 verify_source_crc(source, range.clone(), expected)?;
             }
             packed_streams.push(source.read_range_to_vec(range, metadata_limit)?);
-            packed_index += 1;
         }
 
-        let coder_sizes = folder_coder_unpack_sizes_at(output_base, &folder, unpack_info)?;
-        let unpack_size = *coder_sizes
-            .get(graph.final_output().get())
-            .ok_or(R7zError::Parse)?;
         let next_output_len = output_size
-            .checked_add(unpack_size)
+            .checked_add(folder.unpack_size)
             .ok_or(R7zError::Parse)?;
         if next_output_len > metadata_limit {
             return Err(R7zError::LimitExceeded("metadata"));
         }
         let mut reader = codec::folder_reader_with_pack_streams(
-            &folder,
+            &folder.folder,
             packed_streams,
-            unpack_size,
-            &coder_sizes,
+            folder.unpack_size,
+            folder.coder_sizes,
             password,
         )?;
-        let read_limit = usize::try_from(unpack_size)
+        let read_limit = usize::try_from(folder.unpack_size)
             .map_err(|_| R7zError::LimitExceeded("metadata"))?
             .checked_add(1)
             .ok_or(R7zError::LimitExceeded("metadata"))?;
@@ -1948,19 +1936,18 @@ fn decode_additional_folder_data(
             .take(u64::try_from(read_limit).map_err(|_| R7zError::Parse)?)
             .read_to_end(&mut folder_output)
             .map_err(R7zError::Io)?;
-        if folder_output.len() != usize::try_from(unpack_size).map_err(|_| R7zError::Parse)? {
+        if folder_output.len()
+            != usize::try_from(folder.unpack_size).map_err(|_| R7zError::Parse)?
+        {
             return Err(R7zError::Decompression);
         }
-        if let Some(Some(expected)) = unpack_info.digests.get(folder_idx) {
-            if crc32fast::hash(&folder_output) != *expected {
+        if let Some(expected) = folder.crc {
+            if crc32fast::hash(&folder_output) != expected {
                 return Err(R7zError::Crc);
             }
         }
         output.push(Bytes::from(folder_output));
         output_size = next_output_len;
-        output_base = output_base
-            .checked_add(folder.total_out_streams())
-            .ok_or(R7zError::Parse)?;
     }
 
     Ok(output)

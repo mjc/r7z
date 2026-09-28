@@ -2,12 +2,113 @@ use crate::pack_info::{
     FolderLocation, parse_folder_declaration, scan_pack_info, scan_unpack_info_with_external,
 };
 use crate::parsers::{bitmap_is_set, scan_digests};
-use crate::{PackInfo, Property, R7zError, UnpackInfo, sevenzip_varuint64_decode};
+use crate::{Folder, PackInfo, Property, R7zError, UnpackInfo, sevenzip_varuint64_decode};
 use bytes::Bytes;
 use nom::{IResult, number::complete::le_u8};
+use std::ops::Range;
 
 // Keep a single substream digest table within the default 64 MiB metadata budget.
 const MAX_SUBSTREAM_DIGESTS: usize = (64 * 1024 * 1024) / std::mem::size_of::<Option<u32>>();
+
+pub(crate) struct PackedStream {
+    pub(crate) range: Range<u64>,
+    pub(crate) crc: Option<u32>,
+}
+
+pub(crate) struct PackedFolder<'a> {
+    pub(crate) folder: Folder,
+    pub(crate) streams: Vec<PackedStream>,
+    pub(crate) coder_sizes: &'a [u64],
+    pub(crate) unpack_size: u64,
+    pub(crate) crc: Option<u32>,
+}
+
+pub(crate) struct PackedFolders<'a> {
+    pack_info: &'a PackInfo,
+    unpack_info: &'a UnpackInfo,
+    folder_index: usize,
+    pack_index: usize,
+    output_base: usize,
+    pack_offset: u64,
+}
+
+impl PackedFolders<'_> {
+    pub(crate) fn len(&self) -> usize {
+        self.unpack_info.num_folders_usize()
+    }
+
+    pub(crate) fn pack_pos(&self) -> u64 {
+        self.pack_info.pack_pos
+    }
+}
+
+impl<'a> Iterator for PackedFolders<'a> {
+    type Item = Result<PackedFolder<'a>, R7zError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.folder_index < self.len()).then(|| self.next_folder())
+    }
+}
+
+impl<'a> PackedFolders<'a> {
+    fn next_folder(&mut self) -> Result<PackedFolder<'a>, R7zError> {
+        let (folder, graph) = self
+            .unpack_info
+            .parse_folder_with_graph(self.folder_index)?;
+        let pack_end = self
+            .pack_index
+            .checked_add(graph.packed_stream_count())
+            .ok_or(R7zError::Parse)?;
+        let pack_sizes = self
+            .pack_info
+            .pack_size
+            .get(self.pack_index..pack_end)
+            .ok_or(R7zError::Parse)?;
+        let output_end = self
+            .output_base
+            .checked_add(folder.total_out_streams())
+            .ok_or(R7zError::Parse)?;
+        let coder_sizes = self
+            .unpack_info
+            .unpack_sizes
+            .get(self.output_base..output_end)
+            .ok_or(R7zError::Parse)?;
+        let unpack_size = *coder_sizes
+            .get(graph.final_output().get())
+            .ok_or(R7zError::Parse)?;
+
+        let mut streams = Vec::with_capacity(pack_sizes.len());
+        for (index, &size) in pack_sizes.iter().enumerate() {
+            let end = self.pack_offset.checked_add(size).ok_or(R7zError::Parse)?;
+            streams.push(PackedStream {
+                range: self.pack_offset..end,
+                crc: self
+                    .pack_info
+                    .digests
+                    .get(self.pack_index + index)
+                    .copied()
+                    .flatten(),
+            });
+            self.pack_offset = end;
+        }
+        let crc = self
+            .unpack_info
+            .digests
+            .get(self.folder_index)
+            .copied()
+            .flatten();
+        self.folder_index += 1;
+        self.pack_index = pack_end;
+        self.output_base = output_end;
+        Ok(PackedFolder {
+            folder,
+            streams,
+            coder_sizes,
+            unpack_size,
+            crc,
+        })
+    }
+}
 
 /// Per-file stream metadata within a solid (multi-file) folder.
 #[derive(Debug, PartialEq)]
@@ -259,7 +360,7 @@ impl StreamInfo {
         }
     }
 
-    pub(crate) fn checked_packed_folders(&self) -> Result<(&PackInfo, &UnpackInfo), R7zError> {
+    pub(crate) fn checked_packed_folders(&self) -> Result<PackedFolders<'_>, R7zError> {
         let (pack, unpack) = self.packed_folders()?;
         let stream_count = (0..unpack.num_folders_usize()).try_fold(0usize, |count, index| {
             let (_, graph) = unpack.parse_folder_with_graph(index)?;
@@ -267,7 +368,14 @@ impl StreamInfo {
             count.checked_add(folder_count).ok_or(R7zError::Parse)
         })?;
         match stream_count == pack.pack_size.len() {
-            true => Ok((pack, unpack)),
+            true => Ok(PackedFolders {
+                pack_info: pack,
+                unpack_info: unpack,
+                folder_index: 0,
+                pack_index: 0,
+                output_base: 0,
+                pack_offset: 0,
+            }),
             false => Err(R7zError::Parse),
         }
     }
