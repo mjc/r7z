@@ -1,5 +1,5 @@
 use crate::headers::{HeaderResolution, NextHeader};
-use crate::stream_info::{PackedFolder, PackedStream};
+use crate::stream_info::{DecodedFolder, PackedFolder, PackedStream};
 use crate::{
     EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
     codec, find_next_property_id,
@@ -1941,38 +1941,26 @@ fn decode_additional_folder(
     packs: &MetadataPackReader<'_>,
     folder: &PackedFolder<'_>,
     password: Option<&str>,
-) -> Result<Bytes, R7zError> {
-    let mut packed_streams = Vec::with_capacity(folder.streams.len());
-    for stream in &folder.streams {
-        packed_streams.push(packs.read(stream)?);
-    }
+) -> Result<DecodedFolder, R7zError> {
+    let packed_streams = folder
+        .streams
+        .iter()
+        .map(|stream| packs.read(stream))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut reader = codec::folder_reader_with_pack_streams(
+    let reader = codec::folder_reader_with_pack_streams(
         &folder.folder,
         packed_streams,
         folder.unpack_size,
         folder.coder_sizes,
         password,
     )?;
-    let read_limit = usize::try_from(folder.unpack_size)
-        .map_err(|_| R7zError::LimitExceeded("metadata"))?
-        .checked_add(1)
-        .ok_or(R7zError::LimitExceeded("metadata"))?;
-    let mut folder_output = Vec::with_capacity(read_limit.min(64 * 1024));
+    let mut folder_output = Vec::with_capacity(folder.decoded_len.min(64 * 1024));
     reader
-        .by_ref()
-        .take(u64::try_from(read_limit).map_err(|_| R7zError::Parse)?)
+        .take(folder.read_limit)
         .read_to_end(&mut folder_output)
         .map_err(R7zError::Io)?;
-    if folder_output.len() != usize::try_from(folder.unpack_size).map_err(|_| R7zError::Parse)? {
-        return Err(R7zError::Decompression);
-    }
-    if let Some(expected) = folder.crc {
-        if crc32fast::hash(&folder_output) != expected {
-            return Err(R7zError::Crc);
-        }
-    }
-    Ok(Bytes::from(folder_output))
+    folder.verify_decoded(Bytes::from(folder_output))
 }
 
 fn reserve_decoded_stream_slots(

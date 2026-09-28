@@ -15,56 +15,84 @@ pub(crate) struct PackedStream {
     pub(crate) crc: Option<u32>,
 }
 
+/// Folder bytes whose decoded length and folder CRC have been verified.
+pub(crate) struct DecodedFolder(Bytes);
+
+enum FolderStreamLayout<'a> {
+    Empty,
+    Single {
+        digest: Option<u32>,
+    },
+    Split {
+        explicit_sizes: &'a [u64],
+        last_size: u64,
+        digests: Option<&'a [Option<u32>]>,
+    },
+}
+
 pub(crate) struct PackedFolder<'a> {
     pub(crate) folder: Folder,
     pub(crate) streams: Vec<PackedStream>,
     pub(crate) coder_sizes: &'a [u64],
     pub(crate) unpack_size: u64,
-    pub(crate) crc: Option<u32>,
-    stream_count: usize,
-    explicit_stream_sizes: &'a [u64],
-    stream_digests: Option<&'a [Option<u32>]>,
+    pub(crate) decoded_len: usize,
+    pub(crate) read_limit: u64,
+    crc: Option<u32>,
+    layout: FolderStreamLayout<'a>,
 }
 
 impl PackedFolder<'_> {
+    pub(crate) fn verify_decoded(&self, decoded: Bytes) -> Result<DecodedFolder, R7zError> {
+        if decoded.len() != self.decoded_len {
+            return Err(R7zError::Decompression);
+        }
+        if let Some(expected) = self.crc
+            && crc32fast::hash(&decoded) != expected
+        {
+            return Err(R7zError::Crc);
+        }
+        Ok(DecodedFolder(decoded))
+    }
+
     /// Append each decoded substream as one externally indexed data stream.
     pub(crate) fn append_decoded(
         &self,
-        decoded: Bytes,
+        decoded: DecodedFolder,
         streams: &mut Vec<Bytes>,
     ) -> Result<(), R7zError> {
-        let explicit_size = self
-            .explicit_stream_sizes
-            .iter()
-            .try_fold(0u64, |total, &size| {
-                total.checked_add(size).ok_or(R7zError::Parse)
-            })?;
-        let last_size = self
-            .unpack_size
-            .checked_sub(explicit_size)
-            .ok_or(R7zError::Parse)?;
-        let sizes = self
-            .explicit_stream_sizes
-            .iter()
-            .copied()
-            .chain((self.stream_count > 0).then_some(last_size));
-        let mut offset = 0usize;
-        for (index, size) in sizes.enumerate() {
-            let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
-            let end = offset.checked_add(size).ok_or(R7zError::Parse)?;
-            let stream = decoded.get(offset..end).ok_or(R7zError::Parse)?;
-            if let Some(expected) = self
-                .stream_digests
-                .and_then(|digests| digests.get(index).copied().flatten())
-                && crc32fast::hash(stream) != expected
-            {
-                return Err(R7zError::Crc);
+        let DecodedFolder(decoded) = decoded;
+        match &self.layout {
+            FolderStreamLayout::Empty => {}
+            FolderStreamLayout::Single { digest } => {
+                if digest.is_some_and(|expected| crc32fast::hash(&decoded) != expected) {
+                    return Err(R7zError::Crc);
+                }
+                streams.push(decoded);
             }
-            streams.push(decoded.slice(offset..end));
-            offset = end;
-        }
-        if self.stream_count > 0 && offset != decoded.len() {
-            return Err(R7zError::Parse);
+            FolderStreamLayout::Split {
+                explicit_sizes,
+                last_size,
+                digests,
+            } => {
+                let sizes = explicit_sizes.iter().copied().chain([*last_size]);
+                let mut offset = 0usize;
+                for (index, size) in sizes.enumerate() {
+                    let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
+                    let end = offset.checked_add(size).ok_or(R7zError::Parse)?;
+                    let stream = decoded.get(offset..end).ok_or(R7zError::Parse)?;
+                    if let Some(expected) =
+                        digests.and_then(|digests| digests.get(index).copied().flatten())
+                        && crc32fast::hash(stream) != expected
+                    {
+                        return Err(R7zError::Crc);
+                    }
+                    streams.push(decoded.slice(offset..end));
+                    offset = end;
+                }
+                if offset != decoded.len() {
+                    return Err(R7zError::Parse);
+                }
+            }
         }
         Ok(())
     }
@@ -131,6 +159,14 @@ impl<'a> PackedFolders<'a> {
         let unpack_size = *coder_sizes
             .get(graph.final_output().get())
             .ok_or(R7zError::Parse)?;
+        let decoded_len =
+            usize::try_from(unpack_size).map_err(|_| R7zError::LimitExceeded("metadata"))?;
+        let read_limit = u64::try_from(
+            decoded_len
+                .checked_add(1)
+                .ok_or(R7zError::LimitExceeded("metadata"))?,
+        )
+        .map_err(|_| R7zError::LimitExceeded("metadata"))?;
         let stream_count = self
             .substream_info
             .map(|info| {
@@ -167,6 +203,26 @@ impl<'a> PackedFolders<'a> {
                     .ok_or(R7zError::Parse)
             })
             .transpose()?;
+        let layout = match stream_count {
+            0 => FolderStreamLayout::Empty,
+            1 => FolderStreamLayout::Single {
+                digest: stream_digests.and_then(|digests| digests.first().copied().flatten()),
+            },
+            _ => {
+                let explicit_total = explicit_stream_sizes
+                    .iter()
+                    .try_fold(0u64, |total, &size| {
+                        total.checked_add(size).ok_or(R7zError::Parse)
+                    })?;
+                FolderStreamLayout::Split {
+                    explicit_sizes: explicit_stream_sizes,
+                    last_size: unpack_size
+                        .checked_sub(explicit_total)
+                        .ok_or(R7zError::Parse)?,
+                    digests: stream_digests,
+                }
+            }
+        };
 
         let mut streams = Vec::with_capacity(pack_sizes.len());
         for (index, &size) in pack_sizes.iter().enumerate() {
@@ -198,10 +254,10 @@ impl<'a> PackedFolders<'a> {
             streams,
             coder_sizes,
             unpack_size,
+            decoded_len,
+            read_limit,
             crc,
-            stream_count,
-            explicit_stream_sizes,
-            stream_digests,
+            layout,
         })
     }
 }
@@ -783,7 +839,74 @@ pub(crate) fn scan_stream_info_with_external<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SUBSTREAM_DIGESTS, SubstreamInfo, scan_stream_info, scan_substream_info};
+    use super::{
+        FolderStreamLayout, MAX_SUBSTREAM_DIGESTS, PackedFolder, SubstreamInfo, scan_stream_info,
+        scan_substream_info,
+    };
+    use crate::{Folder, R7zError};
+    use bytes::Bytes;
+
+    fn packed_folder<'a>(
+        decoded_len: usize,
+        crc: Option<u32>,
+        layout: FolderStreamLayout<'a>,
+    ) -> PackedFolder<'a> {
+        PackedFolder {
+            folder: Folder {
+                coders: Default::default(),
+                bind_pairs: Default::default(),
+                packed_indices: Default::default(),
+            },
+            streams: Vec::new(),
+            coder_sizes: &[],
+            unpack_size: decoded_len as u64,
+            decoded_len,
+            read_limit: decoded_len as u64 + 1,
+            crc,
+            layout,
+        }
+    }
+
+    #[test]
+    fn decoded_folder_requires_expected_length_and_crc() {
+        let folder = packed_folder(3, Some(crc32fast::hash(b"abc")), FolderStreamLayout::Empty);
+        assert!(matches!(
+            folder.verify_decoded(Bytes::from_static(b"ab")),
+            Err(R7zError::Decompression)
+        ));
+        assert!(matches!(
+            folder.verify_decoded(Bytes::from_static(b"abd")),
+            Err(R7zError::Crc)
+        ));
+        assert!(folder.verify_decoded(Bytes::from_static(b"abc")).is_ok());
+    }
+
+    #[test]
+    fn split_folder_appends_indexed_substreams_and_checks_their_crcs() {
+        let digests = [Some(crc32fast::hash(b"ab")), Some(crc32fast::hash(b"cde"))];
+        let folder = packed_folder(
+            5,
+            None,
+            FolderStreamLayout::Split {
+                explicit_sizes: &[2],
+                last_size: 3,
+                digests: Some(&digests),
+            },
+        );
+        let decoded = folder.verify_decoded(Bytes::from_static(b"abcde")).unwrap();
+        let mut streams = Vec::new();
+        folder.append_decoded(decoded, &mut streams).unwrap();
+        assert_eq!(
+            streams,
+            [Bytes::from_static(b"ab"), Bytes::from_static(b"cde")]
+        );
+
+        let decoded = folder.verify_decoded(Bytes::from_static(b"abXde")).unwrap();
+        assert!(matches!(
+            folder.append_decoded(decoded, &mut Vec::new()),
+            Err(R7zError::Crc)
+        ));
+    }
 
     // ── scan_substream_info ────────────────────────────────────────────────────
 
