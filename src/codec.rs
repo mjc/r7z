@@ -312,13 +312,47 @@ pub(crate) struct PackedInput<R> {
     pub(crate) size: usize,
 }
 
+pub(crate) enum FolderReader<'a> {
+    Stream(Box<dyn Read + 'a>),
+    Buffered(Cursor<Vec<u8>>),
+}
+
+impl Read for FolderReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stream(reader) => reader.read(buf),
+            Self::Buffered(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl FolderReader<'_> {
+    pub(crate) fn read_bounded_to_vec(
+        self,
+        expected_len: usize,
+        read_limit: u64,
+    ) -> Result<Vec<u8>, R7zError> {
+        match self {
+            Self::Stream(reader) => {
+                let mut output = Vec::with_capacity(expected_len.min(64 * 1024));
+                reader
+                    .take(read_limit)
+                    .read_to_end(&mut output)
+                    .map_err(R7zError::Io)?;
+                Ok(output)
+            }
+            Self::Buffered(reader) => Ok(reader.into_inner()),
+        }
+    }
+}
+
 pub(crate) fn folder_reader_with_pack_streams<'a, R: Read + 'a>(
     folder: &Folder,
     packed_streams: SmallVec<[PackedInput<R>; 4]>,
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
+) -> Result<FolderReader<'a>, R7zError> {
     validate_folder_coder_count(folder)?;
     let graph = folder.graph()?;
     if graph.packed_stream_count() != packed_streams.len() {
@@ -343,6 +377,7 @@ pub(crate) fn folder_reader_with_pack_streams<'a, R: Read + 'a>(
                 coder_unpack_sizes,
                 password,
             )
+            .map(|decoded| FolderReader::Buffered(Cursor::new(decoded)))
         }
         (false, [_]) => {
             let stream = packed_streams.into_iter().next().ok_or(R7zError::Parse)?;
@@ -355,6 +390,7 @@ pub(crate) fn folder_reader_with_pack_streams<'a, R: Read + 'a>(
                 password,
                 &graph,
             )
+            .map(FolderReader::Stream)
         }
         (false, _) => {
             let unsupported = folder
@@ -686,7 +722,7 @@ fn bcj2_folder_reader<'a, R: Read + 'a>(
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
+) -> Result<Vec<u8>, R7zError> {
     if folder.coders.len() == 2
         && folder.coders[1].num_in_streams == 4
         && folder.coders[1].num_out_streams == 1
@@ -726,7 +762,7 @@ fn bcj2_single_predecoder<'a, R: Read + 'a>(
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
+) -> Result<Vec<u8>, R7zError> {
     let output_size = bcj2_output_size(unpack_size)?;
     let [main, call, jump, rc] = packed_streams;
     let decoder_memory = coder_working_set_bytes(&folder.coders[0], main.size)?;
@@ -752,7 +788,7 @@ fn bcj2_single_predecoder<'a, R: Read + 'a>(
         Box::new(rc.reader),
         output_size,
     )?;
-    Ok(Box::new(Cursor::new(decoded)))
+    Ok(decoded)
 }
 
 fn bcj2_lzma_predecoders<'a, R: Read + 'a>(
@@ -761,7 +797,7 @@ fn bcj2_lzma_predecoders<'a, R: Read + 'a>(
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
+) -> Result<Vec<u8>, R7zError> {
     let output_size = bcj2_output_size(unpack_size)?;
     let [main, rc, call, jump] = packed_streams;
     let decoder_memory = [(0, jump.size), (1, call.size), (2, main.size)]
@@ -791,7 +827,7 @@ fn bcj2_lzma_predecoders<'a, R: Read + 'a>(
         password,
     )?;
     let decoded = crate::bcj2::decode(main, call, jump, Box::new(rc.reader), output_size)?;
-    Ok(Box::new(Cursor::new(decoded)))
+    Ok(decoded)
 }
 
 fn read_to_end_bounded(

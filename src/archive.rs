@@ -1024,11 +1024,11 @@ impl Archive {
                 verify_source_crc(&self.source, range.clone(), *expected_crc)?;
             }
         }
-        let mut reader: Box<dyn Read> = if location.packed_ranges.len() == 1 {
+        let mut reader = if location.packed_ranges.len() == 1 {
             let packed = self
                 .source
                 .range_reader(location.packed_ranges[0].clone())?;
-            codec::folder_reader_with_sizes_from_reader(
+            codec::FolderReader::Stream(codec::folder_reader_with_sizes_from_reader(
                 &location.folder,
                 Box::new(packed),
                 location.folder_unpack_size,
@@ -1041,7 +1041,7 @@ impl Archive {
                         .ok_or(R7zError::Parse)?,
                 )
                 .map_err(|_| R7zError::Parse)?,
-            )?
+            )?)
         } else {
             ensure_packed_ranges_buffer_limit(&location.packed_ranges)?;
             let packed_streams = location
@@ -1487,9 +1487,9 @@ impl Archive {
             folder_total_unpack_size_at(coder_output_base, &folder, unpack_info)?;
         let coder_unpack_sizes =
             folder_coder_unpack_sizes_at(coder_output_base, &folder, unpack_info)?;
-        let reader: Box<dyn Read> = if packed_ranges.len() == 1 {
+        let reader = if packed_ranges.len() == 1 {
             let packed = self.source.range_reader(packed_ranges[0].clone())?;
-            codec::folder_reader_with_sizes_from_reader(
+            codec::FolderReader::Stream(codec::folder_reader_with_sizes_from_reader(
                 &folder,
                 Box::new(packed),
                 folder_unpack_size,
@@ -1502,7 +1502,7 @@ impl Archive {
                         .ok_or(R7zError::Parse)?,
                 )
                 .map_err(|_| R7zError::Parse)?,
-            )?
+            )?)
         } else {
             let packed_streams = packed_ranges
                 .iter()
@@ -1970,11 +1970,7 @@ fn decode_additional_folder(
         folder.coder_sizes,
         password,
     )?;
-    let mut folder_output = Vec::with_capacity(folder.decoded_len.min(64 * 1024));
-    reader
-        .take(folder.read_limit)
-        .read_to_end(&mut folder_output)
-        .map_err(R7zError::Io)?;
+    let folder_output = reader.read_bounded_to_vec(folder.decoded_len, folder.read_limit)?;
     folder.verify_decoded(Bytes::from(folder_output))
 }
 
@@ -2036,7 +2032,7 @@ impl ExtractionLocation {
 
 struct FolderStreamReader<'a> {
     folder_idx: usize,
-    reader: Box<dyn Read + 'a>,
+    reader: codec::FolderReader<'a>,
     stream_sizes: Vec<usize>,
     stream_digests: Vec<Option<u32>>,
     current_stream: usize,
@@ -2076,7 +2072,7 @@ impl FolderStreamReader<'_> {
             .copied()
             .ok_or(R7zError::Parse)?;
         let mut content = EntryContentReader {
-            reader: &mut *self.reader,
+            reader: &mut self.reader,
             remaining: u64::try_from(size).map_err(|_| R7zError::Parse)?,
             folder_hasher: self.folder_hasher.as_mut(),
             stream_hasher: expected_stream_digest.map(|_| crc32fast::Hasher::new()),
@@ -3262,7 +3258,7 @@ mod selected_stream_tests {
         hasher.update(b"tail");
         let mut state = FolderStreamReader {
             folder_idx: 0,
-            reader: Box::new(std::io::Cursor::new(&b"tail"[..])),
+            reader: codec::FolderReader::Stream(Box::new(std::io::Cursor::new(&b"tail"[..]))),
             stream_sizes: vec![4],
             stream_digests: vec![None],
             current_stream: 0,
@@ -3284,7 +3280,7 @@ mod selected_stream_tests {
         folder_hasher.update(b"A");
         let mut state = FolderStreamReader {
             folder_idx: 0,
-            reader: Box::new(std::io::Cursor::new(&b"AB"[..])),
+            reader: codec::FolderReader::Stream(Box::new(std::io::Cursor::new(&b"AB"[..]))),
             stream_sizes: vec![1],
             stream_digests: vec![Some(stream_hasher.finalize())],
             current_stream: 0,
