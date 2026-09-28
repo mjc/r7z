@@ -68,6 +68,7 @@ mod delta;
 mod error;
 mod files_info;
 mod folder;
+mod folder_decode;
 mod headers;
 mod method;
 mod pack_info;

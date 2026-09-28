@@ -1,3 +1,4 @@
+mod plan;
 use crate::{Folder, R7zError};
 use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
@@ -5,6 +6,7 @@ use flate2::read::DeflateDecoder;
 use lzma_rust2::{
     Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter, filter::bcj::BcjReader,
 };
+pub(crate) use plan::{DecoderPlan, ReadyDecoder};
 use ppmd_rust::Ppmd7Decoder;
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
@@ -251,36 +253,6 @@ pub(crate) fn folder_reader_with_sizes<'a>(
     )
 }
 
-fn build_decoder_chain<'a>(
-    folder: &Folder,
-    mut reader: Box<dyn Read + 'a>,
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-    graph: &crate::folder::FolderGraph,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
-    // The validated graph supplies decoder order independently of wire order.
-    let coder_count = graph.execution_order().count();
-    for (position, coder_idx) in graph.execution_order().enumerate() {
-        let coder_idx = coder_idx.get();
-        let coder = folder
-            .coders
-            .get(coder_idx)
-            .ok_or(R7zError::InvalidFolderGraph)?;
-        let size =
-            coder_unpack_sizes
-                .get(coder_idx)
-                .copied()
-                .unwrap_or(if position + 1 == coder_count {
-                    unpack_size
-                } else {
-                    0
-                });
-        reader = coder_reader(coder, reader, size, password)?;
-    }
-    Ok(reader)
-}
-
 pub(crate) struct PackedInput<R> {
     pub(crate) reader: R,
     pub(crate) size: usize,
@@ -328,172 +300,37 @@ impl FolderReader<'_> {
 
 pub(crate) fn folder_reader_with_pack_streams<'a, R: Read + 'a>(
     folder: &Folder,
-    mut packed_streams: SmallVec<[PackedInput<R>; 4]>,
+    packed_streams: SmallVec<[PackedInput<R>; 4]>,
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<FolderReader<'a>, R7zError> {
-    validate_folder_coder_count(folder)?;
     let graph = folder.graph()?;
-    if graph.packed_stream_count() != packed_streams.len() {
-        return Err(R7zError::InvalidFolderGraph);
+    let mut sizes = SmallVec::<[u64; 4]>::from_slice(coder_unpack_sizes);
+    // Public adapters historically allow omitted intermediate output sizes.
+    // Resolve that convention here; the executable plan always has a complete table.
+    sizes.resize(folder.total_out_streams(), 0);
+    if coder_unpack_sizes.len() <= graph.final_output().get() {
+        *sizes
+            .get_mut(graph.final_output().get())
+            .ok_or(R7zError::InvalidFolderGraph)? = unpack_size;
     }
-    match DecoderTopology::from_folder(folder)? {
-        DecoderTopology::Bcj2 => {
-            packed_streams.shrink_to_fit();
-            let inputs = packed_streams.into_inner().map_err(|_| R7zError::Parse)?;
-            Bcj2Plan::new(folder, inputs, unpack_size, coder_unpack_sizes)?
-                .decode(password)
-                .map(|decoded| FolderReader::Buffered(Cursor::new(decoded)))
-        }
-        DecoderTopology::Chain => {
-            let stream = packed_streams.pop().ok_or(R7zError::InvalidFolderGraph)?;
-            validate_decoder_working_set(folder, stream.size)?;
-            build_decoder_chain(
-                folder,
-                Box::new(stream.reader),
-                unpack_size,
-                coder_unpack_sizes,
-                password,
-                &graph,
-            )
-            .map(FolderReader::Stream)
-        }
-    }
-}
-
-fn coder_reader<'a>(
-    coder: &crate::CoderInfo,
-    input: Box<dyn Read + 'a>,
-    unpack_size: u64,
-    password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
-    if *coder.codec_id == *CODEC_COPY {
-        return Ok(input);
-    }
-
-    if *coder.codec_id == *CODEC_LZMA {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        if props.len() != 5 {
-            return Err(R7zError::Decompression);
-        }
-        let props_byte = props[0];
-        let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-        if dict_size > MAX_LZMA_DICTIONARY_BYTES {
-            return Err(resource_limit(
-                "LZMA dictionary",
-                MAX_LZMA_DICTIONARY_BYTES as usize,
-            ));
-        }
-        let reader = LzmaReader::new_with_props(input, unpack_size, props_byte, dict_size, None)
-            .map_err(|_| R7zError::Decompression)?;
-        return Ok(Box::new(reader));
-    }
-
-    if *coder.codec_id == *CODEC_LZMA2 {
-        let dict_size = lzma2_dict_size(coder.properties.as_deref())?;
-        return Ok(Box::new(Lzma2Reader::new(input, dict_size, None)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_X86 {
-        return Ok(Box::new(crate::bcj::BcjX86Reader::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_ARM {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Arm,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_ARM64 {
-        let pos = branch_start_pos(coder.properties.as_deref(), 4)?;
-        return Ok(Box::new(BcjReader::new_arm64(input, pos)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_RISCV {
-        let pos = branch_start_pos(coder.properties.as_deref(), 2)?;
-        return Ok(Box::new(BcjReader::new_riscv(input, pos)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_ARM_THUMB {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::ArmThumb,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_IA64 {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Ia64,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_PPC {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Ppc,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_SPARC {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Sparc,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_DEFLATE {
-        return Ok(Box::new(DeflateDecoder::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_BZIP2 {
-        return Ok(Box::new(Bzip2Decoder::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_PPMD {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        let (order, mem_size) = ppmd_properties(props)?;
-        let reader =
-            Ppmd7Decoder::new(input, order, mem_size).map_err(|_| R7zError::Decompression)?;
-        let reader = ExactSizeReader::new(reader, unpack_size);
-        return Ok(Box::new(reader));
-    }
-
-    if *coder.codec_id == *CODEC_DEFLATE64 {
-        return Ok(Box::new(Deflate64Decoder::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_DELTA {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        return Ok(Box::new(crate::delta::DeltaReader::new(input, props)?));
-    }
-
-    if *coder.codec_id == *CODEC_SWAP2 {
-        return Ok(Box::new(crate::byte_swap::ByteSwapReader::new(input, 2)));
-    }
-
-    if *coder.codec_id == *CODEC_SWAP4 {
-        return Ok(Box::new(crate::byte_swap::ByteSwapReader::new(input, 4)));
-    }
-
-    if *coder.codec_id == *CODEC_AES_256_SHA_256 {
-        return aes_coder_reader(coder, input, unpack_size, password);
-    }
-
-    Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
+    let packed_sizes = packed_streams
+        .iter()
+        .map(|input| input.size as u64)
+        .collect::<SmallVec<[_; 4]>>();
+    DecoderPlan::compile(folder, &graph, unpack_size, &sizes, &packed_sizes)?
+        .bind(packed_streams)?
+        .start(password)
 }
 
 fn aes_coder_reader<'a>(
-    coder: &crate::CoderInfo,
+    props: crate::aes::AesProperties,
     mut input: Box<dyn Read + 'a>,
     unpack_size: u64,
     password: Option<&str>,
 ) -> Result<Box<dyn Read + 'a>, R7zError> {
     let password = password.ok_or(R7zError::PasswordRequired)?;
-    let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-    let props = crate::aes::AesProperties::parse(props_bytes)?;
     let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
     let mut encrypted = Vec::new();
     read_to_end_bounded(
@@ -693,136 +530,6 @@ impl DecoderTopology {
                 }))
             }
         }
-    }
-}
-
-enum Bcj2Input<'a, R> {
-    Direct(PackedInput<R>),
-    Coded {
-        input: PackedInput<R>,
-        coder: &'a crate::CoderInfo,
-        unpack_size: u64,
-    },
-}
-
-impl<R: Read> Bcj2Input<'_, R> {
-    fn working_set(&self) -> Result<usize, R7zError> {
-        match self {
-            Self::Direct(_) => Ok(0),
-            Self::Coded { input, coder, .. } => coder_working_set_bytes(coder, input.size),
-        }
-    }
-
-    fn into_reader<'r>(self, password: Option<&str>) -> Result<Box<dyn Read + 'r>, R7zError>
-    where
-        R: 'r,
-    {
-        match self {
-            Self::Direct(input) => Ok(Box::new(input.reader)),
-            Self::Coded {
-                input,
-                coder,
-                unpack_size,
-            } => coder_reader(coder, Box::new(input.reader), unpack_size, password),
-        }
-    }
-}
-
-struct Bcj2Plan<'a, R> {
-    main: Bcj2Input<'a, R>,
-    call: Bcj2Input<'a, R>,
-    jump: Bcj2Input<'a, R>,
-    control: R,
-    output_size: usize,
-}
-
-impl<'a, R: Read> Bcj2Plan<'a, R> {
-    fn new(
-        folder: &'a Folder,
-        inputs: [PackedInput<R>; 4],
-        unpack_size: u64,
-        coder_sizes: &[u64],
-    ) -> Result<Self, R7zError> {
-        let output_size = bcj2_output_size(unpack_size)?;
-        let plan = match (
-            folder.coders.as_slice(),
-            folder.packed_indices.as_slice(),
-            folder.bind_pairs.as_slice(),
-            coder_sizes,
-        ) {
-            ([main_coder, bcj2], [0, 2, 3, 4], [(1, 0)], [main_size, ..])
-                if bcj2.codec_id.as_slice() == CODEC_BCJ2 =>
-            {
-                let [main, call, jump, control] = inputs;
-                let declared_output = usize::try_from(*main_size)
-                    .map_err(|_| R7zError::Parse)?
-                    .checked_add(call.size)
-                    .and_then(|size| size.checked_add(jump.size))
-                    .ok_or(R7zError::Decompression)?;
-                if declared_output != output_size {
-                    return Err(R7zError::Decompression);
-                }
-                Self {
-                    main: Bcj2Input::Coded {
-                        input: main,
-                        coder: main_coder,
-                        unpack_size: *main_size,
-                    },
-                    call: Bcj2Input::Direct(call),
-                    jump: Bcj2Input::Direct(jump),
-                    control: control.reader,
-                    output_size,
-                }
-            }
-            (
-                [jump_coder, call_coder, main_coder, bcj2],
-                [2, 6, 1, 0],
-                [(5, 0), (4, 1), (3, 2)],
-                [jump_size, call_size, main_size, ..],
-            ) if bcj2.codec_id.as_slice() == CODEC_BCJ2 => {
-                let [main, control, call, jump] = inputs;
-                Self {
-                    main: Bcj2Input::Coded {
-                        input: main,
-                        coder: main_coder,
-                        unpack_size: *main_size,
-                    },
-                    call: Bcj2Input::Coded {
-                        input: call,
-                        coder: call_coder,
-                        unpack_size: *call_size,
-                    },
-                    jump: Bcj2Input::Coded {
-                        input: jump,
-                        coder: jump_coder,
-                        unpack_size: *jump_size,
-                    },
-                    control: control.reader,
-                    output_size,
-                }
-            }
-            _ => return Err(R7zError::Parse),
-        };
-        let decoder_memory =
-            [&plan.main, &plan.call, &plan.jump]
-                .into_iter()
-                .try_fold(0usize, |total, input| {
-                    total
-                        .checked_add(input.working_set()?)
-                        .ok_or(R7zError::Decompression)
-                })?;
-        ensure_bcj2_working_budget(output_size, decoder_memory)?;
-        Ok(plan)
-    }
-
-    fn decode(self, password: Option<&str>) -> Result<Vec<u8>, R7zError> {
-        crate::bcj2::decode(
-            self.main.into_reader(password)?,
-            self.call.into_reader(password)?,
-            self.jump.into_reader(password)?,
-            Box::new(self.control),
-            self.output_size,
-        )
     }
 }
 
@@ -1083,7 +790,7 @@ mod tests {
                 .unwrap()
                 .1;
         assert!(matches!(
-            super::coder_reader(&lzma, Box::new(Cursor::new(&[][..])), 0, None),
+            super::plan::CoderPlan::compile(&lzma, 0),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "LZMA dictionary",
                 ..
@@ -1092,7 +799,7 @@ mod tests {
 
         let lzma2 = crate::CoderInfo::parse(&[0x21, 0x21, 1, 40]).unwrap().1;
         assert!(matches!(
-            super::coder_reader(&lzma2, Box::new(Cursor::new(&[][..])), 0, None),
+            super::plan::CoderPlan::compile(&lzma2, 0),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "LZMA dictionary",
                 ..
@@ -1103,7 +810,7 @@ mod tests {
             .unwrap()
             .1;
         assert!(matches!(
-            super::coder_reader(&ppmd, Box::new(Cursor::new(&[][..])), 0, None),
+            super::plan::CoderPlan::compile(&ppmd, 0),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "PPMd memory",
                 ..
