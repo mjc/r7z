@@ -1,6 +1,6 @@
 use crate::files_info::scan_files_info;
 use crate::stream_info::scan_stream_info_with_external;
-use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
+use crate::{FilesInfo, Folder, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
 use bytes::Bytes;
 use nom::IResult;
 use std::cell::OnceCell;
@@ -42,6 +42,33 @@ pub struct EncodedHeader {
 }
 
 impl EncodedHeader {
+    pub(crate) fn stream(&self) -> Result<EncodedHeaderStream<'_>, R7zError> {
+        let packed_size = match (
+            self.pack_info.num_pack_streams,
+            self.pack_info.pack_size.as_slice(),
+            self.unpack_info.num_folders,
+            self.unpack_info.num_folders_usize(),
+        ) {
+            (1, [size], 1, 1) => *size,
+            _ => return Err(R7zError::Parse),
+        };
+        let (folder, graph) = self.unpack_info.parse_folder_with_graph(0)?;
+        let unpack_size = self
+            .unpack_info
+            .unpack_sizes
+            .get(graph.final_output().get())
+            .copied()
+            .ok_or(R7zError::Parse)?;
+        Ok(EncodedHeaderStream {
+            pack_pos: self.pack_info.pack_pos,
+            packed_size,
+            packed_crc: self.pack_info.digests.first().copied().flatten(),
+            folder,
+            unpack_size,
+            coder_unpack_sizes: &self.unpack_info.unpack_sizes,
+        })
+    }
+
     /// Parse an `EncodedHeader` block (pack info + unpack info).
     ///
     /// # Errors
@@ -57,6 +84,35 @@ impl EncodedHeader {
                 unpack_info,
             },
         ))
+    }
+}
+
+pub(crate) struct EncodedHeaderStream<'a> {
+    pub(crate) pack_pos: u64,
+    pub(crate) packed_size: u64,
+    pub(crate) packed_crc: Option<u32>,
+    pub(crate) folder: Folder,
+    pub(crate) unpack_size: u64,
+    pub(crate) coder_unpack_sizes: &'a [u64],
+}
+
+pub(crate) enum NextHeader {
+    Plain,
+    Encoded(Box<EncodedHeader>),
+}
+
+impl NextHeader {
+    pub(crate) fn parse(backing: &Bytes) -> Result<Self, R7zError> {
+        let (input, tag) = Property::parse(backing).map_err(|_| R7zError::Parse)?;
+        match tag {
+            Property::Header => Ok(Self::Plain),
+            Property::EncodedHeader => {
+                let (_, encoded) =
+                    EncodedHeader::parse(input, backing).map_err(|_| R7zError::Parse)?;
+                Ok(Self::Encoded(Box::new(encoded)))
+            }
+            _ => Err(R7zError::Parse),
+        }
     }
 }
 

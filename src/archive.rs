@@ -1,4 +1,4 @@
-use crate::headers::HeaderResolution;
+use crate::headers::{HeaderResolution, NextHeader};
 use crate::{
     EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
     codec, find_next_property_id,
@@ -181,7 +181,7 @@ impl ArchiveSource {
         })
     }
 
-    fn find_signature_offset(&self, limit: u64) -> Result<u64, R7zError> {
+    fn find_signature(&self, limit: u64) -> Result<(u64, SignatureHeader), R7zError> {
         let source_len = self.len()?;
         let scan_len = source_len.min(limit);
         let mut offset = 0u64;
@@ -206,7 +206,7 @@ impl ArchiveSource {
                 let pos = search_start.checked_add(pos).ok_or(R7zError::Parse)?;
                 let candidate = base.checked_add(pos as u64).ok_or(R7zError::Parse)?;
                 match self.signature_at(candidate)? {
-                    SignatureCandidate::Valid => return Ok(candidate),
+                    SignatureCandidate::Valid(signature) => return Ok((candidate, signature)),
                     SignatureCandidate::BadCrc => saw_bad_signature = true,
                     SignatureCandidate::Incomplete => {}
                 }
@@ -239,7 +239,7 @@ impl ArchiveSource {
             return Ok(SignatureCandidate::Incomplete);
         }
         match signature.validate_start_header_crc() {
-            Ok(()) => Ok(SignatureCandidate::Valid),
+            Ok(()) => Ok(SignatureCandidate::Valid(signature)),
             Err(R7zError::Crc) => Ok(SignatureCandidate::BadCrc),
             Err(err) => Err(err),
         }
@@ -247,7 +247,7 @@ impl ArchiveSource {
 }
 
 enum SignatureCandidate {
-    Valid,
+    Valid(SignatureHeader),
     BadCrc,
     Incomplete,
 }
@@ -609,15 +609,7 @@ impl Archive {
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
         let source_len = source.len()?;
-        if source_len < 32 {
-            return Err(R7zError::Parse);
-        }
-        let base_offset = source.find_signature_offset(DEFAULT_MAX_METADATA_BYTES)?;
-        let mut signature_bytes = [0u8; 32];
-        source.read_exact_at(base_offset, &mut signature_bytes)?;
-        let (_, signature) =
-            SignatureHeader::parse(&signature_bytes).map_err(|_| R7zError::Parse)?;
-        signature.validate_start_header_crc()?;
+        let (base_offset, signature) = source.find_signature(DEFAULT_MAX_METADATA_BYTES)?;
 
         if signature.next_header_size > options.max_metadata_bytes {
             return Err(R7zError::LimitExceeded("metadata"));
@@ -633,83 +625,34 @@ impl Archive {
         if crc32fast::hash(&next_header) != signature.next_header_crc {
             return Err(R7zError::Crc);
         }
-        let (prop_input, prop) = Property::parse(&next_header).map_err(|_| R7zError::Parse)?;
-
-        match prop {
-            Property::EncodedHeader => {
-                // Parse the EncodedHeader (describes how the full header is compressed)
-                let (_, encoded_header) =
-                    EncodedHeader::parse(prop_input, &next_header).map_err(|_| R7zError::Parse)?;
-
-                // Decompress the packed header stream
-                let pi = &encoded_header.pack_info;
-                let ui = &encoded_header.unpack_info;
-                let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, pi.pack_pos)?;
-                let pack_size = *pi.pack_size.first().ok_or(R7zError::Parse)?;
-                if pack_size > options.max_metadata_bytes {
-                    return Err(R7zError::LimitExceeded("metadata"));
-                }
-                let data_range = checked_range_u64(source_len, data_start, pack_size)?;
-                if let Some(Some(expected_crc)) = pi.digests.first() {
-                    verify_source_crc(&source, data_range.clone(), *expected_crc)?;
-                }
-                let packed = source.read_range_to_vec(data_range, options.max_metadata_bytes)?;
-                let folder = ui.parse_folder(0)?;
-
-                let unpack_size = ui
-                    .unpack_sizes
-                    .get(folder.graph()?.final_output().get())
-                    .copied()
-                    .ok_or(R7zError::Parse)?;
-                if unpack_size > options.max_metadata_bytes {
-                    return Err(R7zError::LimitExceeded("metadata"));
-                }
-                let decompressed = codec::decompress_folder_with_password_and_sizes(
-                    &folder,
-                    &packed,
-                    unpack_size,
-                    &ui.unpack_sizes,
-                    password,
-                )?;
-                let decompressed = Bytes::from(decompressed);
-
-                let header = parse_header_with_external_data(
+        let (header_bytes, encoded_header) = match NextHeader::parse(&next_header)? {
+            NextHeader::Plain => (next_header, None),
+            NextHeader::Encoded(encoded) => {
+                let bytes = decode_encoded_header(
                     &source,
+                    source_len,
                     base_offset,
-                    &decompressed,
-                    options.max_metadata_bytes,
+                    &encoded,
                     password,
-                )?;
-
-                Ok(Archive {
-                    source,
-                    base_offset,
-                    signature,
-                    encoded_header: Some(encoded_header),
-                    header,
-                })
-            }
-            Property::Header => {
-                // Header is stored uncompressed at next_header_offset (the raw bytes
-                // include the 0x01 tag, so we slice from header_start, not header_start+1)
-                let header = parse_header_with_external_data(
-                    &source,
-                    base_offset,
-                    &next_header,
                     options.max_metadata_bytes,
-                    password,
                 )?;
-
-                Ok(Archive {
-                    source,
-                    base_offset,
-                    signature,
-                    encoded_header: None,
-                    header,
-                })
+                (bytes, Some(*encoded))
             }
-            _ => Err(R7zError::Parse),
-        }
+        };
+        let header = parse_header_with_external_data(
+            &source,
+            base_offset,
+            &header_bytes,
+            options.max_metadata_bytes,
+            password,
+        )?;
+        Ok(Archive {
+            source,
+            base_offset,
+            signature,
+            encoded_header,
+            header,
+        })
     }
 
     /// Number of files (and directories) listed in the archive.
@@ -1887,6 +1830,34 @@ fn verify_source_crc(
     } else {
         Err(R7zError::Crc)
     }
+}
+
+fn decode_encoded_header(
+    source: &ArchiveSource,
+    source_len: u64,
+    base_offset: u64,
+    encoded: &EncodedHeader,
+    password: Option<&str>,
+    metadata_limit: u64,
+) -> Result<Bytes, R7zError> {
+    let stream = encoded.stream()?;
+    let data_start = checked_add_u64(checked_add_u64(base_offset, 32)?, stream.pack_pos)?;
+    if stream.packed_size > metadata_limit || stream.unpack_size > metadata_limit {
+        return Err(R7zError::LimitExceeded("metadata"));
+    }
+    let data_range = checked_range_u64(source_len, data_start, stream.packed_size)?;
+    if let Some(expected_crc) = stream.packed_crc {
+        verify_source_crc(source, data_range.clone(), expected_crc)?;
+    }
+    let packed = source.read_range_to_vec(data_range, metadata_limit)?;
+    let decompressed = codec::decompress_folder_with_password_and_sizes(
+        &stream.folder,
+        &packed,
+        stream.unpack_size,
+        stream.coder_unpack_sizes,
+        password,
+    )?;
+    Ok(Bytes::from(decompressed))
 }
 
 fn parse_header_with_external_data(
