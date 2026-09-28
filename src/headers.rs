@@ -70,25 +70,29 @@ pub struct Header {
     data: Bytes,
     /// Byte offset within `data` where `StreamInfo::parse` should start
     /// (after the `MainStreamsInfo` tag).
-    streams_info_start: Option<u32>,
+    streams_info_range: Option<std::ops::Range<u32>>,
     /// Byte offset within `data` where `FilesInfo::parse` should start
     /// (including the `FilesInfo` tag).
-    files_info_start: Option<u32>,
+    files_info_range: Option<std::ops::Range<u32>>,
+    /// Byte range containing `AdditionalStreamsInfo` when present.
+    additional_streams_range: Option<std::ops::Range<u32>>,
     /// Number of file entries (extracted during scan; avoids a lazy parse just
     /// to read the count).
     num_files: u64,
     /// Lazily-parsed stream descriptor.
-    streams_cache: OnceCell<StreamInfo>,
+    streams_cache: OnceCell<Result<StreamInfo, ()>>,
     /// Lazily-parsed file listing.
-    files_cache: OnceCell<FilesInfo>,
+    files_cache: OnceCell<Result<FilesInfo, ()>>,
+    additional_streams_cache: OnceCell<Result<StreamInfo, ()>>,
 }
 
 impl std::fmt::Debug for Header {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Header")
             .field("data_len", &self.data.len())
-            .field("streams_info_start", &self.streams_info_start)
-            .field("files_info_start", &self.files_info_start)
+            .field("streams_info_range", &self.streams_info_range)
+            .field("files_info_range", &self.files_info_range)
+            .field("additional_streams_range", &self.additional_streams_range)
             .field("num_files", &self.num_files)
             .field("streams_cache", &self.streams_cache)
             .field("files_cache", &self.files_cache)
@@ -108,36 +112,79 @@ impl Header {
 
     /// Access the stream descriptor, parsing it on first call.
     ///
-    /// Returns `None` if the header contained no `MainStreamsInfo` block.
+    /// Returns `None` if the block is absent or fails full parsing. Use
+    /// [`try_streams_info`](Self::try_streams_info) to distinguish those cases.
     ///
-    /// # Panics
-    ///
-    /// Panics if the pre-validated bytes cannot be parsed (should never happen).
     #[must_use]
     pub fn streams_info(&self) -> Option<&StreamInfo> {
-        let off = self.streams_info_start? as usize;
-        Some(self.streams_cache.get_or_init(|| {
-            let (_, si) =
-                StreamInfo::parse(&self.data[off..], &self.data).expect("pre-validated header");
-            si
-        }))
+        self.try_streams_info().ok().flatten()
+    }
+
+    /// Access the stream descriptor and return any full-parser validation error.
+    pub fn try_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
+        let Some(range) = &self.streams_info_range else {
+            return Ok(None);
+        };
+        let parsed = self.streams_cache.get_or_init(|| {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            self.data.get(start..end).ok_or(()).and_then(|slice| {
+                StreamInfo::parse(slice, &self.data)
+                    .ok()
+                    .filter(|(rest, _)| rest.is_empty())
+                    .map(|(_, value)| value)
+                    .ok_or(())
+            })
+        });
+        parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
     }
 
     /// Access the file listing, parsing it on first call.
     ///
-    /// Returns `None` if the header contained no `FilesInfo` block.
+    /// Returns `None` if the block is absent or fails full parsing. Use
+    /// [`try_files_info`](Self::try_files_info) to distinguish those cases.
     ///
-    /// # Panics
-    ///
-    /// Panics if the pre-validated bytes cannot be parsed (should never happen).
     #[must_use]
     pub fn files_info(&self) -> Option<&FilesInfo> {
-        let off = self.files_info_start? as usize;
-        Some(self.files_cache.get_or_init(|| {
-            let (_, fi) =
-                FilesInfo::parse(&self.data[off..], &self.data).expect("pre-validated header");
-            fi
-        }))
+        self.try_files_info().ok().flatten()
+    }
+
+    /// Access the file listing and return any full-parser validation error.
+    pub fn try_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
+        let Some(range) = &self.files_info_range else {
+            return Ok(None);
+        };
+        let parsed = self.files_cache.get_or_init(|| {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            self.data.get(start..end).ok_or(()).and_then(|slice| {
+                FilesInfo::parse(slice, &self.data)
+                    .ok()
+                    .filter(|(rest, info)| rest.is_empty() && info.num_files == self.num_files)
+                    .map(|(_, value)| value)
+                    .ok_or(())
+            })
+        });
+        parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
+    }
+
+    /// Access the additional metadata streams, if present.
+    pub fn try_additional_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
+        let Some(range) = &self.additional_streams_range else {
+            return Ok(None);
+        };
+        let parsed = self.additional_streams_cache.get_or_init(|| {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            self.data.get(start..end).ok_or(()).and_then(|slice| {
+                StreamInfo::parse(slice, &self.data)
+                    .ok()
+                    .filter(|(rest, _)| rest.is_empty())
+                    .map(|(_, value)| value)
+                    .ok_or(())
+            })
+        });
+        parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
     }
 
     /// Parse and validate a decompressed 7z header block.
@@ -164,8 +211,9 @@ impl Header {
             )));
         }
 
-        let mut streams_info_start: Option<u32> = None;
-        let mut files_info_start: Option<u32> = None;
+        let mut streams_info_range: Option<std::ops::Range<u32>> = None;
+        let mut files_info_range: Option<std::ops::Range<u32>> = None;
+        let mut additional_streams_range: Option<std::ops::Range<u32>> = None;
         let mut num_files: u64 = 0;
         let mut input = input;
 
@@ -186,7 +234,25 @@ impl Header {
                         ))
                     })?;
                     let (i, ()) = scan_stream_info(input)?;
-                    streams_info_start = Some(off);
+                    let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
+                    })?;
+                    streams_info_range = Some(off..end);
+                    input = i;
+                }
+                Property::AdditionalStreamsInfo => {
+                    input = i;
+                    let off = u32::try_from(backing.len() - input.len()).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    let (i, ()) = scan_stream_info(input)?;
+                    let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
+                    })?;
+                    additional_streams_range = Some(off..end);
                     input = i;
                 }
                 Property::FilesInfo => {
@@ -198,7 +264,10 @@ impl Header {
                         ))
                     })?;
                     let (i, nf) = scan_files_info(input)?;
-                    files_info_start = Some(off);
+                    let end = u32::try_from(backing.len() - i.len()).map_err(|_| {
+                        nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
+                    })?;
+                    files_info_range = Some(off..end);
                     num_files = nf;
                     input = i;
                 }
@@ -226,11 +295,13 @@ impl Header {
             input,
             Header {
                 data: backing.clone(),
-                streams_info_start,
-                files_info_start,
+                streams_info_range,
+                files_info_range,
+                additional_streams_range,
                 num_files,
                 streams_cache: OnceCell::new(),
                 files_cache: OnceCell::new(),
+                additional_streams_cache: OnceCell::new(),
             },
         ))
     }
@@ -239,6 +310,7 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::{Header, scan_archive_properties};
+    use crate::R7zError;
     use bytes::Bytes;
 
     #[test]
@@ -265,6 +337,31 @@ mod tests {
 
         assert!(rem.is_empty());
         assert_eq!(parsed.num_files(), 0);
+    }
+
+    #[test]
+    fn malformed_lazy_files_info_returns_error_instead_of_panicking() {
+        // The scanner skips the zero-length Name property; the full parser
+        // rejects it because its external flag is missing.
+        let bytes = Bytes::from_static(&[0x01, 0x05, 0x01, 0x11, 0x00, 0x00, 0x00]);
+        let (rem, header) = Header::parse(&bytes).unwrap();
+        assert!(rem.is_empty());
+        assert!(matches!(header.try_files_info(), Err(R7zError::Parse)));
+        assert!(header.files_info().is_none());
+    }
+
+    #[test]
+    fn lazy_header_sections_are_bounded_to_scanned_ranges() {
+        let bytes = Bytes::from_static(&[
+            0x01, // Header
+            0x05, 0x01, 0x11, 0x03, 0x00, b'a', 0x00, // one file name
+            0x00, // END FilesInfo
+            0x19, 0x01, 0xAA, // Dummy property with one byte payload
+            0x00, // END Header
+        ]);
+        let (rem, header) = Header::parse(&bytes).unwrap();
+        assert!(rem.is_empty());
+        assert_eq!(header.try_files_info().unwrap().unwrap().num_files, 1);
     }
 }
 

@@ -3,6 +3,10 @@
 use std::path::PathBuf;
 
 fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
+    build_copy_archive_with_pack_crc(name, data, None)
+}
+
+fn build_copy_archive_with_pack_crc(name: &str, data: &[u8], pack_crc: Option<u32>) -> Vec<u8> {
     let mut header = Vec::new();
     header.push(0x01); // Header
     header.push(0x04); // MainStreamsInfo
@@ -12,6 +16,11 @@ fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
     header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
     header.push(0x09); // Size
     header.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
+    if let Some(crc) = pack_crc {
+        header.push(0x0a); // CRC
+        header.push(0x01); // all defined
+        header.extend_from_slice(&crc.to_le_bytes());
+    }
     header.push(0x00);
 
     header.push(0x07); // UnpackInfo
@@ -62,6 +71,97 @@ fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
     archive.extend_from_slice(&next_header_size.to_le_bytes());
     archive.extend_from_slice(&next_header_crc.to_le_bytes());
     archive.extend_from_slice(data);
+    archive.extend_from_slice(&header);
+    archive
+}
+
+fn build_encoded_copy_archive(name: &str, data: &[u8], header_pack_crc: u32) -> Vec<u8> {
+    let plain = build_copy_archive(name, data);
+    let inner_header = &plain[32 + data.len()..];
+
+    let mut encoded_header = vec![0x17, 0x06]; // EncodedHeader, PackInfo
+    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
+    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    encoded_header.extend_from_slice(&[0x09]); // Size
+    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(inner_header.len() as u64));
+    encoded_header.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
+    encoded_header.extend_from_slice(&header_pack_crc.to_le_bytes());
+    encoded_header.push(0x00); // END PackInfo
+    encoded_header.extend_from_slice(&[0x07, 0x0b]); // UnpackInfo, Folder
+    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    encoded_header.extend_from_slice(&[0x00, 0x01, 0x01, 0x00]); // inline Copy coder
+    encoded_header.push(0x0c); // CodersUnPackSize
+    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(inner_header.len() as u64));
+    encoded_header.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
+    encoded_header.extend_from_slice(&crc32fast::hash(inner_header).to_le_bytes());
+    encoded_header.push(0x00); // END UnpackInfo
+
+    let next_header_offset = (data.len() + inner_header.len()) as u64;
+    let next_header_size = encoded_header.len() as u64;
+    let next_header_crc = crc32fast::hash(&encoded_header);
+    let mut start_header = [0u8; 20];
+    start_header[..8].copy_from_slice(&next_header_offset.to_le_bytes());
+    start_header[8..16].copy_from_slice(&next_header_size.to_le_bytes());
+    start_header[16..].copy_from_slice(&next_header_crc.to_le_bytes());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0x00, 0x04]);
+    archive.extend_from_slice(&crc32fast::hash(&start_header).to_le_bytes());
+    archive.extend_from_slice(&start_header);
+    archive.extend_from_slice(data);
+    archive.extend_from_slice(inner_header);
+    archive.extend_from_slice(&encoded_header);
+    archive
+}
+
+fn build_copy_archive_with_additional_crc(
+    name: &str,
+    data: &[u8],
+    additional_data: &[u8],
+    additional_crc: u32,
+) -> Vec<u8> {
+    let plain = build_copy_archive(name, data);
+    let mut header = plain[32 + data.len()..].to_vec();
+    let files_info = header
+        .windows(2)
+        .position(|window| window == [0x05, 0x01])
+        .unwrap();
+
+    let mut additional_info = vec![0x03, 0x06]; // AdditionalStreamsInfo, PackInfo
+    additional_info.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
+    additional_info.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    additional_info.push(0x09); // Size
+    additional_info
+        .extend_from_slice(&r7z::sevenzip_varuint64_encode(additional_data.len() as u64));
+    additional_info.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
+    additional_info.extend_from_slice(&additional_crc.to_le_bytes());
+    additional_info.push(0x00); // END PackInfo
+    additional_info.extend_from_slice(&[0x07, 0x0b]); // UnpackInfo, Folder
+    additional_info.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    additional_info.extend_from_slice(&[0x00, 0x01, 0x01, 0x00]); // inline Copy coder
+    additional_info.push(0x0c); // CodersUnPackSize
+    additional_info
+        .extend_from_slice(&r7z::sevenzip_varuint64_encode(additional_data.len() as u64));
+    additional_info.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
+    additional_info.extend_from_slice(&crc32fast::hash(additional_data).to_le_bytes());
+    additional_info.push(0x00); // END UnpackInfo
+    additional_info.push(0x00); // END AdditionalStreamsInfo
+    header.splice(files_info..files_info, additional_info);
+
+    let next_header_offset = (data.len() + additional_data.len()) as u64;
+    let next_header_size = header.len() as u64;
+    let next_header_crc = crc32fast::hash(&header);
+    let mut start_header = [0u8; 20];
+    start_header[..8].copy_from_slice(&next_header_offset.to_le_bytes());
+    start_header[8..16].copy_from_slice(&next_header_size.to_le_bytes());
+    start_header[16..].copy_from_slice(&next_header_crc.to_le_bytes());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0x00, 0x04]);
+    archive.extend_from_slice(&crc32fast::hash(&start_header).to_le_bytes());
+    archive.extend_from_slice(&start_header);
+    archive.extend_from_slice(data);
+    archive.extend_from_slice(additional_data);
     archive.extend_from_slice(&header);
     archive
 }
@@ -191,6 +291,67 @@ fn copy_codec_extracts_and_detects_packed_data_crc_mismatch() {
     let archive = r7z::Archive::from_bytes(corrupted.into()).unwrap();
     let err = archive.extract_to_memory(0).unwrap_err();
     assert!(matches!(err, r7z::R7zError::Crc));
+}
+
+#[test]
+fn packed_stream_crc_is_checked_independently_of_unpacked_crc() {
+    let data = b"copy codec payload";
+    let expected_crc = crc32fast::hash(data);
+    let good = build_copy_archive_with_pack_crc("plain.txt", data, Some(expected_crc));
+    let archive = r7z::Archive::from_bytes(good.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+
+    let bad = build_copy_archive_with_pack_crc("plain.txt", data, Some(expected_crc ^ 1));
+    let archive = r7z::Archive::from_bytes(bad.into()).unwrap();
+    assert!(matches!(
+        archive.extract_to_memory(0),
+        Err(r7z::R7zError::Crc)
+    ));
+
+    let no_crc = build_copy_archive_with_pack_crc("plain.txt", data, None);
+    let archive = r7z::Archive::from_bytes(no_crc.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+}
+
+#[test]
+fn encoded_header_pack_crc_is_checked_before_header_decode() {
+    let data = b"payload";
+    let encoded_header = build_copy_archive("file.txt", data);
+    let packed_header = &encoded_header[32 + data.len()..];
+    let good = build_encoded_copy_archive("file.txt", data, crc32fast::hash(packed_header));
+    let archive = r7z::Archive::from_bytes(good.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+
+    let bad = build_encoded_copy_archive("file.txt", data, crc32fast::hash(packed_header) ^ 1);
+    assert!(matches!(
+        r7z::Archive::from_bytes(bad.into()),
+        Err(r7z::R7zError::Crc)
+    ));
+}
+
+#[test]
+fn additional_metadata_pack_crc_is_checked_when_opening() {
+    let data = b"payload";
+    let additional = b"external metadata";
+    let good = build_copy_archive_with_additional_crc(
+        "file.txt",
+        data,
+        additional,
+        crc32fast::hash(additional),
+    );
+    let archive = r7z::Archive::from_bytes(good.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+
+    let bad = build_copy_archive_with_additional_crc(
+        "file.txt",
+        data,
+        additional,
+        crc32fast::hash(additional) ^ 1,
+    );
+    assert!(matches!(
+        r7z::Archive::from_bytes(bad.into()),
+        Err(r7z::R7zError::Crc)
+    ));
 }
 
 #[test]
