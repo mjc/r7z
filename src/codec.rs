@@ -1,4 +1,5 @@
 mod plan;
+mod sizes;
 use crate::{Folder, R7zError};
 use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
@@ -8,6 +9,7 @@ use lzma_rust2::{
 };
 pub(crate) use plan::{DecoderPlan, ReadyDecoder};
 use ppmd_rust::Ppmd7Decoder;
+use sizes::{CoderOutputSizes, OutputSize};
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
@@ -203,6 +205,11 @@ pub fn decompress_folder_with_password(
     decompress_folder_with_password_and_sizes(folder, packed_data, unpack_size, &[], password)
 }
 
+/// Decode using coder output sizes in the folder's output-stream order.
+///
+/// Supplied zeroes mean empty outputs. Omitted entries are inferred through
+/// length-preserving filters where possible; codecs requiring a size reject
+/// unresolved entries. A supplied final size must agree with `unpack_size`.
 pub fn decompress_folder_with_password_and_sizes(
     folder: &Folder,
     packed_data: &[u8],
@@ -274,43 +281,37 @@ fn prepare_folder_decoder<R: Read>(
     coder_unpack_sizes: &[u64],
 ) -> Result<ReadyDecoder<R>, R7zError> {
     let graph = folder.graph()?;
-    let mut sizes = SmallVec::<[u64; 4]>::from_slice(coder_unpack_sizes);
-    // Public adapters historically allow omitted intermediate output sizes.
-    // Resolve that convention here; the executable plan always has a complete table.
-    sizes.resize(folder.total_out_streams(), 0);
-    if coder_unpack_sizes.len() <= graph.final_output().get() {
-        *sizes
-            .get_mut(graph.final_output().get())
-            .ok_or(R7zError::InvalidFolderGraph)? = unpack_size;
-    }
+    let sizes = CoderOutputSizes::partial(folder, &graph, unpack_size, coder_unpack_sizes)?;
     let packed_sizes = packed_streams
         .iter()
         .map(|input| input.size as u64)
         .collect::<SmallVec<[_; 4]>>();
-    DecoderPlan::compile(folder, &graph, unpack_size, &sizes, &packed_sizes)?.bind(packed_streams)
+    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes)?
+        .bind(packed_streams)
 }
 
 fn aes_coder_reader<'a>(
     props: crate::aes::AesProperties,
     mut input: Box<dyn Read + 'a>,
-    unpack_size: u64,
+    input_size: OutputSize,
+    unpack_size: OutputSize,
     password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
+) -> Result<Cursor<Vec<u8>>, R7zError> {
     let password = password.ok_or(R7zError::PasswordRequired)?;
     let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
     let mut encrypted = Vec::new();
     read_to_end_bounded(
         &mut input,
         &mut encrypted,
-        MAX_BUFFERED_AES_BYTES,
+        input_size.buffered_bytes(MAX_BUFFERED_AES_BYTES),
         "AES encrypted input",
     )?;
     drop(input);
     let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
-    if unpack_size > 0 {
-        truncate_to(&mut decrypted, unpack_size)?;
+    if let OutputSize::Known(size) = unpack_size {
+        truncate_to(&mut decrypted, size)?;
     }
-    Ok(Box::new(Cursor::new(decrypted)))
+    Ok(Cursor::new(decrypted))
 }
 
 fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
@@ -348,21 +349,49 @@ fn validate_folder_coder_count(folder: &crate::Folder) -> Result<(), R7zError> {
 struct ExactSizeReader<R> {
     inner: R,
     remaining: u64,
+    end: OutputEnd,
+}
+
+enum OutputEnd {
+    /// The declared size ends the stream (PPMd may decode entropy padding).
+    Sized,
+    /// The underlying codec must also report EOF at the declared size.
+    Terminated,
 }
 
 impl<R> ExactSizeReader<R> {
-    fn new(inner: R, size: u64) -> Self {
+    fn sized(inner: R, size: u64) -> Self {
         Self {
             inner,
             remaining: size,
+            end: OutputEnd::Sized,
+        }
+    }
+    fn terminated(inner: R, size: u64) -> Self {
+        Self {
+            inner,
+            remaining: size,
+            end: OutputEnd::Terminated,
         }
     }
 }
 
 impl<R: Read> Read for ExactSizeReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 || buf.is_empty() {
+        if buf.is_empty() {
             return Ok(0);
+        }
+        if self.remaining == 0 {
+            return match self.end {
+                OutputEnd::Sized => Ok(0),
+                OutputEnd::Terminated => match self.inner.read(&mut [0])? {
+                    0 => Ok(0),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "decoder exceeded declared unpack size",
+                    )),
+                },
+            };
         }
 
         let limit = usize::try_from(self.remaining)
@@ -656,7 +685,7 @@ mod tests {
                 .unwrap()
                 .1;
         assert!(matches!(
-            super::plan::CoderPlan::compile(&lzma, 0),
+            super::plan::CoderPlan::compile(&lzma, super::OutputSize::Known(0)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "LZMA dictionary",
                 ..
@@ -665,7 +694,7 @@ mod tests {
 
         let lzma2 = crate::CoderInfo::parse(&[0x21, 0x21, 1, 40]).unwrap().1;
         assert!(matches!(
-            super::plan::CoderPlan::compile(&lzma2, 0),
+            super::plan::CoderPlan::compile(&lzma2, super::OutputSize::Known(0)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "LZMA dictionary",
                 ..
@@ -676,7 +705,7 @@ mod tests {
             .unwrap()
             .1;
         assert!(matches!(
-            super::plan::CoderPlan::compile(&ppmd, 0),
+            super::plan::CoderPlan::compile(&ppmd, super::OutputSize::Known(0)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "PPMd memory",
                 ..
@@ -710,12 +739,78 @@ mod tests {
 
     #[test]
     fn exact_size_reader_rejects_early_eof() {
-        let mut reader = ExactSizeReader::new(Cursor::new(b"ab"), 3);
+        let mut reader = ExactSizeReader::sized(Cursor::new(b"ab"), 3);
         let mut out = Vec::new();
 
         let err = reader.read_to_end(&mut out).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         assert_eq!(out, b"ab");
+    }
+
+    #[test]
+    fn terminated_reader_checks_exact_short_long_and_empty_outputs() {
+        for (bytes, size, expected) in [
+            (&b"abc"[..], 3, None),
+            (&b"ab"[..], 3, Some(ErrorKind::UnexpectedEof)),
+            (&b"abcd"[..], 3, Some(ErrorKind::InvalidData)),
+            (&b""[..], 0, None),
+            (&b"a"[..], 0, Some(ErrorKind::InvalidData)),
+        ] {
+            let mut reader = ExactSizeReader::terminated(Cursor::new(bytes), size);
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            let result = reader.read_to_end(&mut Vec::new());
+            assert_eq!(result.err().map(|error| error.kind()), expected);
+        }
+    }
+
+    #[test]
+    fn sized_reader_does_not_decode_entropy_padding() {
+        let mut input = Cursor::new(b"abcPADDING");
+        let mut output = Vec::new();
+        ExactSizeReader::sized(&mut input, 3)
+            .read_to_end(&mut output)
+            .unwrap();
+        assert_eq!(output, b"abc");
+        assert_eq!(input.position(), 3);
+    }
+
+    #[test]
+    fn aes_distinguishes_known_empty_output_from_omitted_size() {
+        use super::{OutputSize, aes_coder_reader};
+        let key = crate::aes::derive_key("password", &[], 0).unwrap();
+        let encrypted = crate::aes::encrypt_aes256_cbc_zero_pad(&[], &key, &[0; 16]).unwrap();
+        for (output_size, expected) in [(OutputSize::Known(0), 0), (OutputSize::Unknown, 16)] {
+            let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
+            let mut reader = aes_coder_reader(
+                props,
+                Box::new(Cursor::new(&encrypted)),
+                OutputSize::Known(encrypted.len() as u64),
+                output_size,
+                Some("password"),
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).unwrap();
+            assert_eq!(output, vec![0; expected]);
+        }
+    }
+
+    #[test]
+    fn aes_buffering_obeys_the_admitted_input_size() {
+        let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
+        assert!(matches!(
+            super::aes_coder_reader(
+                props,
+                Box::new(Cursor::new([0; 16])),
+                super::OutputSize::Known(8),
+                super::OutputSize::Known(0),
+                Some("password")
+            ),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "AES encrypted input",
+                limit: 8
+            })
+        ));
     }
 }

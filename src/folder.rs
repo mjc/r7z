@@ -50,7 +50,7 @@ impl OutputStreamIndex {
 }
 
 impl FolderGraph {
-    pub(crate) fn execution_order(&self) -> impl Iterator<Item = CoderIndex> + '_ {
+    pub(crate) fn execution_order(&self) -> impl DoubleEndedIterator<Item = CoderIndex> + '_ {
         self.execution_order.iter().copied()
     }
 
