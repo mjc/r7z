@@ -189,6 +189,7 @@ pub struct Header {
     files_info_range: Option<std::ops::Range<u32>>,
     /// Byte range containing `AdditionalStreamsInfo` when present.
     additional_streams_range: Option<std::ops::Range<u32>>,
+    /// Decoded additional data streams, indexed by external folder references.
     external_folder_data: Vec<Bytes>,
     /// Number of file entries (extracted during scan; avoids a lazy parse just
     /// to read the count).
@@ -346,6 +347,7 @@ impl Header {
     }
 
     /// Parse a header with decoded external folder definition bytes.
+    /// Each buffer is one additional data stream, in data-stream index order.
     ///
     /// # Errors
     ///

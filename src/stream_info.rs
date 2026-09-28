@@ -21,15 +21,66 @@ pub(crate) struct PackedFolder<'a> {
     pub(crate) coder_sizes: &'a [u64],
     pub(crate) unpack_size: u64,
     pub(crate) crc: Option<u32>,
+    stream_count: usize,
+    explicit_stream_sizes: &'a [u64],
+    stream_digests: Option<&'a [Option<u32>]>,
+}
+
+impl PackedFolder<'_> {
+    /// Append each decoded substream as one externally indexed data stream.
+    pub(crate) fn append_decoded(
+        &self,
+        decoded: Bytes,
+        streams: &mut Vec<Bytes>,
+    ) -> Result<(), R7zError> {
+        let explicit_size = self
+            .explicit_stream_sizes
+            .iter()
+            .try_fold(0u64, |total, &size| {
+                total.checked_add(size).ok_or(R7zError::Parse)
+            })?;
+        let last_size = self
+            .unpack_size
+            .checked_sub(explicit_size)
+            .ok_or(R7zError::Parse)?;
+        let sizes = self
+            .explicit_stream_sizes
+            .iter()
+            .copied()
+            .chain((self.stream_count > 0).then_some(last_size));
+        let mut offset = 0usize;
+        for (index, size) in sizes.enumerate() {
+            let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
+            let end = offset.checked_add(size).ok_or(R7zError::Parse)?;
+            let stream = decoded.get(offset..end).ok_or(R7zError::Parse)?;
+            if let Some(expected) = self
+                .stream_digests
+                .and_then(|digests| digests.get(index).copied().flatten())
+                && crc32fast::hash(stream) != expected
+            {
+                return Err(R7zError::Crc);
+            }
+            streams.push(decoded.slice(offset..end));
+            offset = end;
+        }
+        if self.stream_count > 0 && offset != decoded.len() {
+            return Err(R7zError::Parse);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct PackedFolders<'a> {
     pack_info: &'a PackInfo,
     unpack_info: &'a UnpackInfo,
+    substream_info: Option<&'a SubstreamInfo>,
     folder_index: usize,
     pack_index: usize,
     output_base: usize,
     pack_offset: u64,
+    stream_count: usize,
+    stream_size_base: usize,
+    stream_digest_base: usize,
 }
 
 impl PackedFolders<'_> {
@@ -39,6 +90,10 @@ impl PackedFolders<'_> {
 
     pub(crate) fn pack_pos(&self) -> u64 {
         self.pack_info.pack_pos
+    }
+
+    pub(crate) fn stream_count(&self) -> usize {
+        self.stream_count
     }
 }
 
@@ -76,6 +131,42 @@ impl<'a> PackedFolders<'a> {
         let unpack_size = *coder_sizes
             .get(graph.final_output().get())
             .ok_or(R7zError::Parse)?;
+        let stream_count = self
+            .substream_info
+            .map(|info| {
+                info.num_unpack_streams_per_folder
+                    .get(self.folder_index)
+                    .copied()
+                    .ok_or(R7zError::Parse)
+                    .and_then(|count| usize::try_from(count).map_err(|_| R7zError::Parse))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let explicit_count = stream_count.saturating_sub(1);
+        let stream_size_end = self
+            .stream_size_base
+            .checked_add(explicit_count)
+            .ok_or(R7zError::Parse)?;
+        let explicit_stream_sizes = match self.substream_info {
+            Some(info) => info
+                .unpack_sizes
+                .get(self.stream_size_base..stream_size_end)
+                .ok_or(R7zError::Parse)?,
+            None => &[],
+        };
+        let stream_digest_end = self
+            .stream_digest_base
+            .checked_add(stream_count)
+            .ok_or(R7zError::Parse)?;
+        let stream_digests = self
+            .substream_info
+            .filter(|info| !info.digests.is_empty())
+            .map(|info| {
+                info.digests
+                    .get(self.stream_digest_base..stream_digest_end)
+                    .ok_or(R7zError::Parse)
+            })
+            .transpose()?;
 
         let mut streams = Vec::with_capacity(pack_sizes.len());
         for (index, &size) in pack_sizes.iter().enumerate() {
@@ -100,12 +191,17 @@ impl<'a> PackedFolders<'a> {
         self.folder_index += 1;
         self.pack_index = pack_end;
         self.output_base = output_end;
+        self.stream_size_base = stream_size_end;
+        self.stream_digest_base = stream_digest_end;
         Ok(PackedFolder {
             folder,
             streams,
             coder_sizes,
             unpack_size,
             crc,
+            stream_count,
+            explicit_stream_sizes,
+            stream_digests,
         })
     }
 }
@@ -371,11 +467,12 @@ impl StreamInfo {
         if packed_bytes > metadata_limit {
             return Err(R7zError::LimitExceeded("metadata"));
         }
-        let (stream_count, _, _) = (0..unpack.num_folders_usize()).try_fold(
-            (0usize, 0usize, 0u64),
-            |(stream_count, output_base, output_size), index| {
+        let (pack_count, _, _, stream_size_count, stream_count) = (0..unpack.num_folders_usize())
+            .try_fold(
+            (0usize, 0usize, 0u64, 0usize, 0usize),
+            |(pack_count, output_base, output_size, stream_size_count, stream_count), index| {
                 let (folder, graph) = unpack.parse_folder_with_graph(index)?;
-                let stream_count = stream_count
+                let pack_count = pack_count
                     .checked_add(graph.packed_stream_count())
                     .ok_or(R7zError::Parse)?;
                 let output_end = output_base
@@ -388,23 +485,67 @@ impl StreamInfo {
                 let unpack_size = *coder_sizes
                     .get(graph.final_output().get())
                     .ok_or(R7zError::Parse)?;
+                let folder_stream_count = self
+                    .substream_info
+                    .as_ref()
+                    .map(|info| {
+                        info.num_unpack_streams_per_folder
+                            .get(index)
+                            .copied()
+                            .ok_or(R7zError::Parse)
+                            .and_then(|count| usize::try_from(count).map_err(|_| R7zError::Parse))
+                    })
+                    .transpose()?
+                    .unwrap_or(1);
+                let stream_size_end = stream_size_count
+                    .checked_add(folder_stream_count.saturating_sub(1))
+                    .ok_or(R7zError::Parse)?;
+                if let Some(substreams) = &self.substream_info {
+                    let explicit_sizes = substreams
+                        .unpack_sizes
+                        .get(stream_size_count..stream_size_end)
+                        .ok_or(R7zError::Parse)?;
+                    let explicit_total = explicit_sizes.iter().try_fold(0u64, |total, &size| {
+                        total.checked_add(size).ok_or(R7zError::Parse)
+                    })?;
+                    unpack_size
+                        .checked_sub(explicit_total)
+                        .ok_or(R7zError::Parse)?;
+                }
+                let stream_count = stream_count
+                    .checked_add(folder_stream_count)
+                    .ok_or(R7zError::Parse)?;
                 let output_size = output_size
                     .checked_add(unpack_size)
                     .ok_or(R7zError::Parse)?;
                 if output_size > metadata_limit {
                     return Err(R7zError::LimitExceeded("metadata"));
                 }
-                Ok::<_, R7zError>((stream_count, output_end, output_size))
+                Ok::<_, R7zError>((
+                    pack_count,
+                    output_end,
+                    output_size,
+                    stream_size_end,
+                    stream_count,
+                ))
             },
         )?;
-        match stream_count == pack.pack_size.len() {
+        let substreams_complete = self.substream_info.as_ref().is_none_or(|info| {
+            info.unpack_sizes.len() == stream_size_count
+                && (info.digests.is_empty() || info.digests.len() == stream_count)
+        });
+        match pack_count == pack.pack_size.len() && substreams_complete {
             true => Ok(PackedFolders {
                 pack_info: pack,
                 unpack_info: unpack,
+                substream_info: self.substream_info.as_ref(),
                 folder_index: 0,
                 pack_index: 0,
                 output_base: 0,
                 pack_offset: 0,
+                stream_count,
+                stream_size_base: 0,
+                stream_digest_base: 0,
             }),
             false => Err(R7zError::Parse),
         }
