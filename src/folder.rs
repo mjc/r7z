@@ -26,6 +26,50 @@ fn checked_coder_count(
     }
 }
 
+#[derive(Default)]
+struct FolderStreamCounts {
+    inputs: u64,
+    outputs: u64,
+}
+
+impl FolderStreamCounts {
+    fn add_coder<'a>(
+        &mut self,
+        input: &'a [u8],
+        num_inputs: u64,
+        num_outputs: u64,
+    ) -> Result<(), nom::Err<nom::error::Error<&'a [u8]>>> {
+        let too_large = || -> nom::Err<nom::error::Error<&'a [u8]>> {
+            nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        };
+        self.inputs = self.inputs.checked_add(num_inputs).ok_or_else(too_large)?;
+        self.outputs = self
+            .outputs
+            .checked_add(num_outputs)
+            .ok_or_else(too_large)?;
+        if self.inputs > MAX_FOLDER_STREAMS as u64 || self.outputs > MAX_FOLDER_STREAMS as u64 {
+            return Err(too_large());
+        }
+        Ok(())
+    }
+
+    fn layout<'a>(
+        &self,
+        input: &'a [u8],
+    ) -> Result<(u64, u64), nom::Err<nom::error::Error<&'a [u8]>>> {
+        let num_bind_pairs = self.outputs.checked_sub(1).ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+        })?;
+        let num_packed = self.inputs.checked_sub(num_bind_pairs).ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+        })?;
+        Ok((num_bind_pairs, num_packed))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct CoderIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -312,54 +356,21 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
     let (mut input, num_coders) = sevenzip_varuint64_decode(input)?;
     let num_coders = checked_coder_count(input, num_coders)?;
 
-    let mut num_in_total: u64 = 0;
-    let mut num_out_total: u64 = 0;
+    let mut stream_counts = FolderStreamCounts::default();
 
     for _ in 0..num_coders {
         let (remaining, coder) = CoderInfoRef::parse(input)?;
-        num_in_total = num_in_total
-            .checked_add(coder.num_in_streams)
-            .ok_or_else(|| {
-                nom::Err::Failure(nom::error::Error::new(
-                    remaining,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-        num_out_total = num_out_total
-            .checked_add(coder.num_out_streams)
-            .ok_or_else(|| {
-                nom::Err::Failure(nom::error::Error::new(
-                    remaining,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-        if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                remaining,
-                nom::error::ErrorKind::TooLarge,
-            )));
-        }
+        stream_counts.add_coder(remaining, coder.num_in_streams, coder.num_out_streams)?;
         input = remaining;
     }
 
-    let num_bind_pairs = num_out_total.checked_sub(1).ok_or_else(|| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-    })?;
-    if num_bind_pairs > num_in_total {
-        return Err(nom::Err::Failure(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Verify,
-        )));
-    }
+    let (num_bind_pairs, num_packed) = stream_counts.layout(input)?;
     for _ in 0..num_bind_pairs {
         let (i, _in_idx) = sevenzip_varuint64_decode(input)?;
         let (i, _out_idx) = sevenzip_varuint64_decode(i)?;
         input = i;
     }
 
-    let num_packed = num_in_total.checked_sub(num_bind_pairs).ok_or_else(|| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-    })?;
     if num_packed != 1 {
         for _ in 0..num_packed {
             let (i, _idx) = sevenzip_varuint64_decode(input)?;
@@ -367,7 +378,7 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
         }
     }
 
-    let total_out = usize::try_from(num_out_total).map_err(|_| {
+    let total_out = usize::try_from(stream_counts.outputs).map_err(|_| {
         nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::TooLarge,
@@ -431,45 +442,15 @@ impl Folder {
         let mut coders: SmallVec<[CoderInfo; 4]> =
             SmallVec::with_capacity(num_coders.min(input.len()));
         let mut input = input;
+        let mut stream_counts = FolderStreamCounts::default();
         for _ in 0..num_coders {
             let (i, coder) = CoderInfo::parse(input)?;
+            stream_counts.add_coder(i, coder.num_in_streams, coder.num_out_streams)?;
             coders.push(coder);
             input = i;
         }
 
-        let num_in_total = coders
-            .iter()
-            .try_fold(0u64, |sum, c| sum.checked_add(c.num_in_streams))
-            .ok_or_else(|| {
-                nom::Err::Failure(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-        let num_out_total = coders
-            .iter()
-            .try_fold(0u64, |sum, c| sum.checked_add(c.num_out_streams))
-            .ok_or_else(|| {
-                nom::Err::Failure(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-        if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::TooLarge,
-            )));
-        }
-        let num_bind_pairs = num_out_total.checked_sub(1).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-        })?;
-        if num_bind_pairs > num_in_total {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Verify,
-            )));
-        }
+        let (num_bind_pairs, num_packed) = stream_counts.layout(input)?;
 
         let mut bind_pairs: SmallVec<[(u64, u64); 1]> =
             SmallVec::with_capacity(usize_cap(num_bind_pairs, input.len()));
@@ -482,9 +463,6 @@ impl Folder {
 
         // NumPackedStreams = NumInStreams_Total - NumBindPairs
         // Only written explicitly when NumPackedStreams != 1
-        let num_packed = num_in_total.checked_sub(num_bind_pairs).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-        })?;
         let mut packed_indices: SmallVec<[u64; 1]> = SmallVec::new();
         if num_packed != 1 {
             packed_indices.reserve_exact(usize_cap(num_packed, input.len()));
@@ -642,6 +620,47 @@ mod tests {
                     }))
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_reject_excessive_stream_counts_consistently() {
+        let mut input = vec![0x01u8, 0x11, 0x00];
+        input.extend(crate::sevenzip_varuint64_encode(
+            u64::try_from(super::MAX_FOLDER_STREAMS + 1).unwrap(),
+        ));
+        input.push(0x01);
+
+        for result in [
+            Folder::parse(&input).map(|_| ()),
+            scan_folder(&input).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(nom::Err::Failure(nom::error::Error {
+                    code: nom::error::ErrorKind::TooLarge,
+                    ..
+                }))
+            ));
+        }
+
+        let mut truncated_after_limit = vec![0x02u8, 0x11, 0x00];
+        truncated_after_limit.extend(crate::sevenzip_varuint64_encode(
+            u64::try_from(super::MAX_FOLDER_STREAMS + 1).unwrap(),
+        ));
+        truncated_after_limit.push(0x01);
+
+        for result in [
+            Folder::parse(&truncated_after_limit).map(|_| ()),
+            scan_folder(&truncated_after_limit).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(nom::Err::Failure(nom::error::Error {
+                    code: nom::error::ErrorKind::TooLarge,
+                    ..
+                }))
+            ));
         }
     }
 
