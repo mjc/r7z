@@ -7,6 +7,10 @@ pub enum R7zError {
     #[error("parse error")]
     Parse,
 
+    /// Folder coder streams do not form a valid 7z folder graph.
+    #[error("invalid folder graph")]
+    InvalidFolderGraph,
+
     /// A property tag byte was not recognised.
     #[error("invalid property: {0:#04x}")]
     InvalidProperty(u8),

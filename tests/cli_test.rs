@@ -1316,3 +1316,73 @@ fn large_cli_create_1gb_sparse_lzma2_archive() {
 fn large_cli_create_5gb_sparse_lzma2_archive() {
     create_sparse_lzma2_archive_and_list_size(5 * 1024 * 1024 * 1024);
 }
+
+#[test]
+fn cli_mixed_entry_kinds_survive_testing_extraction_and_rewrite() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("mixed.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_directory("directory", r7z::EntryMeta::default())
+        .add_empty_file("empty", r7z::EntryMeta::default())
+        .add_empty_file("empty-link", r7z::EntryMeta::symlink())
+        .add_directory("mode-link", r7z::EntryMeta::symlink())
+        .add_anti_item("removed", r7z::EntryMeta::symlink())
+        .add_file("keep", b"payload")
+        .add_file("drop", b"discard")
+        .add_file_entry("link", b"target", r7z::EntryMeta::symlink())
+        .build()
+        .unwrap();
+    fs::write(&path, bytes).unwrap();
+    run_r7z(&["t".into(), path.display().to_string()]);
+    let output = tmp.path().join("out");
+    run_r7z(&[
+        "x".into(),
+        path.display().to_string(),
+        format!("-o{}", output.display()),
+    ]);
+    assert!(output.join("directory").is_dir());
+    assert!(!output.join("removed").exists());
+    for (name, data) in [
+        ("empty", &b""[..]),
+        ("empty-link", &b""[..]),
+        ("mode-link", &b""[..]),
+        ("keep", &b"payload"[..]),
+        ("drop", &b"discard"[..]),
+        ("link", &b"target"[..]),
+    ] {
+        assert_eq!(fs::read(output.join(name)).unwrap(), data);
+    }
+    let metadata = |archive: &r7z::Archive| {
+        archive
+            .listing(None)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.path != "drop")
+            .map(|entry| {
+                (
+                    entry.path,
+                    entry.kind,
+                    entry.size,
+                    entry.crc,
+                    entry.attributes,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = metadata(&r7z::Archive::open(&path).unwrap());
+    run_r7z(&[
+        "d".into(),
+        "-m0=Copy".into(),
+        path.display().to_string(),
+        "drop".into(),
+    ]);
+    let rewritten = r7z::Archive::open(&path).unwrap();
+    assert_eq!(metadata(&rewritten), before);
+    assert!(rewritten.entries().all(|entry| entry.name != "drop"));
+    let mut keep = Vec::new();
+    rewritten.extract_by_name("keep", &mut keep).unwrap();
+    assert_eq!(keep, b"payload");
+    run_r7z(&["t".into(), path.display().to_string()]);
+}

@@ -1,6 +1,8 @@
-use crate::pack_info::{scan_pack_info, scan_unpack_info};
+use crate::pack_info::{
+    FolderLocation, parse_folder_declaration, scan_pack_info, scan_unpack_info_with_external,
+};
 use crate::parsers::{bitmap_is_set, scan_digests};
-use crate::{PackInfo, Property, UnpackInfo, sevenzip_varuint64_decode};
+use crate::{PackInfo, Property, R7zError, UnpackInfo, sevenzip_varuint64_decode};
 use bytes::Bytes;
 use nom::{IResult, number::complete::le_u8};
 
@@ -225,6 +227,38 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    pub(crate) fn uses_external_folder_data(mut input: &[u8]) -> IResult<&[u8], bool> {
+        loop {
+            let (after_tag, tag) = Property::parse(input)?;
+            match tag {
+                Property::END => return Ok((after_tag, false)),
+                Property::UnPackInfo => {
+                    let (remaining, (_, location)) = parse_folder_declaration(input)?;
+                    return Ok((remaining, matches!(location, FolderLocation::External(_))));
+                }
+                Property::PackInfo => input = scan_pack_info(input)?.0,
+                Property::SubStreamsInfo => input = scan_substream_info(input, 0)?.0,
+                _ => {
+                    let (remaining, size) = sevenzip_varuint64_decode(after_tag)?;
+                    let size = usize::try_from(size).map_err(|_| {
+                        nom::Err::Failure(nom::error::Error::new(
+                            remaining,
+                            nom::error::ErrorKind::TooLarge,
+                        ))
+                    })?;
+                    input = nom::bytes::complete::take(size)(remaining)?.0;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn packed_folders(&self) -> Result<(&PackInfo, &UnpackInfo), R7zError> {
+        match (&self.pack_info, &self.unpack_info) {
+            (Some(pack), Some(unpack)) => Ok((pack, unpack)),
+            _ => Err(R7zError::Parse),
+        }
+    }
+
     /// Parse a `StreamInfo` block from the header stream.
     ///
     /// # Errors
@@ -235,6 +269,19 @@ impl StreamInfo {
     ///
     /// Panics if `num_folders` exceeds `usize::MAX` (impossible in practice).
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], StreamInfo> {
+        Self::parse_with_external(input, backing, &[])
+    }
+
+    /// Parse a stream descriptor with decoded external folder definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a nom error if the descriptor or a referenced folder definition is malformed.
+    pub fn parse_with_external<'a>(
+        input: &'a [u8],
+        backing: &Bytes,
+        external_data: &[Bytes],
+    ) -> IResult<&'a [u8], StreamInfo> {
         let mut pack_info = None;
         let mut unpack_info = None;
         let mut substream_info = None;
@@ -254,7 +301,7 @@ impl StreamInfo {
                     input = i;
                 }
                 Property::UnPackInfo => {
-                    let (i, ui) = UnpackInfo::parse(input, backing)?;
+                    let (i, ui) = UnpackInfo::parse_with_external(input, backing, external_data)?;
                     unpack_info = Some(ui);
                     input = i;
                 }
@@ -391,7 +438,15 @@ fn scan_substream_info(input: &[u8], num_folders: usize) -> IResult<&[u8], ()> {
 /// # Errors
 ///
 /// Returns a nom error if the input is truncated or malformed.
+#[cfg(test)]
 pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
+    scan_stream_info_with_external(input, &[])
+}
+
+pub(crate) fn scan_stream_info_with_external<'a>(
+    input: &'a [u8],
+    external_data: &[Bytes],
+) -> IResult<&'a [u8], ()> {
     let mut num_folders = 0usize;
     let mut input = input;
 
@@ -408,7 +463,7 @@ pub(crate) fn scan_stream_info(input: &[u8]) -> IResult<&[u8], ()> {
                 input = i;
             }
             Property::UnPackInfo => {
-                let (i, nf) = scan_unpack_info(input)?;
+                let (i, nf) = scan_unpack_info_with_external(input, external_data)?;
                 num_folders = nf;
                 input = i;
             }

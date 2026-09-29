@@ -6,6 +6,66 @@ fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
     build_copy_archive_with_pack_crc(name, data, None)
 }
 
+fn build_archive_with_external_folder_definition(name: &str, data: &[u8]) -> Vec<u8> {
+    let plain = build_copy_archive(name, data);
+    let mut header = plain[32 + data.len()..].to_vec();
+    let inline_folder = [0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00];
+    let folder_pos = header
+        .windows(inline_folder.len())
+        .position(|window| window == inline_folder)
+        .unwrap();
+    header.splice(
+        folder_pos..folder_pos + inline_folder.len(),
+        [0x07, 0x0b, 0x01, 0x01, 0x01],
+    );
+
+    let folder_data: [&[u8]; 2] = [&[0x01, 0x01, 0x00, 0xff], &[0x01, 0x01, 0x00]];
+    let folder_crcs = folder_data.map(crc32fast::hash);
+    let mut additional = vec![0x03, 0x06]; // AdditionalStreamsInfo, PackInfo
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(2));
+    additional.push(0x09);
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(4));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(3));
+    additional.extend_from_slice(&[0x0a, 0x01]);
+    for crc in folder_crcs {
+        additional.extend_from_slice(&crc.to_le_bytes());
+    }
+    additional.push(0x00);
+    additional.extend_from_slice(&[0x07, 0x0b, 0x02, 0x00]); // two inline Copy folders
+    additional.extend_from_slice(&[0x01, 0x01, 0x00]);
+    additional.extend_from_slice(&[0x01, 0x01, 0x00]);
+    additional.push(0x0c);
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(4));
+    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(3));
+    additional.extend_from_slice(&[0x0a, 0x01]);
+    for crc in folder_crcs {
+        additional.extend_from_slice(&crc.to_le_bytes());
+    }
+    additional.extend_from_slice(&[0x00, 0x00]); // UnpackInfo and StreamInfo end
+    header.splice(1..1, additional);
+
+    let next_header_offset =
+        (data.len() + folder_data.iter().map(|bytes| bytes.len()).sum::<usize>()) as u64;
+    let next_header_size = header.len() as u64;
+    let next_header_crc = crc32fast::hash(&header);
+    let mut start_header = [0u8; 20];
+    start_header[..8].copy_from_slice(&next_header_offset.to_le_bytes());
+    start_header[8..16].copy_from_slice(&next_header_size.to_le_bytes());
+    start_header[16..].copy_from_slice(&next_header_crc.to_le_bytes());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0x00, 0x04]);
+    archive.extend_from_slice(&crc32fast::hash(&start_header).to_le_bytes());
+    archive.extend_from_slice(&start_header);
+    archive.extend_from_slice(data);
+    for bytes in folder_data {
+        archive.extend_from_slice(bytes);
+    }
+    archive.extend_from_slice(&header);
+    archive
+}
+
 fn build_copy_archive_with_pack_crc(name: &str, data: &[u8], pack_crc: Option<u32>) -> Vec<u8> {
     let mut header = Vec::new();
     header.push(0x01); // Header
@@ -291,6 +351,13 @@ fn copy_codec_extracts_and_detects_packed_data_crc_mismatch() {
     let archive = r7z::Archive::from_bytes(corrupted.into()).unwrap();
     let err = archive.extract_to_memory(0).unwrap_err();
     assert!(matches!(err, r7z::R7zError::Crc));
+}
+
+#[test]
+fn external_folder_definitions_are_loaded_from_additional_streams() {
+    let bytes = build_archive_with_external_folder_definition("external.txt", b"external data");
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"external data");
 }
 
 #[test]

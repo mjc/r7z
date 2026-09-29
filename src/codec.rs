@@ -1,3 +1,5 @@
+mod plan;
+mod sizes;
 use crate::{Folder, R7zError};
 use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
@@ -5,7 +7,9 @@ use flate2::read::DeflateDecoder;
 use lzma_rust2::{
     Lzma2Reader, Lzma2Writer, LzmaOptions, LzmaReader, LzmaWriter, filter::bcj::BcjReader,
 };
+pub(crate) use plan::{DecoderPlan, ReadyDecoder};
 use ppmd_rust::Ppmd7Decoder;
+use sizes::{CoderOutputSizes, OutputSize};
 use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
@@ -20,9 +24,9 @@ const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
 const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
 const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
 const MAX_FOLDER_CODERS: usize = 64;
-// Sum of packed Vec capacities, intermediate Vec capacities, and final output.
+// Remaining buffered paths use this cap for packed folder bytes.
 pub(crate) const MAX_BUFFERED_PACKED_FOLDER_BYTES: usize = 512 * 1024 * 1024;
-const MAX_BCJ2_BUFFERED_BYTES: usize = MAX_BUFFERED_PACKED_FOLDER_BYTES;
+const MAX_BCJ2_WORKING_BYTES: usize = 512 * 1024 * 1024;
 
 /// Compress `data` with LZMA, returning `(properties, compressed_stream)`.
 ///
@@ -201,6 +205,11 @@ pub fn decompress_folder_with_password(
     decompress_folder_with_password_and_sizes(folder, packed_data, unpack_size, &[], password)
 }
 
+/// Decode using coder output sizes in the folder's output-stream order.
+///
+/// Supplied zeroes mean empty outputs. Omitted entries are inferred through
+/// length-preserving filters where possible; codecs requiring a size reject
+/// unresolved entries. A supplied final size must agree with `unpack_size`.
 pub fn decompress_folder_with_password_and_sizes(
     folder: &Folder,
     packed_data: &[u8],
@@ -208,276 +217,101 @@ pub fn decompress_folder_with_password_and_sizes(
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<Vec<u8>, R7zError> {
-    let decoder_memory = folder_decoder_memory_bytes(folder, packed_data.len())?;
-    let mut reader = folder_reader_with_sizes(
+    prepare_folder_decoder(
         folder,
-        packed_data,
+        smallvec::smallvec![PackedInput {
+            reader: Cursor::new(packed_data),
+            size: packed_data.len()
+        }],
         unpack_size,
         coder_unpack_sizes,
-        password,
-    )?;
-    let mut data = Vec::new();
-    read_to_end_bounded(
-        &mut reader,
-        &mut data,
-        growth_safe_output_limit(
-            MAX_MATERIALIZED_OUTPUT_BYTES
-                .checked_sub(decoder_memory)
-                .ok_or_else(|| {
-                    resource_limit("decoder working set", MAX_MATERIALIZED_OUTPUT_BYTES)
-                })?,
-        ),
-        "materialized output",
-    )?;
-    Ok(data)
+    )?
+    .materialize(password)
 }
 
-pub(crate) fn folder_reader_with_sizes<'a>(
-    folder: &Folder,
-    packed_data: &'a [u8],
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
-    folder_reader_with_sizes_from_reader(
-        folder,
-        Box::new(Cursor::new(packed_data)),
-        unpack_size,
-        coder_unpack_sizes,
-        password,
-        packed_data.len(),
-    )
+pub(crate) struct PackedInput<R> {
+    pub(crate) reader: R,
+    pub(crate) size: usize,
 }
 
-pub(crate) fn folder_reader_with_sizes_from_reader<'a>(
-    folder: &Folder,
-    input: Box<dyn Read + 'a>,
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-    packed_input_bytes: usize,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
-    validate_decoder_working_set(folder, packed_input_bytes)?;
-    let order = coder_execution_order(folder)?;
-    build_decoder_chain(
-        folder,
-        input,
-        unpack_size,
-        coder_unpack_sizes,
-        password,
-        &order,
-    )
+pub(crate) enum FolderReader<'a> {
+    Stream(Box<dyn Read + 'a>),
+    Buffered(Cursor<Vec<u8>>),
 }
 
-fn build_decoder_chain<'a>(
-    folder: &Folder,
-    mut reader: Box<dyn Read + 'a>,
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-    order: &[usize],
-) -> Result<Box<dyn Read + 'a>, R7zError> {
-    // Multi-coder chain: resolve bind-pair ordering so that each coder's
-    // output feeds the next one's input.
-    //
-    // In a BCJ+LZMA folder: coder[0]=LZMA, coder[1]=BCJ, bind_pair=(1,0)
-    // meaning BCJ's in-stream (1) ← LZMA's out-stream (0).
-    // Execution order: LZMA first (produces decompressed bytes), then BCJ.
-    //
-    // We build a topological order by figuring out which coder receives the
-    // packed stream (starts first) and following the bind pairs.
-    for (i, &coder_idx) in order.iter().enumerate() {
-        let coder = &folder.coders[coder_idx];
-        let size = coder_unpack_sizes
-            .get(coder_idx)
-            .copied()
-            .unwrap_or(if i == order.len() - 1 { unpack_size } else { 0 });
-        reader = coder_reader(coder, reader, size, password)?;
-    }
-    Ok(reader)
-}
-
-pub(crate) fn folder_reader_with_pack_streams(
-    folder: &Folder,
-    packed_streams: Vec<Vec<u8>>,
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
-    let packed_input_bytes = total_buffered_len(&packed_streams)?;
-    validate_folder_coder_count(folder)?;
-    if is_bcj2_folder(folder) {
-        return bcj2_folder_reader(
-            folder,
-            &packed_streams,
-            unpack_size,
-            coder_unpack_sizes,
-            password,
-        );
-    }
-
-    if packed_streams.len() != 1 {
-        return Err(R7zError::Parse);
-    }
-
-    folder_reader_with_sizes_from_reader(
-        folder,
-        Box::new(Cursor::new(
-            packed_streams.into_iter().next().ok_or(R7zError::Parse)?,
-        )),
-        unpack_size,
-        coder_unpack_sizes,
-        password,
-        packed_input_bytes,
-    )
-}
-
-fn coder_reader<'a>(
-    coder: &crate::CoderInfo,
-    input: Box<dyn Read + 'a>,
-    unpack_size: u64,
-    password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
-    if *coder.codec_id == *CODEC_COPY {
-        return Ok(input);
-    }
-
-    if *coder.codec_id == *CODEC_LZMA {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        if props.len() != 5 {
-            return Err(R7zError::Decompression);
+impl Read for FolderReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stream(reader) => reader.read(buf),
+            Self::Buffered(reader) => reader.read(buf),
         }
-        let props_byte = props[0];
-        let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-        if dict_size > MAX_LZMA_DICTIONARY_BYTES {
-            return Err(resource_limit(
-                "LZMA dictionary",
-                MAX_LZMA_DICTIONARY_BYTES as usize,
-            ));
+    }
+}
+
+impl FolderReader<'_> {
+    pub(crate) fn read_bounded_to_vec(
+        self,
+        capacity_hint: usize,
+        read_limit: u64,
+    ) -> Result<Vec<u8>, R7zError> {
+        match self {
+            Self::Stream(reader) => {
+                let mut output = Vec::with_capacity(capacity_hint.min(64 * 1024));
+                reader
+                    .take(read_limit)
+                    .read_to_end(&mut output)
+                    .map_err(R7zError::Io)?;
+                Ok(output)
+            }
+            Self::Buffered(reader) => {
+                let position = usize::try_from(reader.position()).unwrap_or(usize::MAX);
+                let mut output = reader.into_inner();
+                drop(output.drain(..position.min(output.len())));
+                output.truncate(usize::try_from(read_limit).unwrap_or(usize::MAX));
+                Ok(output)
+            }
         }
-        let reader = LzmaReader::new_with_props(input, unpack_size, props_byte, dict_size, None)
-            .map_err(|_| R7zError::Decompression)?;
-        return Ok(Box::new(reader));
     }
+}
 
-    if *coder.codec_id == *CODEC_LZMA2 {
-        let dict_size = lzma2_dict_size(coder.properties.as_deref())?;
-        return Ok(Box::new(Lzma2Reader::new(input, dict_size, None)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_X86 {
-        return Ok(Box::new(crate::bcj::BcjX86Reader::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_ARM {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Arm,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_ARM64 {
-        let pos = branch_start_pos(coder.properties.as_deref(), 4)?;
-        return Ok(Box::new(BcjReader::new_arm64(input, pos)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_RISCV {
-        let pos = branch_start_pos(coder.properties.as_deref(), 2)?;
-        return Ok(Box::new(BcjReader::new_riscv(input, pos)));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_ARM_THUMB {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::ArmThumb,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_IA64 {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Ia64,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_PPC {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Ppc,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_BCJ_SPARC {
-        return Ok(Box::new(crate::bcj::BranchReader::new(
-            input,
-            crate::bcj::BranchFilter::Sparc,
-        )));
-    }
-
-    if *coder.codec_id == *CODEC_DEFLATE {
-        return Ok(Box::new(DeflateDecoder::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_BZIP2 {
-        return Ok(Box::new(Bzip2Decoder::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_PPMD {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        let (order, mem_size) = ppmd_properties(props)?;
-        let reader =
-            Ppmd7Decoder::new(input, order, mem_size).map_err(|_| R7zError::Decompression)?;
-        let reader = ExactSizeReader::new(reader, unpack_size);
-        return Ok(Box::new(reader));
-    }
-
-    if *coder.codec_id == *CODEC_DEFLATE64 {
-        return Ok(Box::new(Deflate64Decoder::new(input)));
-    }
-
-    if *coder.codec_id == *CODEC_DELTA {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        return Ok(Box::new(crate::delta::DeltaReader::new(input, props)?));
-    }
-
-    if *coder.codec_id == *CODEC_SWAP2 {
-        return Ok(Box::new(crate::byte_swap::ByteSwapReader::new(input, 2)));
-    }
-
-    if *coder.codec_id == *CODEC_SWAP4 {
-        return Ok(Box::new(crate::byte_swap::ByteSwapReader::new(input, 4)));
-    }
-
-    if *coder.codec_id == *CODEC_AES_256_SHA_256 {
-        return aes_coder_reader(coder, input, unpack_size, password);
-    }
-
-    Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec()))
+fn prepare_folder_decoder<R: Read>(
+    folder: &Folder,
+    packed_streams: SmallVec<[PackedInput<R>; 4]>,
+    unpack_size: u64,
+    coder_unpack_sizes: &[u64],
+) -> Result<ReadyDecoder<R>, R7zError> {
+    let graph = folder.graph()?;
+    let sizes = CoderOutputSizes::partial(folder, &graph, unpack_size, coder_unpack_sizes)?;
+    let packed_sizes = packed_streams
+        .iter()
+        .map(|input| input.size as u64)
+        .collect::<SmallVec<[_; 4]>>();
+    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes)?
+        .bind(packed_streams)
 }
 
 fn aes_coder_reader<'a>(
-    coder: &crate::CoderInfo,
+    props: crate::aes::AesProperties,
     mut input: Box<dyn Read + 'a>,
-    unpack_size: u64,
+    input_size: OutputSize,
+    unpack_size: OutputSize,
     password: Option<&str>,
-) -> Result<Box<dyn Read + 'a>, R7zError> {
+) -> Result<Cursor<Vec<u8>>, R7zError> {
     let password = password.ok_or(R7zError::PasswordRequired)?;
-    let props_bytes = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-    let props = crate::aes::AesProperties::parse(props_bytes)?;
     let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
     let mut encrypted = Vec::new();
     read_to_end_bounded(
         &mut input,
         &mut encrypted,
-        MAX_BUFFERED_AES_BYTES,
+        input_size.buffered_bytes(MAX_BUFFERED_AES_BYTES),
         "AES encrypted input",
     )?;
     drop(input);
     let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
-    if unpack_size > 0 {
-        truncate_to(&mut decrypted, unpack_size)?;
+    if let OutputSize::Known(size) = unpack_size {
+        truncate_to(&mut decrypted, size)?;
     }
-    Ok(Box::new(Cursor::new(decrypted)))
+    Ok(Cursor::new(decrypted))
 }
 
 fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
@@ -505,95 +339,6 @@ fn growth_safe_output_limit(available: usize) -> usize {
     available / 2
 }
 
-fn coder_working_set_bytes(
-    coder: &crate::CoderInfo,
-    packed_input_bytes: usize,
-) -> Result<usize, R7zError> {
-    if coder.codec_id.as_slice() == CODEC_LZMA2 {
-        return (lzma2_dict_size(coder.properties.as_deref())? as usize)
-            .checked_add(MAX_LZMA2_PROBABILITY_BYTES)
-            .and_then(|size| size.checked_add(DECODER_OVERHEAD_BYTES))
-            .ok_or(R7zError::Decompression);
-    }
-    if coder.codec_id.as_slice() == CODEC_LZMA {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        if props.len() != 5 {
-            return Err(R7zError::Decompression);
-        }
-        let dict_size = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-        if dict_size > MAX_LZMA_DICTIONARY_BYTES {
-            return Err(resource_limit(
-                "LZMA dictionary",
-                MAX_LZMA_DICTIONARY_BYTES as usize,
-            ));
-        }
-        let memory_kib = lzma_rust2::lzma_get_memory_usage_by_props(dict_size, props[0])
-            .map_err(|_| R7zError::Decompression)?;
-        let memory = usize::try_from(memory_kib)
-            .ok()
-            .and_then(|memory| memory.checked_mul(1024))
-            .ok_or(R7zError::Decompression)?;
-        return memory
-            .checked_add(DECODER_OVERHEAD_BYTES)
-            .ok_or(R7zError::Decompression);
-    }
-    if coder.codec_id.as_slice() == CODEC_PPMD {
-        let props = coder.properties.as_deref().ok_or(R7zError::Decompression)?;
-        return (ppmd_properties(props)?.1 as usize)
-            .checked_add(DECODER_OVERHEAD_BYTES)
-            .ok_or(R7zError::Decompression);
-    }
-    if coder.codec_id.as_slice() == CODEC_AES_256_SHA_256 {
-        return packed_input_bytes
-            .min(MAX_BUFFERED_AES_BYTES)
-            .checked_mul(2)
-            .and_then(|size| size.checked_add(DECODER_OVERHEAD_BYTES))
-            .ok_or(R7zError::Decompression);
-    }
-    if matches!(
-        coder.codec_id.as_slice(),
-        CODEC_COPY
-            | CODEC_BCJ_X86
-            | CODEC_BCJ_ARM
-            | CODEC_BCJ_ARM_THUMB
-            | CODEC_BCJ_IA64
-            | CODEC_BCJ_PPC
-            | CODEC_BCJ_SPARC
-            | CODEC_DELTA
-            | CODEC_SWAP2
-            | CODEC_SWAP4
-    ) {
-        return Ok(0);
-    }
-    Ok(OTHER_CODER_WORKING_SET_BYTES)
-}
-
-fn folder_decoder_memory_bytes(
-    folder: &crate::Folder,
-    packed_input_bytes: usize,
-) -> Result<usize, R7zError> {
-    folder.coders.iter().try_fold(0usize, |total, coder| {
-        total
-            .checked_add(coder_working_set_bytes(coder, packed_input_bytes)?)
-            .ok_or(R7zError::Decompression)
-    })
-}
-
-fn validate_decoder_working_set(
-    folder: &crate::Folder,
-    packed_input_bytes: usize,
-) -> Result<usize, R7zError> {
-    validate_folder_coder_count(folder)?;
-    let working_set = folder_decoder_memory_bytes(folder, packed_input_bytes)?;
-    if working_set > MAX_DECODER_WORKING_SET_BYTES {
-        return Err(resource_limit(
-            "decoder working set",
-            MAX_DECODER_WORKING_SET_BYTES,
-        ));
-    }
-    Ok(working_set)
-}
-
 fn validate_folder_coder_count(folder: &crate::Folder) -> Result<(), R7zError> {
     if folder.coders.len() > MAX_FOLDER_CODERS {
         return Err(R7zError::LimitExceeded("folder coder count"));
@@ -604,21 +349,49 @@ fn validate_folder_coder_count(folder: &crate::Folder) -> Result<(), R7zError> {
 struct ExactSizeReader<R> {
     inner: R,
     remaining: u64,
+    end: OutputEnd,
+}
+
+enum OutputEnd {
+    /// The declared size ends the stream (PPMd may decode entropy padding).
+    Sized,
+    /// The underlying codec must also report EOF at the declared size.
+    Terminated,
 }
 
 impl<R> ExactSizeReader<R> {
-    fn new(inner: R, size: u64) -> Self {
+    fn sized(inner: R, size: u64) -> Self {
         Self {
             inner,
             remaining: size,
+            end: OutputEnd::Sized,
+        }
+    }
+    fn terminated(inner: R, size: u64) -> Self {
+        Self {
+            inner,
+            remaining: size,
+            end: OutputEnd::Terminated,
         }
     }
 }
 
 impl<R: Read> Read for ExactSizeReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 || buf.is_empty() {
+        if buf.is_empty() {
             return Ok(0);
+        }
+        if self.remaining == 0 {
+            return match self.end {
+                OutputEnd::Sized => Ok(0),
+                OutputEnd::Terminated => match self.inner.read(&mut [0])? {
+                    0 => Ok(0),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "decoder exceeded declared unpack size",
+                    )),
+                },
+            };
         }
 
         let limit = usize::try_from(self.remaining)
@@ -637,204 +410,33 @@ impl<R: Read> Read for ExactSizeReader<R> {
     }
 }
 
-fn is_bcj2_folder(folder: &Folder) -> bool {
-    folder
-        .coders
-        .last()
-        .is_some_and(|coder| coder.codec_id.as_slice() == CODEC_BCJ2)
+enum DecoderTopology {
+    Chain,
+    Bcj2,
 }
 
-fn bcj2_folder_reader(
-    folder: &Folder,
-    packed_streams: &[Vec<u8>],
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
-    if packed_streams.len() != 4 {
-        return Err(R7zError::Parse);
+impl DecoderTopology {
+    fn from_folder(folder: &Folder) -> Result<Self, R7zError> {
+        match folder.coders.last() {
+            Some(coder) if coder.codec_id.as_slice() == CODEC_BCJ2 => Ok(Self::Bcj2),
+            _ if folder
+                .coders
+                .iter()
+                .all(|coder| coder.num_in_streams == 1 && coder.num_out_streams == 1) =>
+            {
+                Ok(Self::Chain)
+            }
+            _ => {
+                let unsupported = folder
+                    .coders
+                    .iter()
+                    .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
+                Err(unsupported.map_or(R7zError::InvalidFolderGraph, |coder| {
+                    R7zError::UnsupportedCodec(coder.codec_id.to_vec())
+                }))
+            }
+        }
     }
-
-    if folder.coders.len() == 2
-        && folder.coders[1].num_in_streams == 4
-        && folder.coders[1].num_out_streams == 1
-        && folder.packed_indices.as_slice() == [0, 2, 3, 4]
-        && folder.bind_pairs.as_slice() == [(1, 0)]
-    {
-        return bcj2_single_predecoder(
-            folder,
-            packed_streams,
-            unpack_size,
-            coder_unpack_sizes,
-            password,
-        );
-    }
-
-    if folder.coders.len() != 4
-        || folder.coders[3].num_in_streams != 4
-        || folder.coders[3].num_out_streams != 1
-        || folder.packed_indices.as_slice() != [2, 6, 1, 0]
-        || folder.bind_pairs.as_slice() != [(5, 0), (4, 1), (3, 2)]
-    {
-        return Err(R7zError::Parse);
-    }
-
-    bcj2_lzma_predecoders(
-        folder,
-        packed_streams,
-        unpack_size,
-        coder_unpack_sizes,
-        password,
-    )
-}
-
-fn bcj2_single_predecoder(
-    folder: &Folder,
-    packed_streams: &[Vec<u8>],
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
-    let output_size = bcj2_output_size(unpack_size)?;
-    let packed_bytes = total_buffered_len(packed_streams)?;
-    let decoder_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
-    let main_size = output_size
-        .checked_sub(packed_streams[1].len())
-        .and_then(|size| size.checked_sub(packed_streams[2].len()))
-        .ok_or(R7zError::Decompression)?;
-    let declared_main_size = *coder_unpack_sizes.first().ok_or(R7zError::Parse)?;
-    if usize::try_from(declared_main_size).map_err(|_| R7zError::Parse)? != main_size {
-        return Err(R7zError::Decompression);
-    }
-    ensure_bcj2_buffer_budget(packed_bytes, main_size, output_size, decoder_memory)?;
-    let main = decode_single_coder_to_vec(
-        &folder.coders[0],
-        &packed_streams[0],
-        declared_main_size,
-        main_size,
-        password,
-    )?;
-    if main
-        .len()
-        .checked_add(packed_streams[1].len())
-        .and_then(|len| len.checked_add(packed_streams[2].len()))
-        .ok_or(R7zError::Decompression)?
-        != output_size
-    {
-        return Err(R7zError::Decompression);
-    }
-
-    ensure_bcj2_buffer_budget(packed_bytes, main.capacity(), output_size, 0)?;
-    let decoded = crate::bcj2::decode(
-        &main,
-        &packed_streams[1],
-        &packed_streams[2],
-        &packed_streams[3],
-        output_size,
-    )?;
-    ensure_bcj2_buffer_budget(packed_bytes, main.capacity(), decoded.capacity(), 0)?;
-    Ok(Box::new(Cursor::new(decoded)))
-}
-
-fn bcj2_lzma_predecoders(
-    folder: &Folder,
-    packed_streams: &[Vec<u8>],
-    unpack_size: u64,
-    coder_unpack_sizes: &[u64],
-    password: Option<&str>,
-) -> Result<Box<dyn Read>, R7zError> {
-    let output_size = bcj2_output_size(unpack_size)?;
-    let packed_bytes = total_buffered_len(packed_streams)?;
-    let jump_memory = coder_working_set_bytes(&folder.coders[0], packed_bytes)?;
-    let jump_limit = bcj2_intermediate_available(packed_bytes, output_size, 0, jump_memory)?;
-    let jump_limit = declared_or_fallback_limit(coder_unpack_sizes.first(), jump_limit);
-    let jump = decode_single_coder_to_vec(
-        &folder.coders[0],
-        &packed_streams[3],
-        *coder_unpack_sizes.first().ok_or(R7zError::Parse)?,
-        jump_limit,
-        password,
-    )?;
-    let call_memory = coder_working_set_bytes(&folder.coders[1], packed_bytes)?;
-    let call_limit =
-        bcj2_intermediate_available(packed_bytes, output_size, jump.capacity(), call_memory)?;
-    let call_limit = declared_or_fallback_limit(coder_unpack_sizes.get(1), call_limit);
-    let call = decode_single_coder_to_vec(
-        &folder.coders[1],
-        &packed_streams[2],
-        *coder_unpack_sizes.get(1).ok_or(R7zError::Parse)?,
-        call_limit,
-        password,
-    )?;
-    let main_memory = coder_working_set_bytes(&folder.coders[2], packed_bytes)?;
-    let main_limit = bcj2_intermediate_available(
-        packed_bytes,
-        output_size,
-        jump.capacity()
-            .checked_add(call.capacity())
-            .ok_or(R7zError::Decompression)?,
-        main_memory,
-    )?;
-    let main_limit = declared_or_fallback_limit(coder_unpack_sizes.get(2), main_limit);
-    let main = decode_single_coder_to_vec(
-        &folder.coders[2],
-        &packed_streams[0],
-        *coder_unpack_sizes.get(2).ok_or(R7zError::Parse)?,
-        main_limit,
-        password,
-    )?;
-
-    if main
-        .len()
-        .checked_add(call.len())
-        .and_then(|len| len.checked_add(jump.len()))
-        .ok_or(R7zError::Decompression)?
-        != output_size
-    {
-        return Err(R7zError::Decompression);
-    }
-
-    let intermediate_bytes = jump
-        .capacity()
-        .checked_add(call.capacity())
-        .and_then(|len| len.checked_add(main.capacity()))
-        .ok_or(R7zError::Decompression)?;
-    ensure_bcj2_buffer_budget(packed_bytes, intermediate_bytes, output_size, 0)?;
-    let decoded = crate::bcj2::decode(&main, &call, &jump, &packed_streams[1], output_size)?;
-    ensure_bcj2_buffer_budget(packed_bytes, intermediate_bytes, decoded.capacity(), 0)?;
-    Ok(Box::new(Cursor::new(decoded)))
-}
-
-fn decode_single_coder_to_vec(
-    coder: &crate::CoderInfo,
-    packed_stream: &[u8],
-    unpack_size: u64,
-    max_output: usize,
-    password: Option<&str>,
-) -> Result<Vec<u8>, R7zError> {
-    let mut reader = coder_reader(
-        coder,
-        Box::new(Cursor::new(packed_stream)),
-        unpack_size,
-        password,
-    )?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(max_output)
-        .map_err(|_| resource_limit("BCJ2 intermediate", max_output))?;
-    if output.capacity() > max_output {
-        return Err(resource_limit("BCJ2 intermediate", max_output));
-    }
-    read_to_end_bounded(&mut reader, &mut output, max_output, "BCJ2 intermediate")?;
-    Ok(output)
-}
-
-fn declared_or_fallback_limit(declared_size: Option<&u64>, available: usize) -> usize {
-    let fallback = growth_safe_output_limit(available);
-    declared_size
-        .and_then(|size| usize::try_from(*size).ok())
-        .filter(|size| *size <= available)
-        .unwrap_or(fallback)
 }
 
 fn read_to_end_bounded(
@@ -876,6 +478,70 @@ mod bounded_reader_tests {
     use super::*;
 
     #[test]
+    fn buffered_and_streamed_outputs_share_cursor_and_limit_semantics() {
+        for limit in [0, 3, u64::MAX] {
+            for mut reader in [
+                FolderReader::Stream(Box::new(Cursor::new(b"abcdef"))),
+                FolderReader::Buffered(Cursor::new(b"abcdef".to_vec())),
+            ] {
+                reader.read_exact(&mut [0; 2]).unwrap();
+                let output = reader.read_bounded_to_vec(4, limit).unwrap();
+                let expected = &b"cdef"[..usize::try_from(limit.min(4)).unwrap()];
+                assert_eq!(output, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn bcj2_layouts_map_packed_inputs_to_named_streams() {
+        let copy = || crate::CoderInfo::parse(&[1, 0]).unwrap().1;
+        let bcj2 = || {
+            crate::CoderInfo::parse(&[0x14, 3, 3, 1, 0x1b, 4, 1])
+                .unwrap()
+                .1
+        };
+        let main: &[u8] = &[0xe8];
+        let call: &[u8] = &9u32.to_be_bytes();
+        let control: &[u8] = &[0, 0x7f, 0xff, 0xfc, 0];
+        let layouts = [
+            (
+                Folder {
+                    coders: smallvec::smallvec![copy(), bcj2()],
+                    packed_indices: smallvec::smallvec![0, 2, 3, 4],
+                    bind_pairs: smallvec::smallvec![(1, 0)],
+                },
+                [main, call, &[][..], control],
+                &[1, 5][..],
+            ),
+            (
+                Folder {
+                    coders: smallvec::smallvec![copy(), copy(), copy(), bcj2()],
+                    packed_indices: smallvec::smallvec![2, 6, 1, 0],
+                    bind_pairs: smallvec::smallvec![(5, 0), (4, 1), (3, 2)],
+                },
+                [main, control, call, &[][..]],
+                &[0, 4, 1, 5][..],
+            ),
+        ];
+        for (folder, inputs, sizes) in layouts {
+            let inputs = inputs
+                .into_iter()
+                .map(|bytes| PackedInput {
+                    reader: Cursor::new(bytes),
+                    size: bytes.len(),
+                })
+                .collect();
+            let output = prepare_folder_decoder(&folder, inputs, 5, sizes)
+                .unwrap()
+                .start(None)
+                .unwrap()
+                .read_bounded_to_vec(5, 6)
+                .unwrap();
+            assert_eq!(output, [0xe8, 4, 0, 0, 0]);
+        }
+    }
+
+    #[test]
     fn bounded_reader_grows_geometrically_for_large_outputs() {
         let input = vec![0x5a; 4 * 1024 * 1024];
         let mut reader = Cursor::new(input.as_slice());
@@ -896,58 +562,17 @@ fn bcj2_output_size(unpack_size: u64) -> Result<usize, R7zError> {
     Ok(output_size)
 }
 
-fn total_buffered_len(buffers: &[Vec<u8>]) -> Result<usize, R7zError> {
-    buffers.iter().try_fold(0usize, |total, buffer| {
-        total
-            .checked_add(buffer.capacity())
-            .ok_or(R7zError::Decompression)
-    })
-}
-
-fn bcj2_intermediate_limit(
-    packed_bytes: usize,
-    output_size: usize,
-    intermediate_bytes: usize,
-    decoder_memory: usize,
-) -> Result<usize, R7zError> {
-    Ok(growth_safe_output_limit(bcj2_intermediate_available(
-        packed_bytes,
-        output_size,
-        intermediate_bytes,
-        decoder_memory,
-    )?))
-}
-
-fn bcj2_intermediate_available(
-    packed_bytes: usize,
-    output_size: usize,
-    intermediate_bytes: usize,
-    decoder_memory: usize,
-) -> Result<usize, R7zError> {
-    let committed = packed_bytes
-        .checked_add(output_size)
-        .and_then(|total| total.checked_add(intermediate_bytes))
-        .and_then(|total| total.checked_add(decoder_memory))
+fn ensure_bcj2_working_budget(output_size: usize, decoder_memory: usize) -> Result<(), R7zError> {
+    let committed = output_size
+        .checked_add(decoder_memory)
         .ok_or(R7zError::Decompression)?;
-    let available = MAX_BCJ2_BUFFERED_BYTES
-        .checked_sub(committed)
-        .ok_or_else(|| resource_limit("BCJ2 working buffers", MAX_BCJ2_BUFFERED_BYTES))?;
-    Ok(available)
-}
-
-fn ensure_bcj2_buffer_budget(
-    packed_bytes: usize,
-    intermediate_bytes: usize,
-    output_size: usize,
-    decoder_memory: usize,
-) -> Result<(), R7zError> {
-    bcj2_intermediate_limit(
-        packed_bytes,
-        output_size,
-        intermediate_bytes,
-        decoder_memory,
-    )
-    .map(|_| ())
+    if committed > MAX_BCJ2_WORKING_BYTES {
+        return Err(resource_limit(
+            "BCJ2 working buffers",
+            MAX_BCJ2_WORKING_BYTES,
+        ));
+    }
+    Ok(())
 }
 
 fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
@@ -957,106 +582,6 @@ fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
     }
     data.truncate(size);
     Ok(())
-}
-
-/// Determine the order in which coders should be executed for decompression.
-///
-/// The packed (compressed) stream enters one coder first, its output feeds the
-/// next via bind pairs, and so on.  We return coder indices in execution order.
-fn coder_execution_order(folder: &crate::Folder) -> Result<SmallVec<[usize; 4]>, R7zError> {
-    let n = folder.coders.len();
-    if n <= 1 {
-        return Ok((0..n).collect());
-    }
-
-    if folder
-        .coders
-        .iter()
-        .any(|coder| coder.num_in_streams != 1 || coder.num_out_streams != 1)
-    {
-        return Err(R7zError::Parse);
-    }
-
-    if folder.bind_pairs.len() != n - 1 {
-        return Err(R7zError::Parse);
-    }
-
-    // Find which coder's input stream is NOT bound to any other coder's output.
-    // That coder receives the packed data and runs first.
-    //
-    // Bind pairs: (in_index, out_index) — in_index is a global input stream
-    // index, out_index is a global output stream index.
-    //
-    // For a 2-coder folder:
-    //   coder 0: in_stream 0, out_stream 0
-    //   coder 1: in_stream 1, out_stream 1
-    //   bind_pair (1, 0) means: in_stream 1 ← out_stream 0
-    //   So coder 1's input comes from coder 0's output.
-    //   The packed data goes to the stream NOT appearing as any bind_pair's in_index.
-    //   Stream 0 (coder 0) is not bound as input → coder 0 runs first.
-
-    // Build a set of bound input streams.
-    let bound_in: SmallVec<[u64; 4]> = folder
-        .bind_pairs
-        .iter()
-        .map(|&(in_idx, _)| in_idx)
-        .collect();
-
-    for &(in_idx, out_idx) in &folder.bind_pairs {
-        if in_idx >= n as u64 || out_idx >= n as u64 {
-            return Err(R7zError::Parse);
-        }
-    }
-
-    let start_stream = if folder.packed_indices.is_empty() {
-        let starts: SmallVec<[u64; 2]> = (0..n as u64)
-            .filter(|stream| !bound_in.contains(stream))
-            .collect();
-        if starts.len() != 1 {
-            return Err(R7zError::Parse);
-        }
-        starts[0]
-    } else if folder.packed_indices.len() == 1 {
-        let start = folder.packed_indices[0];
-        if start >= n as u64 || bound_in.contains(&start) {
-            return Err(R7zError::Parse);
-        }
-        start
-    } else {
-        return Err(R7zError::Parse);
-    };
-
-    // Map global stream index → coder index
-    // For simple 1-in/1-out coders: stream i belongs to coder i.
-    // For complex coders we'd need cumulative sums, but 7z BCJ uses simple coders.
-    let mut order = SmallVec::with_capacity(n);
-
-    // Find the first coder (the one whose input stream is not bound)
-    let mut current_stream = start_stream;
-    order.push(usize::try_from(start_stream).map_err(|_| R7zError::Parse)?);
-
-    // Follow the chain: find bind pair where out_index == current_stream,
-    // then the coder that owns in_index is next.
-    while order.len() < n {
-        let matches: SmallVec<[(u64, u64); 2]> = folder
-            .bind_pairs
-            .iter()
-            .copied()
-            .filter(|&(_, out_idx)| out_idx == current_stream)
-            .collect();
-        if matches.len() != 1 {
-            return Err(R7zError::Parse);
-        }
-        let (in_idx, _) = matches[0];
-        let coder_idx = usize::try_from(in_idx).map_err(|_| R7zError::Parse)?;
-        if order.contains(&coder_idx) {
-            return Err(R7zError::Parse);
-        }
-        order.push(coder_idx);
-        current_stream = in_idx;
-    }
-
-    Ok(order)
 }
 
 #[cfg(test)]
@@ -1103,19 +628,6 @@ mod tests {
             lzma2_dict_size(None),
             Err(R7zError::ResourceLimitExceeded { .. })
         ));
-    }
-
-    #[test]
-    fn aes_working_set_uses_packed_size_and_allows_more_than_128_mib() {
-        let aes = crate::CoderInfo::parse(&[0x04, 0x06, 0xF1, 0x07, 0x01])
-            .unwrap()
-            .1;
-        let packed_size = 129 * 1024 * 1024;
-        assert_eq!(
-            super::coder_working_set_bytes(&aes, packed_size).unwrap(),
-            packed_size * 2 + super::DECODER_OVERHEAD_BYTES
-        );
-        assert_eq!(super::MAX_BUFFERED_AES_BYTES, 256 * 1024 * 1024);
     }
 
     #[test]
@@ -1173,7 +685,7 @@ mod tests {
                 .unwrap()
                 .1;
         assert!(matches!(
-            super::coder_reader(&lzma, Box::new(Cursor::new(&[][..])), 0, None),
+            super::plan::CoderPlan::compile(&lzma, super::OutputSize::Known(0)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "LZMA dictionary",
                 ..
@@ -1182,7 +694,7 @@ mod tests {
 
         let lzma2 = crate::CoderInfo::parse(&[0x21, 0x21, 1, 40]).unwrap().1;
         assert!(matches!(
-            super::coder_reader(&lzma2, Box::new(Cursor::new(&[][..])), 0, None),
+            super::plan::CoderPlan::compile(&lzma2, super::OutputSize::Known(0)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "LZMA dictionary",
                 ..
@@ -1193,25 +705,11 @@ mod tests {
             .unwrap()
             .1;
         assert!(matches!(
-            super::coder_reader(&ppmd, Box::new(Cursor::new(&[][..])), 0, None),
+            super::plan::CoderPlan::compile(&ppmd, super::OutputSize::Known(0)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "PPMd memory",
                 ..
             })
-        ));
-    }
-
-    #[test]
-    fn actual_intermediate_growth_is_bounded_despite_dishonest_unpack_size() {
-        let copy = crate::CoderInfo::parse(&[1, 0]).unwrap().1;
-        let err = super::decode_single_coder_to_vec(&copy, b"more than allowed", u64::MAX, 4, None)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            R7zError::ResourceLimitExceeded {
-                resource: "BCJ2 intermediate",
-                limit: 4
-            }
         ));
     }
 
@@ -1228,13 +726,10 @@ mod tests {
     }
 
     #[test]
-    fn bcj2_budget_counts_packed_intermediate_and_final_buffers() {
-        assert_eq!(
-            super::bcj2_intermediate_limit(400, 100, 20, 30).unwrap(),
-            (512 * 1024 * 1024 - 550) / 2
-        );
+    fn bcj2_budget_counts_output_and_live_decoders() {
+        assert!(super::ensure_bcj2_working_budget(400, 100).is_ok());
         assert!(matches!(
-            super::bcj2_intermediate_limit(512 * 1024 * 1024, 1, 0, 0),
+            super::ensure_bcj2_working_budget(512 * 1024 * 1024, 1),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "BCJ2 working buffers",
                 ..
@@ -1243,44 +738,79 @@ mod tests {
     }
 
     #[test]
-    fn bcj2_declared_intermediate_uses_exact_available_budget() {
-        let packed = 45 * 1024 * 1024;
-        let output = 150 * 1024 * 1024;
-        let decoder = 64 * 1024 * 1024;
-        let available = super::bcj2_intermediate_available(packed, output, 0, decoder).unwrap();
-        let declared = 150 * 1024 * 1024;
-
-        assert_eq!(
-            super::declared_or_fallback_limit(Some(&(declared as u64)), available),
-            declared
-        );
-    }
-
-    #[test]
-    fn chained_decoder_state_is_aggregated_before_construction() {
-        let lzma2 = || crate::CoderInfo::parse(&[0x21, 0x21, 1, 32]).unwrap().1;
-        let folder = crate::Folder {
-            coders: vec![lzma2(), lzma2(), lzma2()].into(),
-            bind_pairs: smallvec::SmallVec::default(),
-            packed_indices: smallvec::SmallVec::default(),
-        };
-        assert!(matches!(
-            super::validate_decoder_working_set(&folder, 0),
-            Err(R7zError::ResourceLimitExceeded {
-                resource: "decoder working set",
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn exact_size_reader_rejects_early_eof() {
-        let mut reader = ExactSizeReader::new(Cursor::new(b"ab"), 3);
+        let mut reader = ExactSizeReader::sized(Cursor::new(b"ab"), 3);
         let mut out = Vec::new();
 
         let err = reader.read_to_end(&mut out).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         assert_eq!(out, b"ab");
+    }
+
+    #[test]
+    fn terminated_reader_checks_exact_short_long_and_empty_outputs() {
+        for (bytes, size, expected) in [
+            (&b"abc"[..], 3, None),
+            (&b"ab"[..], 3, Some(ErrorKind::UnexpectedEof)),
+            (&b"abcd"[..], 3, Some(ErrorKind::InvalidData)),
+            (&b""[..], 0, None),
+            (&b"a"[..], 0, Some(ErrorKind::InvalidData)),
+        ] {
+            let mut reader = ExactSizeReader::terminated(Cursor::new(bytes), size);
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            let result = reader.read_to_end(&mut Vec::new());
+            assert_eq!(result.err().map(|error| error.kind()), expected);
+        }
+    }
+
+    #[test]
+    fn sized_reader_does_not_decode_entropy_padding() {
+        let mut input = Cursor::new(b"abcPADDING");
+        let mut output = Vec::new();
+        ExactSizeReader::sized(&mut input, 3)
+            .read_to_end(&mut output)
+            .unwrap();
+        assert_eq!(output, b"abc");
+        assert_eq!(input.position(), 3);
+    }
+
+    #[test]
+    fn aes_distinguishes_known_empty_output_from_omitted_size() {
+        use super::{OutputSize, aes_coder_reader};
+        let key = crate::aes::derive_key("password", &[], 0).unwrap();
+        let encrypted = crate::aes::encrypt_aes256_cbc_zero_pad(&[], &key, &[0; 16]).unwrap();
+        for (output_size, expected) in [(OutputSize::Known(0), 0), (OutputSize::Unknown, 16)] {
+            let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
+            let mut reader = aes_coder_reader(
+                props,
+                Box::new(Cursor::new(&encrypted)),
+                OutputSize::Known(encrypted.len() as u64),
+                output_size,
+                Some("password"),
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).unwrap();
+            assert_eq!(output, vec![0; expected]);
+        }
+    }
+
+    #[test]
+    fn aes_buffering_obeys_the_admitted_input_size() {
+        let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
+        assert!(matches!(
+            super::aes_coder_reader(
+                props,
+                Box::new(Cursor::new([0; 16])),
+                super::OutputSize::Known(8),
+                super::OutputSize::Known(0),
+                Some("password")
+            ),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "AES encrypted input",
+                limit: 8
+            })
+        ));
     }
 }

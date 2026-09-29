@@ -45,6 +45,39 @@ pub enum SevenZMethod {
 }
 
 impl SevenZMethod {
+    pub(crate) const fn stream_arity(self) -> (u64, u64) {
+        match self {
+            Self::Bcj2 => (4, 1),
+            Self::Copy
+            | Self::Lzma
+            | Self::Lzma2
+            | Self::BZip2
+            | Self::Ppmd
+            | Self::Deflate
+            | Self::Deflate64
+            | Self::Bcj
+            | Self::Arm
+            | Self::Arm64
+            | Self::ArmThumb
+            | Self::Ia64
+            | Self::Ppc
+            | Self::Sparc
+            | Self::Riscv
+            | Self::Delta
+            | Self::Swap2
+            | Self::Swap4
+            | Self::Zstd
+            | Self::Brotli
+            | Self::Lz4
+            | Self::Lz5
+            | Self::Lizard
+            | Self::FastLzma2
+            | Self::Lzham
+            | Self::SevenZAes
+            | Self::Aes256Cbc => (1, 1),
+        }
+    }
+
     #[must_use]
     pub fn id(self) -> &'static [u8] {
         match self {
