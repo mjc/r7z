@@ -1374,7 +1374,8 @@ fn cli_test_accepts_wildcard_entry_patterns() {
     {
         let mut writer = r7z::ArchiveWriter::new(&mut cursor, r7z::ArchiveOptions::default())
             .unwrap()
-            .compression(r7z::Codec::Copy);
+            .compression(r7z::Codec::Copy)
+            .expect("codec selection failed");
         writer.append("good.txt", &b"good-payload"[..]).unwrap();
         writer.new_folder().unwrap();
         writer

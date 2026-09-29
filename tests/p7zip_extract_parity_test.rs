@@ -182,7 +182,8 @@ fn write_with_archive_writer(
     let file = std::fs::File::create(archive_path).unwrap();
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .unwrap()
-        .compression(codec);
+        .compression(codec)
+        .expect("codec selection failed");
     for (idx, (path, data)) in files.iter().enumerate() {
         if multi_folder && idx == files.len() / 2 {
             writer.new_folder().unwrap();

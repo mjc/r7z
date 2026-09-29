@@ -110,6 +110,58 @@ struct StreamingLzmaFolder<W: Write> {
     file_crcs: Vec<u32>,
 }
 
+enum WriterMode<W: Write> {
+    Buffered,
+    Copy {
+        current: StreamingCopyFolder,
+        completed: Vec<StreamingCopyFolder>,
+    },
+    Lzma2 {
+        current: Option<StreamingLzma2Folder<W>>,
+        completed: Vec<model::CompletedFolder>,
+    },
+    Lzma {
+        current: Option<Box<StreamingLzmaFolder<W>>>,
+        completed: Vec<model::CompletedFolder>,
+    },
+    BcjLzma2 {
+        current: Option<StreamingBcjLzma2Folder<W>>,
+        completed: Vec<model::CompletedFolder>,
+    },
+    Failed,
+}
+
+impl<W: Write> WriterMode<W> {
+    fn select(options: &ArchiveOptions) -> Self {
+        if options.encryption.is_some() {
+            return Self::Buffered;
+        }
+        match options.codec {
+            Codec::Copy => Self::Copy {
+                current: StreamingCopyFolder::new(),
+                completed: Vec::new(),
+            },
+            Codec::Lzma2 => Self::Lzma2 {
+                current: None,
+                completed: Vec::new(),
+            },
+            Codec::Lzma => Self::Lzma {
+                current: None,
+                completed: Vec::new(),
+            },
+            Codec::Lzma2Bcj => Self::BcjLzma2 {
+                current: None,
+                completed: Vec::new(),
+            },
+            Codec::Ppmd => Self::Buffered,
+        }
+    }
+}
+
+fn writer_failed() -> R7zError {
+    R7zError::InvalidOptions("archive writer cannot be reused after an I/O or encoder failure")
+}
+
 pub struct ArchiveBuilder {
     entries: Vec<WriteEntry>,
     options: ArchiveOptions,
@@ -867,19 +919,12 @@ fn preserved_stream_crc(
 
 pub struct ArchiveWriter<W: Write + Seek> {
     out: Option<W>,
+    mode: WriterMode<W>,
     entries: Vec<WriteEntry>,
     options: ArchiveOptions,
     current_folder: usize,
     current_folder_files: u64,
     current_folder_bytes: u64,
-    copy_current: StreamingCopyFolder,
-    copy_completed: Vec<StreamingCopyFolder>,
-    lzma2_current: Option<StreamingLzma2Folder<W>>,
-    lzma2_completed: Vec<model::CompletedFolder>,
-    bcj_lzma2_current: Option<StreamingBcjLzma2Folder<W>>,
-    bcj_lzma2_completed: Vec<model::CompletedFolder>,
-    lzma_current: Option<StreamingLzmaFolder<W>>,
-    lzma_completed: Vec<model::CompletedFolder>,
 }
 
 impl<W: Write + Seek> ArchiveWriter<W> {
@@ -888,19 +933,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         lzma2::set_default_budget(&mut options);
         Ok(Self {
             out: Some(out),
+            mode: WriterMode::select(&options),
             entries: Vec::new(),
             options,
             current_folder: 0,
             current_folder_files: 0,
             current_folder_bytes: 0,
-            copy_current: StreamingCopyFolder::new(),
-            copy_completed: Vec::new(),
-            lzma2_current: None,
-            lzma2_completed: Vec::new(),
-            bcj_lzma2_current: None,
-            bcj_lzma2_completed: Vec::new(),
-            lzma_current: None,
-            lzma_completed: Vec::new(),
         })
     }
 
@@ -908,10 +946,27 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         Self::new(out, ArchiveOptions::default())
     }
 
-    #[must_use]
-    pub fn compression(mut self, codec: Codec) -> Self {
-        self.options.codec = codec;
-        self
+    pub fn compression(mut self, codec: Codec) -> Result<Self, R7zError> {
+        self.set_compression(codec)?;
+        Ok(self)
+    }
+
+    pub fn set_compression(&mut self, codec: Codec) -> Result<(), R7zError> {
+        if matches!(self.mode, WriterMode::Failed) {
+            return Err(writer_failed());
+        }
+        if self.entries.iter().any(|entry| entry.has_stream) {
+            return Err(R7zError::InvalidOptions(
+                "cannot change compression after appending nonempty file data",
+            ));
+        }
+        let mut options = self.options.clone();
+        options.codec = codec;
+        encode::validate_archive_options(&options)?;
+        lzma2::set_default_budget(&mut options);
+        self.mode = WriterMode::select(&options);
+        self.options = options;
+        Ok(())
     }
 
     pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
@@ -942,30 +997,51 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     pub fn append_empty_entry(&mut self, entry: ArchiveEntry) -> Result<(), R7zError> {
-        match entry.kind {
-            EntryKind::File => self.append_empty_file(&entry.name, entry.meta),
-            EntryKind::Directory => self.append_directory(&entry.name, entry.meta),
-            EntryKind::Anti => self.append_anti_item(&entry.name, entry.meta),
+        if matches!(self.mode, WriterMode::Failed) {
+            return Err(writer_failed());
         }
+        self.entries.push(WriteEntry {
+            name: entry.name,
+            kind: entry.kind,
+            meta: entry.meta,
+            has_stream: false,
+            data: None,
+            folder_id: self.current_folder,
+        });
+        Ok(())
     }
 
     pub fn append_file(
         &mut self,
         name: &str,
+        reader: impl Read,
+        meta: EntryMeta,
+    ) -> Result<(), R7zError> {
+        if matches!(self.mode, WriterMode::Failed) {
+            return Err(writer_failed());
+        }
+        let result = self.append_file_inner(name, reader, meta);
+        if result.is_err() {
+            self.mode = WriterMode::Failed;
+        }
+        result
+    }
+
+    fn append_file_inner(
+        &mut self,
+        name: &str,
         mut reader: impl Read,
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
-        if self.should_stream_copy() {
-            return self.append_copy_streaming(name, reader, meta);
-        }
-        if self.should_stream_lzma2() {
-            return self.append_lzma2_streaming(name, reader, meta);
-        }
-        if self.should_stream_lzma() {
-            return self.append_lzma_streaming(name, reader, meta);
-        }
-        if self.should_stream_bcj_lzma2() {
-            return self.append_bcj_lzma2_streaming(name, reader, meta);
+        match &self.mode {
+            WriterMode::Copy { .. } => return self.append_copy_streaming(name, reader, meta),
+            WriterMode::Lzma2 { .. } => return self.append_lzma2_streaming(name, reader, meta),
+            WriterMode::Lzma { .. } => return self.append_lzma_streaming(name, reader, meta),
+            WriterMode::BcjLzma2 { .. } => {
+                return self.append_bcj_lzma2_streaming(name, reader, meta);
+            }
+            WriterMode::Buffered => {}
+            WriterMode::Failed => return Err(writer_failed()),
         }
 
         let mut data = Vec::new();
@@ -993,57 +1069,48 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     pub fn append_empty_file(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
-        self.entries.push(WriteEntry {
-            name: name.to_string(),
+        self.append_empty_entry(ArchiveEntry {
+            name: name.to_owned(),
             kind: EntryKind::File,
             meta,
-            has_stream: false,
-            data: None,
-            folder_id: self.current_folder,
-        });
-        Ok(())
+        })
     }
 
     pub fn append_directory(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
-        self.entries.push(WriteEntry {
-            name: name.to_string(),
+        self.append_empty_entry(ArchiveEntry {
+            name: name.to_owned(),
             kind: EntryKind::Directory,
             meta,
-            has_stream: false,
-            data: None,
-            folder_id: self.current_folder,
-        });
-        Ok(())
+        })
     }
 
     pub fn append_anti_item(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
-        self.entries.push(WriteEntry {
-            name: name.to_string(),
+        self.append_empty_entry(ArchiveEntry {
+            name: name.to_owned(),
             kind: EntryKind::Anti,
             meta,
-            has_stream: false,
-            data: None,
-            folder_id: self.current_folder,
-        });
-        Ok(())
+        })
     }
 
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
-        if self.should_stream_copy() {
-            self.seal_copy_folder();
-        } else if self.should_stream_lzma2() {
-            self.seal_lzma2_folder()?;
-        } else if self.should_stream_lzma() {
-            self.seal_lzma_folder()?;
-        } else if self.should_stream_bcj_lzma2() {
-            self.seal_bcj_lzma2_folder()?;
-        } else if self
-            .entries
-            .iter()
-            .any(|entry| entry.folder_id == self.current_folder && entry.has_stream)
-        {
-            self.current_folder += 1;
+        let result = match &self.mode {
+            WriterMode::Copy { .. } => {
+                self.seal_copy_folder();
+                Ok(())
+            }
+            WriterMode::Lzma2 { .. } => self.seal_lzma2_folder(),
+            WriterMode::Lzma { .. } => self.seal_lzma_folder(),
+            WriterMode::BcjLzma2 { .. } => self.seal_bcj_lzma2_folder(),
+            WriterMode::Buffered => {
+                self.current_folder += usize::from(self.current_folder_files != 0);
+                Ok(())
+            }
+            WriterMode::Failed => Err(writer_failed()),
+        };
+        if result.is_err() {
+            self.mode = WriterMode::Failed;
         }
+        result?;
         self.current_folder_files = 0;
         self.current_folder_bytes = 0;
         Ok(())
@@ -1080,70 +1147,59 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     pub fn finish(mut self) -> Result<W, R7zError> {
-        if !self.copy_completed.is_empty() || !self.copy_current.file_indices.is_empty() {
-            self.seal_copy_folder();
-            let folders: Vec<model::CompletedFolder> = self
-                .copy_completed
-                .into_iter()
-                .map(model::CompletedFolder::from)
-                .collect();
-            return encode::finish_streamed_archive(
-                self.out.take().ok_or(R7zError::Parse)?,
-                &self.entries,
-                &folders,
-                &self.options,
-            );
+        if matches!(self.mode, WriterMode::Failed) {
+            return Err(writer_failed());
         }
-        if self.lzma2_current.is_some() || !self.lzma2_completed.is_empty() {
-            self.seal_lzma2_folder()?;
-            return encode::finish_streamed_archive(
-                self.out.take().ok_or(R7zError::Parse)?,
-                &self.entries,
-                &self.lzma2_completed,
-                &self.options,
-            );
+        if !self.entries.iter().any(|entry| entry.has_stream) {
+            return self.finish_buffered();
         }
-        if self.lzma_current.is_some() || !self.lzma_completed.is_empty() {
-            self.seal_lzma_folder()?;
-            return encode::finish_streamed_archive(
-                self.out.take().ok_or(R7zError::Parse)?,
-                &self.entries,
-                &self.lzma_completed,
-                &self.options,
-            );
-        }
-        if self.bcj_lzma2_current.is_some() || !self.bcj_lzma2_completed.is_empty() {
-            self.seal_bcj_lzma2_folder()?;
-            return encode::finish_streamed_archive(
-                self.out.take().ok_or(R7zError::Parse)?,
-                &self.entries,
-                &self.bcj_lzma2_completed,
-                &self.options,
-            );
-        }
+        let folders = match &self.mode {
+            WriterMode::Copy { .. } => {
+                self.seal_copy_folder();
+                let WriterMode::Copy { completed, .. } = self.mode else {
+                    unreachable!()
+                };
+                completed.into_iter().map(Into::into).collect()
+            }
+            WriterMode::Lzma2 { .. } => {
+                self.seal_lzma2_folder()?;
+                let WriterMode::Lzma2 { completed, .. } = self.mode else {
+                    unreachable!()
+                };
+                completed
+            }
+            WriterMode::Lzma { .. } => {
+                self.seal_lzma_folder()?;
+                let WriterMode::Lzma { completed, .. } = self.mode else {
+                    unreachable!()
+                };
+                completed
+            }
+            WriterMode::BcjLzma2 { .. } => {
+                self.seal_bcj_lzma2_folder()?;
+                let WriterMode::BcjLzma2 { completed, .. } = self.mode else {
+                    unreachable!()
+                };
+                completed
+            }
+            WriterMode::Buffered => return self.finish_buffered(),
+            WriterMode::Failed => return Err(writer_failed()),
+        };
+        encode::finish_streamed_archive(
+            self.out.take().ok_or(R7zError::Parse)?,
+            &self.entries,
+            &folders,
+            &self.options,
+        )
+    }
 
+    fn finish_buffered(mut self) -> Result<W, R7zError> {
         let bytes = encode::build_archive(&self.entries, &self.options)?;
         let out = self.out.as_mut().ok_or(R7zError::Parse)?;
         out.seek(SeekFrom::Start(0))?;
         out.write_all(&bytes)?;
         out.flush()?;
         self.out.take().ok_or(R7zError::Parse)
-    }
-
-    fn should_stream_copy(&self) -> bool {
-        self.options.codec == Codec::Copy && self.options.encryption.is_none()
-    }
-
-    fn should_stream_lzma2(&self) -> bool {
-        self.options.codec == Codec::Lzma2 && self.options.encryption.is_none()
-    }
-
-    fn should_stream_lzma(&self) -> bool {
-        self.options.codec == Codec::Lzma && self.options.encryption.is_none()
-    }
-
-    fn should_stream_bcj_lzma2(&self) -> bool {
-        self.options.codec == Codec::Lzma2Bcj && self.options.encryption.is_none()
     }
 
     fn append_copy_streaming(
@@ -1197,21 +1253,23 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             folder_id: self.current_folder,
         });
 
-        self.copy_current.file_indices.push(index);
-        self.copy_current.pack_size = self
-            .copy_current
-            .pack_size
-            .checked_add(size)
-            .ok_or(R7zError::Parse)?;
-        self.copy_current.file_sizes.push(size);
-        self.copy_current.file_crcs.push(hasher.finalize());
+        let WriterMode::Copy { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        current.file_indices.push(index);
+        current.pack_size = current.pack_size.checked_add(size).ok_or(R7zError::Parse)?;
+        current.file_sizes.push(size);
+        current.file_crcs.push(hasher.finalize());
 
         self.finish_entry_folder_accounting(size)?;
         Ok(())
     }
 
     fn ensure_copy_stream_started(&mut self) -> Result<(), R7zError> {
-        if !self.copy_completed.is_empty() || !self.copy_current.file_indices.is_empty() {
+        let WriterMode::Copy { current, completed } = &self.mode else {
+            unreachable!()
+        };
+        if !completed.is_empty() || !current.file_indices.is_empty() {
             return Ok(());
         }
         let out = self.out.as_mut().ok_or(R7zError::Parse)?;
@@ -1221,11 +1279,11 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     fn seal_copy_folder(&mut self) {
-        if !self.copy_current.file_indices.is_empty() {
-            self.copy_completed.push(std::mem::replace(
-                &mut self.copy_current,
-                StreamingCopyFolder::new(),
-            ));
+        let WriterMode::Copy { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        if !current.file_indices.is_empty() {
+            completed.push(std::mem::replace(current, StreamingCopyFolder::new()));
             self.current_folder += 1;
         }
     }
@@ -1271,7 +1329,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             data: None,
             folder_id: self.current_folder,
         });
-        let folder = self.lzma2_current.as_mut().ok_or(R7zError::Parse)?;
+        let WriterMode::Lzma2 { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        let folder = current.as_mut().ok_or(R7zError::Parse)?;
         folder.file_indices.push(index);
         folder.unpack_size = folder
             .unpack_size
@@ -1289,7 +1350,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         hasher: &mut crc32fast::Hasher,
         size: &mut u64,
     ) -> Result<(), R7zError> {
-        let folder = self.lzma2_current.as_mut().ok_or(R7zError::Parse)?;
+        let WriterMode::Lzma2 { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        let folder = current.as_mut().ok_or(R7zError::Parse)?;
         folder.writer.write_all(chunk)?;
         hasher.update(chunk);
         *size = size
@@ -1299,10 +1363,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     fn ensure_lzma2_folder(&mut self) -> Result<(), R7zError> {
-        if self.lzma2_current.is_some() {
+        let WriterMode::Lzma2 { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        if current.is_some() {
             return Ok(());
         }
-        if self.lzma2_completed.is_empty() {
+        if completed.is_empty() {
             let out = self.out.as_mut().ok_or(R7zError::Parse)?;
             out.seek(SeekFrom::Start(0))?;
             out.write_all(&[0u8; 32])?;
@@ -1316,7 +1383,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             &self.options.compression,
             None,
         )?;
-        self.lzma2_current = Some(StreamingLzma2Folder {
+        *current = Some(StreamingLzma2Folder {
             writer,
             file_indices: Vec::new(),
             unpack_size: 0,
@@ -1327,7 +1394,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     fn seal_lzma2_folder(&mut self) -> Result<(), R7zError> {
-        let Some(folder) = self.lzma2_current.take() else {
+        let WriterMode::Lzma2 { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        let Some(folder) = current.take() else {
             return Ok(());
         };
         let StreamingLzma2Folder {
@@ -1340,7 +1410,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let count_writer = writer.finish()?;
         let pack_size = count_writer.count;
         self.out = Some(count_writer.inner);
-        self.lzma2_completed.push(model::CompletedFolder {
+        completed.push(model::CompletedFolder {
             file_indices,
             pack_sizes: vec![pack_size],
             coder_info: encode_coder_info_lzma2(encode::lzma2_property_byte(
@@ -1396,7 +1466,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             data: None,
             folder_id: self.current_folder,
         });
-        let folder = self.lzma_current.as_mut().ok_or(R7zError::Parse)?;
+        let WriterMode::Lzma { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        let folder = current.as_mut().ok_or(R7zError::Parse)?;
         folder.file_indices.push(index);
         folder.unpack_size = folder
             .unpack_size
@@ -1414,7 +1487,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         hasher: &mut crc32fast::Hasher,
         size: &mut u64,
     ) -> Result<(), R7zError> {
-        let folder = self.lzma_current.as_mut().ok_or(R7zError::Parse)?;
+        let WriterMode::Lzma { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        let folder = current.as_mut().ok_or(R7zError::Parse)?;
         folder.writer.write_all(chunk)?;
         hasher.update(chunk);
         *size = size
@@ -1424,10 +1500,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     fn ensure_lzma_folder(&mut self) -> Result<(), R7zError> {
-        if self.lzma_current.is_some() {
+        let WriterMode::Lzma { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        if current.is_some() {
             return Ok(());
         }
-        if self.lzma_completed.is_empty() {
+        if completed.is_empty() {
             let out = self.out.as_mut().ok_or(R7zError::Parse)?;
             out.seek(SeekFrom::Start(0))?;
             out.write_all(&[0u8; 32])?;
@@ -1442,24 +1521,26 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             },
             &options,
             false,
-        )
-        .map_err(|_| R7zError::Decompression)?;
+        )?;
         let mut props = Vec::with_capacity(5);
         props.push(writer.props());
         props.extend_from_slice(&dict_size.to_le_bytes());
-        self.lzma_current = Some(StreamingLzmaFolder {
+        *current = Some(Box::new(StreamingLzmaFolder {
             writer,
             props,
             file_indices: Vec::new(),
             unpack_size: 0,
             file_sizes: Vec::new(),
             file_crcs: Vec::new(),
-        });
+        }));
         Ok(())
     }
 
     fn seal_lzma_folder(&mut self) -> Result<(), R7zError> {
-        let Some(folder) = self.lzma_current.take() else {
+        let WriterMode::Lzma { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        let Some(folder) = current.take() else {
             return Ok(());
         };
         let StreamingLzmaFolder {
@@ -1469,11 +1550,11 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             unpack_size,
             file_sizes,
             file_crcs,
-        } = folder;
-        let count_writer = writer.finish().map_err(|_| R7zError::Decompression)?;
+        } = *folder;
+        let count_writer = writer.finish()?;
         let pack_size = count_writer.count;
         self.out = Some(count_writer.inner);
-        self.lzma_completed.push(model::CompletedFolder {
+        completed.push(model::CompletedFolder {
             file_indices,
             pack_sizes: vec![pack_size],
             coder_info: encode_coder_info_lzma(&props),
@@ -1527,7 +1608,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             data: None,
             folder_id: self.current_folder,
         });
-        let folder = self.bcj_lzma2_current.as_mut().ok_or(R7zError::Parse)?;
+        let WriterMode::BcjLzma2 { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        let folder = current.as_mut().ok_or(R7zError::Parse)?;
         folder.file_indices.push(index);
         folder.unpack_size = folder
             .unpack_size
@@ -1545,7 +1629,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         hasher: &mut crc32fast::Hasher,
         size: &mut u64,
     ) -> Result<(), R7zError> {
-        let folder = self.bcj_lzma2_current.as_mut().ok_or(R7zError::Parse)?;
+        let WriterMode::BcjLzma2 { current, .. } = &mut self.mode else {
+            unreachable!()
+        };
+        let folder = current.as_mut().ok_or(R7zError::Parse)?;
         folder.writer.write_all(chunk)?;
         hasher.update(chunk);
         *size = size
@@ -1555,10 +1642,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     fn ensure_bcj_lzma2_folder(&mut self) -> Result<(), R7zError> {
-        if self.bcj_lzma2_current.is_some() {
+        let WriterMode::BcjLzma2 { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        if current.is_some() {
             return Ok(());
         }
-        if self.bcj_lzma2_completed.is_empty() {
+        if completed.is_empty() {
             let out = self.out.as_mut().ok_or(R7zError::Parse)?;
             out.seek(SeekFrom::Start(0))?;
             out.write_all(&[0u8; 32])?;
@@ -1572,7 +1662,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             &self.options.compression,
             None,
         )?;
-        self.bcj_lzma2_current = Some(StreamingBcjLzma2Folder {
+        *current = Some(StreamingBcjLzma2Folder {
             writer: BcjX86Writer::new(lzma2),
             file_indices: Vec::new(),
             unpack_size: 0,
@@ -1583,7 +1673,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     fn seal_bcj_lzma2_folder(&mut self) -> Result<(), R7zError> {
-        let Some(folder) = self.bcj_lzma2_current.take() else {
+        let WriterMode::BcjLzma2 { current, completed } = &mut self.mode else {
+            unreachable!()
+        };
+        let Some(folder) = current.take() else {
             return Ok(());
         };
         let StreamingBcjLzma2Folder {
@@ -1597,7 +1690,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let count_writer = lzma2.finish()?;
         let pack_size = count_writer.count;
         self.out = Some(count_writer.inner);
-        self.bcj_lzma2_completed.push(model::CompletedFolder {
+        completed.push(model::CompletedFolder {
             file_indices,
             pack_sizes: vec![pack_size],
             coder_info: encode_coder_info_bcj_lzma2(encode::lzma2_property_byte(
