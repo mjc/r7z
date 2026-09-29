@@ -378,35 +378,6 @@ impl<R: Read> Read for ExactSizeReader<R> {
     }
 }
 
-enum DecoderTopology {
-    Chain,
-    Bcj2,
-}
-
-impl DecoderTopology {
-    fn from_folder(folder: &Folder) -> Result<Self, R7zError> {
-        match folder.coders.last() {
-            Some(coder) if coder.codec_id.as_slice() == CODEC_BCJ2 => Ok(Self::Bcj2),
-            _ if folder
-                .coders
-                .iter()
-                .all(|coder| coder.num_in_streams == 1 && coder.num_out_streams == 1) =>
-            {
-                Ok(Self::Chain)
-            }
-            _ => {
-                let unsupported = folder
-                    .coders
-                    .iter()
-                    .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
-                Err(unsupported.map_or(R7zError::InvalidFolderGraph, |coder| {
-                    R7zError::UnsupportedCodec(coder.codec_id.to_vec())
-                }))
-            }
-        }
-    }
-}
-
 fn read_to_end_bounded(
     input: &mut dyn Read,
     output: &mut Vec<u8>,

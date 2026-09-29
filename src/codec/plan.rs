@@ -1,5 +1,5 @@
 use super::*;
-use crate::folder::FolderGraph;
+use crate::folder::{Bcj2Layout, CoderIndex, FolderGraph, PackedStreamIndex};
 
 /// An executable topology with parsed codec properties and admitted memory usage.
 pub(crate) struct DecoderPlan<'a> {
@@ -48,6 +48,11 @@ enum Topology {
     },
 }
 
+enum DecoderTopology {
+    Chain,
+    Bcj2(Bcj2Layout),
+}
+
 pub(crate) struct ReadyDecoder<R> {
     topology: BoundTopology<std::io::Take<R>>,
     memory: WorkingSet,
@@ -85,6 +90,44 @@ struct Bcj2Slots {
 
 struct PackedLayout<'a> {
     sizes: &'a [u64],
+}
+
+fn decoder_topology(folder: &Folder, graph: &FolderGraph) -> Result<DecoderTopology, R7zError> {
+    match graph.bcj2_layout(folder)? {
+        Some(layout) => {
+            let bcj2 = folder
+                .coders
+                .iter()
+                .find(|coder| coder.codec_id.as_slice() == crate::CODEC_BCJ2)
+                .ok_or(R7zError::InvalidFolderGraph)?;
+            no_properties(bcj2)?;
+            Ok(DecoderTopology::Bcj2(layout))
+        }
+        None => {
+            let unknown_method = folder
+                .coders
+                .iter()
+                .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
+            match unknown_method {
+                Some(coder) => Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec())),
+                None if folder
+                    .coders
+                    .iter()
+                    .all(|coder| coder.num_in_streams == 1 && coder.num_out_streams == 1) =>
+                {
+                    Ok(DecoderTopology::Chain)
+                }
+                None => Err(R7zError::InvalidFolderGraph),
+            }
+        }
+    }
+}
+
+fn no_properties(coder: &crate::CoderInfo) -> Result<(), R7zError> {
+    match coder.properties.as_deref() {
+        None | Some([]) => Ok(()),
+        Some(_) => Err(R7zError::Decompression),
+    }
 }
 
 /// Readers checked against the planned list and bounded to its byte lengths.
@@ -175,7 +218,7 @@ impl<'a> DecoderPlan<'a> {
         let inputs = PackedLayout {
             sizes: packed_sizes,
         };
-        match DecoderTopology::from_folder(folder)? {
+        match decoder_topology(folder, graph)? {
             DecoderTopology::Chain => {
                 let [packed_size] = packed_sizes else {
                     return Err(R7zError::InvalidFolderGraph);
@@ -224,50 +267,39 @@ impl<'a> DecoderPlan<'a> {
                     inputs,
                 })
             }
-            DecoderTopology::Bcj2 => {
+            DecoderTopology::Bcj2(layout) => {
                 let output_size = bcj2_output_size(unpack_size)?;
-                let (main, call, jump, slots) = match (
-                    folder.coders.as_slice(),
-                    folder.packed_indices.as_slice(),
-                    folder.bind_pairs.as_slice(),
-                    packed_sizes,
-                ) {
-                    ([main, _], [0, 2, 3, 4], [(1, 0)], [_, _, _, _]) => (
-                        (main, sizes.get(0)),
-                        None,
-                        None,
-                        Bcj2Slots {
-                            main: PackedInputSlot(0),
-                            call: PackedInputSlot(1),
-                            jump: PackedInputSlot(2),
-                            control: PackedInputSlot(3),
-                        },
-                    ),
-                    (
-                        [jump, call, main, _],
-                        [2, 6, 1, 0],
-                        [(5, 0), (4, 1), (3, 2)],
-                        [_, _, _, _],
-                    ) => (
-                        (main, sizes.get(2)),
-                        Some((call, sizes.get(1))),
-                        Some((jump, sizes.get(0))),
-                        Bcj2Slots {
-                            main: PackedInputSlot(0),
-                            call: PackedInputSlot(2),
-                            jump: PackedInputSlot(3),
-                            control: PackedInputSlot(1),
-                        },
-                    ),
-                    _ => return Err(R7zError::Parse),
-                };
-                let channel = |(coder, size), slot| {
+                let slot = |packed: PackedStreamIndex| PackedInputSlot(packed.get());
+                let compile_channel = |coder: CoderIndex, packed: PackedInputSlot| {
+                    let index = coder.get();
+                    let coder = folder
+                        .coders
+                        .get(index)
+                        .ok_or(R7zError::InvalidFolderGraph)?;
+                    let size = sizes.get(index);
                     SizedCoder::compile(coder, size)?
-                        .bind_size(OutputSize::Known(inputs.size(slot)? as u64))
+                        .bind_size(OutputSize::Known(inputs.size(packed)? as u64))
                 };
-                let main = channel(main, slots.main)?;
-                let call = call.map(|coder| channel(coder, slots.call)).transpose()?;
-                let jump = jump.map(|coder| channel(coder, slots.jump)).transpose()?;
+                let slots = Bcj2Slots {
+                    main: slot(layout.main.packed),
+                    call: slot(layout.call.packed),
+                    jump: slot(layout.jump.packed),
+                    control: slot(layout.control.packed),
+                };
+                let main = compile_channel(
+                    layout.main.coder.ok_or(R7zError::InvalidFolderGraph)?,
+                    slots.main,
+                )?;
+                let call = layout
+                    .call
+                    .coder
+                    .map(|coder| compile_channel(coder, slots.call))
+                    .transpose()?;
+                let jump = layout
+                    .jump
+                    .coder
+                    .map(|coder| compile_channel(coder, slots.jump))
+                    .transpose()?;
                 let channels = [
                     (Some(&main), slots.main),
                     (call.as_ref(), slots.call),
@@ -496,19 +528,46 @@ impl CoderPlan {
             .filter(|info| info.can_decode())
             .ok_or_else(|| R7zError::UnsupportedCodec(coder.codec_id.to_vec()))?;
         Ok(match info.method {
-            Method::Copy => Self::Copy,
+            Method::Copy => {
+                no_properties(coder)?;
+                Self::Copy
+            }
             Method::Lzma => Self::Lzma(LzmaProperties::parse(properties()?)?),
             Method::Lzma2 => Self::Lzma2(lzma2_dict_size(coder.properties.as_deref())?),
-            Method::Bcj => Self::X86,
-            Method::Arm => Self::Branch(crate::bcj::BranchFilter::Arm),
-            Method::ArmThumb => Self::Branch(crate::bcj::BranchFilter::ArmThumb),
-            Method::Ia64 => Self::Branch(crate::bcj::BranchFilter::Ia64),
-            Method::Ppc => Self::Branch(crate::bcj::BranchFilter::Ppc),
-            Method::Sparc => Self::Branch(crate::bcj::BranchFilter::Sparc),
+            Method::Bcj => {
+                no_properties(coder)?;
+                Self::X86
+            }
+            Method::Arm => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Arm)
+            }
+            Method::ArmThumb => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::ArmThumb)
+            }
+            Method::Ia64 => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Ia64)
+            }
+            Method::Ppc => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Ppc)
+            }
+            Method::Sparc => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Sparc)
+            }
             Method::Arm64 => Self::Arm64(branch_start_pos(coder.properties.as_deref(), 4)?),
             Method::Riscv => Self::Riscv(branch_start_pos(coder.properties.as_deref(), 2)?),
-            Method::Deflate => Self::Deflate,
-            Method::BZip2 => Self::Bzip2,
+            Method::Deflate => {
+                no_properties(coder)?;
+                Self::Deflate
+            }
+            Method::BZip2 => {
+                no_properties(coder)?;
+                Self::Bzip2
+            }
             Method::Ppmd => {
                 let (order, memory) = ppmd_properties(properties()?)?;
                 Self::Ppmd {
@@ -517,15 +576,24 @@ impl CoderPlan {
                     size: size.require()?,
                 }
             }
-            Method::Deflate64 => Self::Deflate64,
+            Method::Deflate64 => {
+                no_properties(coder)?;
+                Self::Deflate64
+            }
             Method::Delta => {
                 let &[distance] = properties()? else {
                     return Err(R7zError::Decompression);
                 };
                 Self::Delta(distance)
             }
-            Method::Swap2 => Self::Swap(2),
-            Method::Swap4 => Self::Swap(4),
+            Method::Swap2 => {
+                no_properties(coder)?;
+                Self::Swap(2)
+            }
+            Method::Swap4 => {
+                no_properties(coder)?;
+                Self::Swap(4)
+            }
             Method::SevenZAes => Self::Aes(crate::aes::AesProperties::parse(properties()?)?),
             _ => return Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec())),
         })
@@ -768,6 +836,26 @@ mod tests {
                 [1, 5, 4, 0],
                 [0, 2, 3, 1],
             ),
+            (
+                Folder {
+                    coders: smallvec::smallvec![copy(), copy(), copy(), bcj2()],
+                    packed_indices: smallvec::smallvec![0, 6, 2, 1],
+                    bind_pairs: smallvec::smallvec![(3, 0), (5, 1), (4, 2)],
+                },
+                vec![1, 0, 4, 5],
+                [1, 5, 4, 0],
+                [0, 2, 3, 1],
+            ),
+            (
+                Folder {
+                    coders: smallvec::smallvec![bcj2(), copy(), copy(), copy()],
+                    packed_indices: smallvec::smallvec![6, 5, 4, 3],
+                    bind_pairs: smallvec::smallvec![(0, 3), (2, 1), (1, 2)],
+                },
+                vec![5, 0, 4, 1],
+                [1, 4, 0, 5],
+                [0, 1, 2, 3],
+            ),
         ];
         for (folder, outputs, packed, expected) in layouts {
             let graph = folder.graph().unwrap();
@@ -828,6 +916,57 @@ mod tests {
 
     fn coder(bytes: &[u8]) -> crate::CoderInfo {
         crate::CoderInfo::parse(bytes).unwrap().1
+    }
+
+    #[test]
+    fn decoders_reject_properties_they_do_not_apply() {
+        let methods = [
+            crate::SevenZMethod::Copy,
+            crate::SevenZMethod::Bcj,
+            crate::SevenZMethod::Arm,
+            crate::SevenZMethod::ArmThumb,
+            crate::SevenZMethod::Ia64,
+            crate::SevenZMethod::Ppc,
+            crate::SevenZMethod::Sparc,
+            crate::SevenZMethod::Deflate,
+            crate::SevenZMethod::BZip2,
+            crate::SevenZMethod::Deflate64,
+            crate::SevenZMethod::Swap2,
+            crate::SevenZMethod::Swap4,
+        ];
+        for method in methods {
+            let mut coder = coder(&[1, 0]);
+            coder.codec_id = arrayvec::ArrayVec::from_iter(method.id().iter().copied());
+            coder.properties = Some(smallvec::smallvec![0]);
+            assert!(
+                matches!(
+                    CoderPlan::compile(&coder, OutputSize::Known(0)),
+                    Err(R7zError::Decompression)
+                ),
+                "{} accepted ignored properties",
+                method.name()
+            );
+
+            coder.properties = Some(smallvec::SmallVec::new());
+            assert!(CoderPlan::compile(&coder, OutputSize::Known(0)).is_ok());
+        }
+    }
+
+    #[test]
+    fn bcj2_rejects_properties_before_binding_inputs() {
+        let copy = || coder(&[1, 0]);
+        let bcj2 = || coder(&[0x14, 3, 3, 1, 0x1b, 4, 1]);
+        let mut folder = Folder {
+            coders: smallvec::smallvec![copy(), bcj2()],
+            packed_indices: smallvec::smallvec![0, 2, 3, 4],
+            bind_pairs: smallvec::smallvec![(1, 0)],
+        };
+        folder.coders[1].properties = Some(smallvec::smallvec![0]);
+        let graph = folder.graph().unwrap();
+        assert!(matches!(
+            DecoderPlan::compile(&folder, &graph, 5, &[1, 5], &[1, 4, 0, 5]),
+            Err(R7zError::Decompression)
+        ));
     }
 
     #[test]
