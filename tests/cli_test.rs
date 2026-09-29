@@ -1126,6 +1126,63 @@ fn cli_extract_file_over_directory_is_not_recursive_delete() {
 }
 
 #[test]
+#[cfg(unix)]
+fn cli_extract_applies_overwrite_policy_to_destination_symlinks() {
+    ["x", "e"]
+        .into_iter()
+        .flat_map(|command| {
+            ["missing", "file", "directory"]
+                .into_iter()
+                .map(move |kind| (command, kind))
+        })
+        .for_each(|(command, kind)| {
+            let tmp = tempdir().unwrap();
+            let archive = tmp.path().join("symlink-destination.7z");
+            let bytes = r7z::ArchiveBuilder::new()
+                .compression(r7z::Codec::Copy)
+                .add_file("entry", b"archive")
+                .build()
+                .unwrap();
+            fs::write(&archive, bytes).unwrap();
+            let outside = tmp.path().join("outside");
+            match kind {
+                "file" => fs::write(&outside, b"keep").unwrap(),
+                "directory" => {
+                    fs::create_dir(&outside).unwrap();
+                    fs::write(outside.join("keep"), b"keep").unwrap();
+                }
+                _ => {}
+            }
+            let out = tmp.path().join("out");
+            fs::create_dir(&out).unwrap();
+            let destination = out.join("entry");
+            std::os::unix::fs::symlink(&outside, &destination).unwrap();
+
+            ["-aos", "-y"].into_iter().for_each(|mode| {
+                run_r7z(&[
+                    command.into(),
+                    mode.into(),
+                    archive.display().to_string(),
+                    format!("-o{}", out.display()),
+                ]);
+                let metadata = fs::symlink_metadata(&destination).unwrap();
+                match mode {
+                    "-aos" => assert!(metadata.is_symlink()),
+                    _ => {
+                        assert!(metadata.is_file());
+                        assert_eq!(fs::read(&destination).unwrap(), b"archive");
+                    }
+                }
+                match kind {
+                    "file" => assert_eq!(fs::read(&outside).unwrap(), b"keep"),
+                    "directory" => assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep"),
+                    _ => assert!(!outside.exists()),
+                }
+            });
+        });
+}
+
+#[test]
 fn cli_extract_warns_when_operands_match_nothing() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

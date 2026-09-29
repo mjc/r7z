@@ -1055,7 +1055,7 @@ enum Destination {
 
 impl Destination {
     fn at(path: &Path) -> Self {
-        match path.metadata() {
+        match fs::symlink_metadata(path) {
             Ok(metadata) => match metadata.is_dir() {
                 true => Self::Directory,
                 false => Self::Other,
