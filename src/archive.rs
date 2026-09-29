@@ -1,4 +1,4 @@
-use crate::entries::{Entries, Entry, EntryKind, EntrySelection};
+use crate::entries::{Entries, Entry, EntryKind, EntryMetadata, EntrySelection};
 use crate::file_streams::{FileStream, FileStreams, FolderIndex, StreamLocation};
 use crate::folder_decode::{
     ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderPlan, FolderLayout, FolderLayouts,
@@ -398,13 +398,17 @@ pub struct ArchiveEntryInfo {
 
 impl ArchiveEntryInfo {
     fn from_entry<S>(entry: &Entry<'_, S>) -> Self {
-        let name = entry.metadata.name();
+        Self::from_metadata(&entry.metadata, entry.kind.entry_type())
+    }
+
+    fn from_metadata(metadata: &EntryMetadata<'_>, entry_type: EntryType) -> Self {
+        let name = metadata.name();
         let safe_name = safe_archive_name(&name).ok();
         Self {
-            index: entry.metadata.index.get(),
+            index: metadata.index.get(),
             name,
             safe_name,
-            entry_type: entry.kind.entry_type(),
+            entry_type,
         }
     }
 
@@ -470,8 +474,7 @@ impl ExactSizeIterator for ArchiveEntries<'_> {}
 /// releases its decoder without reading or checking the remaining folder data.
 pub struct ArchiveReadSession<'a> {
     files: FileStreams<'a>,
-    decoder: FolderDecoder<'a>,
-    password: Option<&'a str>,
+    decoder: EntryDecoder<'a>,
     count: usize,
 }
 
@@ -498,17 +501,8 @@ impl ArchiveReadSession<'_> {
             ));
         }
         let file = self.files.nth(index - next_index)?.ok_or(R7zError::Parse)?;
-        let entry = ArchiveEntryInfo::from_entry(&file);
-        match file.kind {
-            EntryKind::File(location) | EntryKind::Symlink(location) => {
-                self.decoder
-                    .read(location, &entry, self.password, |_, reader| {
-                        callback(reader)
-                    })
-            }
-            EntryKind::EmptyFile | EntryKind::EmptySymlink => callback(&mut std::io::empty()),
-            EntryKind::Directory | EntryKind::Anti => Err(R7zError::Directory),
-        }
+        let entry = ReadableEntry::from_file(file).ok_or(R7zError::Directory)?;
+        self.decoder.read(entry, |_, reader| callback(reader))
     }
 
     /// Copy an entry to a writer while retaining the decoder for subsequent reads.
@@ -1123,15 +1117,15 @@ impl Archive {
             self.num_files(),
             self.try_streams_info()?,
         )?;
-        let decoder = FolderDecoder {
+        let decoder = EntryDecoder {
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
+            password,
             mode: CompletionMode::SelectedStreams,
         };
         Ok(ArchiveReadSession {
             files,
             decoder,
-            password,
             count: self.num_files(),
         })
     }
@@ -1262,23 +1256,18 @@ impl Archive {
             self.num_files(),
             self.try_streams_info()?,
         )?;
-        let mut decoder = FolderDecoder {
+        let mut decoder = EntryDecoder {
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
+            password,
             mode,
         };
         files
             .map_selected(selected, |file| {
-                let entry = ArchiveEntryInfo::from_entry(&file);
-                match file.kind {
-                    EntryKind::File(location) | EntryKind::Symlink(location) => {
-                        decoder.read(location, &entry, password, &mut callback)
-                    }
-                    EntryKind::EmptyFile | EntryKind::EmptySymlink => {
-                        callback(&entry, &mut std::io::empty())
-                    }
-                    EntryKind::Directory | EntryKind::Anti => Ok(()),
-                }
+                ReadableEntry::from_file(file)
+                    .map(|entry| decoder.read(entry, &mut callback))
+                    .transpose()
+                    .map(|_| ())
             })
             .collect::<Result<(), _>>()?;
         decoder.finish()
@@ -1517,45 +1506,92 @@ impl<'a> PackedSource<'a> {
     }
 }
 
-/// Keeps the active decoder for mapped entries selected by the caller.
-struct FolderDecoder<'a> {
+/// File-like content admitted before decoding; directory and anti entries have no variant.
+struct ReadableEntry<'c, 'a> {
+    info: ArchiveEntryInfo,
+    content: EntryContent<'c, 'a>,
+}
+
+enum EntryContent<'c, 'a> {
+    Empty,
+    Stream(StreamLocation<'c, 'a>),
+}
+
+impl<'c, 'a> ReadableEntry<'c, 'a> {
+    fn from_file(file: FileStream<'c, 'a>) -> Option<Self> {
+        let entry_type = file.kind.entry_type();
+        let content = match file.kind {
+            EntryKind::File(location) | EntryKind::Symlink(location) => {
+                EntryContent::Stream(location)
+            }
+            EntryKind::EmptyFile | EntryKind::EmptySymlink => EntryContent::Empty,
+            EntryKind::Directory | EntryKind::Anti => return None,
+        };
+        Some(Self {
+            info: ArchiveEntryInfo::from_metadata(&file.metadata, entry_type),
+            content,
+        })
+    }
+}
+
+/// Shares file-content dispatch and folder decoder state across read APIs.
+struct EntryDecoder<'a> {
     source: PackedSource<'a>,
     current: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
+    password: Option<&'a str>,
     mode: CompletionMode,
 }
 
-impl<'a> FolderDecoder<'a> {
+impl<'a> EntryDecoder<'a> {
     fn read(
         &mut self,
-        location: StreamLocation<'_, 'a>,
-        entry: &ArchiveEntryInfo,
-        password: Option<&str>,
+        entry: ReadableEntry<'_, 'a>,
         callback: impl FnOnce(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    ) -> Result<(), R7zError> {
+        match entry.content {
+            EntryContent::Empty => callback(&entry.info, &mut std::io::empty()),
+            EntryContent::Stream(location) => {
+                self.read_stream(location, |reader| callback(&entry.info, reader))
+            }
+        }
+    }
+
+    fn read_stream(
+        &mut self,
+        location: StreamLocation<'_, 'a>,
+        callback: impl FnOnce(&mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<(), R7zError> {
         let active = match self.current.take() {
             Some((index, active)) if index == location.folder_index => active,
             previous => {
-                if let Some((_, previous)) = previous {
-                    let _completion = previous.finish(self.mode)?;
-                }
+                self.complete(previous)?;
                 location
                     .folder
                     .bind(|stream| self.source.reader(&stream))?
-                    .start(password)?
+                    .start(self.password)?
             }
         };
         let active = active
             .skip_to(location.stream_index.get())?
-            .read_stream(|reader| callback(entry, reader))?;
+            .read_stream(callback)?;
         self.current = Some((location.folder_index, active));
         Ok(())
     }
 
     fn finish(&mut self) -> Result<(), R7zError> {
-        if let Some((_, active)) = self.current.take() {
-            let _completion = active.finish(self.mode)?;
-        }
-        Ok(())
+        let active = self.current.take();
+        self.complete(active)
+    }
+
+    /// Consumes the detached folder on success or failure, including during a switch.
+    fn complete(
+        &self,
+        active: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
+    ) -> Result<(), R7zError> {
+        active
+            .map(|(_, folder)| folder.finish(self.mode))
+            .transpose()
+            .map(|_| ())
     }
 }
 
@@ -2548,6 +2584,9 @@ mod selected_stream_tests {
     #[test]
     fn read_session_rejects_invalid_order_without_consuming_valid_requests() {
         let archive = mixed_entry_archive();
+        archive
+            .stream_selected_files(&[0, 4], |_, _| panic!("non-file batch callback"))
+            .unwrap();
         let mut session = archive.read_session(None).unwrap();
         assert!(matches!(
             session.read_entry(usize::MAX, |_| panic!("invalid index")),
@@ -2632,31 +2671,68 @@ mod selected_stream_tests {
         session.finish().unwrap();
     }
 
-    #[test]
-    fn read_session_finishing_reports_folder_crc_failure_after_selected_entry() {
-        let data = b"abcd";
-        let wrong_crc = crc32fast::hash(data) ^ 1;
+    fn archive_with_folder_crc_failure() -> Archive {
+        let data = b"abcdef";
+        let wrong_crc = crc32fast::hash(b"abcd") ^ 1;
         let mut header = vec![
-            1, 4, 6, 0, 1, 9, 4, 0, // Header, main streams, packed size
-            7, 0x0b, 1, 0, 1, 1, 0, 0x0c, 4, 0x0a, 1, // Copy folder, output size, CRC
+            1, 4, 6, 0, 2, 9, 4, 2, 0, // Header, main streams, packed sizes
+            7, 0x0b, 2, 0, 1, 1, 0, 1, 1, 0, // Two Copy folders
+            0x0c, 4, 2, 0x0a, 1, // Output sizes, defined folder CRCs
         ];
         header.extend_from_slice(&wrong_crc.to_le_bytes());
-        header.extend_from_slice(&[0, 8, 0x0d, 2, 9, 2, 0, 0, 5, 2, 0, 0]);
+        header.extend_from_slice(&crc32fast::hash(b"ef").to_le_bytes());
+        header.extend_from_slice(&[0, 8, 0x0d, 2, 1, 9, 2, 0, 0, 5, 3, 0, 0]);
         let mut bytes = b"7z\xbc\xaf'\x1c\x00\x04".to_vec();
         let mut start = Vec::new();
-        start.extend_from_slice(&4u64.to_le_bytes());
+        start.extend_from_slice(&(data.len() as u64).to_le_bytes());
         start.extend_from_slice(&(header.len() as u64).to_le_bytes());
         start.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
         bytes.extend_from_slice(&crc32fast::hash(&start).to_le_bytes());
         bytes.extend_from_slice(&start);
         bytes.extend_from_slice(data);
         bytes.extend_from_slice(&header);
-        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        Archive::from_bytes(bytes.into()).unwrap()
+    }
+
+    #[test]
+    fn read_session_finishing_reports_folder_crc_failure_after_selected_entry() {
+        let archive = archive_with_folder_crc_failure();
         let mut session = archive.read_session(None).unwrap();
         let mut output = Vec::new();
         session.extract_to_writer(0, &mut output).unwrap();
         assert_eq!(output, b"ab");
         assert!(matches!(session.finish_folder(), Err(R7zError::Crc)));
         session.finish().unwrap();
+
+        let mut output = Vec::new();
+        let result = archive.stream_selected_files(&[0], |_, reader| {
+            reader.read_to_end(&mut output)?;
+            Ok(())
+        });
+        assert_eq!(output, b"ab");
+        assert!(matches!(result, Err(R7zError::Crc)));
+    }
+
+    #[test]
+    fn folder_switch_reports_completion_failure_before_the_next_callback() {
+        let archive = archive_with_folder_crc_failure();
+        let mut session = archive.read_session(None).unwrap();
+        session.extract_to_writer(0, &mut std::io::sink()).unwrap();
+        assert!(matches!(
+            session.read_entry(2, |_| panic!(
+                "next folder callback after failed completion"
+            )),
+            Err(R7zError::Crc)
+        ));
+        session.finish().unwrap();
+
+        let mut visited = Vec::new();
+        let result = archive.stream_selected_files(&[0, 2], |entry, _| {
+            visited.push(entry.index);
+            Ok(())
+        });
+        assert_eq!(visited, [0]);
+        assert!(matches!(result, Err(R7zError::Crc)));
+        assert_eq!(archive.extract_to_memory(2).unwrap(), b"ef");
     }
 }
