@@ -491,6 +491,36 @@ impl std::io::Seek for ControlledOutput {
     }
 }
 
+struct FailAfterBytes {
+    bytes: Cursor<Vec<u8>>,
+    remaining: usize,
+}
+
+impl std::io::Write for FailAfterBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "output failed",
+            ));
+        }
+        let written = bytes.len().min(self.remaining);
+        let written = self.bytes.write(&bytes[..written])?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for FailAfterBytes {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.bytes.seek(position)
+    }
+}
+
 #[test]
 fn short_output_writes_preserve_file_checksums() {
     for codec in CODECS {
@@ -532,36 +562,6 @@ fn folder_finalization_failure_prevents_reusing_the_writer() {
 
 #[test]
 fn encrypted_payload_write_failure_prevents_finishing_or_reusing_the_writer() {
-    struct FailAfterBytes {
-        bytes: Cursor<Vec<u8>>,
-        remaining: usize,
-    }
-
-    impl std::io::Write for FailAfterBytes {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.remaining == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "output failed",
-                ));
-            }
-            let written = bytes.len().min(self.remaining);
-            let written = self.bytes.write(&bytes[..written])?;
-            self.remaining -= written;
-            Ok(written)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl std::io::Seek for FailAfterBytes {
-        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
-            self.bytes.seek(position)
-        }
-    }
-
     let out = FailAfterBytes {
         bytes: Cursor::new(Vec::new()),
         remaining: 8192,
@@ -574,6 +574,32 @@ fn encrypted_payload_write_failure_prevents_finishing_or_reusing_the_writer() {
     ));
     assert!(writer.append("another", SECOND).is_err());
     assert!(writer.finish().is_err());
+}
+
+#[test]
+fn parallel_lzma2_write_failure_drops_the_folder_and_allows_a_new_writer() {
+    let mut options = options(Codec::Lzma2, false);
+    options.compression.threads = EncoderThreads::Fixed(2);
+    options.compression.lzma2_chunk_size = NonZeroU64::new(4096);
+
+    let out = FailAfterBytes {
+        bytes: Cursor::new(Vec::new()),
+        remaining: 96,
+    };
+    let mut writer = ArchiveWriter::new(out, options.clone()).unwrap();
+    let input = vec![0xA5; 64 * 1024];
+
+    assert!(matches!(
+        writer.append("file", input.as_slice()),
+        Err(r7z::R7zError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+    ));
+    assert!(writer.append("another", SECOND).is_err());
+    assert!(writer.finish().is_err());
+
+    let mut next = ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    next.append("file", input.as_slice()).unwrap();
+    let archive = Archive::from_bytes(next.finish().unwrap().into_inner().into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), input);
 }
 
 #[test]
