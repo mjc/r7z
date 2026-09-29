@@ -49,20 +49,63 @@ pub enum PreservedEntryStream {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CopyEntryIndex(usize);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CopyStreamSize(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CopyFileChecksum(u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CopyFileStream {
+    entry: CopyEntryIndex,
+    size: CopyStreamSize,
+    checksum: CopyFileChecksum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyFolderPlan {
+    Automatic,
+    Preplanned,
+}
+
+#[derive(Default)]
 struct StreamingCopyFolder {
-    file_indices: Vec<usize>,
-    pack_size: u64,
-    file_sizes: Vec<u64>,
-    file_crcs: Vec<u32>,
+    streams: Vec<CopyFileStream>,
+    packed_size: CopyStreamSize,
 }
 
 impl StreamingCopyFolder {
-    fn new() -> Self {
-        Self {
-            file_indices: Vec::new(),
-            pack_size: 0,
-            file_sizes: Vec::new(),
-            file_crcs: Vec::new(),
+    fn push(&mut self, stream: CopyFileStream) -> Result<(), R7zError> {
+        self.packed_size = CopyStreamSize(
+            self.packed_size
+                .0
+                .checked_add(stream.size.0)
+                .ok_or(R7zError::Parse)?,
+        );
+        self.streams.push(stream);
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    fn complete(self) -> model::CompletedFolder {
+        model::CompletedFolder {
+            file_indices: self.streams.iter().map(|stream| stream.entry.0).collect(),
+            pack_sizes: vec![self.packed_size.0],
+            coder_info: encode_coder_info_copy(),
+            coder_unpack_sizes: vec![self.packed_size.0],
+            folder_crc: None,
+            file_sizes: self.streams.iter().map(|stream| stream.size.0).collect(),
+            file_crcs: self
+                .streams
+                .iter()
+                .map(|stream| Some(stream.checksum.0))
+                .collect(),
         }
     }
 }
@@ -115,7 +158,7 @@ enum WriterMode<W: Write> {
     Buffered,
     Copy {
         current: StreamingCopyFolder,
-        completed: Vec<StreamingCopyFolder>,
+        completed: Vec<model::CompletedFolder>,
     },
     Lzma2 {
         current: Option<StreamingLzma2Folder<W>>,
@@ -139,7 +182,7 @@ impl<W: Write> WriterMode<W> {
         }
         match options.codec {
             Codec::Copy => Self::Copy {
-                current: StreamingCopyFolder::new(),
+                current: StreamingCopyFolder::default(),
                 completed: Vec::new(),
             },
             Codec::Lzma2 => Self::Lzma2 {
@@ -303,6 +346,27 @@ impl ArchiveBuilder {
     pub fn build(self) -> Result<Vec<u8>, R7zError> {
         let mut options = self.options;
         lzma2::set_default_budget(&mut options);
+        if options.codec == Codec::Copy
+            && options.encryption.is_none()
+            && self.entries.iter().any(|entry| entry.has_stream)
+        {
+            let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
+            let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)?;
+            for entry in entries {
+                match entry.folder_id.cmp(&writer.current_folder) {
+                    std::cmp::Ordering::Less => return Err(R7zError::Parse),
+                    std::cmp::Ordering::Equal => {}
+                    std::cmp::Ordering::Greater => {
+                        writer.new_folder()?;
+                        if entry.folder_id != writer.current_folder {
+                            return Err(R7zError::Parse);
+                        }
+                    }
+                }
+                writer.append_copy_builder_entry(entry)?;
+            }
+            return Ok(writer.finish()?.into_inner());
+        }
         let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
         encode::build_archive(&entries, &options)
     }
@@ -1046,7 +1110,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
         match &self.mode {
-            WriterMode::Copy { .. } => return self.append_copy_streaming(name, reader, meta),
+            WriterMode::Copy { .. } => {
+                return self.append_copy_streaming(name, reader, meta, CopyFolderPlan::Automatic);
+            }
             WriterMode::Lzma2 { .. } => return self.append_lzma2_streaming(name, reader, meta),
             WriterMode::Lzma { .. } => return self.append_lzma_streaming(name, reader, meta),
             WriterMode::BcjLzma2 { .. } => {
@@ -1172,7 +1238,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 let WriterMode::Copy { completed, .. } = self.mode else {
                     unreachable!()
                 };
-                completed.into_iter().map(Into::into).collect()
+                completed
             }
             WriterMode::Lzma2 { .. } => {
                 self.seal_lzma2_folder()?;
@@ -1220,12 +1286,35 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         name: &str,
         mut reader: impl Read,
         meta: EntryMeta,
+        folder_plan: CopyFolderPlan,
     ) -> Result<(), R7zError> {
         let mut hasher = crc32fast::Hasher::new();
         let mut size = 0u64;
         let mut buf = vec![0u8; self.options.streaming.buffer_size];
         let first = reader.read(&mut buf)?;
         if first == 0 {
+            if matches!(folder_plan, CopyFolderPlan::Preplanned) {
+                self.ensure_copy_stream_started()?;
+                let index = self.entries.len();
+                self.entries.push(WriteEntry {
+                    raw_name: None,
+                    name: name.to_string(),
+                    kind: EntryKind::File,
+                    meta,
+                    has_stream: true,
+                    data: None,
+                    folder_id: self.current_folder,
+                });
+                let WriterMode::Copy { current, .. } = &mut self.mode else {
+                    unreachable!()
+                };
+                current.push(CopyFileStream {
+                    entry: CopyEntryIndex(index),
+                    size: CopyStreamSize(0),
+                    checksum: CopyFileChecksum(crc32fast::hash(&[])),
+                })?;
+                return Ok(());
+            }
             self.entries.push(WriteEntry {
                 raw_name: None,
                 name: name.to_string(),
@@ -1271,20 +1360,41 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let WriterMode::Copy { current, .. } = &mut self.mode else {
             unreachable!()
         };
-        current.file_indices.push(index);
-        current.pack_size = current.pack_size.checked_add(size).ok_or(R7zError::Parse)?;
-        current.file_sizes.push(size);
-        current.file_crcs.push(hasher.finalize());
+        current.push(CopyFileStream {
+            entry: CopyEntryIndex(index),
+            size: CopyStreamSize(size),
+            checksum: CopyFileChecksum(hasher.finalize()),
+        })?;
 
-        self.finish_entry_folder_accounting(size)?;
+        if matches!(folder_plan, CopyFolderPlan::Automatic) {
+            self.finish_entry_folder_accounting(size)?;
+        }
         Ok(())
+    }
+
+    fn append_copy_builder_entry(&mut self, entry: WriteEntry) -> Result<(), R7zError> {
+        let WriteEntry {
+            name,
+            kind,
+            meta,
+            has_stream,
+            data,
+            ..
+        } = entry;
+        match (has_stream, data) {
+            (true, Some(data)) => {
+                self.append_copy_streaming(&name, data.as_slice(), meta, CopyFolderPlan::Preplanned)
+            }
+            (false, None) => self.append_empty_entry(ArchiveEntry { name, kind, meta }),
+            _ => Err(R7zError::Parse),
+        }
     }
 
     fn ensure_copy_stream_started(&mut self) -> Result<(), R7zError> {
         let WriterMode::Copy { current, completed } = &self.mode else {
             unreachable!()
         };
-        if !completed.is_empty() || !current.file_indices.is_empty() {
+        if !current.is_empty() || !completed.is_empty() {
             return Ok(());
         }
         let out = self.out.as_mut().ok_or(R7zError::Parse)?;
@@ -1297,8 +1407,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let WriterMode::Copy { current, completed } = &mut self.mode else {
             unreachable!()
         };
-        if !current.file_indices.is_empty() {
-            completed.push(std::mem::replace(current, StreamingCopyFolder::new()));
+        if !current.is_empty() {
+            completed.push(std::mem::take(current).complete());
             self.current_folder += 1;
         }
     }
@@ -1724,20 +1834,6 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         });
         self.current_folder += 1;
         Ok(())
-    }
-}
-
-impl From<StreamingCopyFolder> for model::CompletedFolder {
-    fn from(folder: StreamingCopyFolder) -> Self {
-        Self {
-            file_indices: folder.file_indices,
-            pack_sizes: vec![folder.pack_size],
-            coder_info: encode_coder_info_copy(),
-            coder_unpack_sizes: vec![folder.pack_size],
-            folder_crc: None,
-            file_sizes: folder.file_sizes,
-            file_crcs: folder.file_crcs.into_iter().map(Some).collect(),
-        }
     }
 }
 

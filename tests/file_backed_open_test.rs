@@ -295,6 +295,40 @@ fn source_adapters_decode_the_same_entries() {
 }
 
 #[test]
+fn copy_builder_avoids_copying_the_payload_during_build() {
+    let payload = vec![0x5A; 4 * 1024 * 1024];
+    let builder = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("payload.bin", &payload);
+
+    reset_allocated_bytes();
+    let built = builder.build().unwrap();
+    let builder_allocated = allocated_bytes();
+
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Copy,
+        ..Default::default()
+    };
+    let mut writer = r7z::ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    reset_allocated_bytes();
+    writer
+        .append_file(
+            "payload.bin",
+            Cursor::new(&payload),
+            r7z::EntryMeta::default(),
+        )
+        .unwrap();
+    let streamed = writer.finish().unwrap();
+    let streaming_allocated = allocated_bytes();
+
+    assert_eq!(built, streamed.into_inner());
+    assert!(
+        builder_allocated <= streaming_allocated + 64 * 1024,
+        "Copy builder allocated {builder_allocated} bytes; streaming writer allocated {streaming_allocated} bytes"
+    );
+}
+
+#[test]
 fn extract_to_writer_non_aes_does_not_read_packed_stream_in_one_request() {
     let payload = vec![0xA5; 2 * 1024 * 1024];
     let bytes = r7z::ArchiveBuilder::new()

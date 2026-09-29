@@ -1,8 +1,8 @@
 use std::{io::Cursor, num::NonZeroU64};
 
 use r7z::{
-    Archive, ArchiveOptions, ArchiveWriter, Codec, EncoderThreads, EncryptionOptions, EntryMeta,
-    HeaderMode, SolidMode,
+    Archive, ArchiveBuilder, ArchiveOptions, ArchiveWriter, Codec, EncoderThreads,
+    EncryptionOptions, EntryMeta, HeaderMode, SolidMode,
 };
 
 const CODECS: [Codec; 5] = [
@@ -88,6 +88,62 @@ fn archive_bytes_preserve_each_writer_mode() {
             }
         }
     }
+}
+
+#[test]
+fn copy_builder_and_streaming_writer_emit_the_same_archive() {
+    let options = options(Codec::Copy, false);
+    let streaming = write_files(options.clone(), false);
+    let built = ArchiveBuilder::new()
+        .options(options)
+        .add_directory("dir", EntryMeta::default())
+        .add_empty_file("empty", EntryMeta::default())
+        .add_file("first", FIRST)
+        .add_empty_file("empty2", EntryMeta::default())
+        .add_file("second", SECOND)
+        .add_anti_item("deleted", EntryMeta::default())
+        .build()
+        .unwrap();
+
+    assert_eq!(built, streaming);
+}
+
+#[test]
+fn copy_builder_preserves_preplanned_byte_limit_folders() {
+    let mut options = options(Codec::Copy, false);
+    options.compression.solid = SolidMode::Limit {
+        max_files: None,
+        max_bytes: NonZeroU64::new(10),
+    };
+    let bytes = ArchiveBuilder::new()
+        .options(options)
+        .add_file("first", b"123456")
+        .add_file("second", b"abcdef")
+        .build()
+        .unwrap();
+    let archive = Archive::from_bytes(bytes.into()).unwrap();
+    let unpack = archive
+        .streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap();
+
+    assert_eq!(unpack.num_folders, 2);
+}
+
+#[test]
+fn copy_builder_preserves_empty_symlink_streams() {
+    let bytes = ArchiveBuilder::new()
+        .compression(Codec::Copy)
+        .add_symlink("empty-link", "", EntryMeta::default())
+        .build()
+        .unwrap();
+    let archive = Archive::from_bytes(bytes.into()).unwrap();
+    let files = archive.files_info().unwrap();
+
+    assert_eq!(files.entry_type(0), r7z::EntryType::Symlink);
+    assert_eq!(archive.symlink_target(0).unwrap().as_deref(), Some(""));
 }
 
 #[test]
