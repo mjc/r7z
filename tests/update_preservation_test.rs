@@ -118,6 +118,67 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
 }
 
 #[test]
+fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let kept = vec![0xA5; 4096];
+    fs::write(input.join("kept.bin"), &kept).unwrap();
+    let source_path = tmp.path().join("source.7z");
+    create_p7zip_archive(&input, &source_path, &["kept.bin"], &["-m0=LZMA2"]);
+
+    let source = r7z::Archive::open(&source_path).unwrap();
+    let kept_entry = source.entries().next().unwrap();
+    let raw = source.raw_folder_block(0).unwrap();
+    let added = b"new ppmd data".repeat(128);
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Ppmd,
+        ..r7z::ArchiveOptions::default()
+    };
+    let output = r7z::write_archive_with_preserved_folders(
+        Cursor::new(Vec::new()),
+        vec![
+            r7z::PreservedArchiveEntry {
+                name: kept_entry.name,
+                raw_name: kept_entry.raw_name,
+                kind: r7z::EntryKind::File,
+                meta: r7z::EntryMeta::default(),
+                stream: r7z::PreservedEntryStream::Raw {
+                    folder_id: 0,
+                    size: kept.len() as u64,
+                    crc: Some(crc32fast::hash(&kept)),
+                },
+            },
+            r7z::PreservedArchiveEntry {
+                name: "added.txt".to_owned(),
+                raw_name: None,
+                kind: r7z::EntryKind::File,
+                meta: r7z::EntryMeta::default(),
+                stream: r7z::PreservedEntryStream::Data(added.clone()),
+            },
+        ],
+        vec![raw],
+        &options,
+    )
+    .unwrap();
+    let archive_path = tmp.path().join("mixed.7z");
+    fs::write(&archive_path, output.into_inner()).unwrap();
+    let rewritten = r7z::Archive::open(&archive_path).unwrap();
+    assert_eq!(rewritten.extract_to_memory(0).unwrap(), kept);
+    assert_eq!(rewritten.extract_to_memory(1).unwrap(), added);
+
+    let out_dir = tmp.path().join("out");
+    extract_with_p7zip(tmp.path(), &archive_path, &out_dir);
+    assert_extracted_files(
+        &out_dir,
+        &[
+            (PathBuf::from("kept.bin"), kept),
+            (PathBuf::from("added.txt"), added),
+        ],
+    );
+}
+
+#[test]
 fn update_keeps_raw_name_distinct_from_its_replacement_character_display() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

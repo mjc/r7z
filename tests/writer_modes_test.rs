@@ -490,7 +490,7 @@ fn short_output_writes_preserve_file_checksums() {
 
 #[test]
 fn folder_finalization_failure_prevents_reusing_the_writer() {
-    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
+    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj, Codec::Ppmd] {
         let fail = std::rc::Rc::new(std::cell::Cell::new(false));
         let out = ControlledOutput {
             bytes: Cursor::new(Vec::new()),
@@ -559,7 +559,7 @@ fn encrypted_payload_write_failure_prevents_finishing_or_reusing_the_writer() {
 
 #[test]
 fn archive_finalization_preserves_output_errors() {
-    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
+    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj, Codec::Ppmd] {
         let fail = std::rc::Rc::new(std::cell::Cell::new(false));
         let out = ControlledOutput {
             bytes: Cursor::new(Vec::new()),

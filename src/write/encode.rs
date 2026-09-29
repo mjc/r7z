@@ -590,7 +590,7 @@ fn compress_ppmd(
     Ok((props, compressed))
 }
 
-fn ppmd_options(compression: &CompressionOptions) -> Result<(u8, u32), R7zError> {
+pub(super) fn ppmd_options(compression: &CompressionOptions) -> Result<(u8, u32), R7zError> {
     let order = compression.fast_bytes.unwrap_or(6);
     if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&order) {
         return Err(R7zError::InvalidOptions("PPMd order must be in 2..=64"));

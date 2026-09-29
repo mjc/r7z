@@ -9,9 +9,10 @@ use crate::aes::Aes256CbcEncryptWriter;
 use crate::{R7zError, RawEntryName, RawFolderBlock, bcj::BcjX86Writer};
 use header::{
     CoderSpec, encode_coder_info_aes_then, encode_coder_info_bcj_lzma2, encode_coder_info_copy,
-    encode_coder_info_lzma, encode_coder_info_lzma2,
+    encode_coder_info_lzma, encode_coder_info_lzma2, encode_coder_info_ppmd,
 };
 use lzma_rust2::LzmaWriter;
+use ppmd_rust::Ppmd7Encoder;
 use std::{
     fs::{File, OpenOptions},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
@@ -218,6 +219,10 @@ enum StreamingEncoder<W: Write> {
         writer: Box<LzmaWriter<PayloadWriter<W>>>,
         props: Vec<u8>,
     },
+    Ppmd {
+        writer: Box<Ppmd7Encoder<PayloadWriter<W>>>,
+        props: Vec<u8>,
+    },
     BcjLzma2(BcjX86Writer<lzma2::Encoder<PayloadWriter<W>>>),
 }
 
@@ -277,6 +282,7 @@ impl<W: Write> StreamingFolder<W> {
             StreamingEncoder::Copy(writer) => writer.write_all(chunk),
             StreamingEncoder::Lzma2(writer) => writer.write_all(chunk),
             StreamingEncoder::Lzma { writer, .. } => writer.write_all(chunk),
+            StreamingEncoder::Ppmd { writer, .. } => writer.write_all(chunk),
             StreamingEncoder::BcjLzma2(writer) => writer.write_all(chunk),
         }
     }
@@ -342,6 +348,12 @@ impl<W: Write> StreamingFolder<W> {
                 vec![unpack_size],
                 vec![CoderSpec::Lzma(props)],
             ),
+            StreamingEncoder::Ppmd { writer, props } => (
+                (*writer).finish(false)?,
+                encode_coder_info_ppmd(&props),
+                vec![unpack_size],
+                vec![CoderSpec::Ppmd(props)],
+            ),
             StreamingEncoder::BcjLzma2(writer) => {
                 let writer = writer.finish()?.finish()?;
                 let property = encode::lzma2_property_byte(&options.compression)?;
@@ -375,7 +387,6 @@ impl<W: Write> StreamingFolder<W> {
 }
 
 enum WriterMode<W: Write> {
-    Buffered,
     Streaming {
         codec: Codec,
         current: Option<Box<StreamingFolder<W>>>,
@@ -386,13 +397,10 @@ enum WriterMode<W: Write> {
 
 impl<W: Write> WriterMode<W> {
     fn select(options: &ArchiveOptions) -> Self {
-        match options.codec {
-            Codec::Copy | Codec::Lzma2 | Codec::Lzma | Codec::Lzma2Bcj => Self::Streaming {
-                codec: options.codec,
-                current: None,
-                completed: Vec::new(),
-            },
-            Codec::Ppmd => Self::Buffered,
+        Self::Streaming {
+            codec: options.codec,
+            current: None,
+            completed: Vec::new(),
         }
     }
 }
@@ -543,7 +551,7 @@ impl ArchiveBuilder {
         lzma2::set_default_budget(&mut options);
         if matches!(
             options.codec,
-            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Lzma2Bcj
+            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Ppmd | Codec::Lzma2Bcj
         ) && self.entries.iter().any(|entry| entry.has_stream)
         {
             let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
@@ -800,7 +808,7 @@ fn can_stream_preserved_options(options: &ArchiveOptions) -> bool {
     options.encryption.is_none()
         && matches!(
             options.codec,
-            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Lzma2Bcj
+            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Ppmd | Codec::Lzma2Bcj
         )
 }
 
@@ -902,11 +910,47 @@ fn write_encoded_folder_streaming<W: Write>(
         Codec::Copy => write_copy_folder_streaming(out, streams, file_indices),
         Codec::Lzma2 => write_lzma2_folder_streaming(out, streams, file_indices, options),
         Codec::Lzma => write_lzma_folder_streaming(out, streams, file_indices, options),
+        Codec::Ppmd => write_ppmd_folder_streaming(out, streams, file_indices, options),
         Codec::Lzma2Bcj => write_bcj_lzma2_folder_streaming(out, streams, file_indices, options),
-        Codec::Ppmd => Err(R7zError::InvalidOptions(
-            "PPMd streaming preserved writer is not supported",
-        )),
     }
+}
+
+fn write_ppmd_folder_streaming<W: Write>(
+    out: &mut W,
+    streams: &[StagedStream],
+    file_indices: Vec<usize>,
+    options: &ArchiveOptions,
+) -> Result<model::CompletedFolder, R7zError> {
+    let (order, mem_size) = encode::ppmd_options(&options.compression)?;
+    let mut props = Vec::with_capacity(5);
+    props.push(order);
+    props.extend_from_slice(&mem_size.to_le_bytes());
+    let counting = CountingWriter {
+        inner: out,
+        count: 0,
+    };
+    let mut writer = Ppmd7Encoder::new(counting, u32::from(order), mem_size).map_err(|_| {
+        R7zError::InvalidOptions("PPMd order or memory size is outside supported range")
+    })?;
+    let mut file_sizes = Vec::new();
+    let mut file_crcs = Vec::new();
+    let mut unpack_size = 0u64;
+    for &index in &file_indices {
+        let (size, crc) = write_staged_stream_to(index, streams, &mut writer)?;
+        unpack_size = unpack_size.checked_add(size).ok_or(R7zError::Parse)?;
+        file_sizes.push(size);
+        file_crcs.push(Some(crc));
+    }
+    let counting = writer.finish(false)?;
+    Ok(model::CompletedFolder {
+        file_indices,
+        pack_sizes: vec![counting.count],
+        coder_info: encode_coder_info_ppmd(&props),
+        coder_unpack_sizes: vec![unpack_size],
+        folder_crc: None,
+        file_sizes,
+        file_crcs,
+    })
 }
 
 fn write_copy_folder_streaming<W: Write>(
@@ -1292,31 +1336,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     fn append_file_inner(
         &mut self,
         name: &str,
-        mut reader: impl Read,
+        reader: impl Read,
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
         match &self.mode {
             WriterMode::Streaming { .. } => {
-                return self.append_streaming(name, reader, meta, FolderPlan::Automatic);
+                self.append_streaming(name, reader, meta, FolderPlan::Automatic)
             }
-            WriterMode::Buffered => {}
-            WriterMode::Failed => return Err(writer_failed()),
+            WriterMode::Failed => Err(writer_failed()),
         }
-
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        let size = data.len() as u64;
-        self.entries.push(WriteEntry {
-            raw_name: None,
-            name: name.to_string(),
-            kind: EntryKind::File,
-            meta,
-            has_stream: !data.is_empty(),
-            data: (!data.is_empty()).then_some(data),
-            folder_id: self.current_folder,
-        });
-        self.finish_entry_folder_accounting(size)?;
-        Ok(())
     }
 
     pub fn append_symlink(
@@ -1355,10 +1383,6 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
         let result = match &self.mode {
             WriterMode::Streaming { .. } => self.seal_streaming_folder(),
-            WriterMode::Buffered => {
-                self.current_folder += usize::from(self.current_folder_files != 0);
-                Ok(())
-            }
             WriterMode::Failed => Err(writer_failed()),
         };
         if result.is_err() {
@@ -1415,7 +1439,6 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 };
                 completed
             }
-            WriterMode::Buffered => return self.finish_buffered(),
             WriterMode::Failed => return Err(writer_failed()),
         };
         encode::finish_streamed_archive(
@@ -1624,7 +1647,20 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 Codec::Lzma2Bcj => StreamingEncoder::BcjLzma2(BcjX86Writer::new(
                     lzma2::Encoder::new(payload, &self.options.compression, known_size)?,
                 )),
-                Codec::Ppmd => unreachable!(),
+                Codec::Ppmd => {
+                    let (order, mem_size) = encode::ppmd_options(&self.options.compression)?;
+                    let mut props = Vec::with_capacity(5);
+                    props.push(order);
+                    props.extend_from_slice(&mem_size.to_le_bytes());
+                    let writer = Box::new(
+                        Ppmd7Encoder::new(payload, u32::from(order), mem_size).map_err(|_| {
+                            R7zError::InvalidOptions(
+                                "PPMd order or memory size is outside supported range",
+                            )
+                        })?,
+                    );
+                    StreamingEncoder::Ppmd { writer, props }
+                }
             };
         let WriterMode::Streaming { current, .. } = &mut self.mode else {
             unreachable!()
