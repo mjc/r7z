@@ -59,6 +59,7 @@ extern crate num_derive;
 
 mod aes;
 mod archive;
+mod archive_source;
 pub mod bcj;
 mod bcj2;
 mod byte_range;

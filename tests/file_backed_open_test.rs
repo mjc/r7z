@@ -262,6 +262,39 @@ fn extract_to_writer_from_seek_source_matches_from_bytes() {
 }
 
 #[test]
+fn source_adapters_decode_the_same_entries() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("alpha.txt", b"first payload")
+        .add_file("beta.txt", b"second payload")
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let file_path = tmp.path().join("archive.7z");
+    std::fs::write(&file_path, &bytes).unwrap();
+
+    let split_path = tmp.path().join("split.7z.001");
+    let chunk_size = bytes.len().div_ceil(3);
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let volume = split_path.with_extension(format!("{:03}", index + 1));
+        std::fs::write(volume, chunk).unwrap();
+    }
+
+    let archives = [
+        r7z::Archive::from_bytes(bytes.clone().into()).unwrap(),
+        r7z::Archive::from_reader(Cursor::new(bytes.clone())).unwrap(),
+        r7z::Archive::open(&file_path).unwrap(),
+        r7z::Archive::open(&split_path).unwrap(),
+    ];
+
+    for archive in archives {
+        assert_eq!(archive.num_files(), 2);
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"first payload");
+        assert_eq!(archive.extract_to_memory(1).unwrap(), b"second payload");
+    }
+}
+
+#[test]
 fn extract_to_writer_non_aes_does_not_read_packed_stream_in_one_request() {
     let payload = vec![0xA5; 2 * 1024 * 1024];
     let bytes = r7z::ArchiveBuilder::new()
