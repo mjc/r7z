@@ -136,6 +136,18 @@ pub(crate) fn validate_archive_options(options: &ArchiveOptions) -> Result<(), R
 }
 
 fn validate_compression_options(options: &ArchiveOptions) -> Result<(), R7zError> {
+    let methods: &[crate::SevenZMethod] = match options.codec {
+        Codec::Copy => &[crate::SevenZMethod::Copy],
+        Codec::Lzma => &[crate::SevenZMethod::Lzma],
+        Codec::Lzma2 => &[crate::SevenZMethod::Lzma2],
+        Codec::Ppmd => &[crate::SevenZMethod::Ppmd],
+        Codec::Lzma2Bcj => &[crate::SevenZMethod::Lzma2, crate::SevenZMethod::Bcj],
+    };
+    if methods.iter().any(|method| !method.support().can_encode()) {
+        return Err(R7zError::InvalidOptions(
+            "selected codec is not supported for writing",
+        ));
+    }
     if options.streaming.buffer_size == 0 {
         return Err(R7zError::InvalidOptions(
             "streaming buffer_size must be greater than zero",

@@ -98,7 +98,8 @@ pub use files_info::{EntryType, FilesInfo};
 pub use folder::Folder;
 pub use headers::{EncodedHeader, Header, SignatureHeader};
 pub use method::{
-    ALL_METHODS, MethodKind, P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name,
+    ALL_METHODS, METHOD_REGISTRY, MethodInfo, MethodKind, MethodSupport, P7ZIP_ORACLE_SHA,
+    SevenZMethod, method_from_id, method_from_name, method_info,
 };
 pub use pack_info::{PackInfo, UnpackInfo};
 pub use parsers::*;

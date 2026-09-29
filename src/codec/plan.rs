@@ -492,21 +492,24 @@ impl CoderPlan {
     pub(super) fn compile(coder: &crate::CoderInfo, size: OutputSize) -> Result<Self, R7zError> {
         use crate::SevenZMethod as Method;
         let properties = || coder.properties.as_deref().ok_or(R7zError::Decompression);
-        Ok(match crate::method_from_id(&coder.codec_id) {
-            Some(Method::Copy) => Self::Copy,
-            Some(Method::Lzma) => Self::Lzma(LzmaProperties::parse(properties()?)?),
-            Some(Method::Lzma2) => Self::Lzma2(lzma2_dict_size(coder.properties.as_deref())?),
-            Some(Method::Bcj) => Self::X86,
-            Some(Method::Arm) => Self::Branch(crate::bcj::BranchFilter::Arm),
-            Some(Method::ArmThumb) => Self::Branch(crate::bcj::BranchFilter::ArmThumb),
-            Some(Method::Ia64) => Self::Branch(crate::bcj::BranchFilter::Ia64),
-            Some(Method::Ppc) => Self::Branch(crate::bcj::BranchFilter::Ppc),
-            Some(Method::Sparc) => Self::Branch(crate::bcj::BranchFilter::Sparc),
-            Some(Method::Arm64) => Self::Arm64(branch_start_pos(coder.properties.as_deref(), 4)?),
-            Some(Method::Riscv) => Self::Riscv(branch_start_pos(coder.properties.as_deref(), 2)?),
-            Some(Method::Deflate) => Self::Deflate,
-            Some(Method::BZip2) => Self::Bzip2,
-            Some(Method::Ppmd) => {
+        let info = crate::method_info(&coder.codec_id)
+            .filter(|info| info.can_decode())
+            .ok_or_else(|| R7zError::UnsupportedCodec(coder.codec_id.to_vec()))?;
+        Ok(match info.method {
+            Method::Copy => Self::Copy,
+            Method::Lzma => Self::Lzma(LzmaProperties::parse(properties()?)?),
+            Method::Lzma2 => Self::Lzma2(lzma2_dict_size(coder.properties.as_deref())?),
+            Method::Bcj => Self::X86,
+            Method::Arm => Self::Branch(crate::bcj::BranchFilter::Arm),
+            Method::ArmThumb => Self::Branch(crate::bcj::BranchFilter::ArmThumb),
+            Method::Ia64 => Self::Branch(crate::bcj::BranchFilter::Ia64),
+            Method::Ppc => Self::Branch(crate::bcj::BranchFilter::Ppc),
+            Method::Sparc => Self::Branch(crate::bcj::BranchFilter::Sparc),
+            Method::Arm64 => Self::Arm64(branch_start_pos(coder.properties.as_deref(), 4)?),
+            Method::Riscv => Self::Riscv(branch_start_pos(coder.properties.as_deref(), 2)?),
+            Method::Deflate => Self::Deflate,
+            Method::BZip2 => Self::Bzip2,
+            Method::Ppmd => {
                 let (order, memory) = ppmd_properties(properties()?)?;
                 Self::Ppmd {
                     order,
@@ -514,16 +517,16 @@ impl CoderPlan {
                     size: size.require()?,
                 }
             }
-            Some(Method::Deflate64) => Self::Deflate64,
-            Some(Method::Delta) => {
+            Method::Deflate64 => Self::Deflate64,
+            Method::Delta => {
                 let &[distance] = properties()? else {
                     return Err(R7zError::Decompression);
                 };
                 Self::Delta(distance)
             }
-            Some(Method::Swap2) => Self::Swap(2),
-            Some(Method::Swap4) => Self::Swap(4),
-            Some(Method::SevenZAes) => Self::Aes(crate::aes::AesProperties::parse(properties()?)?),
+            Method::Swap2 => Self::Swap(2),
+            Method::Swap4 => Self::Swap(4),
+            Method::SevenZAes => Self::Aes(crate::aes::AesProperties::parse(properties()?)?),
             _ => return Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec())),
         })
     }
