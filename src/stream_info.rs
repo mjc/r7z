@@ -273,10 +273,6 @@ impl StreamInfo {
     /// # Errors
     ///
     /// Returns a nom error if the input is truncated or malformed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `num_folders` exceeds `usize::MAX` (impossible in practice).
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], StreamInfo> {
         Self::parse_with_external(input, backing, &[])
     }
@@ -285,7 +281,8 @@ impl StreamInfo {
     ///
     /// # Errors
     ///
-    /// Returns a nom error if the descriptor or a referenced folder definition is malformed.
+    /// Returns a nom error if the descriptor or a referenced folder definition
+    /// is malformed, or inline folder bytes are not contained in `backing`.
     pub fn parse_with_external<'a>(
         input: &'a [u8],
         backing: &Bytes,

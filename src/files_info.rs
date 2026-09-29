@@ -1,4 +1,9 @@
-use crate::{Property, entries::EntryKind, parsers::bitmap_is_set, sevenzip_varuint64_decode};
+use crate::{
+    Property,
+    entries::EntryKind,
+    parsers::{bitmap_is_set, bytes_subslice},
+    sevenzip_varuint64_decode,
+};
 use bytes::Bytes;
 use nom::{IResult, bytes::complete::take};
 
@@ -169,12 +174,8 @@ impl FilesInfo {
     /// # Errors
     ///
     /// Returns a nom error if the input is truncated, malformed, or does not start
-    /// with the `FilesInfo` property tag.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a block size encoded in the archive exceeds `usize::MAX`, which
-    /// cannot happen in practice on any platform that can hold the archive in memory.
+    /// with the `FilesInfo` property tag, or if retained property bytes are not
+    /// contained in `backing`.
     #[allow(clippy::too_many_lines)]
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], FilesInfo> {
         let orig_input = input;
@@ -227,7 +228,7 @@ impl FilesInfo {
                         )));
                     }
                     // block[0] is the external flag; block[1..] is the raw UTF-16LE name data.
-                    name_data = backing.slice_ref(&block[1..]);
+                    name_data = bytes_subslice(backing, &block[1..], input)?;
                     input = i;
                 }
                 Property::CTime | Property::ATime | Property::MTime | Property::StartPos => {
@@ -270,7 +271,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    empty_streams = backing.slice_ref(block);
+                    empty_streams = bytes_subslice(backing, block, input)?;
                     input = i;
                 }
                 Property::EmptyFile => {
@@ -282,7 +283,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    empty_files = backing.slice_ref(block);
+                    empty_files = bytes_subslice(backing, block, input)?;
                     input = i;
                 }
                 Property::Anti => {
@@ -294,7 +295,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    anti_items = backing.slice_ref(block);
+                    anti_items = bytes_subslice(backing, block, input)?;
                     input = i;
                 }
                 _ => {
@@ -530,6 +531,14 @@ mod tests {
     #[test]
     fn scan_files_info_wrong_tag() {
         assert!(scan_files_info(&[0x06u8]).is_err());
+    }
+
+    #[test]
+    fn parse_files_info_rejects_name_data_outside_backing() {
+        let input = [0x05u8, 0x01, 0x11, 0x05, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00];
+        let backing = Bytes::from_static(b"unrelated");
+
+        assert!(FilesInfo::parse(&input, &backing).is_err());
     }
 
     #[test]

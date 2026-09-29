@@ -4,7 +4,7 @@ use nom::number::complete::le_u8;
 use smallvec::SmallVec;
 
 use crate::folder::{FolderGraph, scan_folder};
-use crate::parsers::{bitmap_is_set, scan_digests};
+use crate::parsers::{bitmap_is_set, bytes_subslice, scan_digests};
 use crate::{Folder, Property, sevenzip_varuint64_decode, usize_cap};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,7 +300,8 @@ impl UnpackInfo {
     ///
     /// # Errors
     ///
-    /// Returns a nom error if the input is truncated or does not start with the `UnPackInfo` tag.
+    /// Returns a nom error if the input is truncated, does not start with the
+    /// `UnPackInfo` tag, or inline folder bytes are not contained in `backing`.
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], UnpackInfo> {
         Self::parse_with_external(input, backing, &[])
     }
@@ -310,7 +311,8 @@ impl UnpackInfo {
     ///
     /// # Errors
     ///
-    /// Returns a nom error if the block or a referenced folder definition is malformed.
+    /// Returns a nom error if the block or a referenced folder definition is
+    /// malformed, or inline folder bytes are not contained in `backing`.
     pub fn parse_with_external<'a>(
         input: &'a [u8],
         backing: &Bytes,
@@ -323,9 +325,8 @@ impl UnpackInfo {
         let (consumed, total_out_streams) =
             scan_folder_blocks(source.bytes(), num_folders, Some(&mut folder_offsets))
                 .map_err(|kind| nom::Err::Failure(nom::error::Error::new(input, kind)))?;
-        let folder_data = source
-            .backing(backing)
-            .slice_ref(&source.bytes()[..consumed]);
+        let folder_data =
+            bytes_subslice(source.backing(backing), &source.bytes()[..consumed], input)?;
         let mut input = source.remaining_header(input, consumed)?;
 
         // Property-tag loop for CodersUnPackSize and CRC
@@ -616,6 +617,28 @@ mod tests {
         assert_eq!(unpack.unpack_sizes.as_slice(), &[3]);
         assert_eq!(unpack.folder_bytes(0).unwrap(), &[0x01, 0x01, 0x00]);
         assert_eq!(unpack.parse_folder(0).unwrap().coders.len(), 1);
+    }
+
+    #[test]
+    fn parse_unpack_info_rejects_folder_bytes_outside_backing() {
+        let input = [0x07u8, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00];
+        let backing = Bytes::from_static(b"unrelated");
+
+        assert!(UnpackInfo::parse(&input, &backing).is_err());
+    }
+
+    #[test]
+    fn parse_unpack_info_accepts_input_subslice_of_backing() {
+        let input = [0x07u8, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00];
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&input);
+        bytes.push(0xee);
+        let backing = Bytes::from(bytes);
+
+        let (rest, unpack) = UnpackInfo::parse(&backing[1..backing.len() - 1], &backing).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(unpack.folder_bytes(0).unwrap(), &[0x01, 0x01, 0x00]);
     }
 
     #[test]

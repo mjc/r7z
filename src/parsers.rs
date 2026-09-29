@@ -1,4 +1,31 @@
+use bytes::Bytes;
 use nom::{IResult, bytes::complete::take, number::complete::le_u8};
+
+/// Return a zero-copy `Bytes` view when `slice` belongs to `backing`.
+pub(crate) fn bytes_subslice<'a>(
+    backing: &Bytes,
+    slice: &[u8],
+    error_input: &'a [u8],
+) -> Result<Bytes, nom::Err<nom::error::Error<&'a [u8]>>> {
+    if slice.is_empty() {
+        return Ok(Bytes::new());
+    }
+
+    let invalid_backing = || {
+        nom::Err::Failure(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Verify,
+        ))
+    };
+    let offset = (slice.as_ptr() as usize)
+        .checked_sub(backing.as_ptr() as usize)
+        .ok_or_else(invalid_backing)?;
+    let end = offset
+        .checked_add(slice.len())
+        .filter(|&end| end <= backing.len())
+        .ok_or_else(invalid_backing)?;
+    Ok(backing.slice(offset..end))
+}
 
 /// Saturate a `u64` count down to `usize`, capped at `max` so that
 /// `with_capacity` / `reserve_exact` never over-allocates more than the input
