@@ -70,6 +70,21 @@ impl FolderStreamCounts {
     }
 }
 
+fn checked_stream_index(
+    input: &[u8],
+    index: u64,
+    total: u64,
+) -> Result<(), nom::Err<nom::error::Error<&[u8]>>> {
+    if index < total {
+        Ok(())
+    } else {
+        Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct CoderIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -366,14 +381,17 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
 
     let (num_bind_pairs, num_packed) = stream_counts.layout(input)?;
     for _ in 0..num_bind_pairs {
-        let (i, _in_idx) = sevenzip_varuint64_decode(input)?;
-        let (i, _out_idx) = sevenzip_varuint64_decode(i)?;
+        let (i, in_idx) = sevenzip_varuint64_decode(input)?;
+        checked_stream_index(i, in_idx, stream_counts.inputs)?;
+        let (i, out_idx) = sevenzip_varuint64_decode(i)?;
+        checked_stream_index(i, out_idx, stream_counts.outputs)?;
         input = i;
     }
 
     if num_packed != 1 {
         for _ in 0..num_packed {
-            let (i, _idx) = sevenzip_varuint64_decode(input)?;
+            let (i, idx) = sevenzip_varuint64_decode(input)?;
+            checked_stream_index(i, idx, stream_counts.inputs)?;
             input = i;
         }
     }
@@ -456,7 +474,9 @@ impl Folder {
             SmallVec::with_capacity(usize_cap(num_bind_pairs, input.len()));
         for _ in 0..num_bind_pairs {
             let (i, in_idx) = sevenzip_varuint64_decode(input)?;
+            checked_stream_index(i, in_idx, stream_counts.inputs)?;
             let (i, out_idx) = sevenzip_varuint64_decode(i)?;
+            checked_stream_index(i, out_idx, stream_counts.outputs)?;
             bind_pairs.push((in_idx, out_idx));
             input = i;
         }
@@ -468,6 +488,7 @@ impl Folder {
             packed_indices.reserve_exact(usize_cap(num_packed, input.len()));
             for _ in 0..num_packed {
                 let (i, idx) = sevenzip_varuint64_decode(input)?;
+                checked_stream_index(i, idx, stream_counts.inputs)?;
                 packed_indices.push(idx);
                 input = i;
             }
@@ -661,6 +682,25 @@ mod tests {
                     ..
                 }))
             ));
+        }
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_reject_out_of_range_stream_indices() {
+        let invalid_bind_input = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x02, 0x02, 0x00];
+        let invalid_bind_output = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x02, 0x00, 0x02];
+        let invalid_packed = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x01, 0x02, 0x00];
+
+        for input in [
+            &invalid_bind_input[..],
+            &invalid_bind_output[..],
+            &invalid_packed[..],
+        ] {
+            assert!(
+                Folder::parse(input).is_err(),
+                "parser accepted {input:02x?}"
+            );
+            assert!(scan_folder(input).is_err(), "scanner accepted {input:02x?}");
         }
     }
 
