@@ -90,7 +90,8 @@ fn write_writer_archive(archive_path: &Path, codec: r7z::Codec, files: &[(PathBu
     let file = std::fs::File::create(archive_path).unwrap();
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("ArchiveWriter::new failed")
-        .compression(codec);
+        .compression(codec)
+        .expect("codec selection failed");
     for (idx, (name, data)) in files.iter().enumerate() {
         if idx == 1 {
             writer.new_folder().expect("new_folder failed");
@@ -632,7 +633,8 @@ fn archive_writer_bcj_lzma2_p7zip_reads() {
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut w = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .unwrap()
-        .compression(r7z::Codec::Lzma2Bcj);
+        .compression(r7z::Codec::Lzma2Bcj)
+        .expect("codec selection failed");
     w.append("code.bin", &mut data.as_slice()).unwrap();
     w.finish().unwrap();
 
@@ -1069,7 +1071,8 @@ fn archive_writer_copy_streams_payload_before_finish() {
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("new failed")
-        .compression(r7z::Codec::Copy);
+        .compression(r7z::Codec::Copy)
+        .expect("codec selection failed");
 
     writer
         .append_file(
@@ -1137,7 +1140,8 @@ fn archive_writer_lzma_streams_payload_before_finish() {
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("new failed")
-        .compression(r7z::Codec::Lzma);
+        .compression(r7z::Codec::Lzma)
+        .expect("codec selection failed");
 
     writer
         .append_file(
@@ -1170,7 +1174,8 @@ fn archive_writer_bcj_lzma2_streams_payload_before_finish() {
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("new failed")
-        .compression(r7z::Codec::Lzma2Bcj);
+        .compression(r7z::Codec::Lzma2Bcj)
+        .expect("codec selection failed");
 
     writer
         .append_file(
