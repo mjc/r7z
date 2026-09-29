@@ -858,32 +858,37 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     let selected = selected_patterns(&cli.operands);
     let listing = archive.listing(None)?;
-    let mut matched = 0;
-    let mut folders: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for entry in &listing.entries {
-        if entry_is_selected(&entry.path, &selected) {
-            matched += 1;
-            if let Some(folder) = entry.block {
-                folders.entry(folder).or_default().push(entry.index);
-            }
-        }
-    }
-    if !selected.is_empty() && matched == 0 {
+    let mut entries = listing
+        .entries
+        .iter()
+        .filter(|entry| entry_is_selected(&entry.path, &selected))
+        .peekable();
+    if !selected.is_empty() && entries.peek().is_none() {
         eprintln!("No files to process");
         return Ok(EXIT_WARNING);
     }
+    let mut streams = entries
+        .filter_map(|entry| entry.block.map(|folder| (folder, entry.index)))
+        .peekable();
     let mut warnings = 0;
-    if !folders.is_empty() {
+    if streams.peek().is_some() {
         let mut session = archive.read_session(cli.password.as_deref())?;
-        for (folder, indices) in folders {
+        while let Some((folder, first)) = streams.next() {
+            let mut indices = std::iter::once(first).chain(std::iter::from_fn(|| {
+                streams
+                    .next_if(|(block, _)| *block == folder)
+                    .map(|(_, index)| index)
+            }));
             let result = indices
-                .into_iter()
+                .by_ref()
                 .try_for_each(|index| {
                     session
                         .extract_to_writer(index, &mut io::sink())
                         .map(|_| ())
                 })
                 .and_then(|()| session.finish_folder());
+            // A failed folder is reported once; resume at the next independent folder.
+            indices.for_each(drop);
             if let Err(error) = result {
                 warnings = EXIT_WARNING;
                 eprintln!("Testing block {folder} failed: {error}");
