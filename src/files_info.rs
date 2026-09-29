@@ -1,4 +1,4 @@
-use crate::{Property, parsers::bitmap_is_set, sevenzip_varuint64_decode};
+use crate::{Property, entries::EntryKind, parsers::bitmap_is_set, sevenzip_varuint64_decode};
 use bytes::Bytes;
 use nom::{IResult, bytes::complete::take};
 
@@ -45,6 +45,8 @@ pub enum EntryType {
     EmptyFile,
     Anti,
     Symlink,
+    /// A symlink entry with no data stream for its target.
+    EmptySymlink,
 }
 
 pub(crate) struct FilesInfoNameSlices<'a> {
@@ -116,7 +118,7 @@ impl FilesInfo {
 
     /// Returns `true` if entry `i` is a directory.
     pub fn is_directory(&self, i: usize) -> bool {
-        self.is_empty_stream(i) && !self.is_empty_file(i) && !self.is_anti(i)
+        matches!(self.entry_kind(i), EntryKind::Directory)
     }
 
     /// Returns `true` if entry `i` is an anti-item.
@@ -135,17 +137,26 @@ impl FilesInfo {
             .is_some_and(|attrs| ((attrs >> 16) & 0o170_000) == 0o120_000)
     }
 
+    /// Classify an entry using anti-item flags, stream presence, and Unix mode.
+    /// Symlink mode takes precedence over directory flags; anti-items take precedence
+    /// over both. Symlinks without a stream return [`EntryType::EmptySymlink`].
     pub fn entry_type(&self, i: usize) -> EntryType {
-        if self.is_anti(i) {
-            EntryType::Anti
-        } else if self.is_symlink(i) {
-            EntryType::Symlink
-        } else if self.is_directory(i) {
-            EntryType::Directory
-        } else if self.is_empty_file(i) {
-            EntryType::EmptyFile
-        } else {
-            EntryType::File
+        self.entry_kind(i).entry_type()
+    }
+
+    pub(crate) fn entry_kind(&self, i: usize) -> EntryKind<()> {
+        match (
+            self.is_anti(i),
+            self.is_empty_stream(i),
+            self.is_symlink(i),
+            self.is_empty_file(i),
+        ) {
+            (true, _, _, _) => EntryKind::Anti,
+            (false, false, false, _) => EntryKind::File(()),
+            (false, false, true, _) => EntryKind::Symlink(()),
+            (false, true, true, _) => EntryKind::EmptySymlink,
+            (false, true, false, true) => EntryKind::EmptyFile,
+            (false, true, false, false) => EntryKind::Directory,
         }
     }
 

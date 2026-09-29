@@ -65,6 +65,7 @@ mod byte_swap;
 mod codec;
 mod coder_info;
 mod delta;
+mod entries;
 mod error;
 mod file_streams;
 mod files_info;

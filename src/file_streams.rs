@@ -1,3 +1,4 @@
+use crate::entries::{Entries, Entry};
 use crate::folder_decode::{FolderLayout, FolderLayouts, Substream, Substreams};
 use crate::{FilesInfo, R7zError, StreamInfo};
 
@@ -23,10 +24,7 @@ impl SubstreamIndex {
     }
 }
 
-pub(crate) struct FileStream<'c, 'a> {
-    pub(crate) index: usize,
-    pub(crate) location: Option<StreamLocation<'c, 'a>>,
-}
+pub(crate) type FileStream<'c, 'a> = Entry<'a, StreamLocation<'c, 'a>>;
 
 pub(crate) struct StreamLocation<'c, 'a> {
     pub(crate) folder_index: FolderIndex,
@@ -43,8 +41,7 @@ struct FolderStreams<'a> {
 
 /// Maps file entries to substreams without allocating a table or opening decoders.
 pub(crate) struct FileStreams<'a> {
-    files: Option<&'a FilesInfo>,
-    indices: std::ops::Range<usize>,
+    entries: Entries<'a>,
     folders: Option<std::iter::Enumerate<FolderLayouts<'a>>>,
     current: Option<FolderStreams<'a>>,
     pack_pos: u64,
@@ -56,9 +53,8 @@ impl<'a> FileStreams<'a> {
         num_files: usize,
         streams: Option<&'a StreamInfo>,
     ) -> Result<Self, R7zError> {
-        let count = (0..num_files)
-            .filter(|&index| has_stream(files, index))
-            .count();
+        let entries = Entries::new(files, num_files);
+        let count = entries.stream_count();
         let folders = streams
             .filter(|streams| streams.unpack_info.is_some())
             .map(FolderLayouts::for_streams)
@@ -68,8 +64,7 @@ impl<'a> FileStreams<'a> {
         }
         let pack_pos = folders.as_ref().map_or(0, FolderLayouts::pack_pos);
         Ok(Self {
-            files,
-            indices: 0..num_files,
+            entries,
             folders: folders.map(Iterator::enumerate),
             current: None,
             pack_pos,
@@ -82,15 +77,10 @@ impl<'a> FileStreams<'a> {
 
     /// The returned layout borrows the current folder until the next advance.
     pub(crate) fn next(&mut self) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
-        let Some(index) = self.indices.next() else {
-            return Ok(None);
-        };
-        let location = if has_stream(self.files, index) {
-            Some(self.next_stream()?)
-        } else {
-            None
-        };
-        Ok(Some(FileStream { index, location }))
+        self.entries
+            .next()
+            .map(|entry| entry.bind(|()| self.next_stream()))
+            .transpose()
     }
 
     fn next_stream(&mut self) -> Result<StreamLocation<'_, 'a>, R7zError> {
@@ -123,12 +113,6 @@ impl<'a> FileStreams<'a> {
     }
 }
 
-fn has_stream(files: Option<&FilesInfo>, index: usize) -> bool {
-    files.is_none_or(|files| {
-        !files.is_empty_stream(index) && !files.is_directory(index) && !files.is_anti(index)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,9 +136,11 @@ mod tests {
         let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();
         let mut mapped = Vec::new();
         while let Some(file) = files.next().unwrap() {
-            let location = file.location.unwrap();
+            let crate::entries::EntryKind::File(location) = file.kind else {
+                panic!("expected data stream")
+            };
             mapped.push((
-                file.index,
+                file.metadata.index.get(),
                 location.folder_index.get(),
                 location.stream_index.get(),
                 location.stream.range,

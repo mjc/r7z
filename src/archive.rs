@@ -1,4 +1,5 @@
-use crate::file_streams::{FileStreams, FolderIndex, StreamLocation};
+use crate::entries::{Entries, Entry, EntryKind, EntrySelection};
+use crate::file_streams::{FileStream, FileStreams, FolderIndex, StreamLocation};
 use crate::folder_decode::{
     ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderPlan, FolderLayout, FolderLayouts,
     MetadataBudget, PackedStream, VerifiedExternalData,
@@ -396,14 +397,27 @@ pub struct ArchiveEntryInfo {
 }
 
 impl ArchiveEntryInfo {
+    fn from_entry<S>(entry: &Entry<'_, S>) -> Self {
+        let name = entry.metadata.name();
+        let safe_name = safe_archive_name(&name).ok();
+        Self {
+            index: entry.metadata.index.get(),
+            name,
+            safe_name,
+            entry_type: entry.kind.entry_type(),
+        }
+    }
+
     #[must_use]
     pub fn is_file(&self) -> bool {
         matches!(
             self.entry_type,
-            EntryType::File | EntryType::EmptyFile | EntryType::Symlink
+            EntryType::File | EntryType::EmptyFile | EntryType::Symlink | EntryType::EmptySymlink
         )
     }
 
+    /// Whether this entry owns an archive data stream, independent of its length.
+    /// Empty files and empty symlinks have no stream.
     #[must_use]
     pub fn has_data_stream(&self) -> bool {
         matches!(self.entry_type, EntryType::File | EntryType::Symlink)
@@ -427,29 +441,28 @@ impl ArchiveEntryInfo {
 
 /// Iterator returned by [`Archive::entries`].
 pub struct ArchiveEntries<'a> {
-    archive: &'a Archive,
-    next: usize,
-    names: Option<crate::files_info::FilesInfoNameSlices<'a>>,
+    entries: Entries<'a>,
 }
 
 impl Iterator for ArchiveEntries<'_> {
     type Item = ArchiveEntryInfo;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.archive.num_files() {
-            return None;
-        }
-        let name = self
-            .names
-            .as_mut()
-            .and_then(Iterator::next)
-            .flatten()
-            .map(crate::files_info::decode_name);
-        let entry = self.archive.entry_info_with_name(self.next, name);
-        self.next += 1;
-        Some(entry)
+        self.nth(0)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.entries
+            .nth(n)
+            .map(|entry| ArchiveEntryInfo::from_entry(&entry))
     }
 }
+
+impl ExactSizeIterator for ArchiveEntries<'_> {}
 
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -698,19 +711,16 @@ impl Archive {
     /// Return high-level metadata for entry `index`.
     #[must_use]
     pub fn entry(&self, index: usize) -> Option<ArchiveEntryInfo> {
-        if index >= self.num_files() {
-            return None;
-        }
-        Some(self.entry_info(index))
+        Entries::new(self.header.files_info(), self.num_files())
+            .nth(index)
+            .map(|entry| ArchiveEntryInfo::from_entry(&entry))
     }
 
     /// Iterate high-level entry metadata in archive order.
     #[must_use]
     pub fn entries(&self) -> ArchiveEntries<'_> {
         ArchiveEntries {
-            archive: self,
-            next: 0,
-            names: self.header.files_info().map(FilesInfo::name_slices),
+            entries: Entries::new(self.header.files_info(), self.num_files()),
         }
     }
 
@@ -773,15 +783,9 @@ impl Archive {
 
         let mut entries = Vec::with_capacity(self.num_files());
         let files_info = self.try_files_info()?;
-        let mut names = files_info.map(FilesInfo::name_slices);
         let mut files = FileStreams::new(files_info, self.num_files(), streams)?;
         while let Some(file) = files.next()? {
-            let name = names
-                .as_mut()
-                .and_then(Iterator::next)
-                .flatten()
-                .map(crate::files_info::decode_name);
-            entries.push(self.listing_entry(file.index, name, file.location)?);
+            entries.push(Self::listing_entry(file));
         }
 
         Ok(ArchiveListing {
@@ -962,16 +966,13 @@ impl Archive {
         writer: &mut W,
         password: Option<&str>,
     ) -> Result<u64, R7zError> {
-        if file_index >= self.num_files() {
-            return Err(R7zError::Parse);
-        }
-
-        let fi = self.try_files_info()?;
-        if fi.is_some_and(|f| f.is_anti(file_index) || f.is_directory(file_index)) {
-            return Err(R7zError::Directory);
-        }
-        if fi.is_some_and(|f| f.is_empty_stream(file_index) && f.is_empty_file(file_index)) {
-            return Ok(0);
+        let entry = Entries::new(self.try_files_info()?, self.num_files())
+            .nth(file_index)
+            .ok_or(R7zError::Parse)?;
+        match entry.kind {
+            EntryKind::Directory | EntryKind::Anti => return Err(R7zError::Directory),
+            EntryKind::EmptyFile | EntryKind::EmptySymlink => return Ok(0),
+            EntryKind::File(()) | EntryKind::Symlink(()) => {}
         }
 
         let mut written = 0u64;
@@ -1089,33 +1090,16 @@ impl Archive {
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
-        let selected = if let Some(indices) = indices {
-            let mut selected = indices.to_vec();
-            if selected.iter().any(|&index| index >= self.num_files()) {
-                return Err(R7zError::InvalidOptions(
-                    "selected entry index out of bounds",
-                ));
-            }
-            selected.sort_unstable();
-            if selected.windows(2).any(|pair| pair[0] == pair[1]) {
-                return Err(R7zError::InvalidOptions("duplicate selected entry index"));
-            }
-            Some(selected)
-        } else {
-            None
-        };
-        if selected.as_ref().is_some_and(Vec::is_empty) {
+        let mut selected = EntrySelection::new(indices, self.num_files())?;
+        if selected.is_empty() {
             return Ok(());
         }
 
         let files_info = self.try_files_info()?;
         let streams = self.try_streams_info()?;
-        let mut names = files_info.map(FilesInfo::name_slices);
-        let mut selected_position = 0;
-        let mode = if selected.is_some() {
-            CompletionMode::SelectedStreams
-        } else {
-            CompletionMode::WholeFolder
+        let mode = match selected {
+            EntrySelection::All => CompletionMode::WholeFolder,
+            EntrySelection::Selected { .. } => CompletionMode::SelectedStreams,
         };
         let mut files = FileStreams::new(files_info, self.num_files(), streams)?;
         let mut decoder = FolderDecoder {
@@ -1124,27 +1108,16 @@ impl Archive {
             mode,
         };
         while let Some(file) = files.next()? {
-            let index = file.index;
-            let is_selected = selected.as_ref().is_none_or(|indices| {
-                if indices.get(selected_position) == Some(&index) {
-                    selected_position += 1;
-                    true
-                } else {
-                    false
-                }
-            });
-            let raw_name = names.as_mut().and_then(Iterator::next).flatten();
-            if is_selected {
-                let entry =
-                    self.entry_info_with_name(index, raw_name.map(crate::files_info::decode_name));
-                match file.location {
-                    Some(location) => {
-                        decoder = decoder.read(location, &entry, password, &mut callback)?
+            if selected.includes(file.metadata.index) {
+                let entry = ArchiveEntryInfo::from_entry(&file);
+                match file.kind {
+                    EntryKind::File(location) | EntryKind::Symlink(location) => {
+                        decoder = decoder.read(location, &entry, password, &mut callback)?;
                     }
-                    None if !entry.is_directory() && !entry.is_anti() => {
-                        callback(&entry, &mut std::io::empty())?
+                    EntryKind::EmptyFile | EntryKind::EmptySymlink => {
+                        callback(&entry, &mut std::io::empty())?;
                     }
-                    None => {}
+                    EntryKind::Directory | EntryKind::Anti => {}
                 }
             }
         }
@@ -1154,126 +1127,61 @@ impl Archive {
     }
 
     pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
-        let Some(fi) = self.try_files_info()? else {
+        let Some(entry) = Entries::new(self.try_files_info()?, self.num_files()).nth(file_index)
+        else {
             return Ok(None);
         };
-        if !fi.is_symlink(file_index) {
-            return Ok(None);
+        match entry.kind {
+            EntryKind::Symlink(()) | EntryKind::EmptySymlink => {}
+            _ => return Ok(None),
         }
+
         let target = self.extract_to_memory(file_index)?;
         String::from_utf8(target)
             .map(Some)
             .map_err(|_| R7zError::Parse)
     }
 
-    fn listing_entry(
-        &self,
-        file_index: usize,
-        name: Option<String>,
-        location: Option<StreamLocation<'_, '_>>,
-    ) -> Result<ArchiveListingEntry, R7zError> {
-        let fi = self.try_files_info()?;
-        let path = name.unwrap_or_else(|| format!("unknown-{file_index}"));
-        let Some(files) = fi else {
-            return Ok(ArchiveListingEntry {
-                index: file_index,
-                path,
-                kind: ListingEntryKind::File,
-                size: None,
-                packed_size: None,
-                modified: None,
-                attributes: None,
-                crc: None,
-                encrypted: false,
-                methods: archive_method_names(self.try_streams_info()?)?,
-                block: None,
-            });
+    fn listing_entry(file: FileStream<'_, '_>) -> ArchiveListingEntry {
+        let kind = match file.kind.entry_type() {
+            EntryType::File | EntryType::EmptyFile => ListingEntryKind::File,
+            EntryType::Symlink | EntryType::EmptySymlink => ListingEntryKind::Symlink,
+            EntryType::Directory => ListingEntryKind::Directory,
+            EntryType::Anti => ListingEntryKind::Anti,
         };
-
-        let kind = if files.is_anti(file_index) {
-            ListingEntryKind::Anti
-        } else if files.is_directory(file_index) {
-            ListingEntryKind::Directory
-        } else if files.is_symlink(file_index) {
-            ListingEntryKind::Symlink
-        } else {
-            ListingEntryKind::File
-        };
-
-        let modified = files
-            .mtimes
-            .get(file_index)
-            .copied()
-            .flatten()
-            .and_then(filetime_to_system_time);
-        let attributes = files.attributes.get(file_index).copied().flatten();
-
-        if matches!(kind, ListingEntryKind::Directory | ListingEntryKind::Anti)
-            || files.is_empty_stream(file_index)
-        {
-            return Ok(ArchiveListingEntry {
-                index: file_index,
-                path,
-                kind,
-                size: if matches!(kind, ListingEntryKind::Anti) {
-                    None
-                } else {
-                    Some(0)
-                },
-                packed_size: None,
-                modified,
-                attributes,
-                crc: files.is_empty_file(file_index).then_some(0),
-                encrypted: false,
-                methods: Vec::new(),
-                block: None,
-            });
-        }
-
-        let location = location.ok_or(R7zError::Parse)?;
-        let folder_idx = location.folder_index.get();
-        let methods = folder_method_names(location.folder.folder());
-        let encrypted = folder_is_encrypted(location.folder.folder());
-        let size = Some(location.stream.range.end - location.stream.range.start);
-        let packed_size = location
-            .stream_index
-            .is_first()
-            .then(|| location.folder.packed_size());
-        let crc = location.stream.digest;
-
-        Ok(ArchiveListingEntry {
-            index: file_index,
-            path,
+        let mut entry = ArchiveListingEntry {
+            index: file.metadata.index.get(),
+            path: file.metadata.name(),
             kind,
-            size,
-            packed_size,
-            modified,
-            attributes,
-            crc,
-            encrypted,
-            methods,
-            block: Some(folder_idx),
-        })
-    }
-
-    fn entry_info(&self, file_index: usize) -> ArchiveEntryInfo {
-        let fi = self.header.files_info();
-        self.entry_info_with_name(file_index, fi.and_then(|files| files.name(file_index)))
-    }
-
-    fn entry_info_with_name(&self, file_index: usize, name: Option<String>) -> ArchiveEntryInfo {
-        let fi = self.header.files_info();
-        let name = name.unwrap_or_else(|| format!("unknown-{file_index}"));
-        let entry_type = fi
-            .map(|files| files.entry_type(file_index))
-            .unwrap_or(EntryType::File);
-        let safe_name = safe_archive_name(&name).ok();
-        ArchiveEntryInfo {
-            index: file_index,
-            name,
-            safe_name,
-            entry_type,
+            size: None,
+            packed_size: None,
+            modified: file.metadata.modified.and_then(filetime_to_system_time),
+            attributes: file.metadata.attributes,
+            crc: None,
+            encrypted: false,
+            methods: Vec::new(),
+            block: None,
+        };
+        match file.kind {
+            EntryKind::File(location) | EntryKind::Symlink(location) => {
+                entry.size = Some(location.stream.range.end - location.stream.range.start);
+                entry.packed_size = location
+                    .stream_index
+                    .is_first()
+                    .then(|| location.folder.packed_size());
+                entry.crc = location.stream.digest;
+                entry.methods = folder_method_names(location.folder.folder());
+                entry.encrypted = folder_is_encrypted(location.folder.folder());
+                entry.block = Some(location.folder_index.get());
+            }
+            EntryKind::EmptyFile | EntryKind::EmptySymlink => {
+                entry.size = Some(0);
+                entry.crc = Some(0);
+            }
+            EntryKind::Directory => entry.size = Some(0),
+            EntryKind::Anti => {}
         }
+        entry
     }
 
     fn entry_index_by_name(&self, name: &str) -> Result<usize, R7zError> {
@@ -1305,10 +1213,13 @@ impl Archive {
             self.try_streams_info()?,
         )?;
         while let Some(file) = files.next()? {
-            if file.index == file_index {
-                return Ok(file
-                    .location
-                    .map(|location| (location.folder_index.get(), location.stream_index.get())));
+            if file.metadata.index.get() == file_index {
+                return Ok(match file.kind {
+                    EntryKind::File(location) | EntryKind::Symlink(location) => {
+                        Some((location.folder_index.get(), location.stream_index.get()))
+                    }
+                    _ => None,
+                });
             }
         }
         Ok(None)
@@ -1336,24 +1247,9 @@ impl Archive {
         dest: &Path,
         password: Option<&str>,
     ) -> Result<(), R7zError> {
-        let num = self.num_files();
-        let fi = self.try_files_info()?;
-        let mut names = fi.map(FilesInfo::name_slices);
-
-        for i in 0..num {
-            let name = names
-                .as_mut()
-                .and_then(Iterator::next)
-                .flatten()
-                .map(crate::files_info::decode_name)
-                .unwrap_or_else(|| format!("unknown-{i}"));
-            let dest_path = dest.join(safe_archive_name(&name)?);
-
-            if fi.is_some_and(|f| f.is_anti(i)) {
-                continue;
-            }
-
-            if fi.is_some_and(|f| f.is_directory(i)) {
+        for entry in Entries::new(self.try_files_info()?, self.num_files()) {
+            if matches!(entry.kind, EntryKind::Directory) {
+                let dest_path = dest.join(safe_archive_name(&entry.metadata.name())?);
                 std::fs::create_dir_all(&dest_path)?;
             }
         }
@@ -2199,5 +2095,162 @@ mod selected_stream_tests {
             seen,
             vec![(0, b"f".to_vec()), (1, Vec::new()), (2, b"l".to_vec())]
         );
+    }
+
+    fn mixed_entry_archive() -> Archive {
+        let bytes = ArchiveBuilder::new()
+            .compression(Codec::Copy)
+            .add_directory("directory", EntryMeta::default())
+            .add_empty_file("empty", EntryMeta::default())
+            .add_empty_file("empty-link", EntryMeta::symlink())
+            .add_directory("mode-link", EntryMeta::symlink())
+            .add_anti_item("removed", EntryMeta::symlink())
+            .add_file("data", b"payload")
+            .add_file_entry("link", b"target", EntryMeta::symlink())
+            .build()
+            .unwrap();
+        Archive::from_bytes(bytes.into()).unwrap()
+    }
+
+    #[test]
+    fn entry_kinds_agree_across_metadata_listing_and_extraction() {
+        let archive = mixed_entry_archive();
+        let listing = archive.listing(None).unwrap();
+        let expected = [
+            (EntryType::Directory, ListingEntryKind::Directory, false),
+            (EntryType::EmptyFile, ListingEntryKind::File, false),
+            (EntryType::EmptySymlink, ListingEntryKind::Symlink, false),
+            (EntryType::EmptySymlink, ListingEntryKind::Symlink, false),
+            (EntryType::Anti, ListingEntryKind::Anti, false),
+            (EntryType::File, ListingEntryKind::File, true),
+            (EntryType::Symlink, ListingEntryKind::Symlink, true),
+        ];
+        let files = archive.files_info().unwrap();
+        for ((entry, listing), (kind, listing_kind, has_stream)) in
+            archive.entries().zip(&listing.entries).zip(expected)
+        {
+            assert_eq!(entry.entry_type, kind);
+            assert_eq!(files.entry_type(entry.index), kind);
+            assert_eq!(files.is_directory(entry.index), entry.is_directory());
+            assert_eq!(entry.has_data_stream(), has_stream);
+            assert_eq!(listing.kind, listing_kind);
+            assert_eq!(listing.path, entry.name);
+            assert_eq!(listing.block.is_some(), has_stream);
+            assert_eq!(archive.entry(entry.index).unwrap(), entry);
+            let extracted = archive.extract_to_memory(entry.index);
+            if entry.is_file() {
+                assert_eq!(listing.size, Some(extracted.unwrap().len() as u64));
+            } else {
+                assert!(matches!(extracted, Err(R7zError::Directory)));
+            }
+        }
+        assert_eq!(archive.symlink_target(2).unwrap().as_deref(), Some(""));
+        assert_eq!(archive.symlink_target(3).unwrap().as_deref(), Some(""));
+        assert_eq!(archive.symlink_target(4).unwrap(), None);
+        assert_eq!(
+            archive.symlink_target(6).unwrap().as_deref(),
+            Some("target")
+        );
+        assert!(archive.entry(7).is_none());
+    }
+
+    #[test]
+    fn mixed_entries_preserve_names_and_stream_positions_for_selection_and_extract_all() {
+        let archive = mixed_entry_archive();
+        let mut seen = Vec::new();
+        archive
+            .stream_selected_files(&[6, 4, 3, 2, 1, 0, 5], |entry, reader| {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                seen.push((entry.index, entry.name.clone(), bytes));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (1, "empty".into(), Vec::new()),
+                (2, "empty-link".into(), Vec::new()),
+                (3, "mode-link".into(), Vec::new()),
+                (5, "data".into(), b"payload".to_vec()),
+                (6, "link".into(), b"target".to_vec()),
+            ]
+        );
+        let destination = tempfile::tempdir().unwrap();
+        archive.extract_all(destination.path()).unwrap();
+        assert!(destination.path().join("directory").is_dir());
+        assert!(!destination.path().join("removed").exists());
+        for (_, name, data) in seen {
+            assert_eq!(std::fs::read(destination.path().join(name)).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn borrowed_entry_cursor_keeps_names_and_metadata_attached() {
+        let modified = UNIX_EPOCH + Duration::from_secs(123456);
+        let bytes = ArchiveBuilder::new()
+            .compression(Codec::Copy)
+            .add_file_entry(
+                "first",
+                b"a",
+                EntryMeta {
+                    mtime: Some(modified),
+                    attributes: Some(0x20),
+                    ..EntryMeta::default()
+                },
+            )
+            .add_empty_file("middle", EntryMeta::default())
+            .add_file("last", b"b")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let files = archive.files_info().unwrap();
+        let mut entries = Entries::new(Some(files), archive.num_files());
+        assert_eq!(entries.stream_count(), 2);
+        let first = entries.next().unwrap();
+        let raw_name = files.name_slices().next().unwrap().unwrap();
+        assert!(std::ptr::eq(
+            first.metadata.name.unwrap().as_ptr(),
+            raw_name.as_ptr()
+        ));
+        assert_eq!(first.metadata.name(), "first");
+        let listing = archive.listing(None).unwrap();
+        assert_eq!(listing.entries[0].modified, Some(modified));
+        assert_eq!(listing.entries[0].attributes, Some(0x20));
+        assert_eq!(listing.entries[0].crc, Some(crc32fast::hash(b"a")));
+        assert_eq!(listing.entries[1].crc, Some(0));
+        assert_eq!(listing.entries[2].crc, Some(crc32fast::hash(b"b")));
+        assert_eq!(
+            entries
+                .map(|entry| entry.metadata.name())
+                .collect::<Vec<_>>(),
+            ["middle", "last"]
+        );
+    }
+
+    #[test]
+    fn entry_iteration_skips_without_losing_names_or_remaining_count() {
+        let archive = mixed_entry_archive();
+        let mut raw = Entries::new(archive.files_info(), archive.num_files());
+        let mut public = archive.entries();
+        assert_eq!(raw.len(), 7);
+        assert_eq!(public.len(), 7);
+        for (skip, index, name) in [(2, 2, "empty-link"), (0, 3, "mode-link"), (1, 5, "data")] {
+            let raw_entry = raw.nth(skip).unwrap();
+            let public_entry = public.nth(skip).unwrap();
+            assert_eq!(raw_entry.metadata.index.get(), index);
+            assert_eq!(raw_entry.metadata.name(), name);
+            assert_eq!(public_entry.index, index);
+            assert_eq!(public_entry.name, name);
+            assert_eq!(raw.len(), 6 - index);
+            assert_eq!(public.len(), 6 - index);
+        }
+        assert!(raw.nth(usize::MAX).is_none());
+        assert!(public.nth(usize::MAX).is_none());
+        assert_eq!(raw.len(), 0);
+        assert_eq!(public.len(), 0);
+        assert!(raw.next().is_none());
+        assert!(public.next().is_none());
+        assert!(archive.entry(usize::MAX).is_none());
     }
 }

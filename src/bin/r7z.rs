@@ -860,20 +860,15 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let mut sink = io::sink();
     let mut warnings = 0u8;
     let mut matched = 0usize;
-    for i in 0..archive.num_files() {
-        let fi = archive.files_info();
-        let name = fi
-            .and_then(|files| files.name(i))
-            .unwrap_or_else(|| format!("unknown-{i}"));
-        if !entry_is_selected(&name, &selected) {
+    for entry in archive.entries() {
+        if !entry_is_selected(&entry.name, &selected) {
             continue;
         }
         matched += 1;
-        if fi.is_some_and(|files| {
-            files.is_directory(i) || files.is_anti(i) || files.is_empty_file(i)
-        }) {
+        if !entry.has_data_stream() {
             continue;
         }
+        let i = entry.index;
         if let Err(err) =
             archive.extract_to_writer_with_password(i, &mut sink, cli.password.as_deref())
         {
@@ -908,33 +903,26 @@ fn extract_archive_with_ui(
     let mut warnings = 0u8;
     let mut overwrite_mode = cli.overwrite_mode;
 
-    for i in 0..archive.num_files() {
-        let fi = archive.files_info();
-        let name = fi
-            .and_then(|files| files.name(i))
-            .unwrap_or_else(|| format!("unknown-{i}"));
-        if !entry_is_selected(&name, &selected) {
+    for entry in archive.entries() {
+        if !entry_is_selected(&entry.name, &selected) {
             continue;
         }
         matched += 1;
-        let Some(files) = fi else {
-            continue;
-        };
-        if files.is_anti(i) {
+        if entry.is_anti() {
             continue;
         }
 
         let out_path = if flat {
-            let file_name = Path::new(&name)
+            let file_name = Path::new(&entry.name)
                 .file_name()
                 .filter(|part| !part.is_empty())
-                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(name.clone())))?;
+                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))?;
             cli.output_dir.join(file_name)
         } else {
-            safe_join(&cli.output_dir, &name)?
+            safe_join(&cli.output_dir, &entry.name)?
         };
 
-        if files.is_directory(i) {
+        if entry.is_directory() {
             if !flat {
                 if out_path.exists() && !out_path.is_dir() {
                     match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
@@ -973,13 +961,16 @@ fn extract_archive_with_ui(
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if files.is_empty_file(i) {
-            fs::File::create(out_path)?;
-        } else {
-            let mut file = fs::File::create(out_path)?;
-            archive.extract_to_writer_with_password(i, &mut file, cli.password.as_deref())?;
+        let mut file = fs::File::create(out_path)?;
+        if entry.has_data_stream() {
+            archive.extract_to_writer_with_password(
+                entry.index,
+                &mut file,
+                cli.password.as_deref(),
+            )?;
         }
     }
+
     if !selected.is_empty() && matched == 0 {
         eprintln!("No files to process");
         Ok(EXIT_WARNING)
@@ -1325,23 +1316,15 @@ fn preserved_rewrite_entries(
         ));
     };
     let listing = archive.listing(None)?;
-    let mut listing_by_index: Vec<Option<&ArchiveListingEntry>> = vec![None; archive.num_files()];
-    for entry in &listing.entries {
-        if let Some(slot) = listing_by_index.get_mut(entry.index) {
-            *slot = Some(entry);
-        }
-    }
-
-    let mut retained = vec![false; archive.num_files()];
+    let retained = listing
+        .entries
+        .iter()
+        .map(|entry| !should_drop(&entry.path))
+        .collect::<Vec<_>>();
     let mut folder_entries: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (i, is_retained) in retained.iter_mut().enumerate().take(archive.num_files()) {
-        let name = files.name(i).unwrap_or_else(|| format!("unknown-{i}"));
-        *is_retained = !should_drop(&name);
-        if let Some(block) = listing_by_index
-            .get(i)
-            .and_then(|entry| entry.and_then(|entry| entry.block))
-        {
-            folder_entries.entry(block).or_default().push(i);
+    for entry in &listing.entries {
+        if let Some(block) = entry.block {
+            folder_entries.entry(block).or_default().push(entry.index);
         }
     }
 
@@ -1362,17 +1345,14 @@ fn preserved_rewrite_entries(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut entries = Vec::new();
-    for (i, is_retained) in retained.iter().enumerate().take(archive.num_files()) {
+    for (listing_entry, &is_retained) in listing.entries.iter().zip(&retained) {
         if !is_retained {
             continue;
         }
-        let listing_entry = listing_by_index
-            .get(i)
-            .and_then(|entry| *entry)
-            .ok_or(R7zError::Parse)?;
-        let name = files.name(i).unwrap_or_else(|| format!("unknown-{i}"));
+        let i = listing_entry.index;
+        let name = listing_entry.path.clone();
         let meta = entry_meta_from_archive(files, i);
-        let kind = preserved_entry_kind(files, i);
+        let kind = preserved_entry_kind(listing_entry.kind);
         let stream = if let Some(folder) = listing_entry.block {
             if raw_folder_ids.contains(&folder) {
                 PreservedEntryStream::Raw {
@@ -1412,13 +1392,11 @@ fn preserved_rewrite_entries(
     Ok((entries, raw_folders))
 }
 
-fn preserved_entry_kind(files: &r7z::FilesInfo, index: usize) -> r7z::EntryKind {
-    if files.is_anti(index) {
-        r7z::EntryKind::Anti
-    } else if files.is_directory(index) {
-        r7z::EntryKind::Directory
-    } else {
-        r7z::EntryKind::File
+fn preserved_entry_kind(kind: ListingEntryKind) -> r7z::EntryKind {
+    match kind {
+        ListingEntryKind::Anti => r7z::EntryKind::Anti,
+        ListingEntryKind::Directory => r7z::EntryKind::Directory,
+        ListingEntryKind::File | ListingEntryKind::Symlink => r7z::EntryKind::File,
     }
 }
 

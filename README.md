@@ -251,6 +251,10 @@ let archive = Archive::from_bytes(raw.into())?;
 | `fi.is_empty_file(index)` | Entry is a zero-byte file |
 | `fi.is_directory(index)` | Entry is a directory |
 | `fi.is_anti(index)` | Entry is a 7z anti-item |
+| `fi.entry_type(index)` | Classify a file, directory, anti-item, or symlink, including empty files and empty symlinks |
+
+`EntryType::EmptySymlink` identifies a symlink with no target data stream.
+It remains file-like for extraction, and `ArchiveEntryInfo::has_data_stream()` returns `false`.
 
 ### `ArchiveBuilder` — Writing archives
 
