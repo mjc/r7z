@@ -4,6 +4,25 @@ use smallvec::SmallVec;
 
 const MAX_FOLDER_STREAMS: usize = 16_384;
 
+fn checked_coder_count(
+    input: &[u8],
+    count: u64,
+) -> Result<usize, nom::Err<nom::error::Error<&[u8]>>> {
+    let count = usize::try_from(count).map_err(|_| {
+        nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+    match count {
+        1..=MAX_FOLDER_STREAMS => Ok(count),
+        _ => Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct CoderIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -288,13 +307,7 @@ impl Bindings {
 /// Returns a nom error if the bytes are truncated or malformed.
 pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
     let (mut input, num_coders) = sevenzip_varuint64_decode(input)?;
-
-    if num_coders == 0 || num_coders > MAX_FOLDER_STREAMS as u64 {
-        return Err(nom::Err::Failure(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::TooLarge,
-        )));
-    }
+    let num_coders = checked_coder_count(input, num_coders)?;
 
     let mut num_in_total: u64 = 0;
     let mut num_out_total: u64 = 0;
@@ -425,8 +438,9 @@ impl Folder {
     /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
+        let num_coders = checked_coder_count(input, num_coders)?;
         let mut coders: SmallVec<[CoderInfo; 4]> =
-            SmallVec::with_capacity(usize_cap(num_coders, input.len()));
+            SmallVec::with_capacity(num_coders.min(input.len()));
         let mut input = input;
         for _ in 0..num_coders {
             let (i, coder) = CoderInfo::parse(input)?;
@@ -584,6 +598,27 @@ mod tests {
     #[test]
     fn scan_folder_empty() {
         assert!(scan_folder(&[]).is_err());
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_reject_invalid_coder_counts_consistently() {
+        let too_many =
+            crate::sevenzip_varuint64_encode(u64::try_from(super::MAX_FOLDER_STREAMS + 1).unwrap());
+
+        for input in [&[0][..], too_many.as_slice()] {
+            for result in [
+                Folder::parse(input).map(|_| ()),
+                scan_folder(input).map(|_| ()),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(nom::Err::Failure(nom::error::Error {
+                        code: nom::error::ErrorKind::TooLarge,
+                        ..
+                    }))
+                ));
+            }
+        }
     }
 
     #[test]

@@ -56,6 +56,7 @@ impl SubstreamInfo {
                         num_unpack_streams_per_folder.push(n);
                         input = i;
                     }
+                    checked_substream_total(input, &num_unpack_streams_per_folder)?;
                 }
                 Property::Size => {
                     // For each folder, store NumUnpackStreams-1 sizes explicitly;
@@ -82,12 +83,7 @@ impl SubstreamInfo {
                 }
                 Property::CRC => {
                     let total = checked_substream_total(input, &num_unpack_streams_per_folder)?;
-                    if total > MAX_SUBSTREAM_DIGESTS {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        )));
-                    }
+                    check_substream_digest_limit(input, total)?;
                     let (i, crcs) = parse_stream_digests(input, total)?;
                     digests = crcs;
                     input = i;
@@ -135,6 +131,19 @@ fn checked_substream_total<'a>(
             ))
         })
     })
+}
+
+fn check_substream_digest_limit(
+    input: &[u8],
+    total: usize,
+) -> Result<(), nom::Err<nom::error::Error<&[u8]>>> {
+    if total > MAX_SUBSTREAM_DIGESTS {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    Ok(())
 }
 
 fn checked_substream_size_count<'a>(
@@ -409,6 +418,7 @@ fn scan_substream_info(input: &[u8], num_folders: usize) -> IResult<&[u8], ()> {
                 }
             }
             Property::CRC => {
+                check_substream_digest_limit(input, total_streams)?;
                 let (i, ()) = scan_digests(input, total_streams)?;
                 input = i;
             }
@@ -527,10 +537,13 @@ mod tests {
     #[test]
     fn substream_parser_caps_sparse_digest_expansion() {
         let mut input = vec![0x08, 0x0D];
+        let digest_count = MAX_SUBSTREAM_DIGESTS + 1;
         input.extend(crate::sevenzip_varuint64_encode(
-            u64::try_from(MAX_SUBSTREAM_DIGESTS + 1).unwrap(),
+            u64::try_from(digest_count).unwrap(),
         ));
         input.extend([0x0A, 0x00]);
+        input.resize(input.len() + digest_count.div_ceil(8), 0);
+        input.push(0x00);
 
         assert!(matches!(
             SubstreamInfo::parse(&input, 1),
@@ -539,6 +552,24 @@ mod tests {
                 ..
             }))
         ));
+        assert!(matches!(
+            scan_substream_info(&input, 1),
+            Err(nom::Err::Error(nom::error::Error {
+                code: nom::error::ErrorKind::TooLarge,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn substream_parser_rejects_total_stream_count_overflow() {
+        let mut input = vec![0x08, 0x0D];
+        input.extend(crate::sevenzip_varuint64_encode(u64::MAX));
+        input.extend(crate::sevenzip_varuint64_encode(1));
+        input.push(0x00);
+
+        assert!(SubstreamInfo::parse(&input, 2).is_err());
+        assert!(scan_substream_info(&input, 2).is_err());
     }
 
     /// Wrong opening tag returns a hard Failure.

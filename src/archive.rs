@@ -1921,15 +1921,32 @@ mod selected_stream_tests {
     struct ErrorsThenData {
         errors: std::vec::IntoIter<std::io::Error>,
         data: &'static [u8],
+        max_read: usize,
     }
 
     impl Read for ErrorsThenData {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             match self.errors.next() {
                 Some(error) => Err(error),
-                None => self.data.read(buffer),
+                None => {
+                    let read_size = buffer.len().min(self.max_read);
+                    self.data.read(&mut buffer[..read_size])
+                }
             }
         }
+    }
+
+    #[test]
+    fn entry_copy_retries_short_reads() {
+        let mut reader = ErrorsThenData {
+            errors: Vec::new().into_iter(),
+            data: b"payload",
+            max_read: 2,
+        };
+        let mut output = Vec::new();
+
+        assert_eq!(copy_entry(&mut reader, &mut output).unwrap(), 7);
+        assert_eq!(output, b"payload");
     }
 
     #[test]
@@ -1942,6 +1959,7 @@ mod selected_stream_tests {
             ]
             .into_iter(),
             data: b"payload",
+            max_read: usize::MAX,
         };
         let mut output = Vec::new();
         assert_eq!(copy_entry(&mut reader, &mut output).unwrap(), 7);
@@ -1962,6 +1980,7 @@ mod selected_stream_tests {
             let mut reader = ErrorsThenData {
                 errors: vec![std::io::Error::other(expected)].into_iter(),
                 data: b"unread",
+                max_read: usize::MAX,
             };
             let mut output = Vec::new();
             let error = copy_entry(&mut reader, &mut output).unwrap_err();
@@ -1976,6 +1995,7 @@ mod selected_stream_tests {
         let mut reader = ErrorsThenData {
             errors: vec![std::io::ErrorKind::InvalidData.into()].into_iter(),
             data: b"unread",
+            max_read: usize::MAX,
         };
         assert!(matches!(
             copy_entry(&mut reader, &mut std::io::sink()),
