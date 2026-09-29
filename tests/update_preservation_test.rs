@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, io::Cursor, path::PathBuf, process::Command};
 
 use support::{
     assert_extracted_files, create_p7zip_archive, extract_with_p7zip, run_7z_checked,
@@ -75,6 +75,46 @@ fn raw_folder_block_exposes_multi_pack_stream_metadata() {
             .parse_folder(0)
             .unwrap()
     );
+}
+
+#[test]
+fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let data = vec![0x90u8; 4096];
+    fs::write(input.join("program.bin"), &data).unwrap();
+    let archive_path = tmp.path().join("bcj2.7z");
+    create_p7zip_archive(
+        &input,
+        &archive_path,
+        &["program.bin"],
+        &["-m0=BCJ2", "-m1=LZMA2", "-mmt=off"],
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let entry = archive.entries().next().unwrap();
+    let raw = archive.raw_folder_block(0).unwrap();
+    assert!(raw.packed_streams.len() > 1);
+    let output = r7z::write_archive_with_preserved_folders(
+        Cursor::new(Vec::new()),
+        vec![r7z::PreservedArchiveEntry {
+            name: entry.name,
+            raw_name: entry.raw_name,
+            kind: r7z::EntryKind::File,
+            meta: r7z::EntryMeta::default(),
+            stream: r7z::PreservedEntryStream::Raw {
+                folder_id: 0,
+                size: data.len() as u64,
+                crc: Some(crc32fast::hash(&data)),
+            },
+        }],
+        vec![raw],
+        &r7z::ArchiveOptions::default(),
+    )
+    .unwrap();
+    let rewritten = r7z::Archive::from_bytes(output.into_inner().into()).unwrap();
+    assert_eq!(rewritten.extract_to_memory(0).unwrap(), data);
 }
 
 #[test]

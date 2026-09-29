@@ -130,6 +130,13 @@ impl<W: Write> Write for CountingWriter<W> {
 }
 
 enum StreamingEncoder<W: Write> {
+    Raw {
+        writer: CountingWriter<W>,
+        pack_sizes: Vec<u64>,
+        coder_info: Vec<u8>,
+        coder_unpack_sizes: Vec<u64>,
+        folder_crc: Option<u32>,
+    },
     Lzma2(lzma2::Encoder<CountingWriter<W>>),
     Lzma {
         writer: Box<LzmaWriter<CountingWriter<W>>>,
@@ -143,12 +150,52 @@ struct StreamingFolder<W: Write> {
     file_indices: Vec<usize>,
     unpack_size: u64,
     file_sizes: Vec<u64>,
-    file_crcs: Vec<u32>,
+    file_crcs: Vec<Option<u32>>,
 }
 
 impl<W: Write> StreamingFolder<W> {
+    fn raw(
+        mut writer: CountingWriter<W>,
+        raw: RawFolderBlock,
+        write_entries: &[WriteEntry],
+        streams: &[StagedStream],
+        file_indices: Vec<usize>,
+    ) -> Result<Self, R7zError> {
+        if raw.packed_streams.len() != raw.pack_sizes.len() {
+            return Err(R7zError::Parse);
+        }
+        for (packed, &size) in raw.packed_streams.iter().zip(&raw.pack_sizes) {
+            if packed.len() as u64 != size {
+                return Err(R7zError::Parse);
+            }
+            writer.write_all(packed)?;
+        }
+        let file_sizes = file_indices
+            .iter()
+            .map(|&index| staged_stream_size(&write_entries[index], &streams[index]))
+            .collect::<Result<_, _>>()?;
+        let file_crcs = file_indices
+            .iter()
+            .map(|&index| staged_stream_crc(&write_entries[index], &streams[index]))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            encoder: StreamingEncoder::Raw {
+                writer,
+                pack_sizes: raw.pack_sizes,
+                coder_info: raw.folder_info,
+                coder_unpack_sizes: raw.coder_unpack_sizes,
+                folder_crc: raw.folder_crc,
+            },
+            file_indices,
+            unpack_size: 0,
+            file_sizes,
+            file_crcs,
+        })
+    }
+
     fn write_all(&mut self, chunk: &[u8]) -> io::Result<()> {
         match &mut self.encoder {
+            StreamingEncoder::Raw { writer, .. } => writer.write_all(chunk),
             StreamingEncoder::Lzma2(writer) => writer.write_all(chunk),
             StreamingEncoder::Lzma { writer, .. } => writer.write_all(chunk),
             StreamingEncoder::BcjLzma2(writer) => writer.write_all(chunk),
@@ -167,6 +214,26 @@ impl<W: Write> StreamingFolder<W> {
             file_crcs,
         } = self;
         let (writer, coder_info, coder_unpack_sizes) = match encoder {
+            StreamingEncoder::Raw {
+                writer,
+                pack_sizes,
+                coder_info,
+                coder_unpack_sizes,
+                folder_crc,
+            } => {
+                return Ok((
+                    writer,
+                    model::CompletedFolder {
+                        file_indices,
+                        pack_sizes,
+                        coder_info,
+                        coder_unpack_sizes,
+                        folder_crc,
+                        file_sizes,
+                        file_crcs,
+                    },
+                ));
+            }
             StreamingEncoder::Lzma2(writer) => (
                 writer.finish()?,
                 encode_coder_info_lzma2(encode::lzma2_property_byte(&options.compression)?),
@@ -196,7 +263,7 @@ impl<W: Write> StreamingFolder<W> {
                 coder_unpack_sizes,
                 folder_crc: None,
                 file_sizes,
-                file_crcs: file_crcs.into_iter().map(Some).collect(),
+                file_crcs,
             },
         ))
     }
@@ -433,7 +500,7 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
         return Ok(out);
     }
 
-    let (write_entries, streams, folder_order, raw_by_id) =
+    let (write_entries, streams, folder_order, mut raw_by_id) =
         stage_preserved_entries(entries, raw_folders, &options)?;
     let mut out = out;
     out.seek(SeekFrom::Start(0))?;
@@ -448,16 +515,16 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
                 (entry.has_stream && entry.folder_id == folder_id).then_some(idx)
             })
             .collect::<Vec<_>>();
-        if let Some(raw) = raw_by_id.get(&folder_id) {
-            for packed in &raw.packed_streams {
-                out.write_all(packed)?;
-            }
-            completed.push(completed_folder_from_raw(
-                raw,
-                &write_entries,
-                &streams,
-                &file_indices,
-            )?);
+        if let Some(raw) = raw_by_id.remove(&folder_id) {
+            let folder = {
+                let writer = CountingWriter {
+                    inner: &mut out,
+                    count: 0,
+                };
+                StreamingFolder::raw(writer, raw, &write_entries, &streams, file_indices)?
+            };
+            let (_writer, folder) = folder.complete(&options)?;
+            completed.push(folder);
         } else {
             completed.push(write_encoded_folder_streaming(
                 &mut out,
@@ -714,29 +781,6 @@ fn stage_preserved_entries(
         .map(|folder| (folder.folder_index, folder))
         .collect::<std::collections::BTreeMap<_, _>>();
     Ok((write_entries, streams, folder_order, raw_by_id))
-}
-
-fn completed_folder_from_raw(
-    raw: &RawFolderBlock,
-    write_entries: &[WriteEntry],
-    streams: &[StagedStream],
-    file_indices: &[usize],
-) -> Result<model::CompletedFolder, R7zError> {
-    Ok(model::CompletedFolder {
-        file_indices: file_indices.to_vec(),
-        pack_sizes: raw.pack_sizes.clone(),
-        coder_info: raw.folder_info.clone(),
-        coder_unpack_sizes: raw.coder_unpack_sizes.clone(),
-        folder_crc: raw.folder_crc,
-        file_sizes: file_indices
-            .iter()
-            .map(|&idx| staged_stream_size(&write_entries[idx], &streams[idx]))
-            .collect::<Result<Vec<_>, _>>()?,
-        file_crcs: file_indices
-            .iter()
-            .map(|&idx| staged_stream_crc(&write_entries[idx], &streams[idx]))
-            .collect::<Result<Vec<_>, _>>()?,
-    })
 }
 
 fn write_encoded_folder_streaming<W: Write>(
@@ -1497,7 +1541,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .checked_add(size)
             .ok_or(R7zError::Parse)?;
         folder.file_sizes.push(size);
-        folder.file_crcs.push(checksum.finalize());
+        folder.file_crcs.push(Some(checksum.finalize()));
         self.finish_entry_folder_accounting(size)
     }
 
