@@ -512,6 +512,52 @@ fn folder_finalization_failure_prevents_reusing_the_writer() {
 }
 
 #[test]
+fn encrypted_payload_write_failure_prevents_finishing_or_reusing_the_writer() {
+    struct FailAfterBytes {
+        bytes: Cursor<Vec<u8>>,
+        remaining: usize,
+    }
+
+    impl std::io::Write for FailAfterBytes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "output failed",
+                ));
+            }
+            let written = bytes.len().min(self.remaining);
+            let written = self.bytes.write(&bytes[..written])?;
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Seek for FailAfterBytes {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(position)
+        }
+    }
+
+    let out = FailAfterBytes {
+        bytes: Cursor::new(Vec::new()),
+        remaining: 8192,
+    };
+    let mut writer = ArchiveWriter::new(out, options(Codec::Copy, true)).unwrap();
+    let input = vec![0xA5; 64 * 1024];
+    assert!(matches!(
+        writer.append("file", input.as_slice()),
+        Err(r7z::R7zError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+    ));
+    assert!(writer.append("another", SECOND).is_err());
+    assert!(writer.finish().is_err());
+}
+
+#[test]
 fn archive_finalization_preserves_output_errors() {
     for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
         let fail = std::rc::Rc::new(std::cell::Cell::new(false));
