@@ -280,8 +280,12 @@ fn write_names(h: &mut Vec<u8>, entries: &[WriteEntry]) {
     h.push(0x11);
     let mut name_data = Vec::new();
     for entry in entries {
-        for unit in entry.name.encode_utf16() {
-            name_data.extend_from_slice(&unit.to_le_bytes());
+        if let Some(raw_name) = &entry.raw_name {
+            name_data.extend_from_slice(raw_name.as_utf16le());
+        } else {
+            for unit in entry.name.encode_utf16() {
+                name_data.extend_from_slice(&unit.to_le_bytes());
+            }
         }
         name_data.extend_from_slice(&[0, 0]);
     }
@@ -389,6 +393,7 @@ mod tests {
     fn entry(name: &str, kind: EntryKind, has_stream: bool, meta: EntryMeta) -> WriteEntry {
         WriteEntry {
             name: name.to_string(),
+            raw_name: None,
             kind,
             meta,
             has_stream,
@@ -426,6 +431,24 @@ mod tests {
         assert!(fi.is_empty_file(1));
         assert!(fi.is_anti(2));
         assert!(!fi.is_empty_stream(3));
+    }
+
+    #[test]
+    fn files_info_writer_preserves_raw_utf16_name_units() {
+        let raw_name = crate::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+        let mut entry = entry("�", EntryKind::File, true, EntryMeta::default());
+        entry.raw_name = Some(raw_name.clone());
+
+        let header = parse_header(build_header(&[entry], &[]));
+        let stored_name = header
+            .files_info()
+            .unwrap()
+            .name_slices()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored_name.as_ref(), raw_name.as_utf16le());
     }
 
     #[test]

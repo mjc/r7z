@@ -529,8 +529,10 @@ pub enum ListingEntryKind {
 pub struct ArchiveEntryInfo {
     /// Zero-based index in the 7z `FilesInfo` table.
     pub index: usize,
-    /// Raw archive entry name as stored in the header.
+    /// Display form of the archive entry name.
     pub name: String,
+    /// Original UTF-16LE name code units, when the header contains a name.
+    pub raw_name: Option<crate::RawEntryName>,
     /// Normalized relative path when the entry name is safe to extract.
     pub safe_name: Option<PathBuf>,
     /// Entry kind derived from 7z empty-stream, anti-item, and mode metadata.
@@ -548,6 +550,7 @@ impl ArchiveEntryInfo {
         Self {
             index: metadata.index.get(),
             name,
+            raw_name: metadata.name.clone(),
             safe_name,
             entry_type,
         }
@@ -3057,7 +3060,7 @@ mod selected_stream_tests {
         let first = entries.next().unwrap();
         let raw_name = files.name_slices().next().unwrap().unwrap();
         assert!(std::ptr::eq(
-            first.metadata.name.unwrap().as_ptr(),
+            first.metadata.name.as_ref().unwrap().as_utf16le().as_ptr(),
             raw_name.as_ptr()
         ));
         assert_eq!(first.metadata.name(), "first");

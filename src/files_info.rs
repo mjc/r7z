@@ -54,15 +54,15 @@ pub enum EntryType {
     EmptySymlink,
 }
 
-pub(crate) struct FilesInfoNameSlices<'a> {
-    data: &'a [u8],
+pub(crate) struct FilesInfoNameSlices {
+    data: Bytes,
     count: usize,
     position: usize,
     index: usize,
 }
 
-impl<'a> Iterator for FilesInfoNameSlices<'a> {
-    type Item = Option<&'a [u8]>;
+impl Iterator for FilesInfoNameSlices {
+    type Item = Option<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.count {
@@ -77,7 +77,7 @@ impl<'a> Iterator for FilesInfoNameSlices<'a> {
             let is_null = self.data[self.position] == 0 && self.data[self.position + 1] == 0;
             self.position += 2;
             if is_null {
-                return Some(Some(&self.data[start..self.position - 2]));
+                return Some(Some(self.data.slice(start..self.position - 2)));
             }
         }
         Some(None)
@@ -87,7 +87,7 @@ impl<'a> Iterator for FilesInfoNameSlices<'a> {
 impl FilesInfo {
     /// Decode the name of entry `i` on demand (UTF-16LE, null-terminated).
     pub fn name(&self, i: usize) -> Option<String> {
-        self.name_slices().nth(i)?.map(decode_name)
+        self.name_slices().nth(i)?.as_deref().map(decode_name)
     }
 
     /// Iterator over all decoded names (in archive order).
@@ -96,12 +96,13 @@ impl FilesInfo {
     ///
     /// Panics if `num_files` exceeds `usize::MAX` (impossible in practice).
     pub fn names(&self) -> impl Iterator<Item = String> + '_ {
-        self.name_slices().filter_map(|name| name.map(decode_name))
+        self.name_slices()
+            .filter_map(|name| name.as_deref().map(decode_name))
     }
 
-    pub(crate) fn name_slices(&self) -> FilesInfoNameSlices<'_> {
+    pub(crate) fn name_slices(&self) -> FilesInfoNameSlices {
         FilesInfoNameSlices {
-            data: &self.name_data,
+            data: self.name_data.clone(),
             count: usize::try_from(self.num_files).expect("num_files fits in usize"),
             position: 0,
             index: 0,

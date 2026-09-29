@@ -63,6 +63,7 @@ fn staged_bcj_writer_preserves_bytes_across_parallel_blocks() {
     data[MIB - 2..MIB + 3].copy_from_slice(&[0x90, 0xE8, 0, 0, 0]);
     let entries = vec![PreservedArchiveEntry {
         name: "program.bin".to_string(),
+        raw_name: None,
         kind: EntryKind::File,
         meta: EntryMeta::default(),
         stream: PreservedEntryStream::Data(data.clone()),

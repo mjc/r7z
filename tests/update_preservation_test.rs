@@ -77,6 +77,75 @@ fn raw_folder_block_exposes_multi_pack_stream_metadata() {
     );
 }
 
+#[test]
+fn update_keeps_raw_name_distinct_from_its_replacement_character_display() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let new_file = input.join("�");
+    fs::write(&new_file, b"new").unwrap();
+    let archive_path = tmp.path().join("raw-name.7z");
+    let original_name = r7z::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+    let bytes = r7z::build_archive_with_preserved_folders(
+        vec![r7z::PreservedArchiveEntry {
+            name: "�".to_owned(),
+            raw_name: Some(original_name.clone()),
+            kind: r7z::EntryKind::File,
+            meta: r7z::EntryMeta::default(),
+            stream: r7z::PreservedEntryStream::Data(b"old".to_vec()),
+        }],
+        Vec::new(),
+        &r7z::ArchiveOptions::default(),
+    )
+    .unwrap();
+    fs::write(&archive_path, bytes).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "u",
+            archive_path.to_str().unwrap(),
+            new_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "r7z update failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries = r7z::Archive::open(&archive_path)
+        .unwrap()
+        .entries()
+        .collect::<Vec<_>>();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].raw_name.as_ref(), Some(&original_name));
+    assert_eq!(
+        entries[1].raw_name.as_ref().unwrap().as_utf16le(),
+        &[0xFD, 0xFF]
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["d", archive_path.to_str().unwrap(), "�"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "r7z delete failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries = r7z::Archive::open(&archive_path)
+        .unwrap()
+        .entries()
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].raw_name.as_ref(), Some(&original_name));
+}
+
 fn create_zstd_archive_or_skip(
     input: &std::path::Path,
     archive: &std::path::Path,

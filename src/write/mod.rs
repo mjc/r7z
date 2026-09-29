@@ -5,7 +5,7 @@ mod header;
 mod lzma2;
 mod model;
 
-use crate::{R7zError, RawFolderBlock, bcj::BcjX86Writer};
+use crate::{R7zError, RawEntryName, RawFolderBlock, bcj::BcjX86Writer};
 use header::{
     encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
     encode_coder_info_lzma2,
@@ -28,6 +28,7 @@ use model::WriteEntry;
 #[doc(hidden)]
 pub struct PreservedArchiveEntry {
     pub name: String,
+    pub raw_name: Option<RawEntryName>,
     pub kind: EntryKind,
     pub meta: EntryMeta,
     pub stream: PreservedEntryStream,
@@ -198,6 +199,7 @@ impl ArchiveBuilder {
     pub fn add_file(mut self, name: &str, data: &[u8]) -> Self {
         if data.is_empty() {
             self.entries.push(WriteEntry {
+                raw_name: None,
                 name: name.to_string(),
                 kind: EntryKind::File,
                 meta: EntryMeta::default(),
@@ -207,6 +209,7 @@ impl ArchiveBuilder {
             });
         } else {
             self.entries.push(WriteEntry {
+                raw_name: None,
                 name: name.to_string(),
                 kind: EntryKind::File,
                 meta: EntryMeta::default(),
@@ -221,6 +224,7 @@ impl ArchiveBuilder {
     #[must_use]
     pub fn add_file_entry(mut self, name: &str, data: &[u8], meta: EntryMeta) -> Self {
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -234,6 +238,7 @@ impl ArchiveBuilder {
     #[must_use]
     pub fn add_symlink(mut self, name: &str, target: &str, meta: EntryMeta) -> Self {
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta: meta.with_symlink_default(),
@@ -256,6 +261,7 @@ impl ArchiveBuilder {
     #[must_use]
     pub fn add_empty_file(mut self, name: &str, meta: EntryMeta) -> Self {
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -269,6 +275,7 @@ impl ArchiveBuilder {
     #[must_use]
     pub fn add_directory(mut self, name: &str, meta: EntryMeta) -> Self {
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::Directory,
             meta,
@@ -282,6 +289,7 @@ impl ArchiveBuilder {
     #[must_use]
     pub fn add_anti_item(mut self, name: &str, meta: EntryMeta) -> Self {
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::Anti,
             meta,
@@ -426,6 +434,7 @@ fn build_archive_with_preserved_folders_buffered(
             }
         };
         write_entries.push(WriteEntry {
+            raw_name: entry.raw_name,
             name: entry.name,
             kind: entry.kind,
             meta: entry.meta,
@@ -542,6 +551,7 @@ fn stage_preserved_entries(
     for entry in entries {
         let PreservedArchiveEntry {
             name,
+            raw_name,
             kind,
             meta,
             stream,
@@ -584,6 +594,7 @@ fn stage_preserved_entries(
         };
         write_entries.push(WriteEntry {
             name,
+            raw_name,
             kind,
             meta,
             has_stream,
@@ -1001,6 +1012,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             return Err(writer_failed());
         }
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: entry.name,
             kind: entry.kind,
             meta: entry.meta,
@@ -1048,6 +1060,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         reader.read_to_end(&mut data)?;
         let size = data.len() as u64;
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -1214,6 +1227,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
+                raw_name: None,
                 name: name.to_string(),
                 kind: EntryKind::File,
                 meta,
@@ -1245,6 +1259,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let index = self.entries.len();
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -1298,6 +1313,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
+                raw_name: None,
                 name: name.to_string(),
                 kind: EntryKind::File,
                 meta,
@@ -1322,6 +1338,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let index = self.entries.len();
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -1435,6 +1452,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
+                raw_name: None,
                 name: name.to_string(),
                 kind: EntryKind::File,
                 meta,
@@ -1459,6 +1477,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let index = self.entries.len();
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -1577,6 +1596,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let first = reader.read(&mut buf)?;
         if first == 0 {
             self.entries.push(WriteEntry {
+                raw_name: None,
                 name: name.to_string(),
                 kind: EntryKind::File,
                 meta,
@@ -1601,6 +1621,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let index = self.entries.len();
         self.entries.push(WriteEntry {
+            raw_name: None,
             name: name.to_string(),
             kind: EntryKind::File,
             meta,
@@ -1784,6 +1805,7 @@ fn write_entry_from_archive_entry(
         ));
     }
     Ok(WriteEntry {
+        raw_name: None,
         name: entry.name,
         kind: entry.kind,
         meta: entry.meta,

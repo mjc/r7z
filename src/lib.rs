@@ -92,6 +92,7 @@ pub use codec::{
     CODEC_SWAP2, CODEC_SWAP4, decompress_folder, decompress_folder_with_password,
 };
 pub use coder_info::CoderInfo;
+pub use entries::RawEntryName;
 pub use error::R7zError;
 pub use files_info::{EntryType, FilesInfo};
 pub use folder::Folder;

@@ -264,6 +264,7 @@ impl ArchiveEntry {
 #[derive(Clone)]
 pub(crate) struct WriteEntry {
     pub name: String,
+    pub raw_name: Option<crate::RawEntryName>,
     pub kind: EntryKind,
     pub meta: EntryMeta,
     pub has_stream: bool,

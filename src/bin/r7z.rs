@@ -1240,12 +1240,30 @@ fn update_archive(cli: &Cli) -> Result<u8, CliError> {
     let scan = scan_disk_operands(&cli.operands)?;
     let paths = scan.paths;
     let new_entries = collect_disk_entries(&paths)?;
-    let new_names: BTreeSet<String> = new_entries.iter().map(|entry| entry.name.clone()).collect();
+    let new_names = new_entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<BTreeSet<_>>();
+    let new_raw_names = new_entries
+        .iter()
+        .map(|entry| {
+            entry
+                .name
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
     let archive = open_archive(cli)?;
     let (entries, raw_folders) = preserved_rewrite_entries(
         &archive,
         cli.password.as_deref(),
-        |name| new_names.contains(name),
+        |entry| {
+            entry.raw_name.as_ref().map_or_else(
+                || new_names.contains(&entry.name),
+                |name| new_raw_names.contains(name.as_utf16le()),
+            )
+        },
         new_entries,
     )?;
     write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)?;
@@ -1268,7 +1286,7 @@ fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
     let (entries, raw_folders) = preserved_rewrite_entries(
         &archive,
         cli.password.as_deref(),
-        |name| delete_patterns.matches(name),
+        |entry| delete_patterns.matches_entry(entry),
         Vec::new(),
     )?;
     write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)
@@ -1439,7 +1457,7 @@ fn collect_path(
 fn preserved_rewrite_entries(
     archive: &Archive,
     password: Option<&str>,
-    should_drop: impl Fn(&str) -> bool,
+    should_drop: impl Fn(&r7z::ArchiveEntryInfo) -> bool,
     append_entries: Vec<PendingEntry>,
 ) -> Result<(Vec<PreservedArchiveEntry>, Vec<RawFolderBlock>), CliError> {
     let Some(files) = archive.files_info() else {
@@ -1452,10 +1470,10 @@ fn preserved_rewrite_entries(
         ));
     };
     let listing = archive.listing(None)?;
-    let retained = listing
-        .entries
+    let archive_entries = archive.entries().collect::<Vec<_>>();
+    let retained = archive_entries
         .iter()
-        .map(|entry| !should_drop(&entry.path))
+        .map(|entry| !should_drop(entry))
         .collect::<Vec<_>>();
     let mut folder_entries: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for entry in &listing.entries {
@@ -1486,7 +1504,9 @@ fn preserved_rewrite_entries(
             continue;
         }
         let i = listing_entry.index;
-        let name = listing_entry.path.clone();
+        let archive_entry = &archive_entries[i];
+        let name = archive_entry.name.clone();
+        let raw_name = archive_entry.raw_name.clone();
         let meta = entry_meta_from_archive(files, i);
         let kind = preserved_entry_kind(listing_entry.kind);
         let stream = if let Some(folder) = listing_entry.block {
@@ -1519,6 +1539,7 @@ fn preserved_rewrite_entries(
         };
         entries.push(PreservedArchiveEntry {
             name,
+            raw_name,
             kind,
             meta,
             stream,
@@ -1552,6 +1573,7 @@ fn pending_to_preserved_entry(entry: PendingEntry) -> PreservedArchiveEntry {
     };
     PreservedArchiveEntry {
         name,
+        raw_name: None,
         kind,
         meta,
         stream,
@@ -1725,6 +1747,18 @@ impl EntryPatterns {
         }
     }
 
+    fn matches_entry(&self, entry: &r7z::ArchiveEntryInfo) -> bool {
+        match self {
+            Self::All => true,
+            Self::Matching(patterns) => patterns.iter().any(|pattern| {
+                entry.raw_name.as_ref().map_or_else(
+                    || wildcard_match(pattern, &entry.name),
+                    |name| wildcard_match_raw(pattern, name),
+                )
+            }),
+        }
+    }
+
     fn resolve_entries<'a>(
         &'a self,
         archive: &'a Archive,
@@ -1781,8 +1815,36 @@ impl SelectedListing<'_> {
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let text = text.chars().collect::<Vec<_>>();
+    wildcard_match_symbols(
+        pattern.chars().map(NameSymbol::Unicode),
+        text.chars().map(NameSymbol::Unicode),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameSymbol {
+    Unicode(char),
+    UnpairedSurrogate(u16),
+}
+
+fn wildcard_match_raw(pattern: &str, text: &r7z::RawEntryName) -> bool {
+    let units = text
+        .as_utf16le()
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]));
+    let text = char::decode_utf16(units).map(|decoded| match decoded {
+        Ok(character) => NameSymbol::Unicode(character),
+        Err(error) => NameSymbol::UnpairedSurrogate(error.unpaired_surrogate()),
+    });
+    wildcard_match_symbols(pattern.chars().map(NameSymbol::Unicode), text)
+}
+
+fn wildcard_match_symbols(
+    pattern: impl IntoIterator<Item = NameSymbol>,
+    text: impl IntoIterator<Item = NameSymbol>,
+) -> bool {
+    let pattern = pattern.into_iter().collect::<Vec<_>>();
+    let text = text.into_iter().collect::<Vec<_>>();
     let mut matched = vec![vec![false; text.len() + 1]; pattern.len() + 1];
     matched[0][0] = true;
 
@@ -1792,14 +1854,16 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
                 continue;
             }
             match pattern[p_idx] {
-                '*' => {
+                NameSymbol::Unicode('*') => {
                     matched[p_idx + 1][t_idx] = true;
                     if t_idx < text.len() {
                         matched[p_idx][t_idx + 1] = true;
                     }
                 }
-                '?' if t_idx < text.len() => matched[p_idx + 1][t_idx + 1] = true,
-                ch if t_idx < text.len() && ch == text[t_idx] => {
+                NameSymbol::Unicode('?') if t_idx < text.len() => {
+                    matched[p_idx + 1][t_idx + 1] = true;
+                }
+                symbol if t_idx < text.len() && symbol == text[t_idx] => {
                     matched[p_idx + 1][t_idx + 1] = true;
                 }
                 _ => {}
@@ -1875,9 +1939,21 @@ impl From<io::Error> for CliError {
 mod tests {
     use super::{
         CollisionAction, OverwriteAnswer, OverwriteMode, OverwriteUi, decide_overwrite,
-        parse_overwrite_answer,
+        parse_overwrite_answer, wildcard_match_raw,
     };
     use std::{collections::VecDeque, path::Path};
+
+    #[test]
+    fn raw_name_patterns_distinguish_unpaired_surrogates_from_replacement_characters() {
+        let unpaired = r7z::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+        let replacement = r7z::RawEntryName::from_utf16le(vec![0xFD, 0xFF]).unwrap();
+        let supplementary = r7z::RawEntryName::from_utf16le(vec![0x00, 0xD8, 0x00, 0xDC]).unwrap();
+
+        assert!(!wildcard_match_raw("�", &unpaired));
+        assert!(wildcard_match_raw("�", &replacement));
+        assert!(wildcard_match_raw("?", &unpaired));
+        assert!(wildcard_match_raw("?", &supplementary));
+    }
 
     #[test]
     fn parse_overwrite_answers_matches_p7zip_prompt_words() {
