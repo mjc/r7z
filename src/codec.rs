@@ -286,7 +286,7 @@ fn prepare_folder_decoder<R: Read>(
         .iter()
         .map(|input| input.size as u64)
         .collect::<SmallVec<[_; 4]>>();
-    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes)?
+    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes, None)?
         .bind(packed_streams)
 }
 
@@ -331,7 +331,10 @@ fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
 }
 
 fn resource_limit(resource: &'static str, limit: usize) -> R7zError {
-    R7zError::ResourceLimitExceeded { resource, limit }
+    R7zError::ResourceLimitExceeded {
+        resource,
+        limit: limit as u64,
+    }
 }
 
 fn growth_safe_output_limit(available: usize) -> usize {

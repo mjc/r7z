@@ -203,7 +203,13 @@ fn metadata_limit_rejects_oversized_next_header() {
         Err(err) => err,
     };
 
-    assert!(matches!(err, r7z::R7zError::LimitExceeded("metadata")));
+    assert!(matches!(
+        err,
+        r7z::R7zError::ResourceLimitExceeded {
+            resource: "metadata",
+            limit: 1,
+        }
+    ));
 }
 
 #[test]
@@ -228,7 +234,13 @@ fn metadata_limit_rejects_oversized_decoded_header() {
         Err(err) => err,
     };
 
-    assert!(matches!(err, r7z::R7zError::LimitExceeded("metadata")));
+    assert!(matches!(
+        err,
+        r7z::R7zError::ResourceLimitExceeded {
+            resource: "metadata",
+            limit,
+        } if limit == next_header_size + 16
+    ));
 }
 
 #[test]

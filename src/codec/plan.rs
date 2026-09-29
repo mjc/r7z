@@ -19,12 +19,12 @@ impl WorkingSet {
             .ok_or(R7zError::Decompression)
     }
 
-    fn admit(self) -> Result<Self, R7zError> {
-        if self.0 > MAX_DECODER_WORKING_SET_BYTES {
-            return Err(resource_limit(
-                "decoder working set",
-                MAX_DECODER_WORKING_SET_BYTES,
-            ));
+    fn admit(self, configured_limit: Option<u64>) -> Result<Self, R7zError> {
+        let limit = configured_limit.map_or(MAX_DECODER_WORKING_SET_BYTES as u64, |limit| {
+            limit.min(MAX_DECODER_WORKING_SET_BYTES as u64)
+        }) as usize;
+        if self.0 > limit {
+            return Err(resource_limit("decoder working set", limit));
         }
         Ok(self)
     }
@@ -130,6 +130,7 @@ impl<R> BoundInputs<R> {
 }
 
 impl<'a> DecoderPlan<'a> {
+    #[cfg(test)]
     pub(crate) fn compile(
         folder: &Folder,
         graph: &FolderGraph,
@@ -137,8 +138,26 @@ impl<'a> DecoderPlan<'a> {
         sizes: &[u64],
         packed_sizes: &'a [u64],
     ) -> Result<Self, R7zError> {
+        Self::compile_with_working_set_limit(folder, graph, unpack_size, sizes, packed_sizes, None)
+    }
+
+    pub(crate) fn compile_with_working_set_limit(
+        folder: &Folder,
+        graph: &FolderGraph,
+        unpack_size: u64,
+        sizes: &[u64],
+        packed_sizes: &'a [u64],
+        max_working_set_bytes: Option<u64>,
+    ) -> Result<Self, R7zError> {
         let sizes = CoderOutputSizes::complete(folder, graph, unpack_size, sizes)?;
-        Self::with_output_sizes(folder, graph, unpack_size, sizes, packed_sizes)
+        Self::with_output_sizes(
+            folder,
+            graph,
+            unpack_size,
+            sizes,
+            packed_sizes,
+            max_working_set_bytes,
+        )
     }
 
     pub(super) fn with_output_sizes(
@@ -147,6 +166,7 @@ impl<'a> DecoderPlan<'a> {
         unpack_size: u64,
         sizes: CoderOutputSizes<'_>,
         packed_sizes: &'a [u64],
+        max_working_set_bytes: Option<u64>,
     ) -> Result<Self, R7zError> {
         validate_folder_coder_count(folder)?;
         if graph.packed_stream_count() != packed_sizes.len() {
@@ -197,7 +217,7 @@ impl<'a> DecoderPlan<'a> {
                     .try_fold(WorkingSet::default(), |total, step| {
                         total.add(step.working_set()?)
                     })?
-                    .admit()?;
+                    .admit(max_working_set_bytes)?;
                 Ok(Self {
                     topology: Topology::Chain(steps),
                     memory,
@@ -272,6 +292,9 @@ impl<'a> DecoderPlan<'a> {
                     return Err(R7zError::Decompression);
                 }
                 ensure_bcj2_working_budget(output_size, memory.0)?;
+                let memory = memory
+                    .add(WorkingSet(output_size))?
+                    .admit(max_working_set_bytes)?;
                 Ok(Self {
                     topology: Topology::Bcj2 {
                         main,
@@ -341,6 +364,26 @@ impl<R: Read> BoundInput<R> {
 }
 
 impl<R: Read> ReadyDecoder<R> {
+    pub(crate) fn eager_output_size(&self) -> Option<u64> {
+        match &self.topology {
+            BoundTopology::Bcj2 { output_size, .. } => Some(*output_size as u64),
+            BoundTopology::Chain { steps, .. } => {
+                steps.iter().enumerate().rev().find_map(|(index, step)| {
+                    let eager_final_output = matches!(&step.coder, CoderPlan::Aes(_))
+                        && steps[index + 1..]
+                            .iter()
+                            .all(|following| following.coder.preserves_size());
+                    eager_final_output
+                        .then_some(step.output)
+                        .and_then(|output| match output {
+                            OutputSize::Known(size) => Some(size),
+                            OutputSize::Unknown => None,
+                        })
+                })
+            }
+        }
+    }
+
     pub(super) fn materialize(self, password: Option<&str>) -> Result<Vec<u8>, R7zError> {
         let limit = self.memory.output_limit()?;
         let mut reader = self.start(password)?;
@@ -725,6 +768,20 @@ mod tests {
         ];
         for (folder, outputs, packed, expected) in layouts {
             let graph = folder.graph().unwrap();
+            assert!(matches!(
+                DecoderPlan::compile_with_working_set_limit(
+                    &folder,
+                    &graph,
+                    5,
+                    &outputs,
+                    &packed,
+                    Some(0),
+                ),
+                Err(R7zError::ResourceLimitExceeded {
+                    resource: "decoder working set",
+                    limit: 0,
+                })
+            ));
             let inputs = |bad_slot| {
                 packed
                     .iter()

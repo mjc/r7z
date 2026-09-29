@@ -2,8 +2,8 @@ use crate::byte_range::ArchiveSourceRange;
 use crate::entries::{Entries, Entry, EntryKind, EntryMetadata, EntrySelection};
 use crate::file_streams::{FileStream, FileStreams, FolderIndex, StreamLocation};
 use crate::folder_decode::{
-    ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderPlan, FolderLayout, FolderLayouts,
-    MetadataBudget, PackedStream, VerifiedExternalData,
+    ActiveFolder, CompletionMode, DecodedByteBudget, DecodedFolder, ExternalFolderPlan,
+    FolderLayout, FolderLayouts, MetadataBudget, PackedStream, VerifiedExternalData,
 };
 use crate::headers::{HeaderResolution, NextHeader};
 use crate::{
@@ -15,8 +15,8 @@ use memmap2::Mmap;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{fmt, sync::Mutex};
 
 /// Budget for retained header buffers, decoded external metadata, and stream slots.
 /// Extracted file data and decoder working memory have separate limits.
@@ -36,6 +36,69 @@ impl Default for ArchiveOpenOptions {
         Self {
             max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
         }
+    }
+}
+
+/// Limits applied while reading file data from an archive.
+/// The byte count spans an entire one-shot call and persists across every entry
+/// read through an `ArchiveReadSession`. It includes skipped streams needed to
+/// reach a selection, checksum drains, and eagerly decoded output.
+/// `None` leaves each optional limit unset. The retained-output limit applies
+/// only to the `Vec` returned by an in-memory extraction; writer and streaming
+/// APIs are governed by total decoded bytes and decoder working-set limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArchiveReadOptions {
+    /// Maximum estimated live decoder working set. Values above the built-in
+    /// safety cap do not raise it; `None` uses the built-in cap.
+    pub max_decoder_working_set_bytes: Option<u64>,
+    /// Maximum total decoded bytes, defaulting to no cumulative cap.
+    pub max_total_decoded_bytes: Option<u64>,
+    /// Maximum bytes returned by an in-memory extraction, defaulting to no cap.
+    pub max_retained_output_bytes: Option<u64>,
+}
+
+/// Password and limits used for one archive read operation.
+#[derive(Clone, Copy)]
+pub struct ArchiveReadConfig<'a> {
+    /// Resource limits for this operation.
+    pub options: ArchiveReadOptions,
+    password: Option<&'a str>,
+}
+
+impl Default for ArchiveReadConfig<'_> {
+    fn default() -> Self {
+        Self::new(ArchiveReadOptions::default())
+    }
+}
+
+impl<'a> ArchiveReadConfig<'a> {
+    /// Create a read configuration with no password.
+    pub fn new(options: ArchiveReadOptions) -> Self {
+        Self {
+            options,
+            password: None,
+        }
+    }
+
+    /// Supply a password for encrypted archive data.
+    pub fn with_password(mut self, password: &'a str) -> Self {
+        self.password = Some(password);
+        self
+    }
+
+    fn with_optional_password(mut self, password: Option<&'a str>) -> Self {
+        self.password = password;
+        self
+    }
+}
+
+impl fmt::Debug for ArchiveReadConfig<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArchiveReadConfig")
+            .field("options", &self.options)
+            .field("password", &self.password.map(|_| "<redacted>"))
+            .finish()
     }
 }
 
@@ -566,7 +629,8 @@ impl ArchiveReadSession<'_> {
     /// Returns selection, decode, checksum, or callback errors. An invalid index
     /// leaves the session unchanged. A valid request consumes its index even if
     /// it fails. Failed data reads discard the active decoder; later requests
-    /// may open a new decoder.
+    /// may open a new decoder. Reads can also return
+    /// [`R7zError::ResourceLimitExceeded`].
     pub fn read_entry(
         &mut self,
         index: usize,
@@ -605,7 +669,7 @@ impl ArchiveReadSession<'_> {
     /// Without a folder CRC, an unselected tail may remain unread.
     ///
     /// # Errors
-    /// Returns decoding or checksum errors. The decoder is released on both
+    /// Returns decoding, checksum, or resource-limit errors. The decoder is released on both
     /// success and failure, so independent folders can still be processed.
     pub fn finish_folder(&mut self) -> Result<(), R7zError> {
         self.decoder.finish()
@@ -614,7 +678,8 @@ impl ArchiveReadSession<'_> {
     /// Complete the last folder and close this session.
     ///
     /// # Errors
-    /// Returns errors from [`finish_folder`](Self::finish_folder).
+    /// Returns errors from [`finish_folder`](Self::finish_folder), including
+    /// [`R7zError::ResourceLimitExceeded`].
     pub fn finish(mut self) -> Result<(), R7zError> {
         self.finish_folder()
     }
@@ -627,6 +692,54 @@ fn copy_entry(reader: &mut dyn Read, writer: &mut (impl Write + ?Sized)) -> Resu
             Err(error) => R7zError::Io(error),
         }
     })
+}
+
+struct LimitedOutput {
+    bytes: Vec<u8>,
+    limit: Option<u64>,
+    limit_exceeded: bool,
+}
+
+impl LimitedOutput {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            limit_exceeded: false,
+        }
+    }
+
+    fn limit_error(&self) -> R7zError {
+        R7zError::ResourceLimitExceeded {
+            resource: "retained output",
+            limit: self.limit.expect("limit exceeded only when a limit is set"),
+        }
+    }
+}
+
+impl Write for LimitedOutput {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.map_or(buffer.len(), |limit| {
+            limit
+                .saturating_sub(self.bytes.len() as u64)
+                .min(usize::MAX as u64) as usize
+        });
+        let length = buffer.len().min(remaining);
+        self.bytes.extend_from_slice(&buffer[..length]);
+
+        if length < buffer.len() {
+            self.limit_exceeded = true;
+            if length == 0 {
+                return Err(std::io::Error::other("retained output limit exceeded"));
+            }
+        }
+
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Marks read failures so copying can distinguish them from writer failures.
@@ -842,7 +955,10 @@ impl Archive {
         let (base_offset, signature) = source.find_signature(DEFAULT_MAX_METADATA_BYTES)?;
 
         if signature.next_header_size > options.max_metadata_bytes {
-            return Err(R7zError::LimitExceeded("metadata"));
+            return Err(R7zError::ResourceLimitExceeded {
+                resource: "metadata",
+                limit: options.max_metadata_bytes,
+            });
         }
 
         let header_start = checked_add_u64(
@@ -1046,8 +1162,27 @@ impl Archive {
     /// Returns [`R7zError::Directory`] if the entry is a directory or anti-item.
     /// Returns [`R7zError::Decompression`] if decompression fails.
     /// Returns [`R7zError::PasswordRequired`] if the archive is encrypted.
+    /// Returns [`R7zError::ResourceLimitExceeded`] if a decoder resource cap is exceeded.
     pub fn extract_to_memory(&self, file_index: usize) -> Result<Vec<u8>, R7zError> {
-        self.extract_to_memory_with_password(file_index, None)
+        self.extract_to_memory_with_options(file_index, ArchiveReadConfig::default())
+    }
+
+    /// Extract one entry to memory with the supplied read configuration.
+    ///
+    /// # Errors
+    /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
+    pub fn extract_to_memory_with_options(
+        &self,
+        file_index: usize,
+        config: ArchiveReadConfig<'_>,
+    ) -> Result<Vec<u8>, R7zError> {
+        let mut output = LimitedOutput::new(config.options.max_retained_output_bytes);
+        let result = self.extract_to_writer_with_options(file_index, &mut output, config);
+        if output.limit_exceeded {
+            return Err(output.limit_error());
+        }
+        result?;
+        Ok(output.bytes)
     }
 
     /// Extract a single file by index, supplying a password for encrypted archives.
@@ -1056,15 +1191,17 @@ impl Archive {
     ///
     /// Returns [`R7zError::PasswordRequired`] if the file is encrypted and no
     /// password is supplied, or [`R7zError::Decompression`] if decryption/
-    /// decompression fails (e.g. wrong password).
+    /// decompression fails (e.g. wrong password). Returns
+    /// [`R7zError::ResourceLimitExceeded`] if a decoder resource cap is exceeded.
     pub fn extract_to_memory_with_password(
         &self,
         file_index: usize,
         password: Option<&str>,
     ) -> Result<Vec<u8>, R7zError> {
-        let mut bytes = Vec::new();
-        self.extract_to_writer_with_password(file_index, &mut bytes, password)?;
-        Ok(bytes)
+        self.extract_to_memory_with_options(
+            file_index,
+            ArchiveReadConfig::default().with_optional_password(password),
+        )
     }
 
     /// Extract a file selected by entry name to memory.
@@ -1078,7 +1215,20 @@ impl Archive {
     /// Returns [`R7zError::EntryNotFound`] if no entry matches `name`; otherwise
     /// returns the same errors as [`extract_to_memory`](Self::extract_to_memory).
     pub fn extract_to_memory_by_name(&self, name: &str) -> Result<Vec<u8>, R7zError> {
-        self.extract_to_memory_by_name_with_password(name, None)
+        self.extract_to_memory_by_name_with_options(name, ArchiveReadConfig::default())
+    }
+
+    /// Extract a file selected by name with the supplied read configuration.
+    ///
+    /// # Errors
+    /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
+    pub fn extract_to_memory_by_name_with_options(
+        &self,
+        name: &str,
+        config: ArchiveReadConfig<'_>,
+    ) -> Result<Vec<u8>, R7zError> {
+        let index = self.entry_index_by_name(name)?;
+        self.extract_to_memory_with_options(index, config)
     }
 
     /// Extract a file selected by entry name to memory, supplying a password for
@@ -1094,8 +1244,10 @@ impl Archive {
         name: &str,
         password: Option<&str>,
     ) -> Result<Vec<u8>, R7zError> {
-        let index = self.entry_index_by_name(name)?;
-        self.extract_to_memory_with_password(index, password)
+        self.extract_to_memory_by_name_with_options(
+            name,
+            ArchiveReadConfig::default().with_optional_password(password),
+        )
     }
 
     /// Extract a single file by index into a writer.
@@ -1108,13 +1260,38 @@ impl Archive {
     ///
     /// Returns the same archive, codec, and CRC errors as
     /// [`extract_to_memory`](Self::extract_to_memory), plus [`R7zError::Io`] for
-    /// writer failures.
+    /// writer failures and [`R7zError::ResourceLimitExceeded`] for decoder caps.
     pub fn extract_to_writer<W: Write + ?Sized>(
         &self,
         file_index: usize,
         writer: &mut W,
     ) -> Result<u64, R7zError> {
-        self.extract_to_writer_with_password(file_index, writer, None)
+        self.extract_to_writer_with_options(file_index, writer, ArchiveReadConfig::default())
+    }
+
+    /// Extract one entry with a password and resource limits.
+    ///
+    /// # Errors
+    /// Returns [`R7zError::ResourceLimitExceeded`] if a decoder limit is exceeded.
+    pub fn extract_to_writer_with_options<W: Write + ?Sized>(
+        &self,
+        file_index: usize,
+        writer: &mut W,
+        config: ArchiveReadConfig<'_>,
+    ) -> Result<u64, R7zError> {
+        let entry = Entries::new(self.try_files_info()?, self.num_files())
+            .nth(file_index)
+            .ok_or(R7zError::Parse)?;
+        match entry.kind {
+            EntryKind::Directory | EntryKind::Anti => return Err(R7zError::Directory),
+            EntryKind::EmptyFile | EntryKind::EmptySymlink => return Ok(0),
+            EntryKind::File(()) | EntryKind::Symlink(()) => {}
+        }
+
+        let mut session = self.read_session_with_options(config)?;
+        let written = session.extract_to_writer(file_index, writer)?;
+        session.finish()?;
+        Ok(written)
     }
 
     /// Extract a file selected by entry name into a writer.
@@ -1132,7 +1309,21 @@ impl Archive {
         name: &str,
         writer: &mut W,
     ) -> Result<u64, R7zError> {
-        self.extract_by_name_with_password(name, writer, None)
+        self.extract_by_name_with_options(name, writer, ArchiveReadConfig::default())
+    }
+
+    /// Extract a file selected by name to a writer with the supplied read configuration.
+    ///
+    /// # Errors
+    /// Returns [`R7zError::ResourceLimitExceeded`] if the decoded-byte limit is exceeded.
+    pub fn extract_by_name_with_options<W: Write + ?Sized>(
+        &self,
+        name: &str,
+        writer: &mut W,
+        config: ArchiveReadConfig<'_>,
+    ) -> Result<u64, R7zError> {
+        let index = self.entry_index_by_name(name)?;
+        self.extract_to_writer_with_options(index, writer, config)
     }
 
     /// Extract a file selected by entry name into a writer, supplying a password
@@ -1149,8 +1340,11 @@ impl Archive {
         writer: &mut W,
         password: Option<&str>,
     ) -> Result<u64, R7zError> {
-        let index = self.entry_index_by_name(name)?;
-        self.extract_to_writer_with_password(index, writer, password)
+        self.extract_by_name_with_options(
+            name,
+            writer,
+            ArchiveReadConfig::default().with_optional_password(password),
+        )
     }
 
     /// Extract a single file by index into a writer, supplying a password for
@@ -1172,19 +1366,11 @@ impl Archive {
         writer: &mut W,
         password: Option<&str>,
     ) -> Result<u64, R7zError> {
-        let entry = Entries::new(self.try_files_info()?, self.num_files())
-            .nth(file_index)
-            .ok_or(R7zError::Parse)?;
-        match entry.kind {
-            EntryKind::Directory | EntryKind::Anti => return Err(R7zError::Directory),
-            EntryKind::EmptyFile | EntryKind::EmptySymlink => return Ok(0),
-            EntryKind::File(()) | EntryKind::Symlink(()) => {}
-        }
-
-        let mut session = self.read_session(password)?;
-        let written = session.extract_to_writer(file_index, writer)?;
-        session.finish()?;
-        Ok(written)
+        self.extract_to_writer_with_options(
+            file_index,
+            writer,
+            ArchiveReadConfig::default().with_optional_password(password),
+        )
     }
 
     /// Start forward-only reads that reuse solid-folder decoders between entries.
@@ -1193,9 +1379,24 @@ impl Archive {
     ///
     /// # Errors
     /// Returns malformed file/stream layout or packed-source range errors.
+    /// Entry reads may also return [`R7zError::ResourceLimitExceeded`].
     pub fn read_session<'a>(
         &'a self,
         password: Option<&'a str>,
+    ) -> Result<ArchiveReadSession<'a>, R7zError> {
+        self.read_session_with_options(
+            ArchiveReadConfig::default().with_optional_password(password),
+        )
+    }
+
+    /// Start a forward-only read session with the supplied limits.
+    ///
+    /// # Errors
+    /// Returns archive layout or packed-source errors. A read operation may
+    /// later return [`R7zError::ResourceLimitExceeded`].
+    pub fn read_session_with_options<'a>(
+        &'a self,
+        config: ArchiveReadConfig<'a>,
     ) -> Result<ArchiveReadSession<'a>, R7zError> {
         let files = FileStreams::new(
             self.try_files_info()?,
@@ -1205,8 +1406,10 @@ impl Archive {
         let decoder = EntryDecoder {
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
-            password,
+            password: config.password,
             mode: CompletionMode::SelectedStreams,
+            max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
+            budget: DecodedByteBudget::new(config.options.max_total_decoded_bytes),
         };
         Ok(ArchiveReadSession {
             files,
@@ -1226,12 +1429,27 @@ impl Archive {
     ///
     /// # Errors
     ///
-    /// Returns archive parse, codec, password, CRC, and callback errors.
+    /// Returns archive parse, codec, password, CRC, resource-limit, and callback
+    /// errors.
     pub fn stream_files<F>(&self, callback: F) -> Result<(), R7zError>
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
-        self.stream_files_with_password(None, callback)
+        self.stream_files_with_options(ArchiveReadConfig::default(), callback)
+    }
+
+    /// Stream every file-like entry with the supplied read configuration.
+    ///
+    /// Returns [`R7zError::ResourceLimitExceeded`] when a limit is exceeded.
+    pub fn stream_files_with_options<F>(
+        &self,
+        config: ArchiveReadConfig<'_>,
+        callback: F,
+    ) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        self.stream_files_impl(None, config, callback)
     }
 
     /// Stream every file-like entry through `callback`, supplying a password for
@@ -1241,7 +1459,8 @@ impl Archive {
     ///
     /// Returns [`R7zError::PasswordRequired`] if encrypted with no password,
     /// [`R7zError::Crc`] for digest mismatches, [`R7zError::Decompression`] for
-    /// codec failures, or any error returned by the callback.
+    /// codec failures, [`R7zError::ResourceLimitExceeded`] for decoder caps, or
+    /// any error returned by the callback.
     pub fn stream_files_with_password<F>(
         &self,
         password: Option<&str>,
@@ -1250,7 +1469,10 @@ impl Archive {
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
-        self.stream_files_impl(None, password, callback)
+        self.stream_files_with_options(
+            ArchiveReadConfig::default().with_optional_password(password),
+            callback,
+        )
     }
 
     /// Stream the selected file-like entries through `callback` in archive order,
@@ -1274,7 +1496,22 @@ impl Archive {
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
-        self.stream_selected_files_with_password(indices, None, callback)
+        self.stream_selected_files_with_options(indices, ArchiveReadConfig::default(), callback)
+    }
+
+    /// Stream selected entries with the supplied read configuration.
+    ///
+    /// Returns [`R7zError::ResourceLimitExceeded`] when a limit is exceeded.
+    pub fn stream_selected_files_with_options<F>(
+        &self,
+        indices: &[usize],
+        config: ArchiveReadConfig<'_>,
+        callback: F,
+    ) -> Result<(), R7zError>
+    where
+        F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    {
+        self.stream_files_impl(Some(indices), config, callback)
     }
 
     /// Stream selected file-like entries, supplying a password for encrypted
@@ -1300,13 +1537,17 @@ impl Archive {
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
-        self.stream_files_impl(Some(indices), password, callback)
+        self.stream_selected_files_with_options(
+            indices,
+            ArchiveReadConfig::default().with_optional_password(password),
+            callback,
+        )
     }
 
     fn stream_files_impl<F>(
         &self,
         indices: Option<&[usize]>,
-        password: Option<&str>,
+        config: ArchiveReadConfig<'_>,
         callback: F,
     ) -> Result<(), R7zError>
     where
@@ -1314,16 +1555,13 @@ impl Archive {
     {
         match EntrySelection::new(indices, self.num_files())? {
             EntrySelection::Empty => Ok(()),
-            selected @ EntrySelection::All(_) => self.stream_entry_selection(
-                selected,
-                CompletionMode::WholeFolder,
-                password,
-                callback,
-            ),
+            selected @ EntrySelection::All(_) => {
+                self.stream_entry_selection(selected, CompletionMode::WholeFolder, config, callback)
+            }
             selected @ EntrySelection::Selected { .. } => self.stream_entry_selection(
                 selected,
                 CompletionMode::SelectedStreams,
-                password,
+                config,
                 callback,
             ),
         }
@@ -1333,7 +1571,7 @@ impl Archive {
         &self,
         selected: EntrySelection<'_>,
         mode: CompletionMode,
-        password: Option<&str>,
+        config: ArchiveReadConfig<'_>,
         mut callback: impl FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<(), R7zError> {
         let files = FileStreams::new(
@@ -1344,8 +1582,10 @@ impl Archive {
         let mut decoder = EntryDecoder {
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
-            password,
+            password: config.password,
             mode,
+            max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
+            budget: DecodedByteBudget::new(config.options.max_total_decoded_bytes),
         };
         files
             .map_selected(selected, |file| {
@@ -1359,6 +1599,18 @@ impl Archive {
     }
 
     pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
+        self.symlink_target_with_options(file_index, ArchiveReadConfig::default())
+    }
+
+    /// Read a symlink target with the supplied read configuration.
+    ///
+    /// # Errors
+    /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
+    pub fn symlink_target_with_options(
+        &self,
+        file_index: usize,
+        config: ArchiveReadConfig<'_>,
+    ) -> Result<Option<String>, R7zError> {
         let Some(entry) = Entries::new(self.try_files_info()?, self.num_files()).nth(file_index)
         else {
             return Ok(None);
@@ -1368,7 +1620,7 @@ impl Archive {
             _ => return Ok(None),
         }
 
-        let target = self.extract_to_memory(file_index)?;
+        let target = self.extract_to_memory_with_options(file_index, config)?;
         String::from_utf8(target)
             .map(Some)
             .map_err(|_| R7zError::Parse)
@@ -1459,7 +1711,35 @@ impl Archive {
     /// Returns [`R7zError::Io`] if a file or directory cannot be created, or any error
     /// that [`stream_files`](Self::stream_files) can return.
     pub fn extract_all(&self, dest: &Path) -> Result<(), R7zError> {
-        self.extract_all_with_password(dest, None)
+        self.extract_all_with_options(dest, ArchiveReadConfig::default())
+    }
+
+    /// Extract every file with the supplied read configuration.
+    ///
+    /// # Errors
+    /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
+    pub fn extract_all_with_options(
+        &self,
+        dest: &Path,
+        config: ArchiveReadConfig<'_>,
+    ) -> Result<(), R7zError> {
+        for entry in Entries::new(self.try_files_info()?, self.num_files()) {
+            if matches!(entry.kind, EntryKind::Directory) {
+                let dest_path = dest.join(safe_archive_name(&entry.metadata.name())?);
+                std::fs::create_dir_all(&dest_path)?;
+            }
+        }
+
+        self.stream_files_with_options(config, |entry, reader| {
+            let dest_path = dest.join(safe_archive_name(&entry.name)?);
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent).map_err(R7zError::Io)?;
+            }
+            let file = std::fs::File::create(&dest_path).map_err(R7zError::Io)?;
+            let mut writer = BufWriter::new(file);
+            std::io::copy(reader, &mut writer).map_err(R7zError::Io)?;
+            writer.flush().map_err(R7zError::Io)
+        })
     }
 
     /// Extract all files to a directory, supplying a password for encrypted archives.
@@ -1474,23 +1754,10 @@ impl Archive {
         dest: &Path,
         password: Option<&str>,
     ) -> Result<(), R7zError> {
-        for entry in Entries::new(self.try_files_info()?, self.num_files()) {
-            if matches!(entry.kind, EntryKind::Directory) {
-                let dest_path = dest.join(safe_archive_name(&entry.metadata.name())?);
-                std::fs::create_dir_all(&dest_path)?;
-            }
-        }
-
-        self.stream_files_with_password(password, |entry, reader| {
-            let dest_path = dest.join(safe_archive_name(&entry.name)?);
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent).map_err(R7zError::Io)?;
-            }
-            let file = std::fs::File::create(&dest_path).map_err(R7zError::Io)?;
-            let mut writer = BufWriter::new(file);
-            std::io::copy(reader, &mut writer).map_err(R7zError::Io)?;
-            writer.flush().map_err(R7zError::Io)
-        })
+        self.extract_all_with_options(
+            dest,
+            ArchiveReadConfig::default().with_optional_password(password),
+        )
     }
 }
 
@@ -1525,9 +1792,12 @@ fn decode_encoded_header(
     password: Option<&str>,
     budget: MetadataBudget,
 ) -> Result<Header, R7zError> {
-    let folder = encoded.folder(budget.remaining())?;
+    let folder = encoded
+        .folder(budget.remaining())
+        .map_err(|error| budget.map_error(error))?;
     let packs = PackedSource::new(source, base_offset, encoded.pack_info.pack_pos)?;
-    let decoded = decode_metadata_folder(&packs, folder, password, budget.remaining())?;
+    let decoded = decode_metadata_folder(&packs, folder, password, budget.remaining())
+        .map_err(|error| budget.map_error(error))?;
     parse_header_with_external_data(source, base_offset, decoded.as_bytes(), budget, password)
 }
 
@@ -1625,6 +1895,8 @@ struct EntryDecoder<'a> {
     current: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
     password: Option<&'a str>,
     mode: CompletionMode,
+    max_decoder_working_set_bytes: Option<u64>,
+    budget: DecodedByteBudget,
 }
 
 impl<'a> EntryDecoder<'a> {
@@ -1652,13 +1924,16 @@ impl<'a> EntryDecoder<'a> {
                 self.complete(previous)?;
                 location
                     .folder
-                    .bind(|stream| self.source.reader(&stream))?
-                    .start(self.password)?
+                    .bind(
+                        |stream| self.source.reader(&stream),
+                        self.max_decoder_working_set_bytes,
+                    )?
+                    .start(self.password, &mut self.budget)?
             }
         };
         let active = active
-            .skip_to(location.stream_index.get())?
-            .read_stream(callback)?;
+            .skip_to(location.stream_index.get(), &mut self.budget)?
+            .read_stream(&mut self.budget, callback)?;
         self.current = Some((location.folder_index, active));
         Ok(())
     }
@@ -1670,11 +1945,11 @@ impl<'a> EntryDecoder<'a> {
 
     /// Consumes the detached folder on success or failure, including during a switch.
     fn complete(
-        &self,
+        &mut self,
         active: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
     ) -> Result<(), R7zError> {
         active
-            .map(|(_, folder)| folder.finish(self.mode))
+            .map(|(_, folder)| folder.finish(self.mode, &mut self.budget))
             .transpose()
             .map(|_| ())
     }
@@ -1687,7 +1962,7 @@ fn decode_metadata_folder<'a>(
     metadata_limit: u64,
 ) -> Result<DecodedFolder<'a>, R7zError> {
     folder
-        .bind(|stream| packs.reader(&stream))?
+        .bind(|stream| packs.reader(&stream), None)?
         .collect(password, metadata_limit)
 }
 
@@ -1939,7 +2214,7 @@ fn ensure_packed_bytes_limit(packed_bytes: u64) -> Result<(), R7zError> {
     if packed_bytes > limit {
         return Err(R7zError::ResourceLimitExceeded {
             resource: "packed folder buffers",
-            limit: codec::MAX_BUFFERED_PACKED_FOLDER_BYTES,
+            limit: codec::MAX_BUFFERED_PACKED_FOLDER_BYTES as u64,
         });
     }
     Ok(())
@@ -1996,7 +2271,10 @@ fn has_windows_prefix(name: &str) -> bool {
 #[cfg(test)]
 mod selected_stream_tests {
     use super::*;
-    use crate::{ArchiveBuilder, ArchiveOptions, Codec, CompressionOptions, EntryMeta, SolidMode};
+    use crate::{
+        ArchiveBuilder, ArchiveOptions, Codec, CompressionOptions, EncryptionOptions, EntryMeta,
+        SolidMode,
+    };
     use std::num::NonZeroU64;
 
     struct ErrorsThenData {
@@ -2196,6 +2474,181 @@ mod selected_stream_tests {
     }
 
     #[test]
+    fn decoded_byte_limit_carries_across_folder_transitions() {
+        let archive = ArchiveBuilder::new()
+            .options(ArchiveOptions {
+                compression: CompressionOptions {
+                    solid: SolidMode::NonSolid,
+                    ..CompressionOptions::default()
+                },
+                ..ArchiveOptions::default()
+            })
+            .compression(Codec::Copy)
+            .add_file("first", b"1234")
+            .add_file("second", b"5678")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(archive.into()).unwrap();
+        assert_eq!(archive.listing(None).unwrap().blocks, 2);
+        let mut visited = Vec::new();
+
+        let result = archive.stream_selected_files_with_options(
+            &[0, 1],
+            ArchiveReadConfig::new(ArchiveReadOptions {
+                max_decoder_working_set_bytes: None,
+                max_total_decoded_bytes: Some(6),
+                max_retained_output_bytes: None,
+            }),
+            |entry, reader| {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                visited.push((entry.index, bytes.len()));
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "total decoded output",
+                limit: 6,
+            })
+        ));
+        assert_eq!(visited, [(0, 4)]);
+    }
+
+    #[test]
+    fn read_config_debug_redacts_password() {
+        let debug = format!("{:?}", ArchiveReadConfig::default().with_password("secret"));
+
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn decoder_working_set_limit_is_checked_before_reading() {
+        let bytes = ArchiveBuilder::new()
+            .add_file("payload", b"decoder working set")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let mut callback_called = false;
+
+        let result = archive.stream_selected_files_with_options(
+            &[0],
+            ArchiveReadConfig::new(ArchiveReadOptions {
+                max_decoder_working_set_bytes: Some(0),
+                ..ArchiveReadOptions::default()
+            }),
+            |_, _| {
+                callback_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "decoder working set",
+                limit: 0,
+            })
+        ));
+        assert!(!callback_called);
+    }
+
+    #[test]
+    fn retained_output_limit_is_separate_from_decoded_byte_limit() {
+        let bytes = ArchiveBuilder::new()
+            .compression(Codec::Copy)
+            .add_file("payload", b"1234")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+
+        let result = archive.extract_to_memory_with_options(
+            0,
+            ArchiveReadConfig::new(ArchiveReadOptions {
+                max_decoder_working_set_bytes: None,
+                max_total_decoded_bytes: None,
+                max_retained_output_bytes: Some(2),
+            }),
+        );
+
+        assert!(matches!(
+            result,
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "retained output",
+                limit: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn decoded_byte_limit_precharges_eager_aes_output() {
+        let bytes = ArchiveBuilder::new()
+            .options(ArchiveOptions {
+                codec: Codec::Copy,
+                encryption: Some(EncryptionOptions {
+                    password: "secret".to_string(),
+                    encrypt_header: false,
+                    num_cycles_power: 0,
+                    salt_len: 0,
+                    iv_len: 16,
+                }),
+                ..ArchiveOptions::default()
+            })
+            .add_file("payload", b"1234")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let mut callback_called = false;
+
+        let result = archive.stream_selected_files_with_options(
+            &[0],
+            ArchiveReadConfig::new(ArchiveReadOptions {
+                max_decoder_working_set_bytes: None,
+                max_total_decoded_bytes: Some(2),
+                max_retained_output_bytes: None,
+            })
+            .with_password("secret"),
+            |_, _| {
+                callback_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "total decoded output",
+                limit: 2,
+            })
+        ));
+        assert!(!callback_called);
+    }
+
+    #[test]
+    fn symlink_target_options_apply_retained_output_limit() {
+        let archive = mixed_entry_archive();
+        let result = archive.symlink_target_with_options(
+            6,
+            ArchiveReadConfig::new(ArchiveReadOptions {
+                max_decoder_working_set_bytes: None,
+                max_total_decoded_bytes: None,
+                max_retained_output_bytes: Some(2),
+            }),
+        );
+
+        assert!(matches!(
+            result,
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "retained output",
+                limit: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn metadata_budget_is_shared_by_headers_external_bytes_and_slots() {
         for encoded in [false, true] {
             let (bytes, required) = archive_with_external_folder_metadata(encoded);
@@ -2219,7 +2672,13 @@ mod selected_stream_tests {
                     "encoded={encoded}, seekable={seekable}"
                 );
                 assert!(
-                    matches!(open(required - 1), Err(R7zError::LimitExceeded("metadata"))),
+                    matches!(
+                        open(required - 1),
+                        Err(R7zError::ResourceLimitExceeded {
+                            resource: "metadata",
+                            limit,
+                        }) if limit == required - 1
+                    ),
                     "encoded={encoded}, seekable={seekable}"
                 );
             }
