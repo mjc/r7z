@@ -1515,6 +1515,9 @@ impl Archive {
 
     /// Extract every file with the supplied read configuration.
     ///
+    /// Writes are resolved relative to an open handle for `dest`. If a symlink
+    /// redirects a path outside that directory, the write fails.
+    ///
     /// # Errors
     /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
     pub fn extract_all_with_options(
@@ -1522,19 +1525,23 @@ impl Archive {
         dest: &Path,
         config: ArchiveReadConfig<'_>,
     ) -> Result<(), R7zError> {
-        for entry in Entries::new(self.try_files_info()?, self.num_files()) {
-            if matches!(entry.kind, EntryKind::Directory) {
-                let dest_path = dest.join(safe_archive_name(&entry.metadata.name())?);
-                std::fs::create_dir_all(&dest_path)?;
-            }
-        }
+        let dest = crate::extraction::open_destination(dest)?;
+        Entries::new(self.try_files_info()?, self.num_files())
+            .filter(|entry| matches!(entry.kind, EntryKind::Directory))
+            .try_for_each(|entry| {
+                dest.create_dir_all(safe_archive_name(&entry.metadata.name())?)?;
+                Ok::<_, R7zError>(())
+            })?;
 
         self.stream_files_with_options(config, |entry, reader| {
-            let dest_path = dest.join(safe_archive_name(&entry.name)?);
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent).map_err(R7zError::Io)?;
+            let dest_path = safe_archive_name(&entry.name)?;
+            if let Some(parent) = dest_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                dest.create_dir_all(parent).map_err(R7zError::Io)?;
             }
-            let file = std::fs::File::create(&dest_path).map_err(R7zError::Io)?;
+            let file = crate::extraction::create_file(&dest, &dest_path).map_err(R7zError::Io)?;
             let mut writer = BufWriter::new(file);
             std::io::copy(reader, &mut writer).map_err(R7zError::Io)?;
             writer.flush().map_err(R7zError::Io)

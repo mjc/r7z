@@ -1,3 +1,4 @@
+use cap_std::fs::Dir;
 use chrono::{DateTime, Local};
 use r7z::{
     Archive, ArchiveEntryIndex, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec,
@@ -14,7 +15,7 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     num::NonZeroU64,
     ops::ControlFlow,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -939,12 +940,13 @@ fn extract_archive_with_ui(
     ui: &mut impl OverwriteUi,
 ) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
-    fs::create_dir_all(&cli.output_dir)?;
+    let destination = open_destination(&cli.output_dir)?;
     let selected = EntryPatterns::from_paths(&cli.operands);
     match selected.resolve_entries(&archive) {
         Some(entries) => {
             let mut extraction = Extraction {
                 archive: &archive,
+                destination: &destination,
                 password: cli.password.as_deref(),
                 session: None,
                 overwrite_mode: cli.overwrite_mode,
@@ -988,6 +990,7 @@ enum ExtractionKind {
 /// An actionable entry with a destination checked for the selected extraction mode.
 struct ExtractionTarget {
     path: PathBuf,
+    relative_path: PathBuf,
     kind: ExtractionKind,
 }
 
@@ -1007,29 +1010,39 @@ impl ExtractionTarget {
                 ExtractionKind::File(FileContents::Stream(entry.index))
             }
         };
-        let path = if flat {
-            Path::new(&entry.name)
-                .file_name()
-                .filter(|part| !part.is_empty())
-                .map(|name| output_dir.join(name))
-                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))
-        } else {
-            safe_join(output_dir, &entry.name)
-        };
-        match (path, kind, flat) {
+        let target = r7z::safe_archive_name(&entry.name)
+            .map_err(CliError::Fatal)
+            .and_then(|safe_name| {
+                if flat {
+                    safe_name
+                        .file_name()
+                        .filter(|part| !part.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))
+                } else {
+                    Ok(safe_name)
+                }
+            })
+            .map(|relative_path| (output_dir.join(&relative_path), relative_path));
+        match (target, kind, flat) {
             (Err(error), _, _) => Some(Err(error)),
             (Ok(_), ExtractionKind::Directory, true) => None,
-            (Ok(path), kind, _) => Some(Ok(Self { path, kind })),
+            (Ok((path, relative_path)), kind, _) => Some(Ok(Self {
+                path,
+                relative_path,
+                kind,
+            })),
         }
     }
 
     fn prepare(
         &self,
+        destination: &Dir,
         mode: &mut OverwriteMode,
         assume_yes: bool,
         ui: &mut impl OverwriteUi,
     ) -> Result<CollisionAction, CliError> {
-        match (self.kind, Destination::at(&self.path)) {
+        match (self.kind, Destination::at(destination, &self.relative_path)) {
             (_, Destination::Missing) | (ExtractionKind::Directory, Destination::Directory) => {
                 Ok(CollisionAction::Overwrite)
             }
@@ -1040,7 +1053,7 @@ impl ExtractionTarget {
             (_, Destination::Other) => {
                 let action = decide_overwrite(mode, assume_yes, ui, &self.path)?;
                 if matches!(action, CollisionAction::Overwrite) {
-                    fs::remove_file(&self.path)?;
+                    destination.remove_file(&self.relative_path)?;
                 }
                 Ok(action)
             }
@@ -1055,8 +1068,8 @@ enum Destination {
 }
 
 impl Destination {
-    fn at(path: &Path) -> Self {
-        match fs::symlink_metadata(path) {
+    fn at(destination: &Dir, path: &Path) -> Self {
+        match destination.symlink_metadata(path) {
             Ok(metadata) => match metadata.is_dir() {
                 true => Self::Directory,
                 false => Self::Other,
@@ -1069,6 +1082,7 @@ impl Destination {
 /// Owns overwrite decisions and opens a decoder only when a data file is written.
 struct Extraction<'a, U> {
     archive: &'a Archive,
+    destination: &'a Dir,
     password: Option<&'a str>,
     session: Option<r7z::ArchiveReadSession<'a>>,
     overwrite_mode: OverwriteMode,
@@ -1078,17 +1092,32 @@ struct Extraction<'a, U> {
 
 impl<U: OverwriteUi> Extraction<'_, U> {
     fn write(&mut self, target: ExtractionTarget) -> Result<ControlFlow<(), u8>, CliError> {
-        match target.prepare(&mut self.overwrite_mode, self.assume_yes, self.ui)? {
+        match target.prepare(
+            self.destination,
+            &mut self.overwrite_mode,
+            self.assume_yes,
+            self.ui,
+        )? {
             CollisionAction::Skip { warning } => Ok(ControlFlow::Continue(u8::from(warning))),
             CollisionAction::Quit => Ok(ControlFlow::Break(())),
             CollisionAction::Overwrite => {
                 match target.kind {
-                    ExtractionKind::Directory => fs::create_dir_all(&target.path)?,
+                    ExtractionKind::Directory => {
+                        self.destination.create_dir_all(&target.relative_path)?;
+                    }
                     ExtractionKind::File(contents) => {
-                        if let Some(parent) = target.path.parent() {
-                            fs::create_dir_all(parent)?;
+                        if let Some(parent) = target
+                            .relative_path
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                        {
+                            self.destination.create_dir_all(parent)?;
                         }
-                        let mut file = fs::File::create(&target.path)?;
+                        let mut options = cap_std::fs::OpenOptions::new();
+                        options.write(true).create_new(true);
+                        let mut file = self
+                            .destination
+                            .open_with(&target.relative_path, &options)?;
                         match contents {
                             FileContents::Empty => {}
                             FileContents::Stream(index) => {
@@ -1912,20 +1941,9 @@ fn archive_name_to_string(path: &Path) -> Result<String, CliError> {
     }
 }
 
-fn safe_join(root: &Path, name: &str) -> Result<PathBuf, CliError> {
-    let path = Path::new(name);
-    if path.is_absolute() {
-        return Err(CliError::Fatal(R7zError::UnsafePath(name.to_string())));
-    }
-    let mut out = root.to_path_buf();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => return Err(CliError::Fatal(R7zError::UnsafePath(name.to_string()))),
-        }
-    }
-    Ok(out)
+fn open_destination(path: &Path) -> io::Result<Dir> {
+    Dir::create_ambient_dir_all(path, cap_std::ambient_authority())?;
+    Dir::open_ambient_dir(path, cap_std::ambient_authority())
 }
 
 fn open_archive(cli: &Cli) -> Result<Archive, CliError> {

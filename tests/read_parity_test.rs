@@ -262,6 +262,49 @@ fn extract_all_rejects_windows_prefixed_path() {
     assert!(matches!(err, r7z::R7zError::UnsafePath(path) if path == "C:\\evil.txt"));
 }
 
+#[cfg(unix)]
+#[test]
+fn extract_all_does_not_follow_a_parent_symlink_outside_destination() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("nested/escaped.txt", b"must stay in destination")
+        .build()
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let destination = tmp.path().join("destination");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, destination.join("nested")).unwrap();
+
+    assert!(archive.extract_all(&destination).is_err());
+    assert!(!outside.join("escaped.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_all_replaces_hard_links_without_modifying_the_linked_file() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("entry.txt", b"archive contents")
+        .build()
+        .unwrap();
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let destination = tmp.path().join("destination");
+    let outside = tmp.path().join("outside.txt");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(&outside, b"outside contents").unwrap();
+    std::fs::hard_link(&outside, destination.join("entry.txt")).unwrap();
+
+    archive.extract_all(&destination).unwrap();
+
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside contents");
+    assert_eq!(
+        std::fs::read(destination.join("entry.txt")).unwrap(),
+        b"archive contents"
+    );
+}
+
 #[test]
 fn safe_archive_name_normalizes_separators_and_rejects_unsafe_names() {
     assert_eq!(

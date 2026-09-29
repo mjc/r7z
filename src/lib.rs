@@ -69,6 +69,7 @@ mod coder_info;
 mod delta;
 mod entries;
 mod error;
+mod extraction;
 mod file_streams;
 mod files_info;
 mod folder;
