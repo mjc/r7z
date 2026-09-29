@@ -1,7 +1,9 @@
 use crate::archive_source::{ArchiveRangeReader, ArchiveSource, find_magic_offsets};
 use crate::byte_range::ArchiveSourceRange;
 use crate::entries::{Entries, Entry, EntryKind, EntryMetadata, EntrySelection};
-use crate::file_streams::{FileStream, FileStreams, FolderIndex, StreamLocation};
+use crate::file_streams::{
+    FileStream, FileStreams, FolderIndex as ReadFolderIndex, StreamLocation,
+};
 use crate::folder_decode::{
     ActiveFolder, CompletionMode, DecodedByteBudget, DecodedFolder, ExternalFolderPlan,
     FolderLayout, FolderLayouts, MetadataBudget, PackedStream, VerifiedExternalData,
@@ -19,6 +21,7 @@ use std::io::SeekFrom;
 use std::io::{BufWriter, Read, Seek, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Budget for retained header buffers, decoded external metadata, and stream slots.
@@ -146,6 +149,7 @@ impl ArchiveMetadata {
 /// Fully decoded archive with file listing and extraction support.
 pub struct Archive {
     source: ArchiveSource,
+    identity: Arc<()>,
     base_offset: u64,
     pub signature: SignatureHeader,
     /// Present for `EncodedHeader` archives; None for uncompressed-header archives.
@@ -437,16 +441,81 @@ impl Read for EntryReader<'_> {
     }
 }
 
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
+/// Packed bytes and folder metadata copied from an [`Archive`] without decoding.
 pub struct RawFolderBlock {
+    /// Zero-based index of this folder in the source archive.
     pub folder_index: usize,
+    /// Serialized folder coder metadata.
     pub folder_info: Vec<u8>,
+    /// Packed data, with one byte vector per packed stream.
     pub packed_streams: Vec<Vec<u8>>,
+    /// Serialized sizes corresponding to `packed_streams`.
     pub pack_sizes: Vec<u64>,
+    /// Unpacked sizes for the folder's coder streams.
     pub coder_unpack_sizes: Vec<u64>,
+    /// Folder checksum, when present.
     pub folder_crc: Option<u32>,
+    handle: RawFolderHandle,
 }
+
+impl RawFolderBlock {
+    #[must_use]
+    pub fn handle(&self) -> RawFolderHandle {
+        self.handle.clone()
+    }
+}
+
+/// Zero-based folder index scoped to one archive.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FolderIndex(usize);
+
+impl FolderIndex {
+    #[must_use]
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Opaque reference to a raw folder owned by a specific [`Archive`].
+#[derive(Clone)]
+pub struct RawFolderHandle {
+    archive_identity: Arc<()>,
+    index: FolderIndex,
+}
+
+impl RawFolderHandle {
+    #[must_use]
+    pub const fn index(&self) -> FolderIndex {
+        self.index
+    }
+
+    pub(crate) fn belongs_to(&self, archive: &Archive) -> bool {
+        Arc::ptr_eq(&self.archive_identity, &archive.identity)
+    }
+}
+
+impl fmt::Debug for RawFolderHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawFolderHandle")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RawFolderHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && Arc::ptr_eq(&self.archive_identity, &other.archive_identity)
+    }
+}
+
+impl Eq for RawFolderHandle {}
 
 impl Archive {
     /// Open and fully decode a 7z archive from disk using positioned file reads.
@@ -663,6 +732,7 @@ impl Archive {
         };
         Ok(Archive {
             source,
+            identity: Arc::new(()),
             base_offset,
             signature,
             encoded_header,
@@ -788,8 +858,21 @@ impl Archive {
         })
     }
 
+    /// Return the packed data and metadata for a folder without decoding it.
+    ///
+    /// The returned handle is tied to this archive and is required when adding
+    /// the folder to an update. The packed streams are copied into bounded
+    /// buffers.
+    pub fn raw_folder(&self, folder_index: FolderIndex) -> Result<RawFolderBlock, R7zError> {
+        self.read_raw_folder_block(folder_index.get())
+    }
+
     #[doc(hidden)]
     pub fn raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {
+        self.read_raw_folder_block(folder_index)
+    }
+
+    fn read_raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {
         let streams = self.try_streams_info()?.ok_or(R7zError::Parse)?;
         let (_, unpack_info) = streams.packed_folders()?;
         let mut folders = FolderLayouts::for_streams(streams)?;
@@ -815,6 +898,10 @@ impl Archive {
             pack_sizes,
             coder_unpack_sizes: folder.coder_sizes().to_vec(),
             folder_crc: folder.crc(),
+            handle: RawFolderHandle {
+                archive_identity: Arc::clone(&self.identity),
+                index: FolderIndex::new(folder_index),
+            },
         })
     }
 
@@ -1559,7 +1646,7 @@ impl<'c, 'a> ReadableEntry<'c, 'a> {
 /// Shares file-content dispatch and folder decoder state across read APIs.
 struct EntryDecoder<'a> {
     source: PackedSource<'a>,
-    current: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
+    current: Option<(ReadFolderIndex, ActiveFolder<'a, 'a>)>,
     password: Option<&'a str>,
     mode: CompletionMode,
     max_decoder_working_set_bytes: Option<u64>,
@@ -1613,7 +1700,7 @@ impl<'a> EntryDecoder<'a> {
     /// Consumes the detached folder on success or failure, including during a switch.
     fn complete(
         &mut self,
-        active: Option<(FolderIndex, ActiveFolder<'a, 'a>)>,
+        active: Option<(ReadFolderIndex, ActiveFolder<'a, 'a>)>,
     ) -> Result<(), R7zError> {
         active
             .map(|(_, folder)| folder.finish(self.mode, &mut self.budget))

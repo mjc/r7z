@@ -6,7 +6,7 @@ mod lzma2;
 mod model;
 
 use crate::aes::Aes256CbcEncryptWriter;
-use crate::{R7zError, RawEntryName, RawFolderBlock, bcj::BcjX86Writer};
+use crate::{Archive, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle, bcj::BcjX86Writer};
 use header::{
     CoderSpec, encode_coder_info_aes_then, encode_coder_info_bcj_lzma2, encode_coder_info_copy,
     encode_coder_info_lzma, encode_coder_info_lzma2, encode_coder_info_ppmd,
@@ -27,26 +27,40 @@ pub use model::{
 
 use model::WriteEntry;
 
-#[doc(hidden)]
+/// Archive entry used by [`write_archive_update`] to retain or add an item.
 pub struct PreservedArchiveEntry {
+    /// Display name stored in the archive.
     pub name: String,
+    /// Original encoded name when retaining an existing entry.
     pub raw_name: Option<RawEntryName>,
+    /// File, directory, or anti-item kind.
     pub kind: EntryKind,
+    /// Metadata written for this entry.
     pub meta: EntryMeta,
+    /// Data source for the entry.
     pub stream: PreservedEntryStream,
 }
 
-#[doc(hidden)]
+/// Data source for an entry passed to [`write_archive_update`].
 pub enum PreservedEntryStream {
+    /// Entry has no data stream.
     None,
+    /// Data already held in memory.
     Data(Vec<u8>),
+    /// Data read from a file while writing.
     Path {
+        /// File to read.
         path: PathBuf,
+        /// Expected uncompressed size.
         size: u64,
     },
+    /// Compressed folder data retained from the source archive.
     Raw {
-        folder_id: usize,
+        /// Archive-scoped handle returned by [`RawFolderBlock::handle`].
+        folder: RawFolderHandle,
+        /// Uncompressed entry size.
         size: u64,
+        /// Entry checksum, when present.
         crc: Option<u32>,
     },
 }
@@ -684,12 +698,64 @@ pub fn build_archive_with_preserved_folders(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<Vec<u8>, R7zError> {
-    write_archive_with_preserved_folders(Cursor::new(Vec::new()), entries, raw_folders, options)
+    write_preserved_archive(Cursor::new(Vec::new()), entries, raw_folders, options)
         .map(Cursor::into_inner)
+}
+
+/// Write an updated archive while copying unchanged compressed folders from `source`.
+///
+/// Every raw folder handle must come from `source`; a handle obtained from another
+/// archive is rejected before any output is written.
+pub fn write_archive_update<W: Write + Seek>(
+    source: &Archive,
+    out: W,
+    entries: Vec<PreservedArchiveEntry>,
+    raw_folders: Vec<RawFolderBlock>,
+    options: &ArchiveOptions,
+) -> Result<W, R7zError> {
+    validate_raw_folder_ownership(source, &entries, &raw_folders)?;
+    write_preserved_archive(out, entries, raw_folders, options)
 }
 
 #[doc(hidden)]
 pub fn write_archive_with_preserved_folders<W: Write + Seek>(
+    out: W,
+    entries: Vec<PreservedArchiveEntry>,
+    raw_folders: Vec<RawFolderBlock>,
+    options: &ArchiveOptions,
+) -> Result<W, R7zError> {
+    write_preserved_archive(out, entries, raw_folders, options)
+}
+
+fn validate_raw_folder_ownership(
+    source: &Archive,
+    entries: &[PreservedArchiveEntry],
+    raw_folders: &[RawFolderBlock],
+) -> Result<(), R7zError> {
+    if raw_folders
+        .iter()
+        .any(|folder| !folder.handle().belongs_to(source))
+    {
+        return Err(R7zError::ArchiveMismatch);
+    }
+
+    for handle in entries.iter().filter_map(|entry| match &entry.stream {
+        PreservedEntryStream::Raw { folder, .. } => Some(folder),
+        PreservedEntryStream::None
+        | PreservedEntryStream::Data(_)
+        | PreservedEntryStream::Path { .. } => None,
+    }) {
+        if !handle.belongs_to(source)
+            || !raw_folders.iter().any(|folder| folder.handle() == *handle)
+        {
+            return Err(R7zError::ArchiveMismatch);
+        }
+    }
+
+    Ok(())
+}
+
+fn write_preserved_archive<W: Write + Seek>(
     out: W,
     entries: Vec<PreservedArchiveEntry>,
     raw_folders: Vec<RawFolderBlock>,
@@ -766,11 +832,11 @@ fn stage_preserved_entries(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<StagedPreserved, R7zError> {
-    let max_raw_folder = raw_folders
-        .iter()
-        .map(|folder| folder.folder_index)
-        .max()
-        .unwrap_or(0);
+    let raw_by_id = raw_folders
+        .into_iter()
+        .map(|folder| (folder.folder_index, folder))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let max_raw_folder = raw_by_id.keys().copied().max().unwrap_or(0);
     let mut next_data_folder = max_raw_folder.checked_add(1).ok_or(R7zError::Parse)?;
     let mut current_data_folder: Option<usize> = None;
     let mut current_data_files = 0u64;
@@ -788,11 +854,14 @@ fn stage_preserved_entries(
         } = entry;
         let (has_stream, folder_id, staged) = match stream {
             PreservedEntryStream::None => (false, 0, StagedStream::None),
-            PreservedEntryStream::Raw {
-                folder_id,
-                size,
-                crc,
-            } => {
+            PreservedEntryStream::Raw { folder, size, crc } => {
+                let folder_id = folder.index().get();
+                if raw_by_id
+                    .get(&folder_id)
+                    .is_none_or(|raw| raw.handle() != folder)
+                {
+                    return Err(R7zError::ArchiveMismatch);
+                }
                 current_data_folder = None;
                 current_data_files = 0;
                 current_data_bytes = 0;
@@ -841,10 +910,6 @@ fn stage_preserved_entries(
         }
     }
 
-    let raw_by_id = raw_folders
-        .into_iter()
-        .map(|folder| (folder.folder_index, folder))
-        .collect::<std::collections::BTreeMap<_, _>>();
     Ok((write_entries, streams, folder_order, raw_by_id))
 }
 

@@ -94,9 +94,10 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
     let entry = archive.entries().next().unwrap();
-    let raw = archive.raw_folder_block(0).unwrap();
+    let raw = archive.raw_folder(r7z::FolderIndex::new(0)).unwrap();
     assert!(raw.packed_streams.len() > 1);
-    let output = r7z::write_archive_with_preserved_folders(
+    let output = r7z::write_archive_update(
+        &archive,
         Cursor::new(Vec::new()),
         vec![r7z::PreservedArchiveEntry {
             name: entry.name,
@@ -104,7 +105,7 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
             kind: r7z::EntryKind::File,
             meta: r7z::EntryMeta::default(),
             stream: r7z::PreservedEntryStream::Raw {
-                folder_id: 0,
+                folder: raw.handle(),
                 size: data.len() as u64,
                 crc: Some(crc32fast::hash(&data)),
             },
@@ -115,6 +116,44 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
     .unwrap();
     let rewritten = r7z::Archive::from_bytes(output.into_inner().into()).unwrap();
     assert_eq!(rewritten.extract_to_memory(0).unwrap(), data);
+}
+
+#[test]
+fn raw_folder_handles_cannot_cross_archive_updates() {
+    let data = b"archive-owned raw data".repeat(128);
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("kept.bin", &data)
+        .build()
+        .unwrap();
+    let source = r7z::Archive::from_bytes(bytes.clone().into()).unwrap();
+    let other = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let entry = source.entries().next().unwrap();
+    let raw = other.raw_folder(r7z::FolderIndex::new(0)).unwrap();
+    let raw_handle = raw.handle();
+    let original_output = vec![0xA5; 8];
+    let mut output = Cursor::new(original_output.clone());
+
+    assert!(matches!(
+        r7z::write_archive_update(
+            &source,
+            &mut output,
+            vec![r7z::PreservedArchiveEntry {
+                name: entry.name,
+                raw_name: entry.raw_name,
+                kind: r7z::EntryKind::File,
+                meta: r7z::EntryMeta::default(),
+                stream: r7z::PreservedEntryStream::Raw {
+                    folder: raw_handle,
+                    size: data.len() as u64,
+                    crc: Some(crc32fast::hash(&data)),
+                },
+            }],
+            vec![raw],
+            &r7z::ArchiveOptions::default(),
+        ),
+        Err(r7z::R7zError::ArchiveMismatch)
+    ));
+    assert_eq!(output.into_inner(), original_output);
 }
 
 #[test]
@@ -129,7 +168,7 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
 
     let source = r7z::Archive::open(&source_path).unwrap();
     let kept_entry = source.entries().next().unwrap();
-    let raw = source.raw_folder_block(0).unwrap();
+    let raw = source.raw_folder(r7z::FolderIndex::new(0)).unwrap();
     let added = b"new ppmd data".repeat(128);
     let added_path = tmp.path().join("added-source.txt");
     fs::write(&added_path, &added).unwrap();
@@ -138,7 +177,8 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
         encryption: Some(r7z::EncryptionOptions::default_for_password("Secret123")),
         ..r7z::ArchiveOptions::default()
     };
-    let output = r7z::write_archive_with_preserved_folders(
+    let output = r7z::write_archive_update(
+        &source,
         Cursor::new(Vec::new()),
         vec![
             r7z::PreservedArchiveEntry {
@@ -147,7 +187,7 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
                 kind: r7z::EntryKind::File,
                 meta: r7z::EntryMeta::default(),
                 stream: r7z::PreservedEntryStream::Raw {
-                    folder_id: 0,
+                    folder: raw.handle(),
                     size: kept.len() as u64,
                     crc: Some(crc32fast::hash(&kept)),
                 },

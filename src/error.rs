@@ -11,6 +11,10 @@ pub enum R7zError {
     #[error("invalid folder graph")]
     InvalidFolderGraph,
 
+    /// A raw folder handle was used with a different source archive.
+    #[error("raw folder handle belongs to a different archive")]
+    ArchiveMismatch,
+
     /// A property tag byte was not recognised.
     #[error("invalid property: {0:#04x}")]
     InvalidProperty(u8),

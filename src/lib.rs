@@ -84,7 +84,7 @@ mod write;
 pub use archive::{
     Archive, ArchiveEntries, ArchiveEntryInfo, ArchiveListing, ArchiveListingEntry,
     ArchiveMetadata, ArchiveOpenOptions, ArchiveReadConfig, ArchiveReadOptions, ArchiveReadSession,
-    ListingEntryKind, RawFolderBlock, safe_archive_name,
+    FolderIndex, ListingEntryKind, RawFolderBlock, RawFolderHandle, safe_archive_name,
 };
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_ARM64, CODEC_BCJ_IA64,
@@ -112,7 +112,7 @@ pub use write::{
     LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, SolidMode, SpoolMode,
     StreamingOptions, VolumeOptions, build_archive_with_preserved_folders, build_streaming,
     build_streaming_to_writer, build_streaming_volumes, build_streaming_with_options,
-    write_archive_with_preserved_folders,
+    write_archive_update, write_archive_with_preserved_folders,
 };
 
 // Re-export nom's IResult for convenience in integration tests

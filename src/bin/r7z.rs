@@ -1,9 +1,10 @@
 use chrono::{DateTime, Local};
 use r7z::{
     Archive, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec, CompressionLevel,
-    EncoderThreads, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, LzmaAlgorithm,
-    MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError, RawFolderBlock,
-    SevenZMethod, SolidMode, method_from_name, write_archive_with_preserved_folders,
+    EncoderThreads, EncryptionOptions, EntryMeta, FolderIndex, HeaderMode, ListingEntryKind,
+    LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError,
+    RawFolderBlock, SevenZMethod, SolidMode, method_from_name, write_archive_update,
+    write_archive_with_preserved_folders,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1266,7 +1267,13 @@ fn update_archive(cli: &Cli) -> Result<u8, CliError> {
         },
         new_entries,
     )?;
-    write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)?;
+    write_preserved_archive_entries_atomic(
+        Some(&archive),
+        &cli.archive,
+        entries,
+        raw_folders,
+        &cli.options,
+    )?;
     print_scan_warnings(&scan.warnings);
     Ok(if scan.warnings.is_empty() {
         EXIT_OK
@@ -1289,7 +1296,13 @@ fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
         |entry| delete_patterns.matches_entry(entry),
         Vec::new(),
     )?;
-    write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)
+    write_preserved_archive_entries_atomic(
+        Some(&archive),
+        &cli.archive,
+        entries,
+        raw_folders,
+        &cli.options,
+    )
 }
 
 #[derive(Clone)]
@@ -1495,8 +1508,12 @@ fn preserved_rewrite_entries(
 
     let raw_folders = raw_folder_ids
         .iter()
-        .map(|&folder| archive.raw_folder_block(folder))
+        .map(|&folder| archive.raw_folder(FolderIndex::new(folder)))
         .collect::<Result<Vec<_>, _>>()?;
+    let raw_folder_handles = raw_folders
+        .iter()
+        .map(|folder| (folder.folder_index, folder.handle()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut entries = Vec::new();
     for (listing_entry, &is_retained) in listing.entries.iter().zip(&retained) {
@@ -1512,7 +1529,10 @@ fn preserved_rewrite_entries(
         let stream = if let Some(folder) = listing_entry.block {
             if raw_folder_ids.contains(&folder) {
                 PreservedEntryStream::Raw {
-                    folder_id: folder,
+                    folder: raw_folder_handles
+                        .get(&folder)
+                        .cloned()
+                        .ok_or(R7zError::Parse)?,
                     size: listing_entry.size.ok_or(R7zError::Parse)?,
                     crc: listing_entry.crc,
                 }
@@ -1591,10 +1611,10 @@ fn write_archive_entries(
         .map(pending_to_preserved_entry)
         .collect::<Vec<_>>();
     if volume_sizes.is_empty() {
-        write_preserved_archive_entries_atomic(archive_path, preserved, Vec::new(), options)?;
+        write_preserved_archive_entries_atomic(None, archive_path, preserved, Vec::new(), options)?;
     } else {
         let tmp_archive = temp_archive_path(archive_path);
-        write_preserved_archive_entries_atomic(&tmp_archive, preserved, Vec::new(), options)?;
+        write_preserved_archive_entries_atomic(None, &tmp_archive, preserved, Vec::new(), options)?;
         let result = write_volumes_from_file(archive_path, &tmp_archive, volume_sizes);
         let cleanup = fs::remove_file(&tmp_archive);
         result?;
@@ -1608,6 +1628,7 @@ fn write_archive_entries(
 }
 
 fn write_preserved_archive_entries_atomic(
+    source: Option<&Archive>,
     archive_path: &Path,
     entries: Vec<PreservedArchiveEntry>,
     raw_folders: Vec<RawFolderBlock>,
@@ -1615,7 +1636,14 @@ fn write_preserved_archive_entries_atomic(
 ) -> Result<(), CliError> {
     let tmp_path = temp_archive_path(archive_path);
     let file = fs::File::create(&tmp_path)?;
-    if let Err(err) = write_archive_with_preserved_folders(file, entries, raw_folders, options) {
+    let result = match source {
+        Some(source) => write_archive_update(source, file, entries, raw_folders, options),
+        None if raw_folders.is_empty() => {
+            write_archive_with_preserved_folders(file, entries, raw_folders, options)
+        }
+        None => Err(R7zError::ArchiveMismatch),
+    };
+    if let Err(err) = result {
         let _ = fs::remove_file(&tmp_path);
         return Err(err.into());
     }
