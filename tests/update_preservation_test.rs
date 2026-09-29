@@ -131,8 +131,11 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
     let kept_entry = source.entries().next().unwrap();
     let raw = source.raw_folder_block(0).unwrap();
     let added = b"new ppmd data".repeat(128);
+    let added_path = tmp.path().join("added-source.txt");
+    fs::write(&added_path, &added).unwrap();
     let options = r7z::ArchiveOptions {
         codec: r7z::Codec::Ppmd,
+        encryption: Some(r7z::EncryptionOptions::default_for_password("Secret123")),
         ..r7z::ArchiveOptions::default()
     };
     let output = r7z::write_archive_with_preserved_folders(
@@ -154,7 +157,10 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
                 raw_name: None,
                 kind: r7z::EntryKind::File,
                 meta: r7z::EntryMeta::default(),
-                stream: r7z::PreservedEntryStream::Data(added.clone()),
+                stream: r7z::PreservedEntryStream::Path {
+                    path: added_path,
+                    size: added.len() as u64,
+                },
             },
         ],
         vec![raw],
@@ -163,12 +169,33 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
     .unwrap();
     let archive_path = tmp.path().join("mixed.7z");
     fs::write(&archive_path, output.into_inner()).unwrap();
-    let rewritten = r7z::Archive::open(&archive_path).unwrap();
-    assert_eq!(rewritten.extract_to_memory(0).unwrap(), kept);
-    assert_eq!(rewritten.extract_to_memory(1).unwrap(), added);
+    let rewritten = r7z::Archive::open_with_password(&archive_path, Some("Secret123")).unwrap();
+    assert_eq!(
+        rewritten
+            .extract_to_memory_with_password(0, Some("Secret123"))
+            .unwrap(),
+        kept
+    );
+    assert_eq!(
+        rewritten
+            .extract_to_memory_with_password(1, Some("Secret123"))
+            .unwrap(),
+        added
+    );
 
     let out_dir = tmp.path().join("out");
-    extract_with_p7zip(tmp.path(), &archive_path, &out_dir);
+    fs::create_dir_all(&out_dir).unwrap();
+    let out_arg = format!("-o{}", out_dir.display());
+    run_7z_checked(
+        &[
+            "x",
+            "-y",
+            "-pSecret123",
+            archive_path.to_str().unwrap(),
+            &out_arg,
+        ],
+        tmp.path(),
+    );
     assert_extracted_files(
         &out_dir,
         &[

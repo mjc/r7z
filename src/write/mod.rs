@@ -235,7 +235,86 @@ struct StreamingFolder<W: Write> {
     file_crcs: Vec<Option<u32>>,
 }
 
+impl<W: Write> Write for StreamingFolder<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match &mut self.encoder {
+            StreamingEncoder::Raw { writer, .. } => writer.write(bytes),
+            StreamingEncoder::Copy(writer) => writer.write(bytes),
+            StreamingEncoder::Lzma2(writer) => writer.write(bytes),
+            StreamingEncoder::Lzma { writer, .. } => writer.write(bytes),
+            StreamingEncoder::Ppmd { writer, .. } => writer.write(bytes),
+            StreamingEncoder::BcjLzma2(writer) => writer.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.encoder {
+            StreamingEncoder::Raw { writer, .. } => writer.flush(),
+            StreamingEncoder::Copy(writer) => writer.flush(),
+            StreamingEncoder::Lzma2(writer) => writer.flush(),
+            StreamingEncoder::Lzma { writer, .. } => writer.flush(),
+            StreamingEncoder::Ppmd { writer, .. } => writer.flush(),
+            StreamingEncoder::BcjLzma2(writer) => writer.flush(),
+        }
+    }
+}
+
 impl<W: Write> StreamingFolder<W> {
+    fn encoded(
+        codec: Codec,
+        out: W,
+        options: &ArchiveOptions,
+        known_size: Option<u64>,
+    ) -> Result<Self, R7zError> {
+        let payload = PayloadWriter::new(out, options.encryption.as_ref())?;
+        let encoder =
+            match codec {
+                Codec::Copy => StreamingEncoder::Copy(payload),
+                Codec::Lzma2 => StreamingEncoder::Lzma2(lzma2::Encoder::new(
+                    payload,
+                    &options.compression,
+                    known_size,
+                )?),
+                Codec::Lzma => {
+                    let lzma_options = encode::lzma_options(&options.compression);
+                    let dict_size = lzma_options.dict_size;
+                    let writer = LzmaWriter::new_no_header(payload, &lzma_options, false)?;
+                    let mut props = Vec::with_capacity(5);
+                    props.push(writer.props());
+                    props.extend_from_slice(&dict_size.to_le_bytes());
+                    StreamingEncoder::Lzma {
+                        writer: Box::new(writer),
+                        props,
+                    }
+                }
+                Codec::Ppmd => {
+                    let (order, mem_size) = encode::ppmd_options(&options.compression)?;
+                    let mut props = Vec::with_capacity(5);
+                    props.push(order);
+                    props.extend_from_slice(&mem_size.to_le_bytes());
+                    let writer = Box::new(
+                        Ppmd7Encoder::new(payload, u32::from(order), mem_size).map_err(|_| {
+                            R7zError::InvalidOptions(
+                                "PPMd order or memory size is outside supported range",
+                            )
+                        })?,
+                    );
+                    StreamingEncoder::Ppmd { writer, props }
+                }
+                Codec::Lzma2Bcj => StreamingEncoder::BcjLzma2(BcjX86Writer::new(
+                    lzma2::Encoder::new(payload, &options.compression, known_size)?,
+                )),
+            };
+        Ok(Self {
+            encoder,
+            copy: StreamingCopyFolder::default(),
+            file_indices: Vec::new(),
+            unpack_size: 0,
+            file_sizes: Vec::new(),
+            file_crcs: Vec::new(),
+        })
+    }
+
     fn raw(
         mut writer: CountingWriter<W>,
         raw: RawFolderBlock,
@@ -276,14 +355,24 @@ impl<W: Write> StreamingFolder<W> {
         })
     }
 
-    fn write_all(&mut self, chunk: &[u8]) -> io::Result<()> {
+    fn record_stream(&mut self, index: usize, size: u64, checksum: u32) -> Result<(), R7zError> {
         match &mut self.encoder {
-            StreamingEncoder::Raw { writer, .. } => writer.write_all(chunk),
-            StreamingEncoder::Copy(writer) => writer.write_all(chunk),
-            StreamingEncoder::Lzma2(writer) => writer.write_all(chunk),
-            StreamingEncoder::Lzma { writer, .. } => writer.write_all(chunk),
-            StreamingEncoder::Ppmd { writer, .. } => writer.write_all(chunk),
-            StreamingEncoder::BcjLzma2(writer) => writer.write_all(chunk),
+            StreamingEncoder::Copy(_) => self.copy.push(CopyFileStream {
+                entry: CopyEntryIndex(index),
+                size: CopyStreamSize(size),
+                checksum: CopyFileChecksum(checksum),
+            }),
+            StreamingEncoder::Raw { .. } => Err(R7zError::Parse),
+            StreamingEncoder::Lzma2(_)
+            | StreamingEncoder::Lzma { .. }
+            | StreamingEncoder::Ppmd { .. }
+            | StreamingEncoder::BcjLzma2(_) => {
+                self.file_indices.push(index);
+                self.unpack_size = self.unpack_size.checked_add(size).ok_or(R7zError::Parse)?;
+                self.file_sizes.push(size);
+                self.file_crcs.push(Some(checksum));
+                Ok(())
+            }
         }
     }
 
@@ -595,7 +684,8 @@ pub fn build_archive_with_preserved_folders(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<Vec<u8>, R7zError> {
-    build_archive_with_preserved_folders_buffered(entries, raw_folders, options)
+    write_archive_with_preserved_folders(Cursor::new(Vec::new()), entries, raw_folders, options)
+        .map(Cursor::into_inner)
 }
 
 #[doc(hidden)]
@@ -607,15 +697,7 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
 ) -> Result<W, R7zError> {
     let mut options = options.clone();
     lzma2::set_default_budget(&mut options);
-    if entries.is_empty() || !can_stream_preserved_options(&options) {
-        let bytes = build_archive_with_preserved_folders_buffered(entries, raw_folders, &options)?;
-        let mut out = out;
-        out.seek(SeekFrom::Start(0))?;
-        out.write_all(&bytes)?;
-        out.flush()?;
-        return Ok(out);
-    }
-
+    encode::validate_archive_options(&options)?;
     let (write_entries, streams, folder_order, mut raw_by_id) =
         stage_preserved_entries(entries, raw_folders, &options)?;
     let mut out = out;
@@ -644,7 +726,6 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
         } else {
             completed.push(write_encoded_folder_streaming(
                 &mut out,
-                &write_entries,
                 &streams,
                 file_indices,
                 &options,
@@ -653,130 +734,6 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
     }
 
     encode::finish_streamed_archive(out, &write_entries, &completed, &options)
-}
-
-fn build_archive_with_preserved_folders_buffered(
-    entries: Vec<PreservedArchiveEntry>,
-    raw_folders: Vec<RawFolderBlock>,
-    options: &ArchiveOptions,
-) -> Result<Vec<u8>, R7zError> {
-    let mut options = options.clone();
-    lzma2::set_default_budget(&mut options);
-    let max_raw_folder = raw_folders
-        .iter()
-        .map(|folder| folder.folder_index)
-        .max()
-        .unwrap_or(0);
-    let mut next_data_folder = max_raw_folder.checked_add(1).ok_or(R7zError::Parse)?;
-    let mut current_data_folder: Option<usize> = None;
-    let mut current_data_files = 0u64;
-    let mut current_data_bytes = 0u64;
-
-    let mut write_entries = Vec::with_capacity(entries.len());
-    let mut raw_stream_meta = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let mut raw_meta = None;
-        let (has_stream, data, folder_id) = match entry.stream {
-            PreservedEntryStream::None => (false, None, 0),
-            PreservedEntryStream::Raw {
-                folder_id,
-                size,
-                crc,
-            } => {
-                current_data_folder = None;
-                current_data_files = 0;
-                current_data_bytes = 0;
-                raw_meta = Some((size, crc));
-                (true, None, folder_id)
-            }
-            PreservedEntryStream::Data(data) => {
-                let size = data.len() as u64;
-                let folder_id = next_data_folder_id(
-                    &options.compression.solid,
-                    &mut next_data_folder,
-                    &mut current_data_folder,
-                    &mut current_data_files,
-                    &mut current_data_bytes,
-                    size,
-                )?;
-                (true, Some(data), folder_id)
-            }
-            PreservedEntryStream::Path { path, size } => {
-                let folder_id = next_data_folder_id(
-                    &options.compression.solid,
-                    &mut next_data_folder,
-                    &mut current_data_folder,
-                    &mut current_data_files,
-                    &mut current_data_bytes,
-                    size,
-                )?;
-                let data = std::fs::read(path)?;
-                (true, Some(data), folder_id)
-            }
-        };
-        write_entries.push(WriteEntry {
-            raw_name: entry.raw_name,
-            name: entry.name,
-            kind: entry.kind,
-            meta: entry.meta,
-            has_stream,
-            data,
-            folder_id,
-        });
-        raw_stream_meta.push(raw_meta);
-    }
-
-    let mut folder_order = Vec::new();
-    for entry in &write_entries {
-        if entry.has_stream && !folder_order.contains(&entry.folder_id) {
-            folder_order.push(entry.folder_id);
-        }
-    }
-
-    let raw_by_id = raw_folders
-        .into_iter()
-        .map(|folder| (folder.folder_index, folder))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut prepared = Vec::with_capacity(folder_order.len());
-    for folder_id in folder_order {
-        let file_indices = write_entries
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, entry)| {
-                (entry.has_stream && entry.folder_id == folder_id).then_some(idx)
-            })
-            .collect::<Vec<_>>();
-        if let Some(raw) = raw_by_id.get(&folder_id) {
-            prepared.push(model::PreparedFolder {
-                metadata: model::CompletedFolder {
-                    file_indices: file_indices.clone(),
-                    pack_sizes: raw.pack_sizes.clone(),
-                    coder_info: raw.folder_info.clone(),
-                    coder_unpack_sizes: raw.coder_unpack_sizes.clone(),
-                    folder_crc: raw.folder_crc,
-                    file_sizes: file_indices
-                        .iter()
-                        .map(|&idx| {
-                            preserved_stream_size(&write_entries[idx], raw_stream_meta[idx])
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    file_crcs: file_indices
-                        .iter()
-                        .map(|&idx| preserved_stream_crc(&write_entries[idx], raw_stream_meta[idx]))
-                        .collect::<Result<Vec<_>, _>>()?,
-                },
-                packed_streams: raw.packed_streams.clone(),
-            });
-        } else {
-            prepared.push(encode::encode_folder(
-                &write_entries,
-                file_indices,
-                &options,
-            )?);
-        }
-    }
-
-    encode::build_archive_from_prepared(&write_entries, &prepared, &options)
 }
 
 enum StagedStream {
@@ -803,14 +760,6 @@ type StagedPreserved = (
     Vec<usize>,
     std::collections::BTreeMap<usize, RawFolderBlock>,
 );
-
-fn can_stream_preserved_options(options: &ArchiveOptions) -> bool {
-    options.encryption.is_none()
-        && matches!(
-            options.codec,
-            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Ppmd | Codec::Lzma2Bcj
-        )
-}
 
 fn stage_preserved_entries(
     entries: Vec<PreservedArchiveEntry>,
@@ -901,188 +850,18 @@ fn stage_preserved_entries(
 
 fn write_encoded_folder_streaming<W: Write>(
     out: &mut W,
-    _write_entries: &[WriteEntry],
     streams: &[StagedStream],
     file_indices: Vec<usize>,
     options: &ArchiveOptions,
 ) -> Result<model::CompletedFolder, R7zError> {
-    match options.codec {
-        Codec::Copy => write_copy_folder_streaming(out, streams, file_indices),
-        Codec::Lzma2 => write_lzma2_folder_streaming(out, streams, file_indices, options),
-        Codec::Lzma => write_lzma_folder_streaming(out, streams, file_indices, options),
-        Codec::Ppmd => write_ppmd_folder_streaming(out, streams, file_indices, options),
-        Codec::Lzma2Bcj => write_bcj_lzma2_folder_streaming(out, streams, file_indices, options),
-    }
-}
-
-fn write_ppmd_folder_streaming<W: Write>(
-    out: &mut W,
-    streams: &[StagedStream],
-    file_indices: Vec<usize>,
-    options: &ArchiveOptions,
-) -> Result<model::CompletedFolder, R7zError> {
-    let (order, mem_size) = encode::ppmd_options(&options.compression)?;
-    let mut props = Vec::with_capacity(5);
-    props.push(order);
-    props.extend_from_slice(&mem_size.to_le_bytes());
-    let counting = CountingWriter {
-        inner: out,
-        count: 0,
-    };
-    let mut writer = Ppmd7Encoder::new(counting, u32::from(order), mem_size).map_err(|_| {
-        R7zError::InvalidOptions("PPMd order or memory size is outside supported range")
-    })?;
-    let mut file_sizes = Vec::new();
-    let mut file_crcs = Vec::new();
-    let mut unpack_size = 0u64;
-    for &index in &file_indices {
-        let (size, crc) = write_staged_stream_to(index, streams, &mut writer)?;
-        unpack_size = unpack_size.checked_add(size).ok_or(R7zError::Parse)?;
-        file_sizes.push(size);
-        file_crcs.push(Some(crc));
-    }
-    let counting = writer.finish(false)?;
-    Ok(model::CompletedFolder {
-        file_indices,
-        pack_sizes: vec![counting.count],
-        coder_info: encode_coder_info_ppmd(&props),
-        coder_unpack_sizes: vec![unpack_size],
-        folder_crc: None,
-        file_sizes,
-        file_crcs,
-    })
-}
-
-fn write_copy_folder_streaming<W: Write>(
-    out: &mut W,
-    streams: &[StagedStream],
-    file_indices: Vec<usize>,
-) -> Result<model::CompletedFolder, R7zError> {
-    let mut file_sizes = Vec::new();
-    let mut file_crcs = Vec::new();
-    let mut pack_size = 0u64;
-    for &idx in &file_indices {
-        let (size, crc) = write_staged_stream_to(idx, streams, out)?;
-        pack_size = pack_size.checked_add(size).ok_or(R7zError::Parse)?;
-        file_sizes.push(size);
-        file_crcs.push(Some(crc));
-    }
-    Ok(model::CompletedFolder {
-        file_indices,
-        pack_sizes: vec![pack_size],
-        coder_info: encode_coder_info_copy(),
-        coder_unpack_sizes: vec![pack_size],
-        folder_crc: None,
-        file_sizes,
-        file_crcs,
-    })
-}
-
-fn write_lzma2_folder_streaming<W: Write>(
-    out: &mut W,
-    streams: &[StagedStream],
-    file_indices: Vec<usize>,
-    options: &ArchiveOptions,
-) -> Result<model::CompletedFolder, R7zError> {
-    let counting = CountingWriter {
-        inner: out,
-        count: 0,
-    };
     let known_size = staged_folder_size(streams, &file_indices)?;
-    let mut writer = lzma2::Encoder::new(counting, &options.compression, Some(known_size))?;
-    let mut file_sizes = Vec::new();
-    let mut file_crcs = Vec::new();
-    let mut unpack_size = 0u64;
-    for &idx in &file_indices {
-        let (size, crc) = write_staged_stream_to(idx, streams, &mut writer)?;
-        unpack_size = unpack_size.checked_add(size).ok_or(R7zError::Parse)?;
-        file_sizes.push(size);
-        file_crcs.push(Some(crc));
+    let mut folder = StreamingFolder::encoded(options.codec, out, options, Some(known_size))?;
+    for index in file_indices {
+        let (size, checksum) = write_staged_stream_to(index, streams, &mut folder)?;
+        folder.record_stream(index, size, checksum)?;
     }
-    let counting = writer.finish()?;
-    Ok(model::CompletedFolder {
-        file_indices,
-        pack_sizes: vec![counting.count],
-        coder_info: encode_coder_info_lzma2(encode::lzma2_property_byte(&options.compression)?),
-        coder_unpack_sizes: vec![unpack_size],
-        folder_crc: None,
-        file_sizes,
-        file_crcs,
-    })
-}
-
-fn write_lzma_folder_streaming<W: Write>(
-    out: &mut W,
-    streams: &[StagedStream],
-    file_indices: Vec<usize>,
-    options: &ArchiveOptions,
-) -> Result<model::CompletedFolder, R7zError> {
-    let lzma_options = encode::lzma_options(&options.compression);
-    let dict_size = lzma_options.dict_size;
-    let counting = CountingWriter {
-        inner: out,
-        count: 0,
-    };
-    let mut writer = LzmaWriter::new_no_header(counting, &lzma_options, false)
-        .map_err(|_| R7zError::Decompression)?;
-    let mut file_sizes = Vec::new();
-    let mut file_crcs = Vec::new();
-    let mut unpack_size = 0u64;
-    for &idx in &file_indices {
-        let (size, crc) = write_staged_stream_to(idx, streams, &mut writer)?;
-        unpack_size = unpack_size.checked_add(size).ok_or(R7zError::Parse)?;
-        file_sizes.push(size);
-        file_crcs.push(Some(crc));
-    }
-    let props_byte = writer.props();
-    let counting = writer.finish().map_err(|_| R7zError::Decompression)?;
-    let mut props = Vec::with_capacity(5);
-    props.push(props_byte);
-    props.extend_from_slice(&dict_size.to_le_bytes());
-    Ok(model::CompletedFolder {
-        file_indices,
-        pack_sizes: vec![counting.count],
-        coder_info: encode_coder_info_lzma(&props),
-        coder_unpack_sizes: vec![unpack_size],
-        folder_crc: None,
-        file_sizes,
-        file_crcs,
-    })
-}
-
-fn write_bcj_lzma2_folder_streaming<W: Write>(
-    out: &mut W,
-    streams: &[StagedStream],
-    file_indices: Vec<usize>,
-    options: &ArchiveOptions,
-) -> Result<model::CompletedFolder, R7zError> {
-    let counting = CountingWriter {
-        inner: out,
-        count: 0,
-    };
-    let known_size = staged_folder_size(streams, &file_indices)?;
-    let lzma2 = lzma2::Encoder::new(counting, &options.compression, Some(known_size))?;
-    let mut writer = BcjX86Writer::new(lzma2);
-    let mut file_sizes = Vec::new();
-    let mut file_crcs = Vec::new();
-    let mut unpack_size = 0u64;
-    for &idx in &file_indices {
-        let (size, crc) = write_staged_stream_to(idx, streams, &mut writer)?;
-        unpack_size = unpack_size.checked_add(size).ok_or(R7zError::Parse)?;
-        file_sizes.push(size);
-        file_crcs.push(Some(crc));
-    }
-    let lzma2 = writer.finish()?;
-    let counting = lzma2.finish()?;
-    Ok(model::CompletedFolder {
-        file_indices,
-        pack_sizes: vec![counting.count],
-        coder_info: encode_coder_info_bcj_lzma2(encode::lzma2_property_byte(&options.compression)?),
-        coder_unpack_sizes: vec![unpack_size, unpack_size],
-        folder_crc: None,
-        file_sizes,
-        file_crcs,
-    })
+    let (_out, folder) = folder.complete(options)?;
+    Ok(folder)
 }
 
 fn write_staged_stream_to<W: Write>(
@@ -1192,34 +971,6 @@ fn next_data_folder_id(
     *current_files = current_files.checked_add(1).ok_or(R7zError::Parse)?;
     *current_bytes = current_bytes.checked_add(size).ok_or(R7zError::Parse)?;
     Ok(folder_id)
-}
-
-fn preserved_stream_size(
-    entry: &WriteEntry,
-    raw: Option<(u64, Option<u32>)>,
-) -> Result<u64, R7zError> {
-    if let Some((size, _)) = raw {
-        return Ok(size);
-    }
-    entry
-        .data
-        .as_ref()
-        .map(|data| data.len() as u64)
-        .ok_or(R7zError::Parse)
-}
-
-fn preserved_stream_crc(
-    entry: &WriteEntry,
-    raw: Option<(u64, Option<u32>)>,
-) -> Result<Option<u32>, R7zError> {
-    if let Some((_, crc)) = raw {
-        return Ok(crc);
-    }
-    entry
-        .data
-        .as_ref()
-        .map(|data| Some(crc32fast::hash(data)))
-        .ok_or(R7zError::Parse)
 }
 
 pub struct ArchiveWriter<W: Write + Seek> {
@@ -1487,17 +1238,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 else {
                     unreachable!()
                 };
-                if self.options.codec == Codec::Copy {
-                    folder.copy.push(CopyFileStream {
-                        entry: CopyEntryIndex(index),
-                        size: CopyStreamSize(0),
-                        checksum: CopyFileChecksum(crc32fast::hash(&[])),
-                    })?;
-                } else {
-                    folder.file_indices.push(index);
-                    folder.file_sizes.push(0);
-                    folder.file_crcs.push(Some(crc32fast::hash(&[])));
-                }
+                folder.record_stream(index, 0, crc32fast::hash(&[]))?;
                 return Ok(());
             }
             self.entries.push(WriteEntry {
@@ -1554,21 +1295,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         else {
             unreachable!()
         };
-        if self.options.codec == Codec::Copy {
-            folder.copy.push(CopyFileStream {
-                entry: CopyEntryIndex(index),
-                size: CopyStreamSize(size),
-                checksum: CopyFileChecksum(checksum),
-            })?;
-        } else {
-            folder.file_indices.push(index);
-            folder.unpack_size = folder
-                .unpack_size
-                .checked_add(size)
-                .ok_or(R7zError::Parse)?;
-            folder.file_sizes.push(size);
-            folder.file_crcs.push(Some(checksum));
-        }
+        folder.record_stream(index, size, checksum)?;
         if matches!(folder_plan, FolderPlan::Automatic) {
             self.finish_entry_folder_accounting(size)?;
         }
@@ -1619,60 +1346,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         }
 
         let out = self.out.take().ok_or(R7zError::Parse)?;
-        let payload = PayloadWriter::new(out, self.options.encryption.as_ref())?;
         let known_size = match folder_plan {
             FolderPlan::Automatic => None,
             FolderPlan::Preplanned { folder_size } => Some(folder_size),
         };
-        let encoder =
-            match codec {
-                Codec::Copy => StreamingEncoder::Copy(payload),
-                Codec::Lzma2 => StreamingEncoder::Lzma2(lzma2::Encoder::new(
-                    payload,
-                    &self.options.compression,
-                    known_size,
-                )?),
-                Codec::Lzma => {
-                    let options = encode::lzma_options(&self.options.compression);
-                    let dict_size = options.dict_size;
-                    let writer = LzmaWriter::new_no_header(payload, &options, false)?;
-                    let mut props = Vec::with_capacity(5);
-                    props.push(writer.props());
-                    props.extend_from_slice(&dict_size.to_le_bytes());
-                    StreamingEncoder::Lzma {
-                        writer: Box::new(writer),
-                        props,
-                    }
-                }
-                Codec::Lzma2Bcj => StreamingEncoder::BcjLzma2(BcjX86Writer::new(
-                    lzma2::Encoder::new(payload, &self.options.compression, known_size)?,
-                )),
-                Codec::Ppmd => {
-                    let (order, mem_size) = encode::ppmd_options(&self.options.compression)?;
-                    let mut props = Vec::with_capacity(5);
-                    props.push(order);
-                    props.extend_from_slice(&mem_size.to_le_bytes());
-                    let writer = Box::new(
-                        Ppmd7Encoder::new(payload, u32::from(order), mem_size).map_err(|_| {
-                            R7zError::InvalidOptions(
-                                "PPMd order or memory size is outside supported range",
-                            )
-                        })?,
-                    );
-                    StreamingEncoder::Ppmd { writer, props }
-                }
-            };
+        let folder = StreamingFolder::encoded(codec, out, &self.options, known_size)?;
         let WriterMode::Streaming { current, .. } = &mut self.mode else {
             unreachable!()
         };
-        *current = Some(Box::new(StreamingFolder {
-            encoder,
-            copy: StreamingCopyFolder::default(),
-            file_indices: Vec::new(),
-            unpack_size: 0,
-            file_sizes: Vec::new(),
-            file_crcs: Vec::new(),
-        }));
+        *current = Some(Box::new(folder));
         Ok(())
     }
 

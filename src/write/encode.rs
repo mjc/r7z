@@ -279,9 +279,6 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     folders: &[CompletedFolder],
     options: &ArchiveOptions,
 ) -> Result<W, R7zError> {
-    if entries.is_empty() {
-        return Err(R7zError::Parse);
-    }
     validate_archive_options(options)?;
 
     let packed_size = folders.iter().try_fold(0u64, |acc, folder| {
