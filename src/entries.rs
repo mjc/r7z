@@ -102,6 +102,10 @@ impl<'a> Entries<'a> {
             names: files.map(FilesInfo::name_slices),
         }
     }
+    pub(crate) fn next_index(&self) -> usize {
+        self.indices.start
+    }
+
     pub(crate) fn stream_count(&self) -> usize {
         self.indices
             .clone()
@@ -150,7 +154,8 @@ impl ExactSizeIterator for Entries<'_> {}
 
 /// Validated selection in archive order. Sorted callers keep their borrowed list.
 pub(crate) enum EntrySelection<'a> {
-    All,
+    Empty,
+    All(std::ops::Range<usize>),
     Selected {
         indices: Cow<'a, [usize]>,
         position: usize,
@@ -159,8 +164,10 @@ pub(crate) enum EntrySelection<'a> {
 
 impl<'a> EntrySelection<'a> {
     pub(crate) fn new(indices: Option<&'a [usize]>, count: usize) -> Result<Self, R7zError> {
-        let Some(indices) = indices else {
-            return Ok(Self::All);
+        let indices = match indices {
+            None => return Ok(Self::All(0..count)),
+            Some([]) => return Ok(Self::Empty),
+            Some(indices) => indices,
         };
         if indices.iter().any(|&index| index >= count) {
             return Err(R7zError::InvalidOptions(
@@ -182,22 +189,34 @@ impl<'a> EntrySelection<'a> {
             position: 0,
         })
     }
+}
 
-    pub(crate) fn is_empty(&self) -> bool {
-        matches!(self, Self::Selected { indices, .. } if indices.is_empty())
-    }
+impl Iterator for EntrySelection<'_> {
+    type Item = EntryIndex;
 
-    pub(crate) fn includes(&mut self, index: EntryIndex) -> bool {
+    fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::All => true,
+            Self::Empty => None,
+            Self::All(indices) => indices.next().map(EntryIndex),
             Self::Selected { indices, position } => {
-                let selected = indices.get(*position) == Some(&index.get());
-                *position += usize::from(selected);
-                selected
+                let index = *indices.get(*position)?;
+                *position += 1;
+                Some(EntryIndex(index))
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self {
+            Self::Empty => 0,
+            Self::All(indices) => indices.len(),
+            Self::Selected { indices, position } => indices.len() - position,
+        };
+        (remaining, Some(remaining))
+    }
 }
+
+impl ExactSizeIterator for EntrySelection<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -205,7 +224,7 @@ mod tests {
 
     #[test]
     fn selection_borrows_sorted_inputs_and_owns_only_reordered_inputs() {
-        for indices in [&[][..], &[1][..], &[0, 2, 4][..]] {
+        for indices in [&[1][..], &[0, 2, 4][..]] {
             let selection = EntrySelection::new(Some(indices), 5).unwrap();
             assert!(matches!(
                 selection,
@@ -216,7 +235,7 @@ mod tests {
             ));
         }
         let indices = [4, 0, 2];
-        let mut selection = EntrySelection::new(Some(&indices), 5).unwrap();
+        let selection = EntrySelection::new(Some(&indices), 5).unwrap();
         assert!(matches!(
             selection,
             EntrySelection::Selected {
@@ -224,11 +243,25 @@ mod tests {
                 ..
             }
         ));
-        let selected = (0..5)
-            .filter(|&i| selection.includes(EntryIndex(i)))
-            .collect::<Vec<_>>();
+        let selected = selection.map(EntryIndex::get).collect::<Vec<_>>();
         assert_eq!(selected, [0, 2, 4]);
         assert_eq!(indices, [4, 0, 2]);
+    }
+
+    #[test]
+    fn selection_iterator_tracks_remaining_indexes() {
+        [None, Some(&[2, 0, 1][..])]
+            .into_iter()
+            .for_each(|indices| {
+                let mut selection = EntrySelection::new(indices, 3).unwrap();
+                assert_eq!(selection.size_hint(), (3, Some(3)));
+                assert_eq!(selection.next().map(EntryIndex::get), Some(0));
+                assert_eq!(selection.len(), 2);
+                assert_eq!(selection.nth(1).map(EntryIndex::get), Some(2));
+                assert_eq!(selection.size_hint(), (0, Some(0)));
+                assert!(selection.next().is_none());
+                assert!(selection.next().is_none());
+            });
     }
 
     #[test]
@@ -247,12 +280,13 @@ mod tests {
                 ))
             ));
         }
-        let mut all = EntrySelection::new(None, 3).unwrap();
-        assert!(!all.is_empty());
-        assert!((0..3).all(|i| all.includes(EntryIndex(i))));
+        let all = EntrySelection::new(None, 3).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all.map(EntryIndex::get).collect::<Vec<_>>(), [0, 1, 2]);
         let mut none = EntrySelection::new(Some(&[]), 3).unwrap();
-        assert!(none.is_empty());
-        assert!((0..3).all(|i| !none.includes(EntryIndex(i))));
+        assert!(matches!(none, EntrySelection::Empty));
+        assert_eq!(none.len(), 0);
+        assert!(none.next().is_none());
     }
 
     #[test]

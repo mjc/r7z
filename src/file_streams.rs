@@ -1,4 +1,4 @@
-use crate::entries::{Entries, Entry};
+use crate::entries::{Entries, Entry, EntrySelection};
 use crate::folder_decode::{FolderLayout, FolderLayouts, Substream, Substreams};
 use crate::{FilesInfo, R7zError, StreamInfo};
 
@@ -84,6 +84,23 @@ impl<'a> FileStreams<'a> {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Map selected entries while each folder layout is borrowed by the callback.
+    /// Returned values cannot retain that borrow; no layout clones or index table are needed.
+    pub(crate) fn map_selected<T>(
+        mut self,
+        selection: EntrySelection<'_>,
+        mut map: impl FnMut(FileStream<'_, 'a>) -> Result<T, R7zError>,
+    ) -> impl Iterator<Item = Result<T, R7zError>> {
+        selection.map(move |index| {
+            let skip = index
+                .get()
+                .checked_sub(self.entries.next_index())
+                .ok_or(R7zError::Parse)?;
+            let file = self.nth(skip)?.ok_or(R7zError::Parse)?;
+            map(file)
+        })
     }
 
     /// Skip file metadata and advance only the data streams those entries own.
@@ -172,21 +189,58 @@ mod tests {
     #[test]
     fn maps_zero_single_and_multiple_substream_folders_in_order() {
         let streams = mixed_folders();
-        let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();
-        let mut mapped = Vec::new();
-        while let Some(file) = files.next().unwrap() {
+        let files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        let mut mapped_files = files.map_selected(EntrySelection::All(0..3), |file| {
             let crate::entries::EntryKind::File(location) = file.kind else {
                 panic!("expected data stream")
             };
-            mapped.push((
+            Ok((
                 file.metadata.index.get(),
                 location.folder_index.get(),
                 location.stream_index.get(),
                 location.stream.range,
-            ));
-        }
+            ))
+        });
+        let mapped = mapped_files
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(mapped, [(0, 1, 0, 0..2), (1, 2, 0, 0..1), (2, 2, 1, 1..3)]);
-        assert!(files.next().unwrap().is_none());
+        assert!(mapped_files.next().is_none());
+    }
+
+    #[test]
+    fn selected_mapping_skips_gaps_and_stops_consuming_on_callback_error() {
+        let streams = mixed_folders();
+        let files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        let selected = EntrySelection::new(Some(&[2, 0]), 3).unwrap();
+        let mapped = files
+            .map_selected(selected, |file| {
+                let crate::entries::EntryKind::File(location) = file.kind else {
+                    panic!("expected data stream")
+                };
+                Ok((file.metadata.index.get(), location.stream.range))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(mapped, [(0, 0..2), (2, 1..3)]);
+
+        let mut visited = Vec::new();
+        let files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        let result = files
+            .map_selected(EntrySelection::All(0..3), |file| {
+                visited.push(file.metadata.index.get());
+                match file.metadata.index.get() {
+                    1 => Err(R7zError::InvalidOptions("callback failure")),
+                    _ => Ok(()),
+                }
+            })
+            .collect::<Result<(), _>>();
+        assert!(matches!(
+            result,
+            Err(R7zError::InvalidOptions("callback failure"))
+        ));
+        assert_eq!(visited, [0, 1]);
     }
 
     #[test]

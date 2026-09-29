@@ -902,12 +902,18 @@ impl Archive {
             .unwrap_or(0);
         let solid = archive_is_solid(streams);
 
-        let mut entries = Vec::with_capacity(self.num_files());
         let files_info = self.try_files_info()?;
-        let mut files = FileStreams::new(files_info, self.num_files(), streams)?;
-        while let Some(file) = files.next()? {
-            entries.push(Self::listing_entry(file));
-        }
+        let entries = FileStreams::new(files_info, self.num_files(), streams)?
+            .map_selected(EntrySelection::All(0..self.num_files()), |file| {
+                Ok(Self::listing_entry(file))
+            })
+            .try_fold(
+                Vec::with_capacity(self.num_files()),
+                |mut entries, entry| {
+                    entries.push(entry?);
+                    Ok::<_, R7zError>(entries)
+                },
+            )?;
 
         Ok(ArchiveListing {
             archive_type: "7z",
@@ -1222,45 +1228,60 @@ impl Archive {
         &self,
         indices: Option<&[usize]>,
         password: Option<&str>,
-        mut callback: F,
+        callback: F,
     ) -> Result<(), R7zError>
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
-        let mut selected = EntrySelection::new(indices, self.num_files())?;
-        if selected.is_empty() {
-            return Ok(());
+        match EntrySelection::new(indices, self.num_files())? {
+            EntrySelection::Empty => Ok(()),
+            selected @ EntrySelection::All(_) => self.stream_entry_selection(
+                selected,
+                CompletionMode::WholeFolder,
+                password,
+                callback,
+            ),
+            selected @ EntrySelection::Selected { .. } => self.stream_entry_selection(
+                selected,
+                CompletionMode::SelectedStreams,
+                password,
+                callback,
+            ),
         }
+    }
 
-        let files_info = self.try_files_info()?;
-        let streams = self.try_streams_info()?;
-        let mode = match selected {
-            EntrySelection::All => CompletionMode::WholeFolder,
-            EntrySelection::Selected { .. } => CompletionMode::SelectedStreams,
-        };
-        let mut files = FileStreams::new(files_info, self.num_files(), streams)?;
+    fn stream_entry_selection(
+        &self,
+        selected: EntrySelection<'_>,
+        mode: CompletionMode,
+        password: Option<&str>,
+        mut callback: impl FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    ) -> Result<(), R7zError> {
+        let files = FileStreams::new(
+            self.try_files_info()?,
+            self.num_files(),
+            self.try_streams_info()?,
+        )?;
         let mut decoder = FolderDecoder {
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
             mode,
         };
-        while let Some(file) = files.next()? {
-            if selected.includes(file.metadata.index) {
+        files
+            .map_selected(selected, |file| {
                 let entry = ArchiveEntryInfo::from_entry(&file);
                 match file.kind {
                     EntryKind::File(location) | EntryKind::Symlink(location) => {
-                        decoder.read(location, &entry, password, &mut callback)?;
+                        decoder.read(location, &entry, password, &mut callback)
                     }
                     EntryKind::EmptyFile | EntryKind::EmptySymlink => {
-                        callback(&entry, &mut std::io::empty())?;
+                        callback(&entry, &mut std::io::empty())
                     }
-                    EntryKind::Directory | EntryKind::Anti => {}
+                    EntryKind::Directory | EntryKind::Anti => Ok(()),
                 }
-            }
-        }
-        decoder.finish()?;
-
-        Ok(())
+            })
+            .collect::<Result<(), _>>()?;
+        decoder.finish()
     }
 
     pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
@@ -1349,17 +1370,12 @@ impl Archive {
             self.num_files(),
             self.try_streams_info()?,
         )?;
-        while let Some(file) = files.next()? {
-            if file.metadata.index.get() == file_index {
-                return Ok(match file.kind {
-                    EntryKind::File(location) | EntryKind::Symlink(location) => {
-                        Some((location.folder_index.get(), location.stream_index.get()))
-                    }
-                    _ => None,
-                });
+        Ok(files.nth(file_index)?.and_then(|file| match file.kind {
+            EntryKind::File(location) | EntryKind::Symlink(location) => {
+                Some((location.folder_index.get(), location.stream_index.get()))
             }
-        }
-        Ok(None)
+            _ => None,
+        }))
     }
 
     /// Extract all files to a directory.
