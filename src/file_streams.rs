@@ -75,6 +75,16 @@ impl<'a> FileStreams<'a> {
         self.pack_pos
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Skip entries through the same stream mapping used by sequential reads.
+    pub(crate) fn nth(&mut self, n: usize) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
+        (0..n.min(self.len())).try_for_each(|_| self.next().map(|_| ()))?;
+        self.next()
+    }
+
     /// The returned layout borrows the current folder until the next advance.
     pub(crate) fn next(&mut self) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
         self.entries
@@ -147,6 +157,29 @@ mod tests {
             ));
         }
         assert_eq!(mapped, [(0, 1, 0, 0..2), (1, 2, 0, 0..1), (2, 2, 1, 1..3)]);
+        assert!(files.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn nth_advances_across_folders_and_preserves_the_remaining_cursor() {
+        let streams = mixed_folders();
+        let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        assert_eq!(files.len(), 3);
+        let file = files.nth(1).unwrap().unwrap();
+        let crate::entries::EntryKind::File(location) = file.kind else {
+            panic!("expected data stream")
+        };
+        assert_eq!(file.metadata.index.get(), 1);
+        assert_eq!(location.folder_index.get(), 2);
+        assert_eq!(location.stream_index.get(), 0);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files.nth(0).unwrap().unwrap().metadata.index.get(), 2);
+        assert_eq!(files.len(), 0);
+        assert!(files.nth(usize::MAX).unwrap().is_none());
+
+        let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        assert!(files.nth(usize::MAX).unwrap().is_none());
+        assert_eq!(files.len(), 0);
         assert!(files.next().unwrap().is_none());
     }
 

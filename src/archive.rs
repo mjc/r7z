@@ -472,7 +472,6 @@ pub struct ArchiveReadSession<'a> {
     files: FileStreams<'a>,
     decoder: FolderDecoder<'a>,
     password: Option<&'a str>,
-    next_index: usize,
     count: usize,
 }
 
@@ -492,29 +491,24 @@ impl ArchiveReadSession<'_> {
         index: usize,
         callback: impl FnOnce(&mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<(), R7zError> {
-        if index < self.next_index || index >= self.count {
+        let next_index = self.count - self.files.len();
+        if !(next_index..self.count).contains(&index) {
             return Err(R7zError::InvalidOptions(
                 "read session requires increasing valid entry indexes",
             ));
         }
-        while let Some(file) = self.files.next()? {
-            self.next_index = file.metadata.index.get() + 1;
-            if file.metadata.index.get() != index {
-                continue;
+        let file = self.files.nth(index - next_index)?.ok_or(R7zError::Parse)?;
+        let entry = ArchiveEntryInfo::from_entry(&file);
+        match file.kind {
+            EntryKind::File(location) | EntryKind::Symlink(location) => {
+                self.decoder
+                    .read(location, &entry, self.password, |_, reader| {
+                        callback(reader)
+                    })
             }
-            let entry = ArchiveEntryInfo::from_entry(&file);
-            return match file.kind {
-                EntryKind::File(location) | EntryKind::Symlink(location) => {
-                    self.decoder
-                        .read(location, &entry, self.password, |_, reader| {
-                            callback(reader)
-                        })
-                }
-                EntryKind::EmptyFile | EntryKind::EmptySymlink => callback(&mut std::io::empty()),
-                EntryKind::Directory | EntryKind::Anti => Err(R7zError::Directory),
-            };
+            EntryKind::EmptyFile | EntryKind::EmptySymlink => callback(&mut std::io::empty()),
+            EntryKind::Directory | EntryKind::Anti => Err(R7zError::Directory),
         }
-        Err(R7zError::Parse)
     }
 
     /// Copy an entry to a writer while retaining the decoder for subsequent reads.
@@ -555,17 +549,39 @@ impl ArchiveReadSession<'_> {
 }
 
 fn copy_entry(reader: &mut dyn Read, writer: &mut (impl Write + ?Sized)) -> Result<u64, R7zError> {
-    let mut written = 0u64;
-    let mut buffer = [0; 8192];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|_| R7zError::Decompression)?;
-        if count == 0 {
-            return Ok(written);
+    std::io::copy(&mut EntryReader(reader), writer).map_err(|error| {
+        match error.downcast::<EntryReadError>() {
+            Ok(EntryReadError(error)) => error,
+            Err(error) => R7zError::Io(error),
         }
-        writer.write_all(&buffer[..count])?;
-        written = written.checked_add(count as u64).ok_or(R7zError::Parse)?;
+    })
+}
+
+/// Marks read failures so copying can distinguish them from writer failures.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct EntryReadError(R7zError);
+
+/// Restores source error kinds at the decoded-reader boundary for I/O retries.
+struct EntryReader<'a>(&'a mut dyn Read);
+
+impl Read for EntryReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        // Vec writers may offer their entire spare capacity to io::copy.
+        let capacity = buffer.len().min(8 * 1024);
+        self.0.read(&mut buffer[..capacity]).map_err(|error| {
+            let error = match error.kind() {
+                std::io::ErrorKind::Interrupted => R7zError::Io(error),
+                _ => error
+                    .downcast::<R7zError>()
+                    .unwrap_or(R7zError::Decompression),
+            };
+            let kind = match &error {
+                R7zError::Io(error) => error.kind(),
+                _ => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(kind, EntryReadError(error))
+        })
     }
 }
 
@@ -1110,7 +1126,6 @@ impl Archive {
             files,
             decoder,
             password,
-            next_index: 0,
             count: self.num_files(),
         })
     }
@@ -1851,6 +1866,93 @@ mod selected_stream_tests {
     use crate::{ArchiveBuilder, ArchiveOptions, Codec, CompressionOptions, EntryMeta, SolidMode};
     use std::num::NonZeroU64;
 
+    struct ErrorsThenData {
+        errors: std::vec::IntoIter<std::io::Error>,
+        data: &'static [u8],
+    }
+
+    impl Read for ErrorsThenData {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.errors.next() {
+                Some(error) => Err(error),
+                None => self.data.read(buffer),
+            }
+        }
+    }
+
+    #[test]
+    fn entry_copy_retries_direct_and_wrapped_interruptions() {
+        let interrupted = std::io::ErrorKind::Interrupted;
+        let mut reader = ErrorsThenData {
+            errors: vec![
+                interrupted.into(),
+                std::io::Error::other(R7zError::Io(interrupted.into())),
+            ]
+            .into_iter(),
+            data: b"payload",
+        };
+        let mut output = Vec::new();
+        assert_eq!(copy_entry(&mut reader, &mut output).unwrap(), 7);
+        assert_eq!(output, b"payload");
+    }
+
+    #[test]
+    fn entry_copy_preserves_wrapped_source_errors() {
+        [
+            R7zError::Parse,
+            R7zError::LimitExceeded("packed source"),
+            R7zError::Io(std::io::ErrorKind::PermissionDenied.into()),
+        ]
+        .into_iter()
+        .for_each(|expected| {
+            let message = expected.to_string();
+            let variant = std::mem::discriminant(&expected);
+            let mut reader = ErrorsThenData {
+                errors: vec![std::io::Error::other(expected)].into_iter(),
+                data: b"unread",
+            };
+            let mut output = Vec::new();
+            let error = copy_entry(&mut reader, &mut output).unwrap_err();
+            assert_eq!(std::mem::discriminant(&error), variant);
+            assert_eq!(error.to_string(), message);
+            assert!(output.is_empty());
+        });
+    }
+
+    #[test]
+    fn entry_copy_classifies_unrecognized_read_errors_as_decompression() {
+        let mut reader = ErrorsThenData {
+            errors: vec![std::io::ErrorKind::InvalidData.into()].into_iter(),
+            data: b"unread",
+        };
+        assert!(matches!(
+            copy_entry(&mut reader, &mut std::io::sink()),
+            Err(R7zError::Decompression)
+        ));
+    }
+
+    #[test]
+    fn entry_copy_keeps_writer_errors_as_io_even_when_they_wrap_archive_errors() {
+        struct FailedWriter;
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other(R7zError::LimitExceeded("output")))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = copy_entry(&mut &b"payload"[..], &mut FailedWriter).unwrap_err();
+        let R7zError::Io(error) = error else {
+            panic!("expected writer I/O error")
+        };
+        assert!(matches!(
+            error.downcast::<R7zError>(),
+            Ok(R7zError::LimitExceeded("output"))
+        ));
+    }
+
     fn three_file_archive() -> Vec<u8> {
         let options = ArchiveOptions {
             codec: Codec::Copy,
@@ -2458,6 +2560,21 @@ mod selected_stream_tests {
         assert_eq!(data, b"payload");
         assert!(matches!(
             session.read_entry(5, |_| panic!("repeated")),
+            Err(R7zError::InvalidOptions(_))
+        ));
+        session.extract_to_writer(6, &mut std::io::sink()).unwrap();
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn read_session_skips_metadata_entries_before_requested_data() {
+        let archive = mixed_entry_archive();
+        let mut session = archive.read_session(None).unwrap();
+        let mut data = Vec::new();
+        session.extract_to_writer(5, &mut data).unwrap();
+        assert_eq!(data, b"payload");
+        assert!(matches!(
+            session.read_entry(4, |_| panic!("skipped index")),
             Err(R7zError::InvalidOptions(_))
         ));
         session.extract_to_writer(6, &mut std::io::sink()).unwrap();
