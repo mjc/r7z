@@ -24,24 +24,16 @@ const SEVEN_Z_MAGIC: &[u8; 6] = b"7z\xbc\xaf'\x1c";
 const SIGNATURE_SCAN_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArchiveStorageMode {
-    Mmap,
-    Seek,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchiveOpenOptions {
     /// Combined limit for header buffers, decoded external metadata, and its stream slots.
     /// Decoder working memory and parsed metadata tables are bounded separately.
     pub max_metadata_bytes: u64,
-    pub storage_mode: ArchiveStorageMode,
 }
 
 impl Default for ArchiveOpenOptions {
     fn default() -> Self {
         Self {
             max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
-            storage_mode: ArchiveStorageMode::Mmap,
         }
     }
 }
@@ -52,12 +44,16 @@ impl<T: Read + Seek> ReadSeek for T {}
 
 enum ArchiveSource {
     Bytes(Bytes),
+    File {
+        file: PositionedFile,
+        len: u64,
+    },
     Seekable {
         reader: Mutex<Box<dyn ReadSeek + Send>>,
         len: u64,
     },
     Volumes {
-        readers: Mutex<Vec<VolumeReader>>,
+        readers: Vec<VolumeReader>,
         len: u64,
     },
 }
@@ -74,6 +70,16 @@ impl ArchiveSource {
         })
     }
 
+    fn from_file(path: &Path) -> Result<Self, R7zError> {
+        if let Some(source) = Self::from_split_first_volume(path)? {
+            return Ok(source);
+        }
+
+        let file = PositionedFile::open(path)?;
+        let len = file.len()?;
+        Ok(Self::File { file, len })
+    }
+
     fn from_split_first_volume(path: &Path) -> Result<Option<Self>, R7zError> {
         if !is_split_first_volume(path) {
             return Ok(None);
@@ -86,8 +92,8 @@ impl ArchiveSource {
             if !path.exists() {
                 break;
             }
-            let mut file = std::fs::File::open(&path)?;
-            let volume_len = file.seek(SeekFrom::End(0)).map_err(R7zError::Io)?;
+            let file = PositionedFile::open(&path)?;
+            let volume_len = file.len()?;
             let start = len;
             len = checked_add_u64(len, volume_len)?;
             readers.push(VolumeReader {
@@ -98,10 +104,7 @@ impl ArchiveSource {
         }
 
         if readers.len() > 1 {
-            Ok(Some(Self::Volumes {
-                readers: Mutex::new(readers),
-                len,
-            }))
+            Ok(Some(Self::Volumes { readers, len }))
         } else {
             Ok(None)
         }
@@ -110,6 +113,7 @@ impl ArchiveSource {
     fn len(&self) -> Result<u64, R7zError> {
         match self {
             Self::Bytes(bytes) => u64::try_from(bytes.len()).map_err(|_| R7zError::Parse),
+            Self::File { len, .. } => Ok(*len),
             Self::Seekable { len, .. } => Ok(*len),
             Self::Volumes { len, .. } => Ok(*len),
         }
@@ -132,6 +136,7 @@ impl ArchiveSource {
                 dst.copy_from_slice(bytes.get(start..end).ok_or(R7zError::Parse)?);
                 Ok(())
             }
+            Self::File { file, .. } => file.read_exact_at(offset, dst).map_err(R7zError::Io),
             Self::Seekable { reader, .. } => {
                 let mut reader = reader.lock().map_err(|_| R7zError::Parse)?;
                 reader.seek(SeekFrom::Start(offset))?;
@@ -139,12 +144,11 @@ impl ArchiveSource {
                 Ok(())
             }
             Self::Volumes { readers, .. } => {
-                let mut readers = readers.lock().map_err(|_| R7zError::Parse)?;
                 let mut logical_offset = offset;
                 let mut remaining = dst;
                 while !remaining.is_empty() {
                     let volume = readers
-                        .iter_mut()
+                        .iter()
                         .find(|volume| {
                             logical_offset >= volume.start && logical_offset < volume.end
                         })
@@ -153,8 +157,9 @@ impl ArchiveSource {
                     let available = volume.end - logical_offset;
                     let n = usize::try_from(available.min(remaining.len() as u64))
                         .map_err(|_| R7zError::Parse)?;
-                    volume.file.seek(SeekFrom::Start(volume_offset))?;
-                    volume.file.read_exact(&mut remaining[..n])?;
+                    volume
+                        .file
+                        .read_exact_at(volume_offset, &mut remaining[..n])?;
                     logical_offset = logical_offset
                         .checked_add(n as u64)
                         .ok_or(R7zError::Parse)?;
@@ -271,9 +276,78 @@ enum SignatureCandidate {
 }
 
 struct VolumeReader {
-    file: std::fs::File,
+    file: PositionedFile,
     start: u64,
     end: u64,
+}
+
+#[cfg(any(unix, windows))]
+struct PositionedFile(std::fs::File);
+
+#[cfg(not(any(unix, windows)))]
+struct PositionedFile(Mutex<std::fs::File>);
+
+impl PositionedFile {
+    fn open(path: &Path) -> Result<Self, R7zError> {
+        let file = std::fs::File::open(path)?;
+        #[cfg(any(unix, windows))]
+        let file = Self(file);
+        #[cfg(not(any(unix, windows)))]
+        let file = Self(Mutex::new(file));
+        Ok(file)
+    }
+
+    fn len(&self) -> Result<u64, R7zError> {
+        #[cfg(any(unix, windows))]
+        let file = &self.0;
+        #[cfg(not(any(unix, windows)))]
+        let file = self.0.lock().map_err(|_| R7zError::Parse)?;
+        Ok(file.metadata()?.len())
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self
+                .0
+                .lock()
+                .map_err(|_| std::io::Error::other("file lock poisoned"))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(dst)
+        }
+
+        #[cfg(any(unix, windows))]
+        {
+            #[cfg(unix)]
+            use std::os::unix::fs::FileExt;
+            #[cfg(windows)]
+            use std::os::windows::fs::FileExt;
+
+            let mut offset = offset;
+            let mut dst = dst;
+            while !dst.is_empty() {
+                let read = loop {
+                    #[cfg(unix)]
+                    let result = self.0.read_at(dst, offset);
+                    #[cfg(windows)]
+                    let result = self.0.seek_read(dst, offset);
+
+                    match result {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => break result?,
+                    }
+                };
+                if read == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                offset = offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| std::io::Error::other("file offset overflow"))?;
+                dst = &mut dst[read..];
+            }
+            Ok(())
+        }
+    }
 }
 
 struct ArchiveRangeReader<'a> {
@@ -591,23 +665,12 @@ pub struct RawFolderBlock {
 }
 
 impl Archive {
-    /// Open and fully decode a 7z archive from disk.
-    ///
-    /// The file is memory-mapped rather than read into a heap buffer, so the OS
-    /// pages in only the regions that are actually accessed.  This avoids loading
-    /// the entire archive into RAM when only a few files are extracted.
+    /// Open and fully decode a 7z archive from disk using positioned file reads.
     ///
     /// # Errors
     ///
-    /// Returns [`R7zError::Io`] if the file cannot be opened or mapped, or a
+    /// Returns [`R7zError::Io`] if the file cannot be opened or read, or a
     /// parse/CRC error if the archive is malformed.
-    ///
-    /// # Safety
-    ///
-    /// The underlying `mmap(2)` call is unsafe because another process could
-    /// truncate the file while it is mapped, causing a `SIGBUS`.  In practice
-    /// this is rarely an issue for archive files, but callers that need
-    /// stronger guarantees should use [`Archive::from_reader`] instead.
     pub fn open(path: &Path) -> Result<Archive, R7zError> {
         Self::open_with_options(path, ArchiveOpenOptions::default())
     }
@@ -620,7 +683,7 @@ impl Archive {
     ///
     /// # Errors
     ///
-    /// Returns [`R7zError::Io`] if the file cannot be opened or mapped,
+    /// Returns [`R7zError::Io`] if the file cannot be opened or read,
     /// [`R7zError::PasswordRequired`] if the headers are encrypted and no password
     /// is supplied, or a parse/CRC error if the archive is malformed.
     pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Archive, R7zError> {
@@ -639,21 +702,46 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        let source = if let Some(source) = ArchiveSource::from_split_first_volume(path)? {
-            source
-        } else {
-            let file = std::fs::File::open(path)?;
-            match options.storage_mode {
-                ArchiveStorageMode::Mmap => {
-                    // SAFETY: The file is opened read-only and we do not mutate the
-                    // mapping. A concurrent truncation could cause SIGBUS; callers
-                    // that need stronger guarantees can select Seek mode.
-                    let mmap = unsafe { Mmap::map(&file)? };
-                    ArchiveSource::Bytes(Bytes::from_owner(mmap))
-                }
-                ArchiveStorageMode::Seek => ArchiveSource::from_reader(file)?,
-            }
-        };
+        let source = ArchiveSource::from_file(path)?;
+        Self::from_source_with_password(source, password, options)
+    }
+
+    /// Open an archive using a memory map when it is a single file.
+    /// Split archives use positioned reads for each volume.
+    ///
+    /// # Safety
+    ///
+    /// The archive file must not be modified or truncated during this call or
+    /// while the returned archive is alive. Concurrent mutation can cause
+    /// undefined behavior.
+    pub unsafe fn open_mmap(path: &Path) -> Result<Archive, R7zError> {
+        // SAFETY: The caller guarantees the mapped file remains unchanged.
+        unsafe {
+            Self::open_mmap_with_password_and_options(path, None, ArchiveOpenOptions::default())
+        }
+    }
+
+    /// Open an archive with a password and metadata limit using a memory map
+    /// when it is a single file. Split archives use positioned reads for each
+    /// volume.
+    ///
+    /// # Safety
+    ///
+    /// The archive file must not be modified or truncated during this call or
+    /// while the returned archive is alive. Concurrent mutation can cause
+    /// undefined behavior.
+    pub unsafe fn open_mmap_with_password_and_options(
+        path: &Path,
+        password: Option<&str>,
+        options: ArchiveOpenOptions,
+    ) -> Result<Archive, R7zError> {
+        if let Some(source) = ArchiveSource::from_split_first_volume(path)? {
+            return Self::from_source_with_password(source, password, options);
+        }
+        let file = std::fs::File::open(path)?;
+        // SAFETY: The caller guarantees the mapped file remains unchanged.
+        let mmap = unsafe { Mmap::map(&file)? };
+        let source = ArchiveSource::Bytes(Bytes::from_owner(mmap));
         Self::from_source_with_password(source, password, options)
     }
 
@@ -689,14 +777,7 @@ impl Archive {
     where
         R: Read + Seek + Send + 'static,
     {
-        Self::from_reader_with_password_and_options(
-            reader,
-            password,
-            ArchiveOpenOptions {
-                storage_mode: ArchiveStorageMode::Seek,
-                ..ArchiveOpenOptions::default()
-            },
-        )
+        Self::from_reader_with_password_and_options(reader, password, ArchiveOpenOptions::default())
     }
 
     pub fn from_reader_with_options<R>(
@@ -2118,7 +2199,6 @@ mod selected_stream_tests {
                         None,
                         ArchiveOpenOptions {
                             max_metadata_bytes: limit,
-                            ..ArchiveOpenOptions::default()
                         },
                     )
                 };

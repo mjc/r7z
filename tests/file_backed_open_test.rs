@@ -72,30 +72,40 @@ fn from_reader_accepts_cursor() {
 
 #[test]
 fn open_mmap_parses_fixture() {
-    let archive = r7z::Archive::open_with_options(
-        Path::new("tests/fixtures/test_1.7z"),
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Mmap,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    // SAFETY: The fixture is not modified while this archive is alive.
+    let archive =
+        unsafe { r7z::Archive::open_mmap(Path::new("tests/fixtures/test_1.7z")) }.unwrap();
 
     assert!(archive.num_files() > 0);
 }
 
 #[test]
-fn open_seek_mode_parses_fixture() {
-    let archive = r7z::Archive::open_with_options(
-        Path::new("tests/fixtures/test_1.7z"),
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Seek,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+fn open_positioned_reads_parse_fixture() {
+    let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
 
     assert!(archive.num_files() > 0);
+}
+
+#[test]
+fn seek_open_reports_file_truncated_after_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive_path = tmp.path().join("truncated-after-open.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("payload.txt", b"truncated source data")
+        .build()
+        .unwrap();
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&archive_path)
+        .unwrap()
+        .set_len(32)
+        .unwrap();
+
+    assert!(archive.extract_to_memory(0).is_err());
 }
 
 #[test]
@@ -163,20 +173,13 @@ fn sparse_seek_open_does_not_read_whole_file() {
     drop(file);
 
     reset_allocated_bytes();
-    let archive = r7z::Archive::open_with_options(
-        &archive_path,
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Seek,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let archive = r7z::Archive::open(&archive_path).unwrap();
     let allocated = allocated_bytes();
 
     assert_eq!(archive.num_files(), 1);
     assert!(
         allocated < 8 * 1024 * 1024,
-        "seek-backed open allocated {allocated} bytes"
+        "positioned file open allocated {allocated} bytes"
     );
 }
 
@@ -194,7 +197,6 @@ fn metadata_limit_rejects_oversized_next_header() {
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: 1,
-            storage_mode: r7z::ArchiveStorageMode::Seek,
         },
     ) {
         Ok(_) => panic!("archive opened despite metadata limit"),
@@ -220,7 +222,6 @@ fn metadata_limit_rejects_oversized_decoded_header() {
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: next_header_size + 16,
-            storage_mode: r7z::ArchiveStorageMode::Seek,
         },
     ) {
         Ok(_) => panic!("archive opened despite decoded metadata limit"),

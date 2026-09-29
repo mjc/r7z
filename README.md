@@ -6,7 +6,7 @@ A pure-Rust library for reading and writing `.7z` archives.
 [![docs.rs](https://docs.rs/r7z/badge.svg)](https://docs.rs/r7z)
 [![License: LGPL-2.1-or-later](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue)](LICENSE)
 
-r7z implements the 7z binary format spec in pure Rust using `nom` parser combinators. It reads archives created by p7zip / 7-Zip and can build new archives that those tools can open. No C FFI, no unsafe liblzma — compression is handled by the `lzma-rust2` crate.
+r7z implements the 7z binary format spec in pure Rust using `nom` parser combinators. It reads archives created by p7zip / 7-Zip and can build new archives that those tools can open. Compression uses Rust codec crates, including `lzma-rust2`. The `xz2` liblzma binding is used only by the development interoperability tests.
 
 ## Features
 
@@ -18,7 +18,7 @@ r7z implements the 7z binary format spec in pure Rust using `nom` parser combina
 - Supports **encrypted headers** when opened with a password
 - Safe extraction rejects absolute paths, parent-directory traversal, and Windows-prefixed paths
 - Custom **7z varint** encoding/decoding (`sevenzip_varuint64_encode/decode`) — not LEB128
-- Pure Rust — no `unsafe`, no C dependencies
+- File-backed opens use positioned reads by default. The optional `memmap2` API is unsafe because the archive file must remain unchanged while it is open.
 
 ## Installation
 
@@ -57,10 +57,10 @@ let written = archive.extract_to_writer(0, &mut out)?;
 println!("{written} bytes written");
 ```
 
-`Archive::open` is file-backed and uses `mmap` by default, so opening a large
-archive does not allocate a heap buffer for the full file. Use
-`ArchiveOpenOptions { storage_mode: ArchiveStorageMode::Seek, ..Default::default() }`
-when mmap is undesirable.
+`Archive::open` uses positioned file reads, so opening a large archive does not
+allocate a heap buffer for the full file. `Archive::open_mmap` is available as
+an unsafe alternative when the archive file is guaranteed not to change while
+the returned archive is alive.
 
 ### Reading — extract all to disk safely
 
@@ -188,16 +188,15 @@ let file = std::fs::File::open("example.7z")?;
 let archive = Archive::from_reader(file)?;
 ```
 
-`ArchiveOpenOptions` controls file-backed storage mode and metadata limits:
+`ArchiveOpenOptions` controls the metadata limit:
 
 ```rust
-use r7z::{Archive, ArchiveOpenOptions, ArchiveStorageMode};
+use r7z::{Archive, ArchiveOpenOptions};
 use std::path::Path;
 
 let archive = Archive::open_with_options(
     Path::new("example.7z"),
     ArchiveOpenOptions {
-        storage_mode: ArchiveStorageMode::Seek,
         max_metadata_bytes: 64 * 1024 * 1024,
     },
 )?;
@@ -216,9 +215,9 @@ let archive = Archive::from_bytes(raw.into())?;
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `Archive::open(path: &Path)` | `Result<Archive, R7zError>` | File-backed open using mmap by default |
+| `Archive::open(path: &Path)` | `Result<Archive, R7zError>` | File-backed open using positioned reads |
 | `Archive::open_with_password(path, password)` | `Result<Archive, R7zError>` | Open an archive with encrypted headers |
-| `Archive::open_with_options(path, options)` | `Result<Archive, R7zError>` | Open with mmap/seek storage and metadata limits |
+| `Archive::open_with_options(path, options)` | `Result<Archive, R7zError>` | Open with positioned reads and a metadata limit |
 | `Archive::from_reader(reader)` | `Result<Archive, R7zError>` | Decode a seekable `Read + Seek` source |
 | `Archive::from_reader_with_password(reader, password)` | `Result<Archive, R7zError>` | Decode a password-protected seekable source |
 | `Archive::from_bytes(data: bytes::Bytes)` | `Result<Archive, R7zError>` | Decode a `.7z` from an in-memory buffer |
