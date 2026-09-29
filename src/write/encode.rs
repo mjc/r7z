@@ -294,11 +294,12 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     let should_encode = match options.header_mode {
         HeaderMode::Plain => false,
         HeaderMode::Encoded => true,
-        HeaderMode::P7zipDefault => entries.len() > 1,
+        HeaderMode::P7zipDefault => entries.len() > 1 || options.encryption.is_some(),
     };
 
     let (next_header, next_header_offset) = if should_encode {
-        let (pack, coder_info, coder_unpack_sizes) = encode_header_stream(&raw_header, None)?;
+        let (pack, coder_info, coder_unpack_sizes) =
+            encode_header_stream(&raw_header, options.encryption.as_ref())?;
         out.seek(SeekFrom::Start(32 + packed_size))?;
         out.write_all(&pack)?;
         let descriptor = build_encoded_header_descriptor(
@@ -641,13 +642,13 @@ fn encode_lzma2_dict_size(dict_size: u32) -> Result<u8, R7zError> {
     Err(R7zError::InvalidOptions("dictionary_size is too large"))
 }
 
-struct AesMaterial {
-    key: [u8; 32],
-    iv: [u8; 16],
-    props: Vec<u8>,
+pub(super) struct AesMaterial {
+    pub(super) key: [u8; 32],
+    pub(super) iv: [u8; 16],
+    pub(super) props: Vec<u8>,
 }
 
-fn make_aes_material(options: &EncryptionOptions) -> Result<AesMaterial, R7zError> {
+pub(super) fn make_aes_material(options: &EncryptionOptions) -> Result<AesMaterial, R7zError> {
     if options.num_cycles_power > aes::MAX_AES_NUM_CYCLES_POWER {
         return Err(R7zError::InvalidOptions(
             "AES num_cycles_power must be <= 24",

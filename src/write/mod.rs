@@ -5,10 +5,11 @@ mod header;
 mod lzma2;
 mod model;
 
+use crate::aes::Aes256CbcEncryptWriter;
 use crate::{R7zError, RawEntryName, RawFolderBlock, bcj::BcjX86Writer};
 use header::{
-    encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
-    encode_coder_info_lzma2,
+    CoderSpec, encode_coder_info_aes_then, encode_coder_info_bcj_lzma2, encode_coder_info_copy,
+    encode_coder_info_lzma, encode_coder_info_lzma2,
 };
 use lzma_rust2::LzmaWriter;
 use std::{
@@ -66,9 +67,9 @@ struct CopyFileStream {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CopyFolderPlan {
+enum FolderPlan {
     Automatic,
-    Preplanned,
+    Preplanned { folder_size: u64 },
 }
 
 #[derive(Default)]
@@ -87,10 +88,6 @@ impl StreamingCopyFolder {
         );
         self.streams.push(stream);
         Ok(())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.streams.is_empty()
     }
 
     fn complete(self) -> model::CompletedFolder {
@@ -129,6 +126,84 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+enum PayloadWriter<W: Write> {
+    Plain(CountingWriter<W>),
+    Aes {
+        writer: Box<Aes256CbcEncryptWriter<CountingWriter<W>>>,
+        props: Vec<u8>,
+    },
+}
+
+struct EncryptedPayload {
+    plaintext_size: u64,
+    props: Vec<u8>,
+}
+
+struct PayloadCompletion<W: Write> {
+    writer: CountingWriter<W>,
+    encrypted: Option<EncryptedPayload>,
+}
+
+impl<W: Write> PayloadWriter<W> {
+    fn new(out: W, encryption: Option<&EncryptionOptions>) -> Result<Self, R7zError> {
+        match encryption {
+            Some(options) => {
+                let aes = encode::make_aes_material(options)?;
+                Ok(Self::Aes {
+                    writer: Box::new(Aes256CbcEncryptWriter::new(
+                        CountingWriter {
+                            inner: out,
+                            count: 0,
+                        },
+                        &aes.key,
+                        &aes.iv,
+                    )),
+                    props: aes.props,
+                })
+            }
+            None => Ok(Self::Plain(CountingWriter {
+                inner: out,
+                count: 0,
+            })),
+        }
+    }
+
+    fn finish(self) -> Result<PayloadCompletion<W>, R7zError> {
+        match self {
+            Self::Plain(writer) => Ok(PayloadCompletion {
+                writer,
+                encrypted: None,
+            }),
+            Self::Aes { writer, props } => {
+                let (writer, plaintext_size) = (*writer).finish()?;
+                Ok(PayloadCompletion {
+                    writer,
+                    encrypted: Some(EncryptedPayload {
+                        plaintext_size,
+                        props,
+                    }),
+                })
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for PayloadWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(bytes),
+            Self::Aes { writer, .. } => writer.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::Aes { writer, .. } => writer.flush(),
+        }
+    }
+}
+
 enum StreamingEncoder<W: Write> {
     Raw {
         writer: CountingWriter<W>,
@@ -137,16 +212,18 @@ enum StreamingEncoder<W: Write> {
         coder_unpack_sizes: Vec<u64>,
         folder_crc: Option<u32>,
     },
-    Lzma2(lzma2::Encoder<CountingWriter<W>>),
+    Copy(PayloadWriter<W>),
+    Lzma2(lzma2::Encoder<PayloadWriter<W>>),
     Lzma {
-        writer: Box<LzmaWriter<CountingWriter<W>>>,
+        writer: Box<LzmaWriter<PayloadWriter<W>>>,
         props: Vec<u8>,
     },
-    BcjLzma2(BcjX86Writer<lzma2::Encoder<CountingWriter<W>>>),
+    BcjLzma2(BcjX86Writer<lzma2::Encoder<PayloadWriter<W>>>),
 }
 
 struct StreamingFolder<W: Write> {
     encoder: StreamingEncoder<W>,
+    copy: StreamingCopyFolder,
     file_indices: Vec<usize>,
     unpack_size: u64,
     file_sizes: Vec<u64>,
@@ -186,6 +263,7 @@ impl<W: Write> StreamingFolder<W> {
                 coder_unpack_sizes: raw.coder_unpack_sizes,
                 folder_crc: raw.folder_crc,
             },
+            copy: StreamingCopyFolder::default(),
             file_indices,
             unpack_size: 0,
             file_sizes,
@@ -196,6 +274,7 @@ impl<W: Write> StreamingFolder<W> {
     fn write_all(&mut self, chunk: &[u8]) -> io::Result<()> {
         match &mut self.encoder {
             StreamingEncoder::Raw { writer, .. } => writer.write_all(chunk),
+            StreamingEncoder::Copy(writer) => writer.write_all(chunk),
             StreamingEncoder::Lzma2(writer) => writer.write_all(chunk),
             StreamingEncoder::Lzma { writer, .. } => writer.write_all(chunk),
             StreamingEncoder::BcjLzma2(writer) => writer.write_all(chunk),
@@ -208,12 +287,13 @@ impl<W: Write> StreamingFolder<W> {
     ) -> Result<(CountingWriter<W>, model::CompletedFolder), R7zError> {
         let Self {
             encoder,
+            copy,
             file_indices,
             unpack_size,
             file_sizes,
             file_crcs,
         } = self;
-        let (writer, coder_info, coder_unpack_sizes) = match encoder {
+        let (writer, mut coder_info, mut coder_unpack_sizes, specs) = match encoder {
             StreamingEncoder::Raw {
                 writer,
                 pack_sizes,
@@ -234,26 +314,51 @@ impl<W: Write> StreamingFolder<W> {
                     },
                 ));
             }
-            StreamingEncoder::Lzma2(writer) => (
-                writer.finish()?,
-                encode_coder_info_lzma2(encode::lzma2_property_byte(&options.compression)?),
-                vec![unpack_size],
-            ),
+            StreamingEncoder::Copy(writer) => {
+                let PayloadCompletion { writer, encrypted } = writer.finish()?;
+                let mut folder = copy.complete();
+                folder.pack_sizes = vec![writer.count];
+                if let Some(encrypted) = encrypted {
+                    folder.coder_info =
+                        encode_coder_info_aes_then(&[CoderSpec::Copy], &encrypted.props);
+                    folder
+                        .coder_unpack_sizes
+                        .insert(0, encrypted.plaintext_size);
+                }
+                return Ok((writer, folder));
+            }
+            StreamingEncoder::Lzma2(writer) => {
+                let property = encode::lzma2_property_byte(&options.compression)?;
+                (
+                    writer.finish()?,
+                    encode_coder_info_lzma2(property),
+                    vec![unpack_size],
+                    vec![CoderSpec::Lzma2(property)],
+                )
+            }
             StreamingEncoder::Lzma { writer, props } => (
                 writer.finish()?,
                 encode_coder_info_lzma(&props),
                 vec![unpack_size],
+                vec![CoderSpec::Lzma(props)],
             ),
             StreamingEncoder::BcjLzma2(writer) => {
                 let writer = writer.finish()?.finish()?;
+                let property = encode::lzma2_property_byte(&options.compression)?;
                 (
                     writer,
-                    encode_coder_info_bcj_lzma2(encode::lzma2_property_byte(&options.compression)?),
+                    encode_coder_info_bcj_lzma2(property),
                     vec![unpack_size, unpack_size],
+                    vec![CoderSpec::Lzma2(property), CoderSpec::Bcj],
                 )
             }
         };
+        let PayloadCompletion { writer, encrypted } = writer.finish()?;
         let pack_size = writer.count;
+        if let Some(encrypted) = encrypted {
+            coder_info = encode_coder_info_aes_then(&specs, &encrypted.props);
+            coder_unpack_sizes.insert(0, encrypted.plaintext_size);
+        }
         Ok((
             writer,
             model::CompletedFolder {
@@ -271,11 +376,7 @@ impl<W: Write> StreamingFolder<W> {
 
 enum WriterMode<W: Write> {
     Buffered,
-    Copy {
-        current: StreamingCopyFolder,
-        completed: Vec<model::CompletedFolder>,
-    },
-    Compressed {
+    Streaming {
         codec: Codec,
         current: Option<Box<StreamingFolder<W>>>,
         completed: Vec<model::CompletedFolder>,
@@ -285,15 +386,8 @@ enum WriterMode<W: Write> {
 
 impl<W: Write> WriterMode<W> {
     fn select(options: &ArchiveOptions) -> Self {
-        if options.encryption.is_some() {
-            return Self::Buffered;
-        }
         match options.codec {
-            Codec::Copy => Self::Copy {
-                current: StreamingCopyFolder::default(),
-                completed: Vec::new(),
-            },
-            Codec::Lzma2 | Codec::Lzma | Codec::Lzma2Bcj => Self::Compressed {
+            Codec::Copy | Codec::Lzma2 | Codec::Lzma | Codec::Lzma2Bcj => Self::Streaming {
                 codec: options.codec,
                 current: None,
                 completed: Vec::new(),
@@ -447,13 +541,27 @@ impl ArchiveBuilder {
     pub fn build(self) -> Result<Vec<u8>, R7zError> {
         let mut options = self.options;
         lzma2::set_default_budget(&mut options);
-        if options.codec == Codec::Copy
-            && options.encryption.is_none()
-            && self.entries.iter().any(|entry| entry.has_stream)
+        if matches!(
+            options.codec,
+            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Lzma2Bcj
+        ) && self.entries.iter().any(|entry| entry.has_stream)
         {
             let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
+            let mut folder_sizes = std::collections::BTreeMap::<usize, u64>::new();
+            for entry in &entries {
+                if entry.has_stream {
+                    let size = entry
+                        .data
+                        .as_ref()
+                        .map(|data| data.len() as u64)
+                        .ok_or(R7zError::Parse)?;
+                    let folder_size = folder_sizes.entry(entry.folder_id).or_default();
+                    *folder_size = folder_size.checked_add(size).ok_or(R7zError::Parse)?;
+                }
+            }
             let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)?;
             for entry in entries {
+                let folder_size = folder_sizes.get(&entry.folder_id).copied().unwrap_or(0);
                 match entry.folder_id.cmp(&writer.current_folder) {
                     std::cmp::Ordering::Less => return Err(R7zError::Parse),
                     std::cmp::Ordering::Equal => {}
@@ -464,7 +572,7 @@ impl ArchiveBuilder {
                         }
                     }
                 }
-                writer.append_copy_builder_entry(entry)?;
+                writer.append_builder_entry(entry, folder_size)?;
             }
             return Ok(writer.finish()?.into_inner());
         }
@@ -1188,11 +1296,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         meta: EntryMeta,
     ) -> Result<(), R7zError> {
         match &self.mode {
-            WriterMode::Copy { .. } => {
-                return self.append_copy_streaming(name, reader, meta, CopyFolderPlan::Automatic);
-            }
-            WriterMode::Compressed { .. } => {
-                return self.append_compressed_streaming(name, reader, meta);
+            WriterMode::Streaming { .. } => {
+                return self.append_streaming(name, reader, meta, FolderPlan::Automatic);
             }
             WriterMode::Buffered => {}
             WriterMode::Failed => return Err(writer_failed()),
@@ -1249,11 +1354,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
         let result = match &self.mode {
-            WriterMode::Copy { .. } => {
-                self.seal_copy_folder();
-                Ok(())
-            }
-            WriterMode::Compressed { .. } => self.seal_compressed_folder(),
+            WriterMode::Streaming { .. } => self.seal_streaming_folder(),
             WriterMode::Buffered => {
                 self.current_folder += usize::from(self.current_folder_files != 0);
                 Ok(())
@@ -1307,16 +1408,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             return self.finish_buffered();
         }
         let folders = match &self.mode {
-            WriterMode::Copy { .. } => {
-                self.seal_copy_folder();
-                let WriterMode::Copy { completed, .. } = self.mode else {
-                    unreachable!()
-                };
-                completed
-            }
-            WriterMode::Compressed { .. } => {
-                self.seal_compressed_folder()?;
-                let WriterMode::Compressed { completed, .. } = self.mode else {
+            WriterMode::Streaming { .. } => {
+                self.seal_streaming_folder()?;
+                let WriterMode::Streaming { completed, .. } = self.mode else {
                     unreachable!()
                 };
                 completed
@@ -1341,147 +1435,48 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.out.take().ok_or(R7zError::Parse)
     }
 
-    fn append_copy_streaming(
+    fn append_streaming(
         &mut self,
         name: &str,
         mut reader: impl Read,
         meta: EntryMeta,
-        folder_plan: CopyFolderPlan,
+        folder_plan: FolderPlan,
     ) -> Result<(), R7zError> {
-        let mut hasher = crc32fast::Hasher::new();
-        let mut size = 0u64;
-        let mut buf = vec![0u8; self.options.streaming.buffer_size];
-        let first = reader.read(&mut buf)?;
+        let mut buffer = vec![0u8; self.options.streaming.buffer_size];
+        let first = reader.read(&mut buffer)?;
         if first == 0 {
-            if matches!(folder_plan, CopyFolderPlan::Preplanned) {
-                self.ensure_copy_stream_started()?;
+            if matches!(folder_plan, FolderPlan::Preplanned { .. }) {
+                self.ensure_streaming_folder(folder_plan)?;
                 let index = self.entries.len();
                 self.entries.push(WriteEntry {
                     raw_name: None,
-                    name: name.to_string(),
+                    name: name.to_owned(),
                     kind: EntryKind::File,
                     meta,
                     has_stream: true,
                     data: None,
                     folder_id: self.current_folder,
                 });
-                let WriterMode::Copy { current, .. } = &mut self.mode else {
+                let WriterMode::Streaming {
+                    current: Some(folder),
+                    ..
+                } = &mut self.mode
+                else {
                     unreachable!()
                 };
-                current.push(CopyFileStream {
-                    entry: CopyEntryIndex(index),
-                    size: CopyStreamSize(0),
-                    checksum: CopyFileChecksum(crc32fast::hash(&[])),
-                })?;
+                if self.options.codec == Codec::Copy {
+                    folder.copy.push(CopyFileStream {
+                        entry: CopyEntryIndex(index),
+                        size: CopyStreamSize(0),
+                        checksum: CopyFileChecksum(crc32fast::hash(&[])),
+                    })?;
+                } else {
+                    folder.file_indices.push(index);
+                    folder.file_sizes.push(0);
+                    folder.file_crcs.push(Some(crc32fast::hash(&[])));
+                }
                 return Ok(());
             }
-            self.entries.push(WriteEntry {
-                raw_name: None,
-                name: name.to_string(),
-                kind: EntryKind::File,
-                meta,
-                has_stream: false,
-                data: None,
-                folder_id: self.current_folder,
-            });
-            return Ok(());
-        }
-        self.ensure_copy_stream_started()?;
-        self.out
-            .as_mut()
-            .ok_or(R7zError::Parse)?
-            .write_all(&buf[..first])?;
-        hasher.update(&buf[..first]);
-        size = size.checked_add(first as u64).ok_or(R7zError::Parse)?;
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            self.out
-                .as_mut()
-                .ok_or(R7zError::Parse)?
-                .write_all(&buf[..n])?;
-            hasher.update(&buf[..n]);
-            size = size.checked_add(n as u64).ok_or(R7zError::Parse)?;
-        }
-
-        let index = self.entries.len();
-        self.entries.push(WriteEntry {
-            raw_name: None,
-            name: name.to_string(),
-            kind: EntryKind::File,
-            meta,
-            has_stream: size > 0,
-            data: None,
-            folder_id: self.current_folder,
-        });
-
-        let WriterMode::Copy { current, .. } = &mut self.mode else {
-            unreachable!()
-        };
-        current.push(CopyFileStream {
-            entry: CopyEntryIndex(index),
-            size: CopyStreamSize(size),
-            checksum: CopyFileChecksum(hasher.finalize()),
-        })?;
-
-        if matches!(folder_plan, CopyFolderPlan::Automatic) {
-            self.finish_entry_folder_accounting(size)?;
-        }
-        Ok(())
-    }
-
-    fn append_copy_builder_entry(&mut self, entry: WriteEntry) -> Result<(), R7zError> {
-        let WriteEntry {
-            name,
-            kind,
-            meta,
-            has_stream,
-            data,
-            ..
-        } = entry;
-        match (has_stream, data) {
-            (true, Some(data)) => {
-                self.append_copy_streaming(&name, data.as_slice(), meta, CopyFolderPlan::Preplanned)
-            }
-            (false, None) => self.append_empty_entry(ArchiveEntry { name, kind, meta }),
-            _ => Err(R7zError::Parse),
-        }
-    }
-
-    fn ensure_copy_stream_started(&mut self) -> Result<(), R7zError> {
-        let WriterMode::Copy { current, completed } = &self.mode else {
-            unreachable!()
-        };
-        if !current.is_empty() || !completed.is_empty() {
-            return Ok(());
-        }
-        let out = self.out.as_mut().ok_or(R7zError::Parse)?;
-        out.seek(SeekFrom::Start(0))?;
-        out.write_all(&[0u8; 32])?;
-        Ok(())
-    }
-
-    fn seal_copy_folder(&mut self) {
-        let WriterMode::Copy { current, completed } = &mut self.mode else {
-            unreachable!()
-        };
-        if !current.is_empty() {
-            completed.push(std::mem::take(current).complete());
-            self.current_folder += 1;
-        }
-    }
-
-    fn append_compressed_streaming(
-        &mut self,
-        name: &str,
-        mut reader: impl Read,
-        meta: EntryMeta,
-    ) -> Result<(), R7zError> {
-        let mut buffer = vec![0u8; self.options.streaming.buffer_size];
-        let first = reader.read(&mut buffer)?;
-        if first == 0 {
             self.entries.push(WriteEntry {
                 raw_name: None,
                 name: name.to_owned(),
@@ -1494,12 +1489,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             return Ok(());
         }
 
-        self.ensure_compressed_folder()?;
+        self.ensure_streaming_folder(folder_plan)?;
         let mut checksum = crc32fast::Hasher::new();
         let mut size = 0u64;
         let mut chunk = &buffer[..first];
         loop {
-            let WriterMode::Compressed {
+            let WriterMode::Streaming {
                 current: Some(folder),
                 ..
             } = &mut self.mode
@@ -1528,26 +1523,63 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             data: None,
             folder_id: self.current_folder,
         });
-        let WriterMode::Compressed {
+        let checksum = checksum.finalize();
+        let WriterMode::Streaming {
             current: Some(folder),
             ..
         } = &mut self.mode
         else {
             unreachable!()
         };
-        folder.file_indices.push(index);
-        folder.unpack_size = folder
-            .unpack_size
-            .checked_add(size)
-            .ok_or(R7zError::Parse)?;
-        folder.file_sizes.push(size);
-        folder.file_crcs.push(Some(checksum.finalize()));
-        self.finish_entry_folder_accounting(size)
+        if self.options.codec == Codec::Copy {
+            folder.copy.push(CopyFileStream {
+                entry: CopyEntryIndex(index),
+                size: CopyStreamSize(size),
+                checksum: CopyFileChecksum(checksum),
+            })?;
+        } else {
+            folder.file_indices.push(index);
+            folder.unpack_size = folder
+                .unpack_size
+                .checked_add(size)
+                .ok_or(R7zError::Parse)?;
+            folder.file_sizes.push(size);
+            folder.file_crcs.push(Some(checksum));
+        }
+        if matches!(folder_plan, FolderPlan::Automatic) {
+            self.finish_entry_folder_accounting(size)?;
+        }
+        Ok(())
     }
 
-    fn ensure_compressed_folder(&mut self) -> Result<(), R7zError> {
+    fn append_builder_entry(
+        &mut self,
+        entry: WriteEntry,
+        folder_size: u64,
+    ) -> Result<(), R7zError> {
+        let WriteEntry {
+            name,
+            kind,
+            meta,
+            has_stream,
+            data,
+            ..
+        } = entry;
+        match (has_stream, data) {
+            (true, Some(data)) => self.append_streaming(
+                &name,
+                data.as_slice(),
+                meta,
+                FolderPlan::Preplanned { folder_size },
+            ),
+            (false, None) => self.append_empty_entry(ArchiveEntry { name, kind, meta }),
+            _ => Err(R7zError::Parse),
+        }
+    }
+
+    fn ensure_streaming_folder(&mut self, folder_plan: FolderPlan) -> Result<(), R7zError> {
         let (codec, has_current, has_completed) = match &self.mode {
-            WriterMode::Compressed {
+            WriterMode::Streaming {
                 codec,
                 current,
                 completed,
@@ -1564,21 +1596,23 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         }
 
         let out = self.out.take().ok_or(R7zError::Parse)?;
-        let output = CountingWriter {
-            inner: out,
-            count: 0,
+        let payload = PayloadWriter::new(out, self.options.encryption.as_ref())?;
+        let known_size = match folder_plan {
+            FolderPlan::Automatic => None,
+            FolderPlan::Preplanned { folder_size } => Some(folder_size),
         };
         let encoder =
             match codec {
+                Codec::Copy => StreamingEncoder::Copy(payload),
                 Codec::Lzma2 => StreamingEncoder::Lzma2(lzma2::Encoder::new(
-                    output,
+                    payload,
                     &self.options.compression,
-                    None,
+                    known_size,
                 )?),
                 Codec::Lzma => {
                     let options = encode::lzma_options(&self.options.compression);
                     let dict_size = options.dict_size;
-                    let writer = LzmaWriter::new_no_header(output, &options, false)?;
+                    let writer = LzmaWriter::new_no_header(payload, &options, false)?;
                     let mut props = Vec::with_capacity(5);
                     props.push(writer.props());
                     props.extend_from_slice(&dict_size.to_le_bytes());
@@ -1588,15 +1622,16 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                     }
                 }
                 Codec::Lzma2Bcj => StreamingEncoder::BcjLzma2(BcjX86Writer::new(
-                    lzma2::Encoder::new(output, &self.options.compression, None)?,
+                    lzma2::Encoder::new(payload, &self.options.compression, known_size)?,
                 )),
-                Codec::Copy | Codec::Ppmd => unreachable!(),
+                Codec::Ppmd => unreachable!(),
             };
-        let WriterMode::Compressed { current, .. } = &mut self.mode else {
+        let WriterMode::Streaming { current, .. } = &mut self.mode else {
             unreachable!()
         };
         *current = Some(Box::new(StreamingFolder {
             encoder,
+            copy: StreamingCopyFolder::default(),
             file_indices: Vec::new(),
             unpack_size: 0,
             file_sizes: Vec::new(),
@@ -1605,8 +1640,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         Ok(())
     }
 
-    fn seal_compressed_folder(&mut self) -> Result<(), R7zError> {
-        let WriterMode::Compressed {
+    fn seal_streaming_folder(&mut self) -> Result<(), R7zError> {
+        let WriterMode::Streaming {
             current, completed, ..
         } = &mut self.mode
         else {

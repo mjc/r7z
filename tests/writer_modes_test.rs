@@ -91,6 +91,24 @@ fn archive_bytes_preserve_each_writer_mode() {
 }
 
 #[test]
+fn streaming_writer_encrypts_encoded_headers() {
+    let mut options = options(Codec::Lzma2, true);
+    options.header_mode = HeaderMode::Encoded;
+    options.encryption.as_mut().unwrap().encrypt_header = true;
+    let bytes = write_files(options, false);
+    let archive = Archive::from_bytes_with_password(bytes.into(), Some("secret")).unwrap();
+
+    for (index, expected) in [(1, &[][..]), (2, FIRST), (3, &[][..]), (4, SECOND)] {
+        assert_eq!(
+            archive
+                .extract_to_memory_with_password(index, Some("secret"))
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn copy_builder_and_streaming_writer_emit_the_same_archive() {
     let options = options(Codec::Copy, false);
     let streaming = write_files(options.clone(), false);
@@ -133,17 +151,54 @@ fn copy_builder_preserves_preplanned_byte_limit_folders() {
 }
 
 #[test]
-fn copy_builder_preserves_empty_symlink_streams() {
-    let bytes = ArchiveBuilder::new()
-        .compression(Codec::Copy)
-        .add_symlink("empty-link", "", EntryMeta::default())
-        .build()
-        .unwrap();
-    let archive = Archive::from_bytes(bytes.into()).unwrap();
-    let files = archive.files_info().unwrap();
+fn builder_lzma2_admission_uses_the_planned_folder_size() {
+    for codec in [Codec::Lzma2, Codec::Lzma2Bcj] {
+        let mut options = options(codec, false);
+        options.compression.threads = EncoderThreads::Fixed(4);
+        options.compression.encoder_memory_limit = Some(256 * 1024 * 1024);
+        let bytes = ArchiveBuilder::new()
+            .options(options)
+            .add_file("small", b"small folder")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"small folder");
+    }
+}
 
-    assert_eq!(files.entry_type(0), r7z::EntryType::Symlink);
-    assert_eq!(archive.symlink_target(0).unwrap().as_deref(), Some(""));
+#[test]
+fn builders_preserve_empty_symlink_streams_before_non_solid_files() {
+    for codec in [Codec::Copy, Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
+        let mut options = options(codec, false);
+        options.compression.solid = SolidMode::NonSolid;
+        let bytes = ArchiveBuilder::new()
+            .options(options)
+            .add_symlink("empty-link", "", EntryMeta::default())
+            .add_file("after", b"data")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let files = archive.files_info().unwrap();
+
+        assert_eq!(files.entry_type(0), r7z::EntryType::Symlink, "{codec:?}");
+        assert_eq!(
+            archive.symlink_target(0).unwrap().as_deref(),
+            Some(""),
+            "{codec:?}"
+        );
+        assert_eq!(archive.extract_to_memory(1).unwrap(), b"data", "{codec:?}");
+        assert_eq!(
+            archive
+                .streams_info()
+                .unwrap()
+                .unpack_info
+                .as_ref()
+                .unwrap()
+                .num_folders,
+            2,
+            "{codec:?}"
+        );
+    }
 }
 
 #[test]

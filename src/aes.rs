@@ -21,11 +21,14 @@
 
 use crate::R7zError;
 use aes::Aes256;
+use aes::cipher::{Block, BlockEncrypt, KeyInit};
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use sha2::{Digest, Sha256};
+use std::io;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+const CIPHERTEXT_BUFFER_SIZE: usize = 8192;
 
 /// Bound p7zip's default AES KDF cost while rejecting maliciously huge values.
 pub(crate) const MAX_AES_NUM_CYCLES_POWER: u8 = 24;
@@ -190,9 +193,125 @@ pub(crate) fn encrypt_aes256_cbc_zero_pad(
     Ok(out.to_vec())
 }
 
+pub(crate) struct Aes256CbcEncryptWriter<W> {
+    inner: W,
+    cipher: Aes256,
+    previous: [u8; 16],
+    pending: [u8; 16],
+    pending_len: usize,
+    ciphertext: [u8; CIPHERTEXT_BUFFER_SIZE],
+    ciphertext_len: usize,
+    plaintext_size: u64,
+    encrypted_block: bool,
+}
+
+impl<W: io::Write> Aes256CbcEncryptWriter<W> {
+    pub(crate) fn new(inner: W, key: &[u8; 32], iv: &[u8; 16]) -> Self {
+        Self {
+            inner,
+            cipher: Aes256::new(key.into()),
+            previous: *iv,
+            pending: [0; 16],
+            pending_len: 0,
+            ciphertext: [0; CIPHERTEXT_BUFFER_SIZE],
+            ciphertext_len: 0,
+            plaintext_size: 0,
+            encrypted_block: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<(W, u64)> {
+        if self.pending_len != 0 || !self.encrypted_block {
+            self.encrypt_pending()?;
+        }
+        self.flush_ciphertext()?;
+        self.inner.flush()?;
+        Ok((self.inner, self.plaintext_size))
+    }
+
+    fn encrypt_pending(&mut self) -> io::Result<()> {
+        self.pending[self.pending_len..].fill(0);
+        let mut block = Block::<Aes256>::default();
+        block.copy_from_slice(&self.pending);
+        for (byte, previous) in block.iter_mut().zip(self.previous) {
+            *byte ^= previous;
+        }
+        self.cipher.encrypt_block(&mut block);
+        let ciphertext_end = self.ciphertext_len + block.len();
+        self.ciphertext[self.ciphertext_len..ciphertext_end].copy_from_slice(&block);
+        self.ciphertext_len = ciphertext_end;
+        self.previous.copy_from_slice(&block);
+        self.pending = [0; 16];
+        self.pending_len = 0;
+        self.encrypted_block = true;
+        if self.ciphertext_len == self.ciphertext.len() {
+            self.flush_ciphertext()?;
+        }
+        Ok(())
+    }
+
+    fn flush_ciphertext(&mut self) -> io::Result<()> {
+        if self.ciphertext_len == 0 {
+            return Ok(());
+        }
+        self.inner
+            .write_all(&self.ciphertext[..self.ciphertext_len])?;
+        self.ciphertext_len = 0;
+        Ok(())
+    }
+}
+
+impl<W: io::Write> io::Write for Aes256CbcEncryptWriter<W> {
+    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
+        let input_len = input.len();
+        let plaintext_size = self
+            .plaintext_size
+            .checked_add(input_len as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "encrypted stream too large")
+            })?;
+        while !input.is_empty() {
+            let copied = (self.pending.len() - self.pending_len).min(input.len());
+            self.pending[self.pending_len..self.pending_len + copied]
+                .copy_from_slice(&input[..copied]);
+            self.pending_len += copied;
+            input = &input[copied..];
+            if self.pending_len == self.pending.len() {
+                self.encrypt_pending()?;
+            }
+        }
+        self.plaintext_size = plaintext_size;
+        Ok(input_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_ciphertext()?;
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[derive(Default)]
+    struct CountWrites {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl io::Write for CountWrites {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn parse_aes_properties_minimal() {
@@ -202,6 +321,58 @@ mod tests {
         assert_eq!(p.num_cycles_power, 19);
         assert!(p.salt.is_empty());
         assert_eq!(p.iv, [0u8; 16]);
+    }
+
+    #[test]
+    fn streaming_encrypt_matches_zero_padded_cbc_across_chunk_boundaries() {
+        let key = [0x35; 32];
+        let iv = [0xA7; 16];
+        for data in [
+            Vec::new(),
+            (0..15).collect(),
+            (0..16).collect(),
+            (0..17).collect(),
+            (0..65).collect(),
+        ] {
+            let expected = encrypt_aes256_cbc_zero_pad(&data, &key, &iv).unwrap();
+            let mut writer = Aes256CbcEncryptWriter::new(Vec::new(), &key, &iv);
+            for chunk in data.chunks(7) {
+                writer.write_all(chunk).unwrap();
+            }
+            let (actual, plaintext_size) = writer.finish().unwrap();
+            assert_eq!(plaintext_size, data.len() as u64);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn streaming_encrypt_batches_ciphertext_writes() {
+        let data = vec![0x5A; 1024 * 1024];
+        let mut writer = Aes256CbcEncryptWriter::new(CountWrites::default(), &[1; 32], &[2; 16]);
+        writer.write_all(&data).unwrap();
+        let (output, _) = writer.finish().unwrap();
+
+        assert!(output.writes < data.len() / 1024);
+        assert_eq!(output.bytes.len(), data.len());
+    }
+
+    #[test]
+    fn streaming_encrypt_flushes_blocks_and_keeps_partial_plaintext() {
+        let key = [7; 32];
+        let iv = [9; 16];
+        let mut data = vec![3; 16];
+        data.extend_from_slice(&[4; 5]);
+        let mut writer = Aes256CbcEncryptWriter::new(Vec::new(), &key, &iv);
+        writer.write_all(&data[..16]).unwrap();
+        writer.write_all(&data[16..]).unwrap();
+        writer.flush().unwrap();
+
+        let (ciphertext, plaintext_size) = writer.finish().unwrap();
+        assert_eq!(plaintext_size, data.len() as u64);
+        assert_eq!(
+            ciphertext,
+            encrypt_aes256_cbc_zero_pad(&data, &key, &iv).unwrap()
+        );
     }
 
     #[test]
