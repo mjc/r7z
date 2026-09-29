@@ -302,16 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn auto_falls_back_to_single_with_a_small_allowance() {
-        let compression = CompressionOptions {
-            encoder_memory_limit: Some(256 * MIB),
-            ..CompressionOptions::default()
-        };
+    fn auto_limits_workers_to_the_estimated_memory_allowance() {
+        let mut compression = CompressionOptions::default();
         let options = encode::lzma2_options(&compression);
-        assert_eq!(options.lzma_options.get_memory_usage(), 189_361);
-        assert_eq!(
-            select_workers(&compression, &options, Some(256 * MIB)).unwrap(),
-            1
-        );
+        let single_worker = required_bytes(&options, 1).unwrap();
+        let two_workers = required_bytes(&options, 2).unwrap();
+        assert!(two_workers > single_worker);
+
+        compression.encoder_memory_limit = Some(single_worker);
+        assert_eq!(select_workers(&compression, &options, None).unwrap(), 1);
+
+        compression.encoder_memory_limit = Some(single_worker - 1);
+        assert!(matches!(
+            select_workers(&compression, &options, None),
+            Err(R7zError::LimitExceeded("encoder memory"))
+        ));
     }
 }
