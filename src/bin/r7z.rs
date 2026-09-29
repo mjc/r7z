@@ -858,48 +858,73 @@ fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     let selected = selected_patterns(&cli.operands);
     let listing = archive.listing(None)?;
-    let mut entries = listing
-        .entries
-        .iter()
-        .filter(|entry| entry_is_selected(&entry.path, &selected))
-        .peekable();
-    if !selected.is_empty() && entries.peek().is_none() {
+    if !selected.is_empty()
+        && !listing
+            .entries
+            .iter()
+            .any(|entry| entry_is_selected(&entry.path, &selected))
+    {
         eprintln!("No files to process");
         return Ok(EXIT_WARNING);
     }
-    let mut streams = entries
-        .filter_map(|entry| entry.block.map(|folder| (folder, entry.index)))
+    let mut folders = listing_folder_groups(&listing.entries)
+        .filter_map(|(folder, entries)| {
+            let mut indices = entries
+                .iter()
+                .filter(|entry| entry.block.is_some() && entry_is_selected(&entry.path, &selected))
+                .map(|entry| entry.index)
+                .peekable();
+            indices.peek()?;
+            Some((folder, indices))
+        })
         .peekable();
-    let mut warnings = 0;
-    if streams.peek().is_some() {
+    let warnings = if folders.peek().is_some() {
         let mut session = archive.read_session(cli.password.as_deref())?;
-        while let Some((folder, first)) = streams.next() {
-            let mut indices = std::iter::once(first).chain(std::iter::from_fn(|| {
-                streams
-                    .next_if(|(block, _)| *block == folder)
-                    .map(|(_, index)| index)
-            }));
+        let warnings = folders.fold(EXIT_OK, |warnings, (folder, mut indices)| {
             let result = indices
-                .by_ref()
                 .try_for_each(|index| {
                     session
                         .extract_to_writer(index, &mut io::sink())
                         .map(|_| ())
                 })
                 .and_then(|()| session.finish_folder());
-            // A failed folder is reported once; resume at the next independent folder.
-            indices.for_each(drop);
-            if let Err(error) = result {
-                warnings = EXIT_WARNING;
-                eprintln!("Testing block {folder} failed: {error}");
+            match result {
+                Ok(()) => warnings,
+                Err(error) => {
+                    eprintln!("Testing block {folder} failed: {error}");
+                    EXIT_WARNING
+                }
             }
-        }
+        });
         session.finish()?;
-    }
+        warnings
+    } else {
+        EXIT_OK
+    };
     if warnings == 0 {
         println!("Everything is Ok");
     }
     Ok(warnings)
+}
+
+/// Borrow each folder's contiguous listing range, including intervening empty entries.
+fn listing_folder_groups(
+    mut entries: &[ArchiveListingEntry],
+) -> impl Iterator<Item = (usize, &[ArchiveListingEntry])> {
+    std::iter::from_fn(move || {
+        let (start, folder) = entries
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| entry.block.map(|folder| (index, folder)))?;
+        let (_, data_entries) = entries.split_at(start);
+        let end = data_entries
+            .iter()
+            .position(|entry| entry.block.is_some_and(|block| block != folder))
+            .unwrap_or(data_entries.len());
+        let (group, remaining) = data_entries.split_at(end);
+        entries = remaining;
+        Some((folder, group))
+    })
 }
 
 fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
