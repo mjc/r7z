@@ -1,4 +1,7 @@
-use crate::{CoderInfo, R7zError, method_from_id, sevenzip_varuint64_decode, usize_cap};
+use crate::{
+    CoderInfo, R7zError, coder_info::CoderInfoRef, method_from_id, sevenzip_varuint64_decode,
+    usize_cap,
+};
 use nom::IResult;
 use smallvec::SmallVec;
 
@@ -300,7 +303,7 @@ impl Bindings {
 ///
 /// This walks the exact same byte layout as [`Folder::parse`] — varints,
 /// coder blocks, bind pairs, packed indices — and performs identical
-/// bounds / overflow checks, but builds no structs.
+/// bounds / overflow checks without allocating owned structs.
 ///
 /// # Errors
 ///
@@ -313,44 +316,30 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
     let mut num_out_total: u64 = 0;
 
     for _ in 0..num_coders {
-        let (i, flags) = nom::number::complete::le_u8(input)?;
-        let codec_id_size = usize::from(flags & 0x0f);
-        let is_complex = (flags & 0x10) != 0;
-        let has_attributes = (flags & 0x20) != 0;
-
-        let (i, _codec_id) = nom::bytes::complete::take(codec_id_size)(i)?;
-
-        let (i, n_in, n_out) = if is_complex {
-            let (i, n_in) = sevenzip_varuint64_decode(i)?;
-            let (i, n_out) = sevenzip_varuint64_decode(i)?;
-            (i, n_in, n_out)
-        } else {
-            (i, 1u64, 1u64)
-        };
-
-        num_in_total = num_in_total.checked_add(n_in).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
-        })?;
-        num_out_total = num_out_total.checked_add(n_out).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
-        })?;
+        let (remaining, coder) = CoderInfoRef::parse(input)?;
+        num_in_total = num_in_total
+            .checked_add(coder.num_in_streams)
+            .ok_or_else(|| {
+                nom::Err::Failure(nom::error::Error::new(
+                    remaining,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+        num_out_total = num_out_total
+            .checked_add(coder.num_out_streams)
+            .ok_or_else(|| {
+                nom::Err::Failure(nom::error::Error::new(
+                    remaining,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
         if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
             return Err(nom::Err::Failure(nom::error::Error::new(
-                i,
+                remaining,
                 nom::error::ErrorKind::TooLarge,
             )));
         }
-
-        input = if has_attributes {
-            let (i, prop_size) = sevenzip_varuint64_decode(i)?;
-            let sz = usize::try_from(prop_size).map_err(|_| {
-                nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
-            })?;
-            let (i, _props) = nom::bytes::complete::take(sz)(i)?;
-            i
-        } else {
-            i
-        };
+        input = remaining;
     }
 
     let num_bind_pairs = num_out_total.checked_sub(1).ok_or_else(|| {
@@ -592,6 +581,41 @@ mod tests {
     fn scan_folder_truncated() {
         // num_coders=1 but no coder bytes
         assert!(scan_folder(&[0x01u8]).is_err());
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_agree_on_coder_layouts() {
+        let copy = [0x01u8, 0x01, 0x00];
+        let lzma = [
+            0x01u8, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5d, 0x00, 0x10, 0x00, 0x00,
+        ];
+        let multiple_packed = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x01, 0x00, 0x01];
+        let chained = [
+            0x02u8, 0x11, 0x00, 0x01, 0x01, 0x11, 0x00, 0x01, 0x01, 0x00, 0x00,
+        ];
+
+        for folder in [&copy[..], &lzma[..], &multiple_packed[..], &chained[..]] {
+            for end in 0..=folder.len() {
+                assert_folder_parser_and_scanner_agree(&folder[..end]);
+            }
+
+            let mut trailing = folder.to_vec();
+            trailing.extend_from_slice(&[0xde, 0xad]);
+            assert_folder_parser_and_scanner_agree(&trailing);
+        }
+    }
+
+    fn assert_folder_parser_and_scanner_agree(input: &[u8]) {
+        match (scan_folder(input), Folder::parse(input)) {
+            (Ok((scan_rest, out_streams)), Ok((parse_rest, folder))) => {
+                assert_eq!(scan_rest.len(), parse_rest.len());
+                assert_eq!(out_streams, folder.total_out_streams());
+            }
+            (Err(_), Err(_)) => {}
+            (scan, parse) => {
+                panic!("scanner/parser disagree for {input:02x?}: scan={scan:?}, parse={parse:?}")
+            }
+        }
     }
 
     /// Empty input returns an error.
