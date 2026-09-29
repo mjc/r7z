@@ -42,9 +42,14 @@ struct FolderStreams<'a> {
 /// Maps file entries to substreams without allocating a table or opening decoders.
 pub(crate) struct FileStreams<'a> {
     entries: Entries<'a>,
+    streams: StreamLocations<'a>,
+    pack_pos: u64,
+}
+
+/// Advances through folder and substream iterators independently of file metadata.
+struct StreamLocations<'a> {
     folders: Option<std::iter::Enumerate<FolderLayouts<'a>>>,
     current: Option<FolderStreams<'a>>,
-    pack_pos: u64,
 }
 
 impl<'a> FileStreams<'a> {
@@ -65,8 +70,10 @@ impl<'a> FileStreams<'a> {
         let pack_pos = folders.as_ref().map_or(0, FolderLayouts::pack_pos);
         Ok(Self {
             entries,
-            folders: folders.map(Iterator::enumerate),
-            current: None,
+            streams: StreamLocations {
+                folders: folders.map(Iterator::enumerate),
+                current: None,
+            },
             pack_pos,
         })
     }
@@ -79,9 +86,15 @@ impl<'a> FileStreams<'a> {
         self.entries.len()
     }
 
-    /// Skip entries through the same stream mapping used by sequential reads.
+    /// Skip file metadata and advance only the data streams those entries own.
     pub(crate) fn nth(&mut self, n: usize) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
-        (0..n.min(self.len())).try_for_each(|_| self.next().map(|_| ()))?;
+        let skipped_streams = self
+            .entries
+            .by_ref()
+            .take(n)
+            .filter(|entry| entry.kind.has_stream())
+            .count();
+        self.streams.advance_by(skipped_streams)?;
         self.next()
     }
 
@@ -89,31 +102,47 @@ impl<'a> FileStreams<'a> {
     pub(crate) fn next(&mut self) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
         self.entries
             .next()
-            .map(|entry| entry.bind(|()| self.next_stream()))
+            .map(|entry| entry.bind(|()| self.streams.nth(0)))
             .transpose()
     }
+}
 
-    fn next_stream(&mut self) -> Result<StreamLocation<'_, 'a>, R7zError> {
-        while self
-            .current
-            .as_ref()
-            .is_none_or(|folder| folder.streams.len() == 0)
-        {
-            let (index, folder) = self
-                .folders
-                .as_mut()
-                .and_then(Iterator::next)
-                .ok_or(R7zError::Parse)?;
-            let folder = folder?;
-            let streams = folder.substreams().enumerate();
-            self.current = Some(FolderStreams {
-                index: FolderIndex(index),
-                folder,
-                streams,
-            });
+impl<'a> StreamLocations<'a> {
+    fn advance_by(&mut self, count: usize) -> Result<(), R7zError> {
+        match count {
+            0 => Ok(()),
+            count => self.nth(count - 1).map(|_| ()),
         }
+    }
+
+    /// Locate the containing folder before advancing within its substream iterator.
+    fn nth(&mut self, mut n: usize) -> Result<StreamLocation<'_, 'a>, R7zError> {
+        let remaining = self.folders.iter_mut().flatten().map(|(index, folder)| {
+            folder.map(|folder| FolderStreams {
+                index: FolderIndex(index),
+                streams: folder.substreams().enumerate(),
+                folder,
+            })
+        });
+        self.current = self
+            .current
+            .take()
+            .map(Ok)
+            .into_iter()
+            .chain(remaining)
+            .find_map(|folder| match folder {
+                Ok(folder) => match n.checked_sub(folder.streams.len()) {
+                    Some(remaining) => {
+                        n = remaining;
+                        None
+                    }
+                    None => Some(Ok(folder)),
+                },
+                Err(error) => Some(Err(error)),
+            })
+            .transpose()?;
         let current = self.current.as_mut().ok_or(R7zError::Parse)?;
-        let (index, stream) = current.streams.next().ok_or(R7zError::Parse)?;
+        let (index, stream) = current.streams.nth(n).ok_or(R7zError::Parse)?;
         Ok(StreamLocation {
             folder_index: current.index,
             stream_index: SubstreamIndex(index),
@@ -176,6 +205,17 @@ mod tests {
         assert_eq!(files.nth(0).unwrap().unwrap().metadata.index.get(), 2);
         assert_eq!(files.len(), 0);
         assert!(files.nth(usize::MAX).unwrap().is_none());
+
+        let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        let file = files.nth(2).unwrap().unwrap();
+        let crate::entries::EntryKind::File(location) = file.kind else {
+            panic!("expected data stream")
+        };
+        assert_eq!(file.metadata.index.get(), 2);
+        assert_eq!(location.folder_index.get(), 2);
+        assert_eq!(location.stream_index.get(), 1);
+        assert_eq!(location.stream.range, 1..3);
+        assert_eq!(files.len(), 0);
 
         let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();
         assert!(files.nth(usize::MAX).unwrap().is_none());
