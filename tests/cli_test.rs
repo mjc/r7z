@@ -1174,6 +1174,50 @@ fn cli_test_warns_when_operands_match_nothing() {
 }
 
 #[test]
+fn cli_test_empty_archive_distinguishes_all_from_unmatched_patterns() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("empty.7z");
+    fs::write(&path, r7z::ArchiveBuilder::new().build().unwrap()).unwrap();
+
+    let output = run_r7z(&["t".into(), path.display().to_string()]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["t", path.to_str().unwrap(), "*"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No files to process"));
+}
+
+#[test]
+fn cli_test_metadata_only_selection_does_not_open_encrypted_data() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("metadata.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            encryption: Some(r7z::EncryptionOptions::default_for_password("secret")),
+            ..Default::default()
+        })
+        .add_file("payload", b"encrypted payload")
+        .add_directory("directory", r7z::EntryMeta::default())
+        .add_empty_file("empty", r7z::EntryMeta::default())
+        .add_empty_file("empty-link", r7z::EntryMeta::symlink())
+        .add_anti_item("removed", r7z::EntryMeta::default())
+        .build()
+        .unwrap();
+    fs::write(&path, bytes).unwrap();
+
+    ["directory", "empty", "empty-link", "removed"]
+        .into_iter()
+        .for_each(|name| {
+            let output = run_r7z(&["t".into(), path.display().to_string(), name.into()]);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
+        });
+}
+
+#[test]
 fn cli_delete_accepts_wildcard_entry_patterns() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

@@ -631,7 +631,7 @@ fn list_archive(cli: &Cli) -> Result<(), CliError> {
     let archive = open_archive(cli)?;
     let physical_size = fs::metadata(&cli.archive).ok().map(|meta| meta.len());
     let listing = archive.listing(physical_size)?;
-    let selected = selected_patterns(&cli.operands);
+    let selected = EntryPatterns::from_paths(&cli.operands);
     if cli.technical {
         print_technical_listing(&listing, &cli.archive, &selected);
     } else {
@@ -640,7 +640,7 @@ fn list_archive(cli: &Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
+fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &EntryPatterns) {
     println!();
     print_listing_header(listing, archive_path);
     println!();
@@ -655,7 +655,7 @@ fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[Stri
     for entry in listing
         .entries
         .iter()
-        .filter(|entry| entry_is_selected(&entry.path, selected))
+        .filter(|entry| selected.matches(&entry.path))
     {
         if matches!(entry.kind, ListingEntryKind::Anti) {
             continue;
@@ -689,14 +689,18 @@ fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[Stri
     println!();
 }
 
-fn print_technical_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
+fn print_technical_listing(
+    listing: &ArchiveListing,
+    archive_path: &Path,
+    selected: &EntryPatterns,
+) {
     print_listing_header(listing, archive_path);
     println!();
     println!("----------");
     for entry in listing
         .entries
         .iter()
-        .filter(|entry| entry_is_selected(&entry.path, selected))
+        .filter(|entry| selected.matches(&entry.path))
     {
         println!("Path = {}", entry.path);
         println!("Size = {}", size_text(entry.size));
@@ -856,30 +860,25 @@ fn summary_text(files: usize, folders: usize) -> String {
 
 fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
-    let selected = selected_patterns(&cli.operands);
+    let selected = EntryPatterns::from_paths(&cli.operands);
     let listing = archive.listing(None)?;
-    if !selected.is_empty()
-        && !listing
-            .entries
-            .iter()
-            .any(|entry| entry_is_selected(&entry.path, &selected))
-    {
-        eprintln!("No files to process");
-        return Ok(EXIT_WARNING);
+    match selected.resolve_listing(&listing.entries) {
+        Some(selected) => test_selected_folders(&archive, cli.password.as_deref(), selected),
+        None => {
+            eprintln!("No files to process");
+            Ok(EXIT_WARNING)
+        }
     }
-    let mut folders = listing_folder_groups(&listing.entries)
-        .filter_map(|(folder, entries)| {
-            let mut indices = entries
-                .iter()
-                .filter(|entry| entry.block.is_some() && entry_is_selected(&entry.path, &selected))
-                .map(|entry| entry.index)
-                .peekable();
-            indices.peek()?;
-            Some((folder, indices))
-        })
-        .peekable();
+}
+
+fn test_selected_folders(
+    archive: &Archive,
+    password: Option<&str>,
+    selected: SelectedListing<'_>,
+) -> Result<u8, CliError> {
+    let mut folders = selected.folders().peekable();
     let warnings = if folders.peek().is_some() {
-        let mut session = archive.read_session(cli.password.as_deref())?;
+        let mut session = archive.read_session(password)?;
         let warnings = folders.fold(EXIT_OK, |warnings, (folder, mut indices)| {
             let result = indices
                 .try_for_each(|index| {
@@ -939,14 +938,14 @@ fn extract_archive_with_ui(
 ) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     fs::create_dir_all(&cli.output_dir)?;
-    let selected = selected_patterns(&cli.operands);
+    let selected = EntryPatterns::from_paths(&cli.operands);
     let mut matched = 0usize;
     let mut warnings = 0u8;
     let mut overwrite_mode = cli.overwrite_mode;
 
     let mut session: Option<r7z::ArchiveReadSession<'_>> = None;
     'entries: for entry in archive.entries() {
-        if !entry_is_selected(&entry.name, &selected) {
+        if !selected.matches(&entry.name) {
             continue;
         }
         matched += 1;
@@ -1022,11 +1021,12 @@ fn extract_archive_with_ui(
     if let Some(session) = session {
         session.finish()?;
     }
-    if !selected.is_empty() && matched == 0 {
-        eprintln!("No files to process");
-        Ok(EXIT_WARNING)
-    } else {
-        Ok(warnings)
+    match (selected, matched) {
+        (EntryPatterns::Matching(_), 0) => {
+            eprintln!("No files to process");
+            Ok(EXIT_WARNING)
+        }
+        _ => Ok(warnings),
     }
 }
 
@@ -1178,12 +1178,12 @@ fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
             "no archive entries were provided".to_string(),
         ));
     }
-    let delete_patterns = selected_patterns(&cli.operands);
+    let delete_patterns = EntryPatterns::from_paths(&cli.operands);
     let archive = open_archive(cli)?;
     let (entries, raw_folders) = preserved_rewrite_entries(
         &archive,
         cli.password.as_deref(),
-        |name| entry_is_selected(name, &delete_patterns),
+        |name| delete_patterns.matches(name),
         Vec::new(),
     )?;
     write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)
@@ -1613,15 +1613,69 @@ fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, nanos as u32))
 }
 
-fn selected_patterns(paths: &[PathBuf]) -> Vec<String> {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .collect()
+enum EntryPatterns {
+    All,
+    Matching(Vec<String>),
 }
 
-fn entry_is_selected(name: &str, patterns: &[String]) -> bool {
-    patterns.is_empty() || patterns.iter().any(|pattern| wildcard_match(pattern, name))
+impl EntryPatterns {
+    fn from_paths(paths: &[PathBuf]) -> Self {
+        match paths {
+            [] => Self::All,
+            paths => Self::Matching(
+                paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Matching(patterns) => {
+                patterns.iter().any(|pattern| wildcard_match(pattern, name))
+            }
+        }
+    }
+
+    fn resolve_listing<'a>(
+        &'a self,
+        entries: &'a [ArchiveListingEntry],
+    ) -> Option<SelectedListing<'a>> {
+        let entries = match self {
+            Self::All => entries,
+            Self::Matching(_) => {
+                let first = entries.iter().position(|entry| self.matches(&entry.path))?;
+                entries.split_at(first).1
+            }
+        };
+        Some(SelectedListing {
+            entries,
+            patterns: self,
+        })
+    }
+}
+
+/// A listing whose selection is either unrestricted or has at least one match.
+struct SelectedListing<'a> {
+    entries: &'a [ArchiveListingEntry],
+    patterns: &'a EntryPatterns,
+}
+
+impl SelectedListing<'_> {
+    fn folders(&self) -> impl Iterator<Item = (usize, impl Iterator<Item = usize>)> {
+        listing_folder_groups(self.entries).filter_map(|(folder, entries)| {
+            let mut indices = entries
+                .iter()
+                .filter(|entry| entry.block.is_some() && self.patterns.matches(&entry.path))
+                .map(|entry| entry.index)
+                .peekable();
+            indices.peek()?;
+            Some((folder, indices))
+        })
+    }
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
