@@ -82,9 +82,10 @@ mod stream_info;
 mod write;
 
 pub use archive::{
-    Archive, ArchiveEntries, ArchiveEntryInfo, ArchiveListing, ArchiveListingEntry,
-    ArchiveMetadata, ArchiveOpenOptions, ArchiveReadConfig, ArchiveReadOptions, ArchiveReadSession,
-    FolderIndex, ListingEntryKind, RawFolderBlock, RawFolderHandle, safe_archive_name,
+    Archive, ArchiveEntries, ArchiveEntryIndex, ArchiveEntryInfo, ArchiveListing,
+    ArchiveListingEntry, ArchiveMetadata, ArchiveOpenOptions, ArchiveReadConfig,
+    ArchiveReadOptions, ArchiveReadSession, FolderIndex, ListingEntryKind, RawFolderBlock,
+    RawFolderHandle, safe_archive_name,
 };
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_ARM64, CODEC_BCJ_IA64,

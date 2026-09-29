@@ -1,9 +1,9 @@
 use chrono::{DateTime, Local};
 use r7z::{
-    Archive, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec, CompressionLevel,
-    EncoderThreads, EncryptionOptions, EntryMeta, FolderIndex, HeaderMode, ListingEntryKind,
-    LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, R7zError,
-    RawFolderBlock, SevenZMethod, SolidMode, method_from_name, write_archive_update,
+    Archive, ArchiveEntryIndex, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec,
+    CompressionLevel, EncoderThreads, EncryptionOptions, EntryMeta, FolderIndex, HeaderMode,
+    ListingEntryKind, LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream,
+    R7zError, RawFolderBlock, SevenZMethod, SolidMode, method_from_name, write_archive_update,
     write_archive_with_preserved_folders,
 };
 use std::{
@@ -1512,7 +1512,7 @@ fn preserved_rewrite_entries(
         .collect::<Result<Vec<_>, _>>()?;
     let raw_folder_handles = raw_folders
         .iter()
-        .map(|folder| (folder.folder_index, folder.handle()))
+        .map(|folder| (folder.folder_index().get(), folder.handle()))
         .collect::<BTreeMap<_, _>>();
 
     let mut entries = Vec::new();
@@ -1533,6 +1533,7 @@ fn preserved_rewrite_entries(
                         .get(&folder)
                         .cloned()
                         .ok_or(R7zError::Parse)?,
+                    source_entry: ArchiveEntryIndex::new(i),
                     size: listing_entry.size.ok_or(R7zError::Parse)?,
                     crc: listing_entry.crc,
                 }

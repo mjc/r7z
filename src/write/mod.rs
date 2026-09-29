@@ -6,7 +6,10 @@ mod lzma2;
 mod model;
 
 use crate::aes::Aes256CbcEncryptWriter;
-use crate::{Archive, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle, bcj::BcjX86Writer};
+use crate::{
+    Archive, ArchiveEntryIndex, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle,
+    bcj::BcjX86Writer,
+};
 use header::{
     CoderSpec, encode_coder_info_aes_then, encode_coder_info_bcj_lzma2, encode_coder_info_copy,
     encode_coder_info_lzma, encode_coder_info_lzma2, encode_coder_info_ppmd,
@@ -58,6 +61,8 @@ pub enum PreservedEntryStream {
     Raw {
         /// Archive-scoped handle returned by [`RawFolderBlock::handle`].
         folder: RawFolderHandle,
+        /// Source entry represented by this raw substream.
+        source_entry: ArchiveEntryIndex,
         /// Uncompressed entry size.
         size: u64,
         /// Entry checksum, when present.
@@ -704,8 +709,15 @@ pub fn build_archive_with_preserved_folders(
 
 /// Write an updated archive while copying unchanged compressed folders from `source`.
 ///
-/// Every raw folder handle must come from `source`; a handle obtained from another
-/// archive is rejected before any output is written.
+/// Every raw folder and entry handle must come from `source`. Each copied folder
+/// must include every source substream once, in order, and its output entries must
+/// stay together. Invalid layouts are rejected before any output is written.
+///
+/// # Errors
+///
+/// Returns [`R7zError::ArchiveMismatch`] for handles from another archive,
+/// [`R7zError::InvalidRawFolderLayout`] when copied entries do not match the
+/// source folder layout, or an encoding or I/O error while writing.
 pub fn write_archive_update<W: Write + Seek>(
     source: &Archive,
     out: W,
@@ -713,7 +725,7 @@ pub fn write_archive_update<W: Write + Seek>(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<W, R7zError> {
-    validate_raw_folder_ownership(source, &entries, &raw_folders)?;
+    validate_raw_folder_update(source, &entries, &raw_folders)?;
     write_preserved_archive(out, entries, raw_folders, options)
 }
 
@@ -727,7 +739,7 @@ pub fn write_archive_with_preserved_folders<W: Write + Seek>(
     write_preserved_archive(out, entries, raw_folders, options)
 }
 
-fn validate_raw_folder_ownership(
+fn validate_raw_folder_update(
     source: &Archive,
     entries: &[PreservedArchiveEntry],
     raw_folders: &[RawFolderBlock],
@@ -739,16 +751,48 @@ fn validate_raw_folder_ownership(
         return Err(R7zError::ArchiveMismatch);
     }
 
-    for handle in entries.iter().filter_map(|entry| match &entry.stream {
-        PreservedEntryStream::Raw { folder, .. } => Some(folder),
-        PreservedEntryStream::None
-        | PreservedEntryStream::Data(_)
-        | PreservedEntryStream::Path { .. } => None,
-    }) {
-        if !handle.belongs_to(source)
-            || !raw_folders.iter().any(|folder| folder.handle() == *handle)
-        {
+    let listing = source.listing(None)?;
+    let mut raw_entries = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for preserved in entries {
+        let PreservedEntryStream::Raw {
+            folder,
+            source_entry,
+            size,
+            crc,
+        } = &preserved.stream
+        else {
+            continue;
+        };
+        let source_entry_index = source_entry.get();
+        let source_info = listing
+            .entries
+            .get(source_entry_index)
+            .filter(|source_info| source_info.index == source_entry_index)
+            .ok_or(R7zError::InvalidRawFolderLayout)?;
+        if !folder.belongs_to(source) || !raw_folders.iter().any(|raw| raw.handle() == *folder) {
             return Err(R7zError::ArchiveMismatch);
+        }
+        if source_info.block != Some(folder.index().get())
+            || source_info.size != Some(*size)
+            || source_info.crc != *crc
+        {
+            return Err(R7zError::InvalidRawFolderLayout);
+        }
+        raw_entries
+            .entry(folder.index().get())
+            .or_default()
+            .push(source_entry_index);
+    }
+
+    for (folder_index, entries) in raw_entries {
+        let source_entries = listing
+            .entries
+            .iter()
+            .filter(|source_entry| source_entry.block == Some(folder_index))
+            .map(|source_entry| source_entry.index)
+            .collect::<Vec<_>>();
+        if entries.into_iter().ne(source_entries) {
+            return Err(R7zError::InvalidRawFolderLayout);
         }
     }
 
@@ -834,7 +878,7 @@ fn stage_preserved_entries(
 ) -> Result<StagedPreserved, R7zError> {
     let raw_by_id = raw_folders
         .into_iter()
-        .map(|folder| (folder.folder_index, folder))
+        .map(|folder| (folder.folder_index().get(), folder))
         .collect::<std::collections::BTreeMap<_, _>>();
     let max_raw_folder = raw_by_id.keys().copied().max().unwrap_or(0);
     let mut next_data_folder = max_raw_folder.checked_add(1).ok_or(R7zError::Parse)?;
@@ -854,7 +898,9 @@ fn stage_preserved_entries(
         } = entry;
         let (has_stream, folder_id, staged) = match stream {
             PreservedEntryStream::None => (false, 0, StagedStream::None),
-            PreservedEntryStream::Raw { folder, size, crc } => {
+            PreservedEntryStream::Raw {
+                folder, size, crc, ..
+            } => {
                 let folder_id = folder.index().get();
                 if raw_by_id
                     .get(&folder_id)
@@ -908,6 +954,22 @@ fn stage_preserved_entries(
         if entry.has_stream && !folder_order.contains(&entry.folder_id) {
             folder_order.push(entry.folder_id);
         }
+    }
+
+    let mut completed_folders = std::collections::BTreeSet::new();
+    let mut current_folder = None;
+    for folder_id in write_entries
+        .iter()
+        .filter(|entry| entry.has_stream)
+        .map(|entry| entry.folder_id)
+    {
+        if current_folder == Some(folder_id) {
+            continue;
+        }
+        if !completed_folders.insert(folder_id) {
+            return Err(R7zError::InvalidRawFolderLayout);
+        }
+        current_folder = Some(folder_id);
     }
 
     Ok((write_entries, streams, folder_order, raw_by_id))

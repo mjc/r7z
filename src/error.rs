@@ -15,6 +15,10 @@ pub enum R7zError {
     #[error("raw folder handle belongs to a different archive")]
     ArchiveMismatch,
 
+    /// Retained raw folder entries do not match the source folder layout.
+    #[error("raw folder entries must preserve the complete source substream order")]
+    InvalidRawFolderLayout,
+
     /// A property tag byte was not recognised.
     #[error("invalid property: {0:#04x}")]
     InvalidProperty(u8),

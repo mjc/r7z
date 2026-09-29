@@ -444,22 +444,52 @@ impl Read for EntryReader<'_> {
 #[derive(Clone, Debug)]
 /// Packed bytes and folder metadata copied from an [`Archive`] without decoding.
 pub struct RawFolderBlock {
-    /// Zero-based index of this folder in the source archive.
-    pub folder_index: usize,
-    /// Serialized folder coder metadata.
-    pub folder_info: Vec<u8>,
-    /// Packed data, with one byte vector per packed stream.
-    pub packed_streams: Vec<Vec<u8>>,
-    /// Serialized sizes corresponding to `packed_streams`.
-    pub pack_sizes: Vec<u64>,
-    /// Unpacked sizes for the folder's coder streams.
-    pub coder_unpack_sizes: Vec<u64>,
-    /// Folder checksum, when present.
-    pub folder_crc: Option<u32>,
+    pub(crate) folder_info: Vec<u8>,
+    pub(crate) packed_streams: Vec<Vec<u8>>,
+    pub(crate) pack_sizes: Vec<u64>,
+    pub(crate) coder_unpack_sizes: Vec<u64>,
+    pub(crate) folder_crc: Option<u32>,
     handle: RawFolderHandle,
 }
 
 impl RawFolderBlock {
+    /// Zero-based folder index in the source archive.
+    #[must_use]
+    pub const fn folder_index(&self) -> FolderIndex {
+        self.handle.index
+    }
+
+    /// Serialized folder coder metadata.
+    #[must_use]
+    pub fn folder_info(&self) -> &[u8] {
+        &self.folder_info
+    }
+
+    /// Packed data, with one byte slice per packed stream.
+    #[must_use]
+    pub fn packed_streams(&self) -> &[Vec<u8>] {
+        &self.packed_streams
+    }
+
+    /// Serialized sizes corresponding to [`Self::packed_streams`].
+    #[must_use]
+    pub fn pack_sizes(&self) -> &[u64] {
+        &self.pack_sizes
+    }
+
+    /// Unpacked sizes for the folder's coder streams.
+    #[must_use]
+    pub fn coder_unpack_sizes(&self) -> &[u64] {
+        &self.coder_unpack_sizes
+    }
+
+    /// Folder checksum, when present.
+    #[must_use]
+    pub const fn folder_crc(&self) -> Option<u32> {
+        self.folder_crc
+    }
+
+    /// Handle required to refer to this folder in [`crate::write_archive_update`].
     #[must_use]
     pub fn handle(&self) -> RawFolderHandle {
         self.handle.clone()
@@ -471,6 +501,22 @@ impl RawFolderBlock {
 pub struct FolderIndex(usize);
 
 impl FolderIndex {
+    #[must_use]
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Zero-based entry index scoped to one archive.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArchiveEntryIndex(usize);
+
+impl ArchiveEntryIndex {
     #[must_use]
     pub const fn new(index: usize) -> Self {
         Self(index)
@@ -892,7 +938,6 @@ impl Archive {
             })
             .collect::<Result<Vec<_>, R7zError>>()?;
         Ok(RawFolderBlock {
-            folder_index,
             folder_info: unpack_info.folder_bytes(folder_index)?.to_vec(),
             packed_streams,
             pack_sizes,

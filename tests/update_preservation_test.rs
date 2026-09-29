@@ -50,22 +50,22 @@ fn raw_folder_block_exposes_multi_pack_stream_metadata() {
     let archive = r7z::Archive::open(&archive_path).unwrap();
     let block = archive.raw_folder_block(0).unwrap();
 
-    assert_eq!(block.folder_index, 0);
-    assert_eq!(block.packed_streams.len(), block.pack_sizes.len());
+    assert_eq!(block.folder_index(), r7z::FolderIndex::new(0));
+    assert_eq!(block.packed_streams().len(), block.pack_sizes().len());
     assert!(
-        block.packed_streams.len() > 1,
+        block.packed_streams().len() > 1,
         "BCJ2 fixture should have multiple packed streams"
     );
     assert_eq!(
         block
-            .packed_streams
+            .packed_streams()
             .iter()
             .map(|stream| stream.len() as u64)
             .collect::<Vec<_>>(),
-        block.pack_sizes
+        block.pack_sizes()
     );
     assert_eq!(
-        r7z::Folder::parse(&block.folder_info).unwrap().1,
+        r7z::Folder::parse(block.folder_info()).unwrap().1,
         archive
             .streams_info()
             .unwrap()
@@ -95,7 +95,7 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
     let archive = r7z::Archive::open(&archive_path).unwrap();
     let entry = archive.entries().next().unwrap();
     let raw = archive.raw_folder(r7z::FolderIndex::new(0)).unwrap();
-    assert!(raw.packed_streams.len() > 1);
+    assert!(raw.packed_streams().len() > 1);
     let output = r7z::write_archive_update(
         &archive,
         Cursor::new(Vec::new()),
@@ -106,6 +106,7 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
             meta: r7z::EntryMeta::default(),
             stream: r7z::PreservedEntryStream::Raw {
                 folder: raw.handle(),
+                source_entry: r7z::ArchiveEntryIndex::new(0),
                 size: data.len() as u64,
                 crc: Some(crc32fast::hash(&data)),
             },
@@ -144,6 +145,7 @@ fn raw_folder_handles_cannot_cross_archive_updates() {
                 meta: r7z::EntryMeta::default(),
                 stream: r7z::PreservedEntryStream::Raw {
                     folder: raw_handle,
+                    source_entry: r7z::ArchiveEntryIndex::new(0),
                     size: data.len() as u64,
                     crc: Some(crc32fast::hash(&data)),
                 },
@@ -152,6 +154,83 @@ fn raw_folder_handles_cannot_cross_archive_updates() {
             &r7z::ArchiveOptions::default(),
         ),
         Err(r7z::R7zError::ArchiveMismatch)
+    ));
+    assert_eq!(output.into_inner(), original_output);
+}
+
+#[test]
+fn raw_folder_updates_require_complete_contiguous_source_entries() {
+    let data = b"solid source entry".repeat(128);
+    let bytes = r7z::ArchiveBuilder::new()
+        .add_file("first.bin", &data)
+        .add_file("second.bin", &data)
+        .build()
+        .unwrap();
+    let source = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    let listing = source.listing(None).unwrap();
+    assert_eq!(listing.entries[0].block, listing.entries[1].block);
+    let folder_index = listing.entries[0].block.unwrap();
+    let raw = source
+        .raw_folder(r7z::FolderIndex::new(folder_index))
+        .unwrap();
+    let raw_entry = |name: &str, source_entry: usize| r7z::PreservedArchiveEntry {
+        name: name.to_owned(),
+        raw_name: None,
+        kind: r7z::EntryKind::File,
+        meta: r7z::EntryMeta::default(),
+        stream: r7z::PreservedEntryStream::Raw {
+            folder: raw.handle(),
+            source_entry: r7z::ArchiveEntryIndex::new(source_entry),
+            size: data.len() as u64,
+            crc: Some(crc32fast::hash(&data)),
+        },
+    };
+    let mut output = Cursor::new(vec![0xA5; 8]);
+    let original_output = output.get_ref().clone();
+
+    assert!(matches!(
+        r7z::write_archive_update(
+            &source,
+            &mut output,
+            vec![raw_entry("first.bin", 0)],
+            vec![raw.clone()],
+            &r7z::ArchiveOptions::default(),
+        ),
+        Err(r7z::R7zError::InvalidRawFolderLayout)
+    ));
+    assert_eq!(output.get_ref(), &original_output);
+
+    assert!(matches!(
+        r7z::write_archive_update(
+            &source,
+            &mut output,
+            vec![raw_entry("second.bin", 1), raw_entry("first.bin", 0)],
+            vec![raw.clone()],
+            &r7z::ArchiveOptions::default(),
+        ),
+        Err(r7z::R7zError::InvalidRawFolderLayout)
+    ));
+    assert_eq!(output.get_ref(), &original_output);
+
+    assert!(matches!(
+        r7z::write_archive_update(
+            &source,
+            &mut output,
+            vec![
+                raw_entry("first.bin", 0),
+                r7z::PreservedArchiveEntry {
+                    name: "added.bin".to_owned(),
+                    raw_name: None,
+                    kind: r7z::EntryKind::File,
+                    meta: r7z::EntryMeta::default(),
+                    stream: r7z::PreservedEntryStream::Data(data.clone()),
+                },
+                raw_entry("second.bin", 1),
+            ],
+            vec![raw],
+            &r7z::ArchiveOptions::default(),
+        ),
+        Err(r7z::R7zError::InvalidRawFolderLayout)
     ));
     assert_eq!(output.into_inner(), original_output);
 }
@@ -188,6 +267,7 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
                 meta: r7z::EntryMeta::default(),
                 stream: r7z::PreservedEntryStream::Raw {
                     folder: raw.handle(),
+                    source_entry: r7z::ArchiveEntryIndex::new(0),
                     size: kept.len() as u64,
                     crc: Some(crc32fast::hash(&kept)),
                 },
