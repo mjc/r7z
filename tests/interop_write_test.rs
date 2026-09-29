@@ -2017,6 +2017,120 @@ fn build_streaming_to_writer_matches_seek_backed_output() {
 }
 
 #[test]
+fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let entries = || vec![("payload".to_string(), b"temporary spool limit".as_slice())];
+    let mut expected = std::io::Cursor::new(Vec::new());
+    r7z::build_streaming_with_options(entries(), &mut expected, r7z::ArchiveOptions::default())
+        .unwrap();
+    let spool_limit = expected.get_ref().len() as u64 - 1;
+    let tmp = tempfile::tempdir().unwrap();
+
+    for spool in [
+        r7z::SpoolMode::TempFile {
+            dir: Some(tmp.path().to_path_buf()),
+        },
+        r7z::SpoolMode::Auto {
+            memory_threshold: 1,
+            dir: Some(tmp.path().to_path_buf()),
+        },
+    ] {
+        let exact_limit_spool = spool.clone();
+        let mut output = WriteOnly(Vec::new());
+        let result = r7z::build_streaming_to_writer(
+            entries(),
+            &mut output,
+            r7z::ArchiveOptions {
+                streaming: r7z::StreamingOptions {
+                    spool,
+                    max_temporary_storage_bytes: Some(spool_limit),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(r7z::R7zError::ResourceLimitExceeded {
+                resource: "temporary storage",
+                limit,
+            }) if limit == spool_limit
+        ));
+        assert!(output.0.is_empty());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+        let mut exact_limit_output = WriteOnly(Vec::new());
+        r7z::build_streaming_to_writer(
+            entries(),
+            &mut exact_limit_output,
+            r7z::ArchiveOptions {
+                streaming: r7z::StreamingOptions {
+                    spool: exact_limit_spool,
+                    max_temporary_storage_bytes: Some(expected.get_ref().len() as u64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            exact_limit_output.0.as_slice(),
+            expected.get_ref().as_slice()
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn memory_spool_does_not_use_temporary_storage_allowance() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = WriteOnly(Vec::new());
+    r7z::build_streaming_to_writer(
+        [("payload".to_string(), b"memory spool".as_slice())],
+        &mut output,
+        r7z::ArchiveOptions {
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::Memory,
+                max_temporary_storage_bytes: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        r7z::Archive::from_bytes(output.0.into())
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        b"memory spool"
+    );
+}
+
+#[test]
 fn build_streaming_volumes_splits_final_archive_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("split.7z");

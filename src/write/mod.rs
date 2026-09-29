@@ -1831,6 +1831,7 @@ where
     R: Read,
 {
     encode::validate_archive_options(&options)?;
+    let max_temporary_storage_bytes = options.streaming.max_temporary_storage_bytes;
     match options.streaming.spool.clone() {
         SpoolMode::Memory => {
             let mut spool = Cursor::new(Vec::new());
@@ -1842,38 +1843,60 @@ where
         SpoolMode::Auto {
             memory_threshold,
             dir,
-        } => {
-            let mut spool = AutoSpool::new(memory_threshold, dir)?;
-            let result = (|| {
-                build_streaming_with_options(entries, &mut spool, options)?;
-                spool.seek(SeekFrom::Start(0))?;
-                io::copy(&mut spool, &mut out)?;
-                out.flush()?;
-                Ok(())
-            })();
-            let remove_result = spool.cleanup();
-            match (result, remove_result) {
-                (Err(err), _) => Err(err),
-                (Ok(()), Err(err)) => Err(err.into()),
-                (Ok(()), Ok(())) => Ok(()),
-            }
-        }
-        SpoolMode::TempFile { dir } => {
-            let (mut spool, path) = create_temp_spool(dir.as_deref())?;
-            let result = (|| {
-                build_streaming_with_options(entries, &mut spool, options)?;
-                spool.seek(SeekFrom::Start(0))?;
-                io::copy(&mut spool, &mut out)?;
-                out.flush()?;
-                Ok(())
-            })();
-            let remove_result = std::fs::remove_file(&path);
-            match (result, remove_result) {
-                (Err(err), _) => Err(err),
-                (Ok(()), Err(err)) => Err(err.into()),
-                (Ok(()), Ok(())) => Ok(()),
-            }
-        }
+        } => build_streaming_with_temp_spool(
+            entries,
+            &mut out,
+            options,
+            memory_threshold,
+            dir,
+            max_temporary_storage_bytes,
+        ),
+        SpoolMode::TempFile { dir } => build_streaming_with_temp_spool(
+            entries,
+            &mut out,
+            options,
+            0,
+            dir,
+            max_temporary_storage_bytes,
+        ),
+    }
+}
+
+fn build_streaming_with_temp_spool<W, I, R>(
+    entries: I,
+    out: &mut W,
+    options: ArchiveOptions,
+    memory_threshold: u64,
+    dir: Option<PathBuf>,
+    max_temporary_storage_bytes: Option<u64>,
+) -> Result<(), R7zError>
+where
+    W: Write,
+    I: IntoIterator<Item = (String, R)>,
+    R: Read,
+{
+    let mut spool = AutoSpool::new(memory_threshold, dir, max_temporary_storage_bytes)?;
+    let result = (|| {
+        build_streaming_with_options(entries, &mut spool, options)?;
+        spool.seek(SeekFrom::Start(0))?;
+        io::copy(&mut spool, out)?;
+        out.flush()?;
+        Ok(())
+    })();
+    let limit_exceeded = spool.limit_exceeded;
+    let cleanup_result = spool.cleanup();
+
+    if limit_exceeded {
+        return Err(R7zError::ResourceLimitExceeded {
+            resource: "temporary storage",
+            limit: max_temporary_storage_bytes.expect("limit exceeded only when configured"),
+        });
+    }
+
+    match (result, cleanup_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -1959,11 +1982,17 @@ enum AutoSpoolInner {
 struct AutoSpool {
     memory_threshold: u64,
     dir: Option<PathBuf>,
+    max_temporary_storage_bytes: Option<u64>,
+    limit_exceeded: bool,
     inner: AutoSpoolInner,
 }
 
 impl AutoSpool {
-    fn new(memory_threshold: u64, dir: Option<PathBuf>) -> Result<Self, R7zError> {
+    fn new(
+        memory_threshold: u64,
+        dir: Option<PathBuf>,
+        max_temporary_storage_bytes: Option<u64>,
+    ) -> Result<Self, R7zError> {
         let inner = if memory_threshold == 0 {
             let (file, path) = create_temp_spool(dir.as_deref())?;
             AutoSpoolInner::TempFile { file, path }
@@ -1973,28 +2002,66 @@ impl AutoSpool {
         Ok(Self {
             memory_threshold,
             dir,
+            max_temporary_storage_bytes,
+            limit_exceeded: false,
             inner,
         })
     }
 
     fn maybe_roll_to_file(&mut self, write_len: usize) -> io::Result<()> {
-        let AutoSpoolInner::Memory(cursor) = &mut self.inner else {
+        let AutoSpoolInner::Memory(cursor) = &self.inner else {
             return Ok(());
         };
 
+        let write_len = u64::try_from(write_len).unwrap_or(u64::MAX);
         let projected_len = cursor
             .position()
-            .saturating_add(write_len as u64)
+            .saturating_add(write_len)
             .max(cursor.get_ref().len() as u64);
         if projected_len <= self.memory_threshold {
             return Ok(());
         }
+        if self
+            .max_temporary_storage_bytes
+            .is_some_and(|limit| projected_len > limit)
+        {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("temporary storage limit exceeded"));
+        }
 
         let current_pos = cursor.position();
         let (mut file, path) = create_temp_spool(self.dir.as_deref()).map_err(io::Error::other)?;
-        file.write_all(cursor.get_ref())?;
-        file.seek(SeekFrom::Start(current_pos))?;
+        let result = file
+            .write_all(cursor.get_ref())
+            .and_then(|()| file.seek(SeekFrom::Start(current_pos)).map(|_| ()));
+        if let Err(error) = result {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
         self.inner = AutoSpoolInner::TempFile { file, path };
+        Ok(())
+    }
+
+    fn check_temporary_file_write(&mut self, write_len: usize) -> io::Result<()> {
+        if self.max_temporary_storage_bytes.is_none() || write_len == 0 {
+            return Ok(());
+        }
+        let AutoSpoolInner::TempFile { file, .. } = &mut self.inner else {
+            return Ok(());
+        };
+        let write_len = u64::try_from(write_len).unwrap_or(u64::MAX);
+        let projected_len = file
+            .stream_position()?
+            .saturating_add(write_len)
+            .max(file.metadata()?.len());
+        if self
+            .max_temporary_storage_bytes
+            .is_some_and(|limit| projected_len > limit)
+        {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("temporary storage limit exceeded"));
+        }
         Ok(())
     }
 
@@ -2008,6 +2075,7 @@ impl AutoSpool {
 
 impl Write for AutoSpool {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_temporary_file_write(buf.len())?;
         self.maybe_roll_to_file(buf.len())?;
         match &mut self.inner {
             AutoSpoolInner::Memory(cursor) => cursor.write(buf),
