@@ -22,13 +22,12 @@ use std::io::{Cursor, Read, Write};
 const MAX_LZMA_DICTIONARY_BYTES: u32 = 256 * 1024 * 1024;
 const MAX_LZMA2_PROBABILITY_BYTES: usize = 24 * 1024;
 const MAX_PPMD_MEMORY_BYTES: u32 = 256 * 1024 * 1024;
-// AES decryption holds both encrypted and decrypted copies, each capped here.
-const MAX_BUFFERED_AES_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BCJ2_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
 const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
 const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
+const AES_CBC_WORKING_SET_BYTES: usize = 1024;
 const MAX_FOLDER_CODERS: usize = 64;
 // Remaining buffered paths use this cap for packed folder bytes.
 pub(crate) const MAX_BUFFERED_PACKED_FOLDER_BYTES: usize = 512 * 1024 * 1024;
@@ -257,26 +256,22 @@ fn prepare_folder_decoder<R: Read>(
 
 fn aes_coder_reader<'a>(
     props: crate::aes::AesProperties,
-    mut input: Box<dyn Read + 'a>,
+    input: Box<dyn Read + 'a>,
     input_size: OutputSize,
     unpack_size: OutputSize,
     password: Option<&str>,
-) -> Result<Cursor<Vec<u8>>, R7zError> {
+) -> Result<crate::aes::Aes256CbcDecryptReader<Box<dyn Read + 'a>>, R7zError> {
     let password = password.ok_or(R7zError::PasswordRequired)?;
     let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
-    let mut encrypted = Vec::new();
-    read_to_end_bounded(
-        &mut input,
-        &mut encrypted,
-        input_size.buffered_bytes(MAX_BUFFERED_AES_BYTES),
-        "AES encrypted input",
-    )?;
-    drop(input);
-    let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
-    if let OutputSize::Known(size) = unpack_size {
-        truncate_to(&mut decrypted, size)?;
-    }
-    Ok(Cursor::new(decrypted))
+    let ciphertext_size = match input_size {
+        OutputSize::Known(size) => Some(size),
+        OutputSize::Unknown => None,
+    };
+    let plaintext_size = match unpack_size {
+        OutputSize::Known(size) => Some(size),
+        OutputSize::Unknown => None,
+    };
+    crate::aes::Aes256CbcDecryptReader::new(input, &key, &props.iv, ciphertext_size, plaintext_size)
 }
 
 fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
@@ -514,15 +509,6 @@ fn ensure_bcj2_working_budget(output_size: usize, decoder_memory: usize) -> Resu
     Ok(())
 }
 
-fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
-    let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
-    if data.len() < size {
-        return Err(R7zError::Decompression);
-    }
-    data.truncate(size);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -736,20 +722,29 @@ mod tests {
     }
 
     #[test]
-    fn aes_buffering_obeys_the_admitted_input_size() {
+    fn aes_coder_reader_streams_inputs_over_256_mib() {
+        use super::{OutputSize, aes_coder_reader};
+
+        let size = 256 * 1024 * 1024 + 16;
         let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
-        assert!(matches!(
-            super::aes_coder_reader(
-                props,
-                Box::new(Cursor::new([0; 16])),
-                super::OutputSize::Known(8),
-                super::OutputSize::Known(0),
-                Some("password")
-            ),
-            Err(R7zError::ResourceLimitExceeded {
-                resource: "AES encrypted input",
-                limit: 8
-            })
-        ));
+        let mut reader = aes_coder_reader(
+            props,
+            Box::new(std::io::repeat(0).take(size)),
+            OutputSize::Known(size),
+            OutputSize::Known(size),
+            Some("password"),
+        )
+        .unwrap();
+        let mut output = [0; 8192];
+        let mut read = 0;
+        loop {
+            let n = reader.read(&mut output).unwrap();
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+        }
+
+        assert_eq!(read, size);
     }
 }

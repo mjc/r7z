@@ -491,7 +491,7 @@ struct DecodeStep {
 
 impl DecodeStep {
     fn working_set(&self) -> Result<WorkingSet, R7zError> {
-        self.coder.working_set(self.input)
+        self.coder.working_set()
     }
 
     fn open<'r>(
@@ -599,7 +599,7 @@ impl CoderPlan {
         })
     }
 
-    fn working_set(&self, input_size: OutputSize) -> Result<WorkingSet, R7zError> {
+    fn working_set(&self) -> Result<WorkingSet, R7zError> {
         let bytes = match self {
             Self::Lzma(properties) => properties.memory,
             Self::Lzma2(dictionary) => (*dictionary as usize)
@@ -609,10 +609,8 @@ impl CoderPlan {
             Self::Ppmd { memory, .. } => (*memory as usize)
                 .checked_add(DECODER_OVERHEAD_BYTES)
                 .ok_or(R7zError::Decompression)?,
-            Self::Aes(_) => input_size
-                .buffered_bytes(MAX_BUFFERED_AES_BYTES)
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(DECODER_OVERHEAD_BYTES))
+            Self::Aes(_) => AES_CBC_WORKING_SET_BYTES
+                .checked_add(DECODER_OVERHEAD_BYTES)
                 .ok_or(R7zError::Decompression)?,
             Self::Copy | Self::X86 | Self::Branch(_) | Self::Delta(_) | Self::Swap(_) => 0,
             Self::Arm64(_) | Self::Riscv(_) | Self::Deflate | Self::Bzip2 | Self::Deflate64 => {
@@ -973,7 +971,7 @@ mod tests {
     fn typed_codec_plans_preserve_memory_estimates() {
         let lzma2 = CoderPlan::compile(&coder(&[0x21, 0x21, 1, 0]), OutputSize::Known(0)).unwrap();
         assert_eq!(
-            lzma2.working_set(OutputSize::Known(0)).unwrap().0,
+            lzma2.working_set().unwrap().0,
             4096 + MAX_LZMA2_PROBABILITY_BYTES + DECODER_OVERHEAD_BYTES
         );
         let ppmd = CoderPlan::compile(
@@ -982,31 +980,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ppmd.working_set(OutputSize::Known(0)).unwrap().0,
+            ppmd.working_set().unwrap().0,
             1024 * 1024 + DECODER_OVERHEAD_BYTES
         );
         let copy = CoderPlan::compile(&coder(&[1, 0]), OutputSize::Known(0)).unwrap();
-        assert_eq!(
-            copy.working_set(OutputSize::Known(usize::MAX as u64))
-                .unwrap()
-                .0,
-            0
-        );
+        assert_eq!(copy.working_set().unwrap().0, 0);
     }
 
     #[test]
-    fn aes_working_set_uses_packed_size_and_caps_buffer_estimate() {
+    fn aes_working_set_covers_streaming_state() {
         let aes = CoderPlan::compile(
             &coder(&[0x24, 6, 0xf1, 7, 1, 2, 0, 0]),
             OutputSize::Known(0),
         )
         .unwrap();
-        for packed in [0, 129 * 1024 * 1024, MAX_BUFFERED_AES_BYTES, usize::MAX] {
-            assert_eq!(
-                aes.working_set(OutputSize::Known(packed as u64)).unwrap().0,
-                packed.min(MAX_BUFFERED_AES_BYTES) * 2 + DECODER_OVERHEAD_BYTES
-            );
-        }
+        assert_eq!(
+            aes.working_set().unwrap().0,
+            AES_CBC_WORKING_SET_BYTES + DECODER_OVERHEAD_BYTES
+        );
     }
 
     #[test]
@@ -1198,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn aes_admission_uses_the_preceding_coders_output() {
+    fn aes_admission_does_not_scale_with_the_preceding_coders_output() {
         let folder = pair(
             coder(&[0x21, 0x21, 1, 0]),
             coder(&[0x24, 6, 0xf1, 7, 1, 2, 0, 0]),
@@ -1209,11 +1200,11 @@ mod tests {
             plan.memory.0,
             4096 + MAX_LZMA2_PROBABILITY_BYTES
                 + DECODER_OVERHEAD_BYTES
-                + 2 * 4096
+                + AES_CBC_WORKING_SET_BYTES
                 + DECODER_OVERHEAD_BYTES
         );
-        for sizes in [&[][..], &[MAX_BUFFERED_AES_BYTES as u64, 0][..]] {
-            assert!(matches!(
+        for sizes in [&[][..], &[256 * 1024 * 1024, 0][..]] {
+            assert!(
                 prepare_folder_decoder(
                     &folder,
                     smallvec::smallvec![PackedInput {
@@ -1222,12 +1213,9 @@ mod tests {
                     }],
                     0,
                     sizes
-                ),
-                Err(R7zError::ResourceLimitExceeded {
-                    resource: "decoder working set",
-                    ..
-                })
-            ));
+                )
+                .is_ok()
+            );
         }
     }
 
