@@ -464,6 +464,111 @@ impl Iterator for ArchiveEntries<'_> {
 
 impl ExactSizeIterator for ArchiveEntries<'_> {}
 
+/// Forward-only entry reads sharing the current solid-folder decoder.
+///
+/// Call [`finish`](Self::finish) to verify the last folder. Dropping a session
+/// releases its decoder without reading or checking the remaining folder data.
+pub struct ArchiveReadSession<'a> {
+    files: FileStreams<'a>,
+    decoder: FolderDecoder<'a>,
+    password: Option<&'a str>,
+    next_index: usize,
+    count: usize,
+}
+
+impl ArchiveReadSession<'_> {
+    /// Read an entry whose index is greater than every previously requested index.
+    /// Unread entry bytes are drained and checked after the callback returns.
+    /// Directories and anti-items return [`R7zError::Directory`]. Empty file-like
+    /// entries invoke the callback with an empty reader.
+    ///
+    /// # Errors
+    /// Returns selection, decode, checksum, or callback errors. An invalid index
+    /// leaves the session unchanged. A valid request consumes its index even if
+    /// it fails. Failed data reads discard the active decoder; later requests
+    /// may open a new decoder.
+    pub fn read_entry(
+        &mut self,
+        index: usize,
+        callback: impl FnOnce(&mut dyn Read) -> Result<(), R7zError>,
+    ) -> Result<(), R7zError> {
+        if index < self.next_index || index >= self.count {
+            return Err(R7zError::InvalidOptions(
+                "read session requires increasing valid entry indexes",
+            ));
+        }
+        while let Some(file) = self.files.next()? {
+            self.next_index = file.metadata.index.get() + 1;
+            if file.metadata.index.get() != index {
+                continue;
+            }
+            let entry = ArchiveEntryInfo::from_entry(&file);
+            return match file.kind {
+                EntryKind::File(location) | EntryKind::Symlink(location) => {
+                    self.decoder
+                        .read(location, &entry, self.password, |_, reader| {
+                            callback(reader)
+                        })
+                }
+                EntryKind::EmptyFile | EntryKind::EmptySymlink => callback(&mut std::io::empty()),
+                EntryKind::Directory | EntryKind::Anti => Err(R7zError::Directory),
+            };
+        }
+        Err(R7zError::Parse)
+    }
+
+    /// Copy an entry to a writer while retaining the decoder for subsequent reads.
+    ///
+    /// # Errors
+    /// Returns the errors from [`read_entry`](Self::read_entry), or a writer error.
+    pub fn extract_to_writer<W: Write + ?Sized>(
+        &mut self,
+        index: usize,
+        writer: &mut W,
+    ) -> Result<u64, R7zError> {
+        let mut written = 0;
+        self.read_entry(index, |reader| {
+            written = copy_entry(reader, writer)?;
+            Ok(())
+        })?;
+        Ok(written)
+    }
+
+    /// Complete the current folder and release its decoder. With a folder CRC,
+    /// this reads and verifies the remaining data, including unselected entries.
+    /// Without a folder CRC, an unselected tail may remain unread.
+    ///
+    /// # Errors
+    /// Returns decoding or checksum errors. The decoder is released on both
+    /// success and failure, so independent folders can still be processed.
+    pub fn finish_folder(&mut self) -> Result<(), R7zError> {
+        self.decoder.finish()
+    }
+
+    /// Complete the last folder and close this session.
+    ///
+    /// # Errors
+    /// Returns errors from [`finish_folder`](Self::finish_folder).
+    pub fn finish(mut self) -> Result<(), R7zError> {
+        self.finish_folder()
+    }
+}
+
+fn copy_entry(reader: &mut dyn Read, writer: &mut (impl Write + ?Sized)) -> Result<u64, R7zError> {
+    let mut written = 0u64;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| R7zError::Decompression)?;
+        if count == 0 {
+            return Ok(written);
+        }
+        writer.write_all(&buffer[..count])?;
+        written = written.checked_add(count as u64).ok_or(R7zError::Parse)?;
+    }
+}
+
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawFolderBlock {
@@ -975,22 +1080,39 @@ impl Archive {
             EntryKind::File(()) | EntryKind::Symlink(()) => {}
         }
 
-        let mut written = 0u64;
-        self.stream_files_impl(Some(&[file_index]), password, |_, reader| {
-            let mut buffer = [0; 8192];
-            loop {
-                let count = reader
-                    .read(&mut buffer)
-                    .map_err(|_| R7zError::Decompression)?;
-                if count == 0 {
-                    break;
-                }
-                writer.write_all(&buffer[..count])?;
-                written = written.checked_add(count as u64).ok_or(R7zError::Parse)?;
-            }
-            Ok(())
-        })?;
+        let mut session = self.read_session(password)?;
+        let written = session.extract_to_writer(file_index, writer)?;
+        session.finish()?;
         Ok(written)
+    }
+
+    /// Start forward-only reads that reuse solid-folder decoders between entries.
+    /// No packed data is opened until an entry with a data stream is requested.
+    /// Finish the session explicitly to check its final folder CRC.
+    ///
+    /// # Errors
+    /// Returns malformed file/stream layout or packed-source range errors.
+    pub fn read_session<'a>(
+        &'a self,
+        password: Option<&'a str>,
+    ) -> Result<ArchiveReadSession<'a>, R7zError> {
+        let files = FileStreams::new(
+            self.try_files_info()?,
+            self.num_files(),
+            self.try_streams_info()?,
+        )?;
+        let decoder = FolderDecoder {
+            source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
+            current: None,
+            mode: CompletionMode::SelectedStreams,
+        };
+        Ok(ArchiveReadSession {
+            files,
+            decoder,
+            password,
+            next_index: 0,
+            count: self.num_files(),
+        })
     }
 
     /// Stream every file-like entry through `callback`, decoding each solid
@@ -1112,7 +1234,7 @@ impl Archive {
                 let entry = ArchiveEntryInfo::from_entry(&file);
                 match file.kind {
                     EntryKind::File(location) | EntryKind::Symlink(location) => {
-                        decoder = decoder.read(location, &entry, password, &mut callback)?;
+                        decoder.read(location, &entry, password, &mut callback)?;
                     }
                     EntryKind::EmptyFile | EntryKind::EmptySymlink => {
                         callback(&entry, &mut std::io::empty())?;
@@ -1373,12 +1495,12 @@ struct FolderDecoder<'a> {
 
 impl<'a> FolderDecoder<'a> {
     fn read(
-        mut self,
+        &mut self,
         location: StreamLocation<'_, 'a>,
         entry: &ArchiveEntryInfo,
         password: Option<&str>,
-        callback: &mut impl FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
-    ) -> Result<Self, R7zError> {
+        callback: impl FnOnce(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
+    ) -> Result<(), R7zError> {
         let active = match self.current.take() {
             Some((index, active)) if index == location.folder_index => active,
             previous => {
@@ -1395,11 +1517,11 @@ impl<'a> FolderDecoder<'a> {
             .skip_to(location.stream_index.get())?
             .read_stream(|reader| callback(entry, reader))?;
         self.current = Some((location.folder_index, active));
-        Ok(self)
+        Ok(())
     }
 
-    fn finish(self) -> Result<(), R7zError> {
-        if let Some((_, active)) = self.current {
+    fn finish(&mut self) -> Result<(), R7zError> {
+        if let Some((_, active)) = self.current.take() {
             let _completion = active.finish(self.mode)?;
         }
         Ok(())
@@ -2252,5 +2374,156 @@ mod selected_stream_tests {
         assert!(raw.next().is_none());
         assert!(public.next().is_none());
         assert!(archive.entry(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn read_session_reuses_packed_reads_across_solid_entries() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Counted {
+            data: std::io::Cursor<Vec<u8>>,
+            read: Arc<AtomicUsize>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.data.read(buf)?;
+                self.read.fetch_add(n, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(from)
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let archive = Archive::from_reader(Counted {
+            data: std::io::Cursor::new(three_file_archive()),
+            read: count.clone(),
+        })
+        .unwrap();
+        count.store(0, Ordering::Relaxed);
+        archive
+            .stream_selected_files(&[0, 1], |_, _| Ok(()))
+            .unwrap();
+        let batched = count.swap(0, Ordering::Relaxed);
+        let mut session = archive.read_session(None).unwrap();
+        session
+            .read_entry(0, |reader| {
+                let mut first = [0];
+                reader.read_exact(&mut first)?;
+                Ok(())
+            })
+            .unwrap();
+        session.read_entry(1, |_| Ok(())).unwrap();
+        session.finish().unwrap();
+        let reused = count.swap(0, Ordering::Relaxed);
+        assert!(reused > 0);
+        assert_eq!(reused, batched);
+        archive.extract_to_writer(0, &mut std::io::sink()).unwrap();
+        archive.extract_to_writer(1, &mut std::io::sink()).unwrap();
+        assert!(count.load(Ordering::Relaxed) > reused);
+    }
+
+    #[test]
+    fn read_session_rejects_invalid_order_without_consuming_valid_requests() {
+        let archive = mixed_entry_archive();
+        let mut session = archive.read_session(None).unwrap();
+        assert!(matches!(
+            session.read_entry(usize::MAX, |_| panic!("invalid index")),
+            Err(R7zError::InvalidOptions(_))
+        ));
+        assert!(matches!(
+            session.read_entry(0, |_| panic!("directory")),
+            Err(R7zError::Directory)
+        ));
+        for index in [1, 2, 3] {
+            assert_eq!(
+                session.extract_to_writer(index, &mut Vec::new()).unwrap(),
+                0
+            );
+        }
+        assert!(matches!(
+            session.read_entry(4, |_| panic!("anti-item")),
+            Err(R7zError::Directory)
+        ));
+        assert!(matches!(
+            session.read_entry(3, |_| panic!("backward")),
+            Err(R7zError::InvalidOptions(_))
+        ));
+        let mut data = Vec::new();
+        assert_eq!(session.extract_to_writer(5, &mut data).unwrap(), 7);
+        assert_eq!(data, b"payload");
+        assert!(matches!(
+            session.read_entry(5, |_| panic!("repeated")),
+            Err(R7zError::InvalidOptions(_))
+        ));
+        session.extract_to_writer(6, &mut std::io::sink()).unwrap();
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn read_session_recovers_at_independent_folders_after_decode_or_callback_errors() {
+        for corrupt in [false, true] {
+            let mut bytes = three_file_archive();
+            if corrupt {
+                corrupt_file_data(&mut bytes, 0);
+            }
+            let archive = Archive::from_bytes(bytes.into()).unwrap();
+            let mut session = archive.read_session(None).unwrap();
+            let result = session.read_entry(0, |reader| {
+                if !corrupt {
+                    return Err(R7zError::InvalidOptions("callback failure"));
+                }
+                std::io::copy(reader, &mut std::io::sink()).map_err(R7zError::Io)?;
+                Ok(())
+            });
+            assert!(result.is_err());
+            session.finish_folder().unwrap();
+            let mut data = Vec::new();
+            session.extract_to_writer(2, &mut data).unwrap();
+            assert_eq!(data, archive.extract_to_memory(2).unwrap());
+            session.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn read_session_finish_does_not_decode_unselected_tail_without_folder_crc() {
+        let mut bytes = three_file_archive();
+        corrupt_stream_data(&mut bytes, 1);
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let mut session = archive.read_session(None).unwrap();
+        session.extract_to_writer(0, &mut std::io::sink()).unwrap();
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn read_session_finishing_reports_folder_crc_failure_after_selected_entry() {
+        let data = b"abcd";
+        let wrong_crc = crc32fast::hash(data) ^ 1;
+        let mut header = vec![
+            1, 4, 6, 0, 1, 9, 4, 0, // Header, main streams, packed size
+            7, 0x0b, 1, 0, 1, 1, 0, 0x0c, 4, 0x0a, 1, // Copy folder, output size, CRC
+        ];
+        header.extend_from_slice(&wrong_crc.to_le_bytes());
+        header.extend_from_slice(&[0, 8, 0x0d, 2, 9, 2, 0, 0, 5, 2, 0, 0]);
+        let mut bytes = b"7z\xbc\xaf'\x1c\x00\x04".to_vec();
+        let mut start = Vec::new();
+        start.extend_from_slice(&4u64.to_le_bytes());
+        start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        start.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&start).to_le_bytes());
+        bytes.extend_from_slice(&start);
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&header);
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let mut session = archive.read_session(None).unwrap();
+        let mut output = Vec::new();
+        session.extract_to_writer(0, &mut output).unwrap();
+        assert_eq!(output, b"ab");
+        assert!(matches!(session.finish_folder(), Err(R7zError::Crc)));
+        session.finish().unwrap();
     }
 }

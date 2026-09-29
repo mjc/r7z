@@ -1386,3 +1386,62 @@ fn cli_mixed_entry_kinds_survive_testing_extraction_and_rewrite() {
     assert_eq!(keep, b"payload");
     run_r7z(&["t".into(), path.display().to_string()]);
 }
+
+#[test]
+fn cli_test_continues_with_independent_folders_after_corruption() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("corrupt.7z");
+    let mut bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            compression: r7z::CompressionOptions {
+                solid: r7z::SolidMode::NonSolid,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .add_file("first", b"first")
+        .add_file("middle", b"middle")
+        .add_file("last", b"last")
+        .build()
+        .unwrap();
+    bytes[32] ^= 1;
+    bytes[32 + 5 + 6] ^= 1;
+    fs::write(&path, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["t", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(errors.contains("Testing block 0 failed"), "{errors}");
+    assert!(errors.contains("Testing block 2 failed"), "{errors}");
+    assert!(!errors.contains("Testing block 1 failed"), "{errors}");
+    run_r7z(&["t".into(), path.display().to_string(), "middle".into()]);
+}
+
+#[test]
+fn cli_skipped_encrypted_files_do_not_open_a_decoder() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("encrypted.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            encryption: Some(r7z::EncryptionOptions::default_for_password("secret")),
+            ..Default::default()
+        })
+        .add_file("keep", b"encrypted payload")
+        .build()
+        .unwrap();
+    fs::write(&path, bytes).unwrap();
+    let out = tmp.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), b"existing").unwrap();
+    run_r7z(&[
+        "x".into(),
+        "-aos".into(),
+        path.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+    assert_eq!(fs::read(out.join("keep")).unwrap(), b"existing");
+}

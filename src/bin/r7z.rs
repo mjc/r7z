@@ -857,28 +857,39 @@ fn summary_text(files: usize, folders: usize) -> String {
 fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     let selected = selected_patterns(&cli.operands);
-    let mut sink = io::sink();
-    let mut warnings = 0u8;
-    let mut matched = 0usize;
-    for entry in archive.entries() {
-        if !entry_is_selected(&entry.name, &selected) {
-            continue;
-        }
-        matched += 1;
-        if !entry.has_data_stream() {
-            continue;
-        }
-        let i = entry.index;
-        if let Err(err) =
-            archive.extract_to_writer_with_password(i, &mut sink, cli.password.as_deref())
-        {
-            warnings = EXIT_WARNING;
-            eprintln!("Testing entry {i} failed: {err}");
+    let listing = archive.listing(None)?;
+    let mut matched = 0;
+    let mut folders: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for entry in &listing.entries {
+        if entry_is_selected(&entry.path, &selected) {
+            matched += 1;
+            if let Some(folder) = entry.block {
+                folders.entry(folder).or_default().push(entry.index);
+            }
         }
     }
     if !selected.is_empty() && matched == 0 {
         eprintln!("No files to process");
         return Ok(EXIT_WARNING);
+    }
+    let mut warnings = 0;
+    if !folders.is_empty() {
+        let mut session = archive.read_session(cli.password.as_deref())?;
+        for (folder, indices) in folders {
+            let result = indices
+                .into_iter()
+                .try_for_each(|index| {
+                    session
+                        .extract_to_writer(index, &mut io::sink())
+                        .map(|_| ())
+                })
+                .and_then(|()| session.finish_folder());
+            if let Err(error) = result {
+                warnings = EXIT_WARNING;
+                eprintln!("Testing block {folder} failed: {error}");
+            }
+        }
+        session.finish()?;
     }
     if warnings == 0 {
         println!("Everything is Ok");
@@ -903,7 +914,8 @@ fn extract_archive_with_ui(
     let mut warnings = 0u8;
     let mut overwrite_mode = cli.overwrite_mode;
 
-    for entry in archive.entries() {
+    let mut session: Option<r7z::ArchiveReadSession<'_>> = None;
+    'entries: for entry in archive.entries() {
         if !entry_is_selected(&entry.name, &selected) {
             continue;
         }
@@ -933,7 +945,10 @@ fn extract_archive_with_ui(
                             }
                             continue;
                         }
-                        CollisionAction::Quit => return Ok(EXIT_WARNING),
+                        CollisionAction::Quit => {
+                            warnings = EXIT_WARNING;
+                            break 'entries;
+                        }
                     }
                 }
                 fs::create_dir_all(&out_path)?;
@@ -955,7 +970,10 @@ fn extract_archive_with_ui(
                     }
                     continue;
                 }
-                CollisionAction::Quit => return Ok(EXIT_WARNING),
+                CollisionAction::Quit => {
+                    warnings = EXIT_WARNING;
+                    break 'entries;
+                }
             }
         }
         if let Some(parent) = out_path.parent() {
@@ -963,14 +981,17 @@ fn extract_archive_with_ui(
         }
         let mut file = fs::File::create(out_path)?;
         if entry.has_data_stream() {
-            archive.extract_to_writer_with_password(
-                entry.index,
-                &mut file,
-                cli.password.as_deref(),
-            )?;
+            let session = match &mut session {
+                Some(session) => session,
+                empty @ None => empty.insert(archive.read_session(cli.password.as_deref())?),
+            };
+            session.extract_to_writer(entry.index, &mut file)?;
         }
     }
 
+    if let Some(session) = session {
+        session.finish()?;
+    }
     if !selected.is_empty() && matched == 0 {
         eprintln!("No files to process");
         Ok(EXIT_WARNING)
@@ -1762,6 +1783,63 @@ mod tests {
         assert_eq!(mode, OverwriteMode::Ask);
         assert_eq!(ui.prompts, vec!["exists.txt"]);
         assert!(ui.warned.is_empty());
+    }
+
+    #[test]
+    fn extraction_session_keeps_overwrite_prompts_in_entry_order_and_stops_on_quit() {
+        for answers in [
+            vec![OverwriteAnswer::No, OverwriteAnswer::Yes],
+            vec![OverwriteAnswer::Quit],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("solid.7z");
+            let bytes = r7z::ArchiveBuilder::new()
+                .compression(r7z::Codec::Copy)
+                .add_file("first", b"one")
+                .add_file("skip", b"two")
+                .add_file("last", b"three")
+                .build()
+                .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let output = root.path().join("out");
+            std::fs::create_dir(&output).unwrap();
+            std::fs::write(output.join("skip"), b"old-two").unwrap();
+            std::fs::write(output.join("last"), b"old-three").unwrap();
+            let cli = super::Cli::parse(vec![
+                "x".into(),
+                path.display().to_string(),
+                format!("-o{}", output.display()),
+            ])
+            .unwrap();
+            let quit = answers == [OverwriteAnswer::Quit];
+            let mut ui = FakeOverwriteUi::interactive(answers);
+            assert_eq!(
+                super::extract_archive_with_ui(&cli, false, &mut ui).unwrap(),
+                super::EXIT_WARNING
+            );
+            assert_eq!(std::fs::read(output.join("first")).unwrap(), b"one");
+            assert_eq!(std::fs::read(output.join("skip")).unwrap(), b"old-two");
+            assert_eq!(
+                std::fs::read(output.join("last")).unwrap(),
+                if quit {
+                    &b"old-three"[..]
+                } else {
+                    &b"three"[..]
+                }
+            );
+            let expected = if quit {
+                vec![output.join("skip")]
+            } else {
+                vec![output.join("skip"), output.join("last")]
+            };
+            assert_eq!(
+                ui.prompts,
+                expected
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     struct FakeOverwriteUi {
