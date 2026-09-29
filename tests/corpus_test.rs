@@ -81,7 +81,7 @@ fn run_manifest(path: &str) {
 }
 
 fn extract_all_file_entries(archive: &r7z::Archive, password: Option<&str>, path: &Path) {
-    let Some(files) = archive.files_info() else {
+    let Some(files) = archive.raw_files_info() else {
         return;
     };
     for idx in 0..archive.num_files() {

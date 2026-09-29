@@ -22,11 +22,11 @@ fn build_archive_with_external_folder_definition(name: &str, data: &[u8]) -> Vec
     let folder_data: [&[u8]; 2] = [&[0x01, 0x01, 0x00, 0xff], &[0x01, 0x01, 0x00]];
     let folder_crcs = folder_data.map(crc32fast::hash);
     let mut additional = vec![0x03, 0x06]; // AdditionalStreamsInfo, PackInfo
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(2));
+    additional.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(data.len() as u64));
+    additional.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(2));
     additional.push(0x09);
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(4));
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(3));
+    additional.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(4));
+    additional.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(3));
     additional.extend_from_slice(&[0x0a, 0x01]);
     for crc in folder_crcs {
         additional.extend_from_slice(&crc.to_le_bytes());
@@ -36,8 +36,8 @@ fn build_archive_with_external_folder_definition(name: &str, data: &[u8]) -> Vec
     additional.extend_from_slice(&[0x01, 0x01, 0x00]);
     additional.extend_from_slice(&[0x01, 0x01, 0x00]);
     additional.push(0x0c);
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(4));
-    additional.extend_from_slice(&r7z::sevenzip_varuint64_encode(3));
+    additional.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(4));
+    additional.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(3));
     additional.extend_from_slice(&[0x0a, 0x01]);
     for crc in folder_crcs {
         additional.extend_from_slice(&crc.to_le_bytes());
@@ -72,10 +72,10 @@ fn build_copy_archive_with_pack_crc(name: &str, data: &[u8], pack_crc: Option<u3
     header.push(0x04); // MainStreamsInfo
 
     header.push(0x06); // PackInfo
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(0));
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(0));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     header.push(0x09); // Size
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(data.len() as u64));
     if let Some(crc) = pack_crc {
         header.push(0x0a); // CRC
         header.push(0x01); // all defined
@@ -85,13 +85,13 @@ fn build_copy_archive_with_pack_crc(name: &str, data: &[u8], pack_crc: Option<u3
 
     header.push(0x07); // UnpackInfo
     header.push(0x0b); // Folder
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     header.push(0x00); // external = false
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1)); // one coder
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1)); // one coder
     header.push(0x01); // simple coder, one-byte id, no properties
     header.push(0x00); // Copy codec
     header.push(0x0c); // CodersUnPackSize
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(data.len() as u64));
     header.push(0x0a); // CRC
     header.push(0x01); // all defined
     header.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
@@ -100,14 +100,16 @@ fn build_copy_archive_with_pack_crc(name: &str, data: &[u8], pack_crc: Option<u3
     header.push(0x00); // END MainStreamsInfo
 
     header.push(0x05); // FilesInfo
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     header.push(0x11); // Name
     let mut name_data = Vec::new();
     for unit in name.encode_utf16() {
         name_data.extend_from_slice(&unit.to_le_bytes());
     }
     name_data.extend_from_slice(&[0, 0]);
-    header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1 + name_data.len() as u64));
+    header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
+        1 + name_data.len() as u64,
+    ));
     header.push(0x00); // external = false
     header.extend_from_slice(&name_data);
     header.push(0x00); // END FilesInfo
@@ -140,18 +142,22 @@ fn build_encoded_copy_archive(name: &str, data: &[u8], header_pack_crc: u32) -> 
     let inner_header = &plain[32 + data.len()..];
 
     let mut encoded_header = vec![0x17, 0x06]; // EncodedHeader, PackInfo
-    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
-    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    encoded_header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(data.len() as u64));
+    encoded_header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     encoded_header.extend_from_slice(&[0x09]); // Size
-    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(inner_header.len() as u64));
+    encoded_header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
+        inner_header.len() as u64
+    ));
     encoded_header.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
     encoded_header.extend_from_slice(&header_pack_crc.to_le_bytes());
     encoded_header.push(0x00); // END PackInfo
     encoded_header.extend_from_slice(&[0x07, 0x0b]); // UnpackInfo, Folder
-    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    encoded_header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     encoded_header.extend_from_slice(&[0x00, 0x01, 0x01, 0x00]); // inline Copy coder
     encoded_header.push(0x0c); // CodersUnPackSize
-    encoded_header.extend_from_slice(&r7z::sevenzip_varuint64_encode(inner_header.len() as u64));
+    encoded_header.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
+        inner_header.len() as u64
+    ));
     encoded_header.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
     encoded_header.extend_from_slice(&crc32fast::hash(inner_header).to_le_bytes());
     encoded_header.push(0x00); // END UnpackInfo
@@ -188,20 +194,22 @@ fn build_copy_archive_with_additional_crc(
         .unwrap();
 
     let mut additional_info = vec![0x03, 0x06]; // AdditionalStreamsInfo, PackInfo
-    additional_info.extend_from_slice(&r7z::sevenzip_varuint64_encode(data.len() as u64));
-    additional_info.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    additional_info.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(data.len() as u64));
+    additional_info.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     additional_info.push(0x09); // Size
-    additional_info
-        .extend_from_slice(&r7z::sevenzip_varuint64_encode(additional_data.len() as u64));
+    additional_info.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
+        additional_data.len() as u64
+    ));
     additional_info.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
     additional_info.extend_from_slice(&additional_crc.to_le_bytes());
     additional_info.push(0x00); // END PackInfo
     additional_info.extend_from_slice(&[0x07, 0x0b]); // UnpackInfo, Folder
-    additional_info.extend_from_slice(&r7z::sevenzip_varuint64_encode(1));
+    additional_info.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(1));
     additional_info.extend_from_slice(&[0x00, 0x01, 0x01, 0x00]); // inline Copy coder
     additional_info.push(0x0c); // CodersUnPackSize
-    additional_info
-        .extend_from_slice(&r7z::sevenzip_varuint64_encode(additional_data.len() as u64));
+    additional_info.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
+        additional_data.len() as u64
+    ));
     additional_info.extend_from_slice(&[0x0a, 0x01]); // CRC, all defined
     additional_info.extend_from_slice(&crc32fast::hash(additional_data).to_le_bytes());
     additional_info.push(0x00); // END UnpackInfo

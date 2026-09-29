@@ -19,14 +19,14 @@ fn unpack_info_folder_bytes_round_trip_to_folder_parser() {
         .unwrap();
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let unpack_info = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
         .unwrap();
 
     let raw = unpack_info.folder_bytes(0).unwrap();
-    let folder_from_bytes = r7z::Folder::parse(raw).unwrap().1;
+    let folder_from_bytes = r7z::raw::Folder::parse(raw).unwrap().1;
     let folder_from_index = unpack_info.parse_folder(0).unwrap();
 
     assert_eq!(folder_from_bytes, folder_from_index);
@@ -48,9 +48,11 @@ fn raw_folder_block_exposes_multi_pack_stream_metadata() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let block = archive.raw_folder_block(0).unwrap();
+    let block = archive
+        .raw_folder(r7z::update::v1::FolderIndex::new(0))
+        .unwrap();
 
-    assert_eq!(block.folder_index(), r7z::FolderIndex::new(0));
+    assert_eq!(block.folder_index(), r7z::update::v1::FolderIndex::new(0));
     assert_eq!(block.packed_streams().len(), block.pack_sizes().len());
     assert!(
         block.packed_streams().len() > 1,
@@ -65,9 +67,9 @@ fn raw_folder_block_exposes_multi_pack_stream_metadata() {
         block.pack_sizes()
     );
     assert_eq!(
-        r7z::Folder::parse(block.folder_info()).unwrap().1,
+        r7z::raw::Folder::parse(block.folder_info()).unwrap().1,
         archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -101,7 +103,7 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
     let output = r7z::update::v1::write_archive_update(
         &archive,
         Cursor::new(Vec::new()),
-        vec![r7z::PreservedArchiveEntry {
+        vec![r7z::update::v1::PreservedArchiveEntry {
             name: entry.name,
             raw_name: entry.raw_name,
             kind: r7z::EntryKind::File,
@@ -131,23 +133,25 @@ fn raw_folder_handles_cannot_cross_archive_updates() {
     let source = r7z::Archive::from_bytes(bytes.clone().into()).unwrap();
     let other = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let entry = source.entries().next().unwrap();
-    let raw = other.raw_folder(r7z::FolderIndex::new(0)).unwrap();
+    let raw = other
+        .raw_folder(r7z::update::v1::FolderIndex::new(0))
+        .unwrap();
     let raw_handle = raw.handle();
     let original_output = vec![0xA5; 8];
     let mut output = Cursor::new(original_output.clone());
 
     assert!(matches!(
-        r7z::write_archive_update(
+        r7z::update::v1::write_archive_update(
             &source,
             &mut output,
-            vec![r7z::PreservedArchiveEntry {
+            vec![r7z::update::v1::PreservedArchiveEntry {
                 name: entry.name,
                 raw_name: entry.raw_name,
                 kind: r7z::EntryKind::File,
                 meta: r7z::EntryMeta::default(),
-                stream: r7z::PreservedEntryStream::Raw {
+                stream: r7z::update::v1::PreservedEntryStream::Raw {
                     folder: raw_handle,
-                    source_entry: r7z::ArchiveEntryIndex::new(0),
+                    source_entry: r7z::update::v1::ArchiveEntryIndex::new(0),
                     size: data.len() as u64,
                     crc: Some(crc32fast::hash(&data)),
                 },
@@ -173,16 +177,16 @@ fn raw_folder_updates_require_complete_contiguous_source_entries() {
     assert_eq!(listing.entries[0].block, listing.entries[1].block);
     let folder_index = listing.entries[0].block.unwrap();
     let raw = source
-        .raw_folder(r7z::FolderIndex::new(folder_index))
+        .raw_folder(r7z::update::v1::FolderIndex::new(folder_index))
         .unwrap();
-    let raw_entry = |name: &str, source_entry: usize| r7z::PreservedArchiveEntry {
+    let raw_entry = |name: &str, source_entry: usize| r7z::update::v1::PreservedArchiveEntry {
         name: name.to_owned(),
         raw_name: None,
         kind: r7z::EntryKind::File,
         meta: r7z::EntryMeta::default(),
-        stream: r7z::PreservedEntryStream::Raw {
+        stream: r7z::update::v1::PreservedEntryStream::Raw {
             folder: raw.handle(),
-            source_entry: r7z::ArchiveEntryIndex::new(source_entry),
+            source_entry: r7z::update::v1::ArchiveEntryIndex::new(source_entry),
             size: data.len() as u64,
             crc: Some(crc32fast::hash(&data)),
         },
@@ -191,7 +195,7 @@ fn raw_folder_updates_require_complete_contiguous_source_entries() {
     let original_output = output.get_ref().clone();
 
     assert!(matches!(
-        r7z::write_archive_update(
+        r7z::update::v1::write_archive_update(
             &source,
             &mut output,
             vec![raw_entry("first.bin", 0)],
@@ -203,7 +207,7 @@ fn raw_folder_updates_require_complete_contiguous_source_entries() {
     assert_eq!(output.get_ref(), &original_output);
 
     assert!(matches!(
-        r7z::write_archive_update(
+        r7z::update::v1::write_archive_update(
             &source,
             &mut output,
             vec![raw_entry("second.bin", 1), raw_entry("first.bin", 0)],
@@ -215,17 +219,17 @@ fn raw_folder_updates_require_complete_contiguous_source_entries() {
     assert_eq!(output.get_ref(), &original_output);
 
     assert!(matches!(
-        r7z::write_archive_update(
+        r7z::update::v1::write_archive_update(
             &source,
             &mut output,
             vec![
                 raw_entry("first.bin", 0),
-                r7z::PreservedArchiveEntry {
+                r7z::update::v1::PreservedArchiveEntry {
                     name: "added.bin".to_owned(),
                     raw_name: None,
                     kind: r7z::EntryKind::File,
                     meta: r7z::EntryMeta::default(),
-                    stream: r7z::PreservedEntryStream::Data(data.clone()),
+                    stream: r7z::update::v1::PreservedEntryStream::Data(data.clone()),
                 },
                 raw_entry("second.bin", 1),
             ],
@@ -249,7 +253,9 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
 
     let source = r7z::Archive::open(&source_path).unwrap();
     let kept_entry = source.entries().next().unwrap();
-    let raw = source.raw_folder(r7z::FolderIndex::new(0)).unwrap();
+    let raw = source
+        .raw_folder(r7z::update::v1::FolderIndex::new(0))
+        .unwrap();
     let added = b"new ppmd data".repeat(128);
     let added_path = tmp.path().join("added-source.txt");
     fs::write(&added_path, &added).unwrap();
@@ -258,28 +264,28 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
         encryption: Some(r7z::EncryptionOptions::default_for_password("Secret123")),
         ..r7z::ArchiveOptions::default()
     };
-    let output = r7z::write_archive_update(
+    let output = r7z::update::v1::write_archive_update(
         &source,
         Cursor::new(Vec::new()),
         vec![
-            r7z::PreservedArchiveEntry {
+            r7z::update::v1::PreservedArchiveEntry {
                 name: kept_entry.name,
                 raw_name: kept_entry.raw_name,
                 kind: r7z::EntryKind::File,
                 meta: r7z::EntryMeta::default(),
-                stream: r7z::PreservedEntryStream::Raw {
+                stream: r7z::update::v1::PreservedEntryStream::Raw {
                     folder: raw.handle(),
-                    source_entry: r7z::ArchiveEntryIndex::new(0),
+                    source_entry: r7z::update::v1::ArchiveEntryIndex::new(0),
                     size: kept.len() as u64,
                     crc: Some(crc32fast::hash(&kept)),
                 },
             },
-            r7z::PreservedArchiveEntry {
+            r7z::update::v1::PreservedArchiveEntry {
                 name: "added.txt".to_owned(),
                 raw_name: None,
                 kind: r7z::EntryKind::File,
                 meta: r7z::EntryMeta::default(),
-                stream: r7z::PreservedEntryStream::Path {
+                stream: r7z::update::v1::PreservedEntryStream::Path {
                     path: added_path,
                     size: added.len() as u64,
                 },
@@ -335,14 +341,14 @@ fn update_keeps_raw_name_distinct_from_its_replacement_character_display() {
     let new_file = input.join("�");
     fs::write(&new_file, b"new").unwrap();
     let archive_path = tmp.path().join("raw-name.7z");
-    let original_name = r7z::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
-    let bytes = r7z::build_archive_with_preserved_folders(
-        vec![r7z::PreservedArchiveEntry {
+    let original_name = r7z::raw::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+    let bytes = r7z::update::v1::build_archive_with_preserved_folders(
+        vec![r7z::update::v1::PreservedArchiveEntry {
             name: "�".to_owned(),
             raw_name: Some(original_name.clone()),
             kind: r7z::EntryKind::File,
             meta: r7z::EntryMeta::default(),
-            stream: r7z::PreservedEntryStream::Data(b"old".to_vec()),
+            stream: r7z::update::v1::PreservedEntryStream::Data(b"old".to_vec()),
         }],
         Vec::new(),
         &r7z::ArchiveOptions::default(),

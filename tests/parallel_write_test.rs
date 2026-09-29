@@ -3,10 +3,12 @@ use std::{
     num::NonZeroU64,
 };
 
+use r7z::update::v1::{
+    PreservedArchiveEntry, PreservedEntryStream, write_archive_with_preserved_folders,
+};
 use r7z::{
     Archive, ArchiveBuilder, ArchiveOptions, ArchiveWriter, Codec, EncoderThreads,
-    EncryptionOptions, EntryKind, EntryMeta, PreservedArchiveEntry, PreservedEntryStream, R7zError,
-    SolidMode, write_archive_with_preserved_folders,
+    EncryptionOptions, EntryKind, EntryMeta, R7zError, SolidMode,
 };
 
 const MIB: usize = 1024 * 1024;

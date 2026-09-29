@@ -40,10 +40,8 @@ use std::path::Path;
 let archive = Archive::open(Path::new("example.7z"))?;
 println!("Files: {}", archive.num_files());
 
-if let Some(fi) = archive.files_info() {
-    for name in &fi.names {
-        println!("  {name}");
-    }
+for entry in archive.entries() {
+    println!("  {}", entry.name);
 }
 
 // Extract first file to an in-memory buffer.
@@ -224,9 +222,10 @@ let archive = Archive::from_bytes(raw.into())?;
 | `Archive::from_bytes_with_password(data, password)` | `Result<Archive, R7zError>` | Decode password-protected bytes |
 | `archive.num_files()` | `usize` | Number of entries (files and directories) |
 | `archive.entries()` | `Iterator<Item = ArchiveEntryInfo>` | High-level entry metadata with type and safe normalized name |
+| `archive.entry(index)` | `Option<ArchiveEntryInfo>` | High-level metadata for one entry |
 | `archive.safe_name(index)` | `Result<PathBuf, R7zError>` | Reject unsafe names and normalize a relative archive path |
-| `archive.files_info()` | `Option<&FilesInfo>` | File names, sizes, and attributes |
-| `archive.streams_info()` | `Option<&StreamInfo>` | Raw stream/pack metadata |
+| `archive.raw_files_info()` | `Option<&raw::FilesInfo>` | Low-level file metadata for format tools |
+| `archive.raw_streams_info()` | `Option<&raw::StreamInfo>` | Low-level stream and pack metadata for format tools |
 | `archive.extract_to_memory(index: usize)` | `Result<Vec<u8>, R7zError>` | Decompress file at `index` (0-based) |
 | `archive.extract_to_memory_with_password(index, password)` | `Result<Vec<u8>, R7zError>` | Decrypt/decompress file at `index` |
 | `archive.extract_to_memory_by_name(name)` | `Result<Vec<u8>, R7zError>` | Decompress file by exact or normalized safe name |
@@ -247,20 +246,15 @@ and releases the current decoder without closing the session. Dropping a session
 verify its remaining data. Failed data reads release the decoder, allowing a later request
 to continue at an independent folder.
 
-### `FilesInfo` — Entry metadata helpers
-
-| Method | Description |
-|--------|-------------|
-| `fi.name(index)` | Decode a UTF-16LE entry name |
-| `fi.names()` | Iterate decoded names |
-| `fi.is_empty_stream(index)` | Entry has no data stream |
-| `fi.is_empty_file(index)` | Entry is a zero-byte file |
-| `fi.is_directory(index)` | Entry is a directory |
-| `fi.is_anti(index)` | Entry is a 7z anti-item |
-| `fi.entry_type(index)` | Classify a file, directory, anti-item, or symlink, including empty files and empty symlinks |
-
 `EntryType::EmptySymlink` identifies a symlink with no target data stream.
 It remains file-like for extraction, and `ArchiveEntryInfo::has_data_stream()` returns `false`.
+
+### Raw format access
+
+Parser structures and helpers live in `r7z::raw`. Most applications should use
+`ArchiveEntryInfo`; format inspectors can use `Archive::raw_header`,
+`Archive::raw_signature`, `Archive::raw_encoded_header`, and the raw metadata
+accessors. See [MIGRATION.md](MIGRATION.md) for changes from the 0.1 root API.
 
 ### `ArchiveBuilder` — Writing archives
 

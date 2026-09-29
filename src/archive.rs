@@ -151,10 +151,10 @@ pub struct Archive {
     source: ArchiveSource,
     identity: Arc<()>,
     base_offset: u64,
-    pub signature: SignatureHeader,
+    signature: SignatureHeader,
     /// Present for `EncodedHeader` archives; None for uncompressed-header archives.
-    pub encoded_header: Option<EncodedHeader>,
-    pub header: Header,
+    encoded_header: Option<EncodedHeader>,
+    header: Header,
 }
 
 /// Archive-level and per-entry metadata used for p7zip-style listing output.
@@ -489,7 +489,7 @@ impl RawFolderBlock {
         self.folder_crc
     }
 
-    /// Handle required to refer to this folder in [`crate::write_archive_update`].
+    /// Handle required to refer to this folder in [`crate::update::v1::write_archive_update`].
     #[must_use]
     pub fn handle(&self) -> RawFolderHandle {
         self.handle.clone()
@@ -797,14 +797,43 @@ impl Archive {
         usize::try_from(self.header.num_files()).unwrap_or(0)
     }
 
+    /// Return the parsed 7z header for low-level format inspection.
     #[must_use]
-    pub fn files_info(&self) -> Option<&FilesInfo> {
+    pub fn raw_header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Return the parsed 7z signature header for low-level format inspection.
+    #[must_use]
+    pub fn raw_signature(&self) -> &SignatureHeader {
+        &self.signature
+    }
+
+    /// Return the encoded header metadata when the archive stores it encoded.
+    #[must_use]
+    pub fn raw_encoded_header(&self) -> Option<&EncodedHeader> {
+        self.encoded_header.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn files_info(&self) -> Option<&FilesInfo> {
         self.header.files_info()
     }
 
     /// Fallible file metadata access for callers that need malformed-header errors.
-    pub fn try_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
+    pub(crate) fn try_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
         self.header.try_files_info()
+    }
+
+    /// Return the parsed file metadata for low-level format inspection.
+    #[must_use]
+    pub fn raw_files_info(&self) -> Option<&FilesInfo> {
+        self.files_info()
+    }
+
+    /// Fallible file metadata access for low-level format inspection.
+    pub fn try_raw_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
+        self.try_files_info()
     }
 
     /// Return high-level metadata for entry `index`.
@@ -843,13 +872,24 @@ impl Archive {
     }
 
     #[must_use]
-    pub fn streams_info(&self) -> Option<&StreamInfo> {
+    pub(crate) fn streams_info(&self) -> Option<&StreamInfo> {
         self.header.streams_info()
     }
 
     /// Fallible stream metadata access for callers that need malformed-header errors.
-    pub fn try_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
+    pub(crate) fn try_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
         self.header.try_streams_info()
+    }
+
+    /// Return the parsed stream metadata for low-level format inspection.
+    #[must_use]
+    pub fn raw_streams_info(&self) -> Option<&StreamInfo> {
+        self.streams_info()
+    }
+
+    /// Fallible stream metadata access for low-level format inspection.
+    pub fn try_raw_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
+        self.try_streams_info()
     }
 
     /// Build p7zip-style listing metadata without extracting file contents.
@@ -911,11 +951,6 @@ impl Archive {
     /// buffers.
     pub fn raw_folder(&self, folder_index: FolderIndex) -> Result<RawFolderBlock, R7zError> {
         self.read_raw_folder_block(folder_index.get())
-    }
-
-    #[doc(hidden)]
-    pub fn raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {
-        self.read_raw_folder_block(folder_index)
     }
 
     fn read_raw_folder_block(&self, folder_index: usize) -> Result<RawFolderBlock, R7zError> {

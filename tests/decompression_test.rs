@@ -1,11 +1,12 @@
-use r7z::{Archive, CODEC_BCJ_X86, CODEC_LZMA, CODEC_LZMA2, decompress_folder};
+use r7z::raw::decompress_folder;
+use r7z::{Archive, CODEC_BCJ_X86, CODEC_LZMA, CODEC_LZMA2};
 
 mod support;
 
 #[test]
 fn decompress_lzma_packed_header() {
     let buf = support::valid_7z_string();
-    let meta = r7z::ArchiveMetadata::parse(&buf).unwrap();
+    let meta = r7z::raw::ArchiveMetadata::parse(&buf).unwrap();
 
     let pi = &meta.encoded_header.pack_info;
     let ui = &meta.encoded_header.unpack_info;
@@ -34,7 +35,7 @@ fn archive_metadata_parse_accepts_prepended_bytes() {
     let mut buf = b"stub bytes before the 7z signature".to_vec();
     buf.extend_from_slice(&support::valid_7z_string());
 
-    let meta = r7z::ArchiveMetadata::parse(&buf).unwrap();
+    let meta = r7z::raw::ArchiveMetadata::parse(&buf).unwrap();
 
     assert_eq!(meta.signature.signature, *b"7z\xbc\xaf'\x1c");
 }
@@ -45,7 +46,7 @@ fn archive_open_and_decompress_header_stream() {
     let path = env::current_dir().unwrap().join("tests/fixtures/test_1.7z");
     let meta = Archive::open(&path).unwrap();
 
-    let eh = meta.encoded_header.as_ref().unwrap();
+    let eh = meta.raw_encoded_header().unwrap();
     let pi = &eh.pack_info;
     let ui = &eh.unpack_info;
 
@@ -81,11 +82,11 @@ fn decompress_bcj_lzma2_fixture() {
 
     // Verify the file listing
     assert_eq!(archive.num_files(), 1);
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "prog.bin");
 
     // Verify streams_info shows BCJ + LZMA2 coders
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 2, "expected 2 coders (LZMA2 + BCJ)");

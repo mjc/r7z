@@ -13,7 +13,7 @@ fn fixture_bytes() -> Vec<u8> {
 fn bench_signature_parse(c: &mut Criterion) {
     let data = fixture_bytes();
     c.bench_function("SignatureHeader::parse", |b| {
-        b.iter(|| r7z::SignatureHeader::parse(black_box(&data)).unwrap())
+        b.iter(|| r7z::raw::SignatureHeader::parse(black_box(&data)).unwrap())
     });
 }
 
@@ -72,7 +72,7 @@ fn bench_archive_from_bytes(c: &mut Criterion) {
 fn bench_extract_to_memory(c: &mut Criterion) {
     let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
     // Find the first non-empty file index
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let num_files = usize::try_from(fi.num_files).expect("num_files fits in usize");
     let idx = (0..num_files)
         .find(|&i| !fi.is_empty_stream(i))
@@ -84,7 +84,7 @@ fn bench_extract_to_memory(c: &mut Criterion) {
 
 fn bench_extract_to_writer_seek_backed(c: &mut Criterion) {
     let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let num_files = usize::try_from(fi.num_files).expect("num_files fits in usize");
     let idx = (0..num_files)
         .find(|&i| !fi.is_empty_stream(i))

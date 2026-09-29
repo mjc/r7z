@@ -39,6 +39,30 @@
 //! directory traversal, and Windows-prefixed paths. Directory entries and zero-byte
 //! files are handled distinctly.
 //!
+//! Format parser types are available through [`raw`] for applications that need
+//! to inspect 7z structures directly. The root API exposes archive operations.
+//!
+//! ```compile_fail
+//! let _: Option<r7z::Folder> = None;
+//! ```
+//!
+//! ```compile_fail
+//! let _: Option<r7z::FilesInfo> = None;
+//! ```
+//!
+//! ```compile_fail
+//! let _: Option<r7z::ArchiveMetadata> = None;
+//! ```
+//!
+//! ```compile_fail
+//! let _: Option<r7z::PreservedArchiveEntry> = None;
+//! ```
+//!
+//! ```rust
+//! let _: Option<r7z::raw::Folder> = None;
+//! let _: Option<r7z::update::v1::FolderIndex> = None;
+//! ```
+//!
 //! ## Writing
 //!
 //! ```rust,no_run
@@ -79,44 +103,45 @@ mod method;
 mod pack_info;
 mod parsers;
 mod property;
+pub mod raw;
 mod stream_info;
 pub mod update;
 mod write;
 
 pub use archive::{
-    Archive, ArchiveEntries, ArchiveEntryIndex, ArchiveEntryInfo, ArchiveListing,
-    ArchiveListingEntry, ArchiveMetadata, ArchiveOpenOptions, ArchiveReadConfig,
-    ArchiveReadOptions, ArchiveReadSession, FolderIndex, ListingEntryKind, RawFolderBlock,
-    RawFolderHandle, safe_archive_name,
+    Archive, ArchiveEntries, ArchiveEntryInfo, ArchiveListing, ArchiveListingEntry,
+    ArchiveOpenOptions, ArchiveReadConfig, ArchiveReadOptions, ArchiveReadSession,
+    ListingEntryKind, safe_archive_name,
 };
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_ARM64, CODEC_BCJ_IA64,
     CODEC_BCJ_PPC, CODEC_BCJ_RISCV, CODEC_BCJ_SPARC, CODEC_BCJ_X86, CODEC_BCJ2, CODEC_BZIP2,
     CODEC_COPY, CODEC_DEFLATE, CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2, CODEC_PPMD,
-    CODEC_SWAP2, CODEC_SWAP4, decompress_folder, decompress_folder_with_password,
+    CODEC_SWAP2, CODEC_SWAP4,
 };
-pub use coder_info::CoderInfo;
-pub use entries::RawEntryName;
 pub use error::R7zError;
-pub use files_info::{EntryType, FilesInfo};
-pub use folder::Folder;
-pub use headers::{EncodedHeader, Header, SignatureHeader};
+pub use files_info::EntryType;
 pub use method::{
     ALL_METHODS, METHOD_REGISTRY, MethodInfo, MethodKind, MethodSupport, P7ZIP_ORACLE_SHA,
     SevenZMethod, method_from_id, method_from_name, method_info,
 };
-pub use pack_info::{PackInfo, UnpackInfo};
-pub use parsers::*;
-pub use property::{Property, find_next_property_id};
-pub use stream_info::{StreamInfo, SubstreamInfo};
 pub use write::{
     ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec, CompressionLevel,
     CompressionOptions, EncoderThreads, EncryptionOptions, EntryKind, EntryMeta, HeaderMode,
-    LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream, SolidMode, SpoolMode,
-    StreamingOptions, VolumeOptions, build_archive_with_preserved_folders, build_streaming,
-    build_streaming_to_writer, build_streaming_volumes, build_streaming_with_options,
-    write_archive_update, write_archive_with_preserved_folders,
+    LzmaAlgorithm, MatchFinder, SolidMode, SpoolMode, StreamingOptions, VolumeOptions,
+    build_streaming, build_streaming_to_writer, build_streaming_volumes,
+    build_streaming_with_options,
 };
 
-// Re-export nom's IResult for convenience in integration tests
-pub use nom::IResult;
+pub(crate) use archive::{ArchiveEntryIndex, RawFolderBlock, RawFolderHandle};
+pub(crate) use coder_info::CoderInfo;
+pub(crate) use entries::RawEntryName;
+pub(crate) use files_info::FilesInfo;
+pub(crate) use folder::Folder;
+pub(crate) use headers::{EncodedHeader, Header, SignatureHeader};
+pub(crate) use pack_info::{PackInfo, UnpackInfo};
+#[cfg(test)]
+pub(crate) use parsers::sevenzip_varuint64_encode;
+pub(crate) use parsers::{sevenzip_varuint64_decode, usize_cap};
+pub(crate) use property::{Property, find_next_property_id};
+pub(crate) use stream_info::StreamInfo;

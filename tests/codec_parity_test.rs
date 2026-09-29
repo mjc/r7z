@@ -6,9 +6,9 @@ use smallvec::{SmallVec, smallvec};
 use std::io::{Read, Write};
 use support::create_p7zip_archive;
 
-fn branch_folder(method: &[u8], properties: Option<&[u8]>) -> r7z::Folder {
-    r7z::Folder {
-        coders: smallvec![r7z::CoderInfo {
+fn branch_folder(method: &[u8], properties: Option<&[u8]>) -> r7z::raw::Folder {
+    r7z::raw::Folder {
+        coders: smallvec![r7z::raw::CoderInfo {
             codec_id: coder_id(method),
             num_in_streams: 1,
             num_out_streams: 1,
@@ -60,7 +60,7 @@ fn official_7zip_2603_branch_archives_extract() {
             .join(name);
         let archive = r7z::Archive::open(&path).unwrap();
         let folder = archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -103,7 +103,7 @@ fn branch_filter_properties_validate_length_and_alignment() {
             let folder = branch_folder(method, Some(bad));
             assert!(
                 matches!(
-                    r7z::decompress_folder(&folder, &[], 0),
+                    r7z::raw::decompress_folder(&folder, &[], 0),
                     Err(r7z::R7zError::Decompression)
                 ),
                 "{method:?} {bad:?}"
@@ -112,13 +112,13 @@ fn branch_filter_properties_validate_length_and_alignment() {
         if alignment == 4 {
             let folder = branch_folder(method, Some(&[2, 0, 0, 0]));
             assert!(matches!(
-                r7z::decompress_folder(&folder, &[], 0),
+                r7z::raw::decompress_folder(&folder, &[], 0),
                 Err(r7z::R7zError::Decompression)
             ));
         }
         for valid in [None, Some(&[][..]), Some(&[0, 0, 0, 0][..])] {
             let folder = branch_folder(method, valid);
-            assert_eq!(r7z::decompress_folder(&folder, &[], 0).unwrap(), []);
+            assert_eq!(r7z::raw::decompress_folder(&folder, &[], 0).unwrap(), []);
         }
     }
 }
@@ -176,9 +176,9 @@ fn coder_id(id: &[u8]) -> ArrayVec<u8, 15> {
     out
 }
 
-fn single_lzma2_folder(properties: &[u8]) -> r7z::Folder {
-    r7z::Folder {
-        coders: smallvec![r7z::CoderInfo {
+fn single_lzma2_folder(properties: &[u8]) -> r7z::raw::Folder {
+    r7z::raw::Folder {
+        coders: smallvec![r7z::raw::CoderInfo {
             codec_id: coder_id(r7z::CODEC_LZMA2),
             num_in_streams: 1,
             num_out_streams: 1,
@@ -198,7 +198,7 @@ fn lzma_property_block_from_archive_builder_is_exactly_five_bytes() {
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     let ui = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -231,7 +231,7 @@ fn p7zip_lzma2_property_values_extract_with_r7z() {
 
         let archive = r7z::Archive::open(&archive_path).unwrap();
         let ui = archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -257,14 +257,14 @@ fn p7zip_lzma2_property_values_extract_with_r7z() {
 fn lzma2_property_values_within_the_default_cap_decode_empty_stream() {
     for prop in 0u8..=24 {
         let folder = single_lzma2_folder(&[prop]);
-        let result = std::panic::catch_unwind(|| r7z::decompress_folder(&folder, &[0x00], 0));
+        let result = std::panic::catch_unwind(|| r7z::raw::decompress_folder(&folder, &[0x00], 0));
         assert!(result.is_ok(), "LZMA2 property {prop} panicked");
         assert_eq!(result.unwrap().unwrap(), Vec::<u8>::new());
     }
 
     for prop in [33, 40] {
         let folder = single_lzma2_folder(&[prop]);
-        let result = r7z::decompress_folder(&folder, &[0x00], 0);
+        let result = r7z::raw::decompress_folder(&folder, &[0x00], 0);
         assert!(matches!(
             result,
             Err(r7z::R7zError::ResourceLimitExceeded {
@@ -279,7 +279,7 @@ fn lzma2_property_values_within_the_default_cap_decode_empty_stream() {
 fn unsupported_lzma2_property_shapes_return_r7z_errors() {
     for properties in [&[][..], &[0x1c, 0x00][..], &[41][..]] {
         let folder = single_lzma2_folder(properties);
-        let result = std::panic::catch_unwind(|| r7z::decompress_folder(&folder, &[0x00], 0));
+        let result = std::panic::catch_unwind(|| r7z::raw::decompress_folder(&folder, &[0x00], 0));
         assert!(
             result.is_ok(),
             "LZMA2 properties {properties:?} panicked instead of returning an error"

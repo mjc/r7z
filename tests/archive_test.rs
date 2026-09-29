@@ -1,4 +1,5 @@
-use r7z::{Archive, ArchiveMetadata};
+use r7z::Archive;
+use r7z::raw::ArchiveMetadata;
 
 mod support;
 
@@ -44,7 +45,7 @@ fn parse_archive_metadata_from_test_fixture() {
 #[test]
 fn validate_crc_test_fixture() {
     let buf = support::valid_7z_string();
-    let (_, sig) = r7z::SignatureHeader::parse(&buf).unwrap();
+    let (_, sig) = r7z::raw::SignatureHeader::parse(&buf).unwrap();
     sig.validate_start_header_crc().unwrap();
 }
 
@@ -55,10 +56,10 @@ fn archive_open_full_header() {
     let archive = Archive::open(&path).unwrap();
 
     // Signature
-    assert_eq!(archive.signature.major_version, 0x00);
+    assert_eq!(archive.raw_signature().major_version, 0x00);
 
     // Encoded header
-    let eh = archive.encoded_header.as_ref().unwrap();
+    let eh = archive.raw_encoded_header().unwrap();
     assert_eq!(eh.unpack_info.num_folders, 1);
     // LZMA header codec
     assert_eq!(
@@ -71,7 +72,7 @@ fn archive_open_full_header() {
     // Full header: file listing
     assert_eq!(archive.num_files(), 4); // 1 dir + 3 files
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.num_files, 4);
     assert_eq!(fi.name(0).unwrap(), "scripts");
     assert_eq!(fi.name(1).unwrap(), "scripts/py7zr");
@@ -79,7 +80,7 @@ fn archive_open_full_header() {
     assert_eq!(fi.name(3).unwrap(), "setup.py");
 
     // StreamsInfo: LZMA2 file data codec
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     assert_eq!(
         ui.parse_folder(0).unwrap().coders[0].codec_id.as_slice(),

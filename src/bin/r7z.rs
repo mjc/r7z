@@ -1,11 +1,13 @@
 use cap_std::fs::Dir;
 use chrono::{DateTime, Local};
+use r7z::update::v1::{
+    ArchiveEntryIndex, FolderIndex, PreservedArchiveEntry, PreservedEntryStream, RawFolderBlock,
+    write_archive_update, write_archive_with_preserved_folders,
+};
 use r7z::{
-    Archive, ArchiveEntryIndex, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec,
-    CompressionLevel, EncoderThreads, EncryptionOptions, EntryMeta, FolderIndex, HeaderMode,
-    ListingEntryKind, LzmaAlgorithm, MatchFinder, PreservedArchiveEntry, PreservedEntryStream,
-    R7zError, RawFolderBlock, SevenZMethod, SolidMode, method_from_name, write_archive_update,
-    write_archive_with_preserved_folders,
+    Archive, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec, CompressionLevel,
+    EncoderThreads, EncryptionOptions, EntryMeta, HeaderMode, ListingEntryKind, LzmaAlgorithm,
+    MatchFinder, R7zError, SevenZMethod, SolidMode, method_from_name,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1502,7 +1504,7 @@ fn preserved_rewrite_entries(
     should_drop: impl Fn(&r7z::ArchiveEntryInfo) -> bool,
     append_entries: Vec<PendingEntry>,
 ) -> Result<(Vec<PreservedArchiveEntry>, Vec<RawFolderBlock>), CliError> {
-    let Some(files) = archive.files_info() else {
+    let Some(files) = archive.raw_files_info() else {
         return Ok((
             append_entries
                 .into_iter()
@@ -1727,7 +1729,7 @@ fn write_volumes_from_file(
     Ok(())
 }
 
-fn entry_meta_from_archive(files: &r7z::FilesInfo, index: usize) -> EntryMeta {
+fn entry_meta_from_archive(files: &r7z::raw::FilesInfo, index: usize) -> EntryMeta {
     EntryMeta {
         ctime: files
             .ctimes
@@ -1885,7 +1887,7 @@ enum NameSymbol {
     UnpairedSurrogate(u16),
 }
 
-fn wildcard_match_raw(pattern: &str, text: &r7z::RawEntryName) -> bool {
+fn wildcard_match_raw(pattern: &str, text: &r7z::raw::RawEntryName) -> bool {
     let units = text
         .as_utf16le()
         .chunks_exact(2)
@@ -1992,9 +1994,10 @@ mod tests {
 
     #[test]
     fn raw_name_patterns_distinguish_unpaired_surrogates_from_replacement_characters() {
-        let unpaired = r7z::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
-        let replacement = r7z::RawEntryName::from_utf16le(vec![0xFD, 0xFF]).unwrap();
-        let supplementary = r7z::RawEntryName::from_utf16le(vec![0x00, 0xD8, 0x00, 0xDC]).unwrap();
+        let unpaired = r7z::raw::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+        let replacement = r7z::raw::RawEntryName::from_utf16le(vec![0xFD, 0xFF]).unwrap();
+        let supplementary =
+            r7z::raw::RawEntryName::from_utf16le(vec![0x00, 0xD8, 0x00, 0xDC]).unwrap();
 
         assert!(!wildcard_match_raw("�", &unpaired));
         assert!(wildcard_match_raw("�", &replacement));

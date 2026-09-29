@@ -141,7 +141,7 @@ fn copy_builder_preserves_preplanned_byte_limit_folders() {
         .unwrap();
     let archive = Archive::from_bytes(bytes.into()).unwrap();
     let unpack = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -178,7 +178,7 @@ fn builders_preserve_empty_symlink_streams_before_non_solid_files() {
             .build()
             .unwrap();
         let archive = Archive::from_bytes(bytes.into()).unwrap();
-        let files = archive.files_info().unwrap();
+        let files = archive.raw_files_info().unwrap();
 
         assert_eq!(files.entry_type(0), r7z::EntryType::Symlink, "{codec:?}");
         assert_eq!(
@@ -189,7 +189,7 @@ fn builders_preserve_empty_symlink_streams_before_non_solid_files() {
         assert_eq!(archive.extract_to_memory(1).unwrap(), b"data", "{codec:?}");
         assert_eq!(
             archive
-                .streams_info()
+                .raw_streams_info()
                 .unwrap()
                 .unpack_info
                 .as_ref()

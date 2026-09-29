@@ -123,7 +123,11 @@ fn open_split_archive_first_volume_reads_siblings() {
     std::fs::write(tmp.path().join("split.7z.003"), &bytes[chunk * 2..]).unwrap();
 
     let archive = r7z::Archive::open(&first).unwrap();
-    let names = archive.files_info().unwrap().names().collect::<Vec<_>>();
+    let names = archive
+        .raw_files_info()
+        .unwrap()
+        .names()
+        .collect::<Vec<_>>();
     let alpha_idx = names.iter().position(|name| name == "alpha.txt").unwrap();
     let beta_idx = names
         .iter()

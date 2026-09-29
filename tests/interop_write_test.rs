@@ -134,7 +134,7 @@ fn r7z_write_r7z_read_single_file() {
 
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), 1);
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "hello.txt");
 
     let extracted = archive.extract_to_memory(0).unwrap();
@@ -159,7 +159,7 @@ fn r7z_write_r7z_read_multi_file() {
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), files.len());
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     for (i, (name, original)) in files.iter().enumerate() {
         assert_eq!(fi.name(i).unwrap(), *name);
         let extracted = archive.extract_to_memory(i).unwrap();
@@ -317,7 +317,7 @@ fn archive_writer_single_folder_r7z_reads() {
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), files.len());
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     for (i, (name, original)) in files.iter().enumerate() {
         assert_eq!(fi.name(i).unwrap(), *name);
         let extracted = archive.extract_to_memory(i).unwrap();
@@ -352,7 +352,7 @@ fn archive_writer_multi_folder_r7z_reads() {
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), 4);
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let all = [folder0[0], folder0[1], folder1[0], folder1[1]];
     for (i, (name, original)) in all.iter().enumerate() {
         assert_eq!(fi.name(i).unwrap(), *name);
@@ -443,7 +443,7 @@ fn archive_writer_mtime_r7z_reads() {
     w.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     // The raw FILETIME: seconds since Windows epoch × 10_000_000
     // Windows epoch offset = 11_644_473_600 s
@@ -465,7 +465,7 @@ fn archive_writer_unix_mode_r7z_reads() {
     w.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     let attrs = fi.attributes.first().copied().flatten().unwrap();
     // High 16 bits = st_mode, low 16 bits = Windows attribs (0x20)
@@ -496,7 +496,7 @@ fn archive_builder_full_metadata_r7z_reads() {
         .expect("build failed");
 
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     assert_eq!(fi.ctimes[0], Some(filetime_from_unix_secs(ctime_secs)));
     assert_eq!(fi.ctimes[1], None);
@@ -568,7 +568,7 @@ fn r7z_write_bcj_lzma2_r7z_reads() {
     assert_eq!(archive.num_files(), 1);
 
     // Verify the archive uses BCJ + LZMA2
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 2, "expected 2 coders for BCJ+LZMA2");
@@ -685,7 +685,7 @@ fn archive_builder_lzma_literal_position_options_p7zip_extracts() {
 
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -957,9 +957,9 @@ fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
         .expect("build failed");
 
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_some());
+    assert!(archive.raw_encoded_header().is_some());
     let ui = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -996,7 +996,7 @@ fn archive_builder_lzma2_levels_write_p7zip_dictionary_properties() {
         std::fs::write(&archive_path, &bytes).unwrap();
         let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
         let folder = archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -1025,7 +1025,7 @@ fn archive_builder_header_modes_are_honored() {
         .build()
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(single_default.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_none());
+    assert!(archive.raw_encoded_header().is_none());
 
     let encoded = r7z::ArchiveBuilder::new()
         .options(r7z::ArchiveOptions {
@@ -1036,7 +1036,7 @@ fn archive_builder_header_modes_are_honored() {
         .build()
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(encoded.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_some());
+    assert!(archive.raw_encoded_header().is_some());
 
     let plain = r7z::ArchiveBuilder::new()
         .options(r7z::ArchiveOptions {
@@ -1048,7 +1048,7 @@ fn archive_builder_header_modes_are_honored() {
         .build()
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(plain.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_none());
+    assert!(archive.raw_encoded_header().is_none());
 }
 
 #[test]
@@ -1264,7 +1264,7 @@ fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     writer.finish().expect("finish failed");
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(archive.num_files(), 5);
     assert_eq!(fi.name(0).unwrap(), "a.txt");
     assert_eq!(fi.name(1).unwrap(), "nested");
@@ -1275,7 +1275,7 @@ fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     assert!(fi.is_empty_file(2));
     assert!(fi.is_anti(3));
     let unpack_info = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -1323,7 +1323,7 @@ fn archive_entry_helpers_round_trip_and_validate_stream_kind() {
         )
         .unwrap();
     let archive = r7z::Archive::from_bytes(builder.build().unwrap().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_directory(0));
     assert_eq!(archive.extract_to_memory(1).unwrap(), b"hello");
     assert!(fi.is_empty_file(2));
@@ -1365,7 +1365,7 @@ fn archive_entry_helpers_round_trip_and_validate_stream_kind() {
     writer.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_directory(0));
     assert_eq!(archive.extract_to_memory(1).unwrap(), b"hello");
     assert!(fi.is_empty_file(2));
@@ -1387,7 +1387,7 @@ fn archive_builder_empty_directory_and_anti_items_round_trip_and_p7zip_lists() {
     std::fs::write(&archive_path, bytes).unwrap();
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_directory(0));
     assert!(fi.is_empty_file(1));
     assert!(fi.is_anti(3));
@@ -1425,8 +1425,8 @@ fn archive_builder_empty_only_p7zip_extracts_and_r7z_reads() {
     std::fs::write(&archive_path, bytes).unwrap();
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    assert!(archive.streams_info().is_none());
-    let fi = archive.files_info().unwrap();
+    assert!(archive.raw_streams_info().is_none());
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(archive.num_files(), 3);
     assert_eq!(fi.name(0).unwrap(), "emptydir");
     assert_eq!(fi.name(1).unwrap(), "emptydir/empty.txt");
@@ -1516,7 +1516,7 @@ fn archive_builder_default_aes_properties_match_p7zip_settings() {
         .expect("build failed");
 
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
-    let streams = archive.streams_info().unwrap();
+    let streams = archive.raw_streams_info().unwrap();
     let unpack_info = streams.unpack_info.as_ref().unwrap();
     let folder = unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
@@ -1535,7 +1535,7 @@ fn archive_builder_default_aes_properties_match_p7zip_settings() {
         .expect("build failed");
     let archive = r7z::Archive::from_bytes_with_password(bytes.into(), Some("HeaderSecret"))
         .expect("from_bytes_with_password failed");
-    let encoded_header = archive.encoded_header.as_ref().unwrap();
+    let encoded_header = archive.raw_encoded_header().unwrap();
     let folder = encoded_header.unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
     assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
@@ -1561,7 +1561,7 @@ fn archive_builder_salted_aes_content_p7zip_and_r7z_extract() {
     std::fs::write(&archive_path, bytes).unwrap();
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let streams = archive.streams_info().unwrap();
+    let streams = archive.raw_streams_info().unwrap();
     let unpack_info = streams.unpack_info.as_ref().unwrap();
     let folder = unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
@@ -1623,7 +1623,7 @@ fn archive_builder_salted_aes_encrypted_header_p7zip_and_r7z_extract() {
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
-    let encoded_header = archive.encoded_header.as_ref().unwrap();
+    let encoded_header = archive.raw_encoded_header().unwrap();
     let folder = encoded_header.unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
     assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
@@ -1890,8 +1890,8 @@ fn archive_builder_empty_only_encrypted_header_p7zip_and_r7z_read() {
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
 
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
-    assert!(archive.streams_info().is_none());
-    let fi = archive.files_info().unwrap();
+    assert!(archive.raw_streams_info().is_none());
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(archive.num_files(), 3);
     assert!(fi.is_directory(0));
     assert!(fi.is_empty_file(1));
@@ -1963,7 +1963,7 @@ fn compression_options_control_lzma2_properties_and_solid_blocks() {
         .unwrap();
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let unpack_info = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -2202,7 +2202,7 @@ fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
         .build()
         .unwrap();
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_symlink(0));
     assert_eq!(fi.entry_type(0), r7z::EntryType::Symlink);
     assert_eq!(

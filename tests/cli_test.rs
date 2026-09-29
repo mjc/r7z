@@ -299,7 +299,7 @@ fn cli_create_accepts_p7zip_method_chain_options() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -564,7 +564,7 @@ fn cli_create_accepts_lzma_literal_position_options() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -603,7 +603,7 @@ fn cli_create_accepts_standalone_lzma_literal_position_switches() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -659,7 +659,7 @@ fn cli_create_accepts_ppmd_method() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -733,7 +733,7 @@ fn cli_create_accepts_p7zip_standalone_compression_options() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -877,7 +877,7 @@ fn cli_create_accepts_p7zip_solid_file_limit() {
     let archive = r7z::Archive::open(&archive).unwrap();
     assert_eq!(
         archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -910,7 +910,7 @@ fn cli_create_accepts_p7zip_solid_byte_limit() {
     let archive = r7z::Archive::open(&archive).unwrap();
     assert_eq!(
         archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
