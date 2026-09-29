@@ -198,7 +198,7 @@ mod tests {
                 file.metadata.index.get(),
                 location.folder_index.get(),
                 location.stream_index.get(),
-                location.stream.range,
+                location.stream.range.into_range(),
             ))
         });
         let mapped = mapped_files
@@ -219,7 +219,10 @@ mod tests {
                 let crate::entries::EntryKind::File(location) = file.kind else {
                     panic!("expected data stream")
                 };
-                Ok((file.metadata.index.get(), location.stream.range))
+                Ok((
+                    file.metadata.index.get(),
+                    location.stream.range.into_range(),
+                ))
             })
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -268,7 +271,7 @@ mod tests {
         assert_eq!(file.metadata.index.get(), 2);
         assert_eq!(location.folder_index.get(), 2);
         assert_eq!(location.stream_index.get(), 1);
-        assert_eq!(location.stream.range, 1..3);
+        assert_eq!(location.stream.range.into_range(), 1..3);
         assert_eq!(files.len(), 0);
 
         let mut files = FileStreams::new(None, 3, Some(&streams)).unwrap();

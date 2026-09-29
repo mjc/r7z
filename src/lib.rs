@@ -61,6 +61,7 @@ mod aes;
 mod archive;
 pub mod bcj;
 mod bcj2;
+mod byte_range;
 mod byte_swap;
 mod codec;
 mod coder_info;

@@ -1,3 +1,4 @@
+use crate::byte_range::ArchiveSourceRange;
 use crate::entries::{Entries, Entry, EntryKind, EntryMetadata, EntrySelection};
 use crate::file_streams::{FileStream, FileStreams, FolderIndex, StreamLocation};
 use crate::folder_decode::{
@@ -170,34 +171,37 @@ impl ArchiveSource {
         }
     }
 
-    fn read_range_to_vec(&self, range: Range<u64>, limit: u64) -> Result<Vec<u8>, R7zError> {
-        let len = checked_sub_u64(range.end, range.start)?;
+    fn read_range_to_vec(
+        &self,
+        range: ArchiveSourceRange,
+        limit: u64,
+    ) -> Result<Vec<u8>, R7zError> {
+        let len = range.len();
         if len > limit {
             return Err(R7zError::LimitExceeded("metadata"));
         }
         let len = usize::try_from(len).map_err(|_| R7zError::Parse)?;
         let mut out = vec![0u8; len];
-        self.read_exact_at(range.start, &mut out)?;
+        self.read_exact_at(range.start(), &mut out)?;
         Ok(out)
     }
 
-    fn range_reader(&self, range: Range<u64>) -> Result<ArchiveRangeReader<'_>, R7zError> {
-        if range.start > range.end || range.end > self.len()? {
+    fn range_reader(&self, range: ArchiveSourceRange) -> Result<ArchiveRangeReader<'_>, R7zError> {
+        if range.end() > self.len()? {
             return Err(R7zError::Parse);
         }
         Ok(ArchiveRangeReader {
             source: self,
-            pos: range.start,
-            end: range.end,
+            pos: range.start(),
+            end: range.end(),
         })
     }
 
     fn packed_input(
         &self,
-        range: Range<u64>,
+        range: ArchiveSourceRange,
     ) -> Result<codec::PackedInput<ArchiveRangeReader<'_>>, R7zError> {
-        let size = usize::try_from(checked_sub_u64(range.end, range.start)?)
-            .map_err(|_| R7zError::Parse)?;
+        let size = usize::try_from(range.len()).map_err(|_| R7zError::Parse)?;
         Ok(codec::PackedInput {
             reader: self.range_reader(range)?,
             size,
@@ -1010,7 +1014,7 @@ impl Archive {
         let folder = folders.nth(folder_index).ok_or(R7zError::Parse)??;
         let pack_sizes = folder
             .packed_streams()
-            .map(|stream| stream.range.end - stream.range.start)
+            .map(|stream| stream.range.len())
             .collect::<Vec<_>>();
         ensure_packed_folder_buffer_limit(&pack_sizes)?;
         let packed_buffer_limit = codec::MAX_BUFFERED_PACKED_FOLDER_BYTES as u64;
@@ -1392,7 +1396,7 @@ impl Archive {
         };
         match file.kind {
             EntryKind::File(location) | EntryKind::Symlink(location) => {
-                entry.size = Some(location.stream.range.end - location.stream.range.start);
+                entry.size = Some(location.stream.range.len());
                 entry.packed_size = location
                     .stream_index
                     .is_first()
@@ -1494,7 +1498,7 @@ impl Archive {
 
 fn verify_source_crc(
     source: &ArchiveSource,
-    range: Range<u64>,
+    range: ArchiveSourceRange,
     expected: u32,
 ) -> Result<(), R7zError> {
     let mut reader = source.range_reader(range)?;
@@ -1569,12 +1573,12 @@ impl<'a> PackedSource<'a> {
         Ok(Self { source, start })
     }
 
-    fn range(&self, stream: &PackedStream) -> Result<Range<u64>, R7zError> {
-        let start = checked_add_u64(self.start, stream.range.start)?;
-        let size = stream.range.end - stream.range.start;
+    fn range(&self, stream: &PackedStream) -> Result<ArchiveSourceRange, R7zError> {
+        let start = checked_add_u64(self.start, stream.range.start())?;
+        let size = stream.range.len();
         let range = checked_range_u64(self.source.len()?, start, size)?;
         if let Some(expected) = stream.crc {
-            verify_source_crc(self.source, range.clone(), expected)?;
+            verify_source_crc(self.source, range, expected)?;
         }
         Ok(range)
     }
@@ -1861,10 +1865,6 @@ fn checked_add_u64(lhs: u64, rhs: u64) -> Result<u64, R7zError> {
     lhs.checked_add(rhs).ok_or(R7zError::Parse)
 }
 
-fn checked_sub_u64(lhs: u64, rhs: u64) -> Result<u64, R7zError> {
-    lhs.checked_sub(rhs).ok_or(R7zError::Parse)
-}
-
 fn checked_range(total_len: usize, start: usize, len: u64) -> Result<Range<usize>, R7zError> {
     let len = usize::try_from(len).map_err(|_| R7zError::Parse)?;
     let end = start.checked_add(len).ok_or(R7zError::Parse)?;
@@ -1875,10 +1875,10 @@ fn checked_range(total_len: usize, start: usize, len: u64) -> Result<Range<usize
     }
 }
 
-fn checked_range_u64(total_len: u64, start: u64, len: u64) -> Result<Range<u64>, R7zError> {
+fn checked_range_u64(total_len: u64, start: u64, len: u64) -> Result<ArchiveSourceRange, R7zError> {
     let end = start.checked_add(len).ok_or(R7zError::Parse)?;
     if end <= total_len {
-        Ok(start..end)
+        Ok(ArchiveSourceRange::from_range(start..end))
     } else {
         Err(R7zError::Parse)
     }
@@ -2184,6 +2184,18 @@ mod selected_stream_tests {
     }
 
     #[test]
+    fn packed_source_translates_pack_offsets_to_archive_offsets() {
+        let source = ArchiveSource::Bytes(Bytes::from(vec![0; 128]));
+        let packed = PackedSource::new(&source, 5, 7).unwrap();
+        let stream = PackedStream {
+            range: crate::byte_range::PackedRange::from_range(3..9),
+            crc: None,
+        };
+
+        assert_eq!(packed.range(&stream).unwrap().into_range(), 47..53);
+    }
+
+    #[test]
     fn metadata_budget_is_shared_by_headers_external_bytes_and_slots() {
         for encoded in [false, true] {
             let (bytes, required) = archive_with_external_folder_metadata(encoded);
@@ -2243,9 +2255,9 @@ mod selected_stream_tests {
         let mut folders = FolderLayouts::for_streams(streams).unwrap();
         let position = archive.base_offset + 32 + folders.pack_pos();
         let folder = folders.nth(folder_index).unwrap().unwrap();
-        let packed_start = folder.packed_streams().next().unwrap().range.start;
+        let packed_start = folder.packed_streams().next().unwrap().range.start();
         let stream_start = if within_stream {
-            folder.substreams().nth(stream_index).unwrap().range.start
+            folder.substreams().nth(stream_index).unwrap().range.start()
         } else {
             0
         };

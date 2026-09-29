@@ -1,9 +1,9 @@
+use crate::byte_range::{DecodedRange, PackedRange};
 use crate::stream_info::SubstreamInfo;
 use crate::{Folder, PackInfo, R7zError, UnpackInfo, codec};
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::io::Read;
-use std::ops::Range;
 
 /// Remaining capacity for retained header bytes and external metadata.
 pub(crate) struct MetadataBudget(u64);
@@ -67,7 +67,7 @@ impl<'a> ExternalFolderPlan<'a> {
 }
 
 pub(crate) struct PackedStream {
-    pub(crate) range: Range<u64>,
+    pub(crate) range: PackedRange,
     pub(crate) crc: Option<u32>,
 }
 
@@ -86,7 +86,7 @@ impl PackedStreams<'_> {
             .scan(self.start, |offset, (index, &size)| {
                 let end = *offset + size;
                 let stream = PackedStream {
-                    range: *offset..end,
+                    range: PackedRange::from_range(*offset..end),
                     crc: self.digests.get(index).copied().flatten(),
                 };
                 *offset = end;
@@ -212,7 +212,7 @@ impl<'a> FolderStreamLayout<'a> {
 }
 
 pub(crate) struct Substream {
-    pub(crate) range: Range<u64>,
+    pub(crate) range: DecodedRange,
     pub(crate) digest: Option<u32>,
 }
 
@@ -236,7 +236,7 @@ impl Iterator for Substreams<'_> {
             .or(self.layout.final_size)?;
         let end = self.offset + size;
         let stream = Substream {
-            range: self.offset..end,
+            range: DecodedRange::from_range(self.offset..end),
             digest: self.layout.digests.get(self.position).copied().flatten(),
         };
         self.offset = end;
@@ -393,8 +393,8 @@ impl<'a> DecodedFolder<'a> {
         self.layout.streams().map(move |substream| {
             // Materialization proved the whole folder fits usize before reading.
             let start =
-                usize::try_from(substream.range.start).expect("materialized substream start");
-            let end = usize::try_from(substream.range.end).expect("materialized substream end");
+                usize::try_from(substream.range.start()).expect("materialized substream start");
+            let end = usize::try_from(substream.range.end()).expect("materialized substream end");
             let stream = self.state.0.slice(start..end);
             if substream
                 .digest
@@ -689,7 +689,7 @@ impl ActiveFolder<'_, '_> {
         let stream = self.streams.next().ok_or(R7zError::Parse)?;
         let mut content = SubstreamReader {
             reader: &mut self.reader,
-            remaining: stream.range.end - stream.range.start,
+            remaining: stream.range.len(),
             folder_digest: &mut self.digest,
             stream_digest: DigestState::new(stream.digest),
             decoded_len: &mut self.decoded_len,
@@ -878,7 +878,7 @@ mod tests {
             assert_eq!(
                 streams
                     .by_ref()
-                    .map(|stream| (stream.range.start, stream.range.end))
+                    .map(|stream| (stream.range.start(), stream.range.end()))
                     .collect::<Vec<_>>(),
                 expected
             );
@@ -923,7 +923,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let stream = folder.substreams().next().unwrap();
-        assert_eq!(stream.range, 0..3);
+        assert_eq!(stream.range.into_range(), 0..3);
         assert_eq!(stream.digest, Some(digest));
     }
 
