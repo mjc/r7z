@@ -1126,6 +1126,63 @@ fn cli_extract_file_over_directory_is_not_recursive_delete() {
 }
 
 #[test]
+#[cfg(unix)]
+fn cli_extract_applies_overwrite_policy_to_destination_symlinks() {
+    ["x", "e"]
+        .into_iter()
+        .flat_map(|command| {
+            ["missing", "file", "directory"]
+                .into_iter()
+                .map(move |kind| (command, kind))
+        })
+        .for_each(|(command, kind)| {
+            let tmp = tempdir().unwrap();
+            let archive = tmp.path().join("symlink-destination.7z");
+            let bytes = r7z::ArchiveBuilder::new()
+                .compression(r7z::Codec::Copy)
+                .add_file("entry", b"archive")
+                .build()
+                .unwrap();
+            fs::write(&archive, bytes).unwrap();
+            let outside = tmp.path().join("outside");
+            match kind {
+                "file" => fs::write(&outside, b"keep").unwrap(),
+                "directory" => {
+                    fs::create_dir(&outside).unwrap();
+                    fs::write(outside.join("keep"), b"keep").unwrap();
+                }
+                _ => {}
+            }
+            let out = tmp.path().join("out");
+            fs::create_dir(&out).unwrap();
+            let destination = out.join("entry");
+            std::os::unix::fs::symlink(&outside, &destination).unwrap();
+
+            ["-aos", "-y"].into_iter().for_each(|mode| {
+                run_r7z(&[
+                    command.into(),
+                    mode.into(),
+                    archive.display().to_string(),
+                    format!("-o{}", out.display()),
+                ]);
+                let metadata = fs::symlink_metadata(&destination).unwrap();
+                match mode {
+                    "-aos" => assert!(metadata.is_symlink()),
+                    _ => {
+                        assert!(metadata.is_file());
+                        assert_eq!(fs::read(&destination).unwrap(), b"archive");
+                    }
+                }
+                match kind {
+                    "file" => assert_eq!(fs::read(&outside).unwrap(), b"keep"),
+                    "directory" => assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep"),
+                    _ => assert!(!outside.exists()),
+                }
+            });
+        });
+}
+
+#[test]
 fn cli_extract_warns_when_operands_match_nothing() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
@@ -1169,6 +1226,75 @@ fn cli_test_warns_when_operands_match_nothing() {
         .output()
         .unwrap();
 
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No files to process"));
+}
+
+#[test]
+fn cli_test_empty_archive_distinguishes_all_from_unmatched_patterns() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("empty.7z");
+    fs::write(&path, r7z::ArchiveBuilder::new().build().unwrap()).unwrap();
+
+    let output = run_r7z(&["t".into(), path.display().to_string()]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["t", path.to_str().unwrap(), "*"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No files to process"));
+}
+
+#[test]
+fn cli_metadata_only_selection_does_not_open_encrypted_data() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("metadata.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            encryption: Some(r7z::EncryptionOptions::default_for_password("secret")),
+            ..Default::default()
+        })
+        .add_file("payload", b"encrypted payload")
+        .add_directory("directory", r7z::EntryMeta::default())
+        .add_empty_file("empty", r7z::EntryMeta::default())
+        .add_empty_file("empty-link", r7z::EntryMeta::symlink())
+        .add_anti_item("removed", r7z::EntryMeta::default())
+        .build()
+        .unwrap();
+    fs::write(&path, bytes).unwrap();
+
+    ["directory", "empty", "empty-link", "removed"]
+        .into_iter()
+        .for_each(|name| {
+            let output = run_r7z(&["t".into(), path.display().to_string(), name.into()]);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
+            ["x", "e"].into_iter().for_each(|command| {
+                let destination = tmp.path().join(format!("{command}-{name}"));
+                run_r7z(&[
+                    command.into(),
+                    path.display().to_string(),
+                    name.into(),
+                    format!("-o{}", destination.display()),
+                ]);
+                match (command, name) {
+                    ("x", "directory") => assert!(destination.join(name).is_dir()),
+                    (_, "empty" | "empty-link") => {
+                        assert_eq!(fs::read(destination.join(name)).unwrap(), b"");
+                    }
+                    _ => assert!(!destination.join(name).exists()),
+                }
+                assert!(!destination.join("payload").exists());
+            });
+        });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["x", path.to_str().unwrap(), "missing"])
+        .arg(format!("-o{}", tmp.path().join("unmatched").display()))
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("No files to process"));
 }
@@ -1385,4 +1511,63 @@ fn cli_mixed_entry_kinds_survive_testing_extraction_and_rewrite() {
     rewritten.extract_by_name("keep", &mut keep).unwrap();
     assert_eq!(keep, b"payload");
     run_r7z(&["t".into(), path.display().to_string()]);
+}
+
+#[test]
+fn cli_test_continues_with_independent_folders_after_corruption() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("corrupt.7z");
+    let mut bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            compression: r7z::CompressionOptions {
+                solid: r7z::SolidMode::NonSolid,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .add_file("first", b"first")
+        .add_file("middle", b"middle")
+        .add_file("last", b"last")
+        .build()
+        .unwrap();
+    bytes[32] ^= 1;
+    bytes[32 + 5 + 6] ^= 1;
+    fs::write(&path, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["t", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(errors.contains("Testing block 0 failed"), "{errors}");
+    assert!(errors.contains("Testing block 2 failed"), "{errors}");
+    assert!(!errors.contains("Testing block 1 failed"), "{errors}");
+    run_r7z(&["t".into(), path.display().to_string(), "middle".into()]);
+}
+
+#[test]
+fn cli_skipped_encrypted_files_do_not_open_a_decoder() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("encrypted.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .options(r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            encryption: Some(r7z::EncryptionOptions::default_for_password("secret")),
+            ..Default::default()
+        })
+        .add_file("keep", b"encrypted payload")
+        .build()
+        .unwrap();
+    fs::write(&path, bytes).unwrap();
+    let out = tmp.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), b"existing").unwrap();
+    run_r7z(&[
+        "x".into(),
+        "-aos".into(),
+        path.display().to_string(),
+        format!("-o{}", out.display()),
+    ]);
+    assert_eq!(fs::read(out.join("keep")).unwrap(), b"existing");
 }

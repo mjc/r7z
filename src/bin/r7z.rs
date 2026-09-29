@@ -12,6 +12,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
     num::NonZeroU64,
+    ops::ControlFlow,
     path::{Component, Path, PathBuf},
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -631,7 +632,7 @@ fn list_archive(cli: &Cli) -> Result<(), CliError> {
     let archive = open_archive(cli)?;
     let physical_size = fs::metadata(&cli.archive).ok().map(|meta| meta.len());
     let listing = archive.listing(physical_size)?;
-    let selected = selected_patterns(&cli.operands);
+    let selected = EntryPatterns::from_paths(&cli.operands);
     if cli.technical {
         print_technical_listing(&listing, &cli.archive, &selected);
     } else {
@@ -640,7 +641,7 @@ fn list_archive(cli: &Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
+fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &EntryPatterns) {
     println!();
     print_listing_header(listing, archive_path);
     println!();
@@ -655,7 +656,7 @@ fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[Stri
     for entry in listing
         .entries
         .iter()
-        .filter(|entry| entry_is_selected(&entry.path, selected))
+        .filter(|entry| selected.matches(&entry.path))
     {
         if matches!(entry.kind, ListingEntryKind::Anti) {
             continue;
@@ -689,14 +690,18 @@ fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[Stri
     println!();
 }
 
-fn print_technical_listing(listing: &ArchiveListing, archive_path: &Path, selected: &[String]) {
+fn print_technical_listing(
+    listing: &ArchiveListing,
+    archive_path: &Path,
+    selected: &EntryPatterns,
+) {
     print_listing_header(listing, archive_path);
     println!();
     println!("----------");
     for entry in listing
         .entries
         .iter()
-        .filter(|entry| entry_is_selected(&entry.path, selected))
+        .filter(|entry| selected.matches(&entry.path))
     {
         println!("Path = {}", entry.path);
         println!("Size = {}", size_text(entry.size));
@@ -856,34 +861,70 @@ fn summary_text(files: usize, folders: usize) -> String {
 
 fn test_archive(cli: &Cli) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
-    let selected = selected_patterns(&cli.operands);
-    let mut sink = io::sink();
-    let mut warnings = 0u8;
-    let mut matched = 0usize;
-    for entry in archive.entries() {
-        if !entry_is_selected(&entry.name, &selected) {
-            continue;
-        }
-        matched += 1;
-        if !entry.has_data_stream() {
-            continue;
-        }
-        let i = entry.index;
-        if let Err(err) =
-            archive.extract_to_writer_with_password(i, &mut sink, cli.password.as_deref())
-        {
-            warnings = EXIT_WARNING;
-            eprintln!("Testing entry {i} failed: {err}");
+    let selected = EntryPatterns::from_paths(&cli.operands);
+    let listing = archive.listing(None)?;
+    match selected.resolve_listing(&listing.entries) {
+        Some(selected) => test_selected_folders(&archive, cli.password.as_deref(), selected),
+        None => {
+            eprintln!("No files to process");
+            Ok(EXIT_WARNING)
         }
     }
-    if !selected.is_empty() && matched == 0 {
-        eprintln!("No files to process");
-        return Ok(EXIT_WARNING);
-    }
+}
+
+fn test_selected_folders(
+    archive: &Archive,
+    password: Option<&str>,
+    selected: SelectedListing<'_>,
+) -> Result<u8, CliError> {
+    let mut folders = selected.folders().peekable();
+    let warnings = if folders.peek().is_some() {
+        let mut session = archive.read_session(password)?;
+        let warnings = folders.fold(EXIT_OK, |warnings, (folder, mut indices)| {
+            let result = indices
+                .try_for_each(|index| {
+                    session
+                        .extract_to_writer(index, &mut io::sink())
+                        .map(|_| ())
+                })
+                .and_then(|()| session.finish_folder());
+            match result {
+                Ok(()) => warnings,
+                Err(error) => {
+                    eprintln!("Testing block {folder} failed: {error}");
+                    EXIT_WARNING
+                }
+            }
+        });
+        session.finish()?;
+        warnings
+    } else {
+        EXIT_OK
+    };
     if warnings == 0 {
         println!("Everything is Ok");
     }
     Ok(warnings)
+}
+
+/// Borrow each folder's contiguous listing range, including intervening empty entries.
+fn listing_folder_groups(
+    mut entries: &[ArchiveListingEntry],
+) -> impl Iterator<Item = (usize, &[ArchiveListingEntry])> {
+    std::iter::from_fn(move || {
+        let (start, folder) = entries
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| entry.block.map(|folder| (index, folder)))?;
+        let (_, data_entries) = entries.split_at(start);
+        let end = data_entries
+            .iter()
+            .position(|entry| entry.block.is_some_and(|block| block != folder))
+            .unwrap_or(data_entries.len());
+        let (group, remaining) = data_entries.split_at(end);
+        entries = remaining;
+        Some((folder, group))
+    })
 }
 
 fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
@@ -898,84 +939,179 @@ fn extract_archive_with_ui(
 ) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     fs::create_dir_all(&cli.output_dir)?;
-    let selected = selected_patterns(&cli.operands);
-    let mut matched = 0usize;
-    let mut warnings = 0u8;
-    let mut overwrite_mode = cli.overwrite_mode;
-
-    for entry in archive.entries() {
-        if !entry_is_selected(&entry.name, &selected) {
-            continue;
+    let selected = EntryPatterns::from_paths(&cli.operands);
+    match selected.resolve_entries(&archive) {
+        Some(entries) => {
+            let mut extraction = Extraction {
+                archive: &archive,
+                password: cli.password.as_deref(),
+                session: None,
+                overwrite_mode: cli.overwrite_mode,
+                assume_yes: cli.assume_yes,
+                ui,
+            };
+            let result = entries
+                .filter_map(|entry| ExtractionTarget::from_entry(entry, &cli.output_dir, flat))
+                .map(|target| target.and_then(|target| extraction.write(target)))
+                .try_fold(EXIT_OK, |warnings, result| match result {
+                    Ok(ControlFlow::Continue(warning)) => ControlFlow::Continue(warnings | warning),
+                    Ok(ControlFlow::Break(())) => ControlFlow::Break(Ok(EXIT_WARNING)),
+                    Err(error) => ControlFlow::Break(Err(error)),
+                });
+            let warnings = match result {
+                ControlFlow::Continue(warnings) => warnings,
+                ControlFlow::Break(result) => result?,
+            };
+            extraction.finish()?;
+            Ok(warnings)
         }
-        matched += 1;
-        if entry.is_anti() {
-            continue;
+        None => {
+            eprintln!("No files to process");
+            Ok(EXIT_WARNING)
         }
+    }
+}
 
-        let out_path = if flat {
-            let file_name = Path::new(&entry.name)
+#[derive(Clone, Copy)]
+enum FileContents {
+    Empty,
+    Stream(usize),
+}
+
+#[derive(Clone, Copy)]
+enum ExtractionKind {
+    Directory,
+    File(FileContents),
+}
+
+/// An actionable entry with a destination checked for the selected extraction mode.
+struct ExtractionTarget {
+    path: PathBuf,
+    kind: ExtractionKind,
+}
+
+impl ExtractionTarget {
+    fn from_entry(
+        entry: r7z::ArchiveEntryInfo,
+        output_dir: &Path,
+        flat: bool,
+    ) -> Option<Result<Self, CliError>> {
+        let kind = match entry.entry_type {
+            r7z::EntryType::Anti => return None,
+            r7z::EntryType::Directory => ExtractionKind::Directory,
+            r7z::EntryType::EmptyFile | r7z::EntryType::EmptySymlink => {
+                ExtractionKind::File(FileContents::Empty)
+            }
+            r7z::EntryType::File | r7z::EntryType::Symlink => {
+                ExtractionKind::File(FileContents::Stream(entry.index))
+            }
+        };
+        let path = if flat {
+            Path::new(&entry.name)
                 .file_name()
                 .filter(|part| !part.is_empty())
-                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))?;
-            cli.output_dir.join(file_name)
+                .map(|name| output_dir.join(name))
+                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))
         } else {
-            safe_join(&cli.output_dir, &entry.name)?
+            safe_join(output_dir, &entry.name)
         };
-
-        if entry.is_directory() {
-            if !flat {
-                if out_path.exists() && !out_path.is_dir() {
-                    match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
-                        CollisionAction::Overwrite => fs::remove_file(&out_path)?,
-                        CollisionAction::Skip { warning } => {
-                            if warning {
-                                warnings = EXIT_WARNING;
-                            }
-                            continue;
-                        }
-                        CollisionAction::Quit => return Ok(EXIT_WARNING),
-                    }
-                }
-                fs::create_dir_all(&out_path)?;
-            }
-            continue;
-        }
-
-        if out_path.exists() {
-            if out_path.is_dir() {
-                ui.warn_skip_existing(&out_path)?;
-                warnings = EXIT_WARNING;
-                continue;
-            }
-            match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
-                CollisionAction::Overwrite => fs::remove_file(&out_path)?,
-                CollisionAction::Skip { warning } => {
-                    if warning {
-                        warnings = EXIT_WARNING;
-                    }
-                    continue;
-                }
-                CollisionAction::Quit => return Ok(EXIT_WARNING),
-            }
-        }
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = fs::File::create(out_path)?;
-        if entry.has_data_stream() {
-            archive.extract_to_writer_with_password(
-                entry.index,
-                &mut file,
-                cli.password.as_deref(),
-            )?;
+        match (path, kind, flat) {
+            (Err(error), _, _) => Some(Err(error)),
+            (Ok(_), ExtractionKind::Directory, true) => None,
+            (Ok(path), kind, _) => Some(Ok(Self { path, kind })),
         }
     }
 
-    if !selected.is_empty() && matched == 0 {
-        eprintln!("No files to process");
-        Ok(EXIT_WARNING)
-    } else {
-        Ok(warnings)
+    fn prepare(
+        &self,
+        mode: &mut OverwriteMode,
+        assume_yes: bool,
+        ui: &mut impl OverwriteUi,
+    ) -> Result<CollisionAction, CliError> {
+        match (self.kind, Destination::at(&self.path)) {
+            (_, Destination::Missing) | (ExtractionKind::Directory, Destination::Directory) => {
+                Ok(CollisionAction::Overwrite)
+            }
+            (ExtractionKind::File(_), Destination::Directory) => {
+                ui.warn_skip_existing(&self.path)?;
+                Ok(CollisionAction::Skip { warning: true })
+            }
+            (_, Destination::Other) => {
+                let action = decide_overwrite(mode, assume_yes, ui, &self.path)?;
+                if matches!(action, CollisionAction::Overwrite) {
+                    fs::remove_file(&self.path)?;
+                }
+                Ok(action)
+            }
+        }
+    }
+}
+
+enum Destination {
+    Missing,
+    Directory,
+    Other,
+}
+
+impl Destination {
+    fn at(path: &Path) -> Self {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => match metadata.is_dir() {
+                true => Self::Directory,
+                false => Self::Other,
+            },
+            Err(_) => Self::Missing,
+        }
+    }
+}
+
+/// Owns overwrite decisions and opens a decoder only when a data file is written.
+struct Extraction<'a, U> {
+    archive: &'a Archive,
+    password: Option<&'a str>,
+    session: Option<r7z::ArchiveReadSession<'a>>,
+    overwrite_mode: OverwriteMode,
+    assume_yes: bool,
+    ui: &'a mut U,
+}
+
+impl<U: OverwriteUi> Extraction<'_, U> {
+    fn write(&mut self, target: ExtractionTarget) -> Result<ControlFlow<(), u8>, CliError> {
+        match target.prepare(&mut self.overwrite_mode, self.assume_yes, self.ui)? {
+            CollisionAction::Skip { warning } => Ok(ControlFlow::Continue(u8::from(warning))),
+            CollisionAction::Quit => Ok(ControlFlow::Break(())),
+            CollisionAction::Overwrite => {
+                match target.kind {
+                    ExtractionKind::Directory => fs::create_dir_all(&target.path)?,
+                    ExtractionKind::File(contents) => {
+                        if let Some(parent) = target.path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let mut file = fs::File::create(&target.path)?;
+                        match contents {
+                            FileContents::Empty => {}
+                            FileContents::Stream(index) => {
+                                let session = match &mut self.session {
+                                    Some(session) => session,
+                                    empty @ None => {
+                                        empty.insert(self.archive.read_session(self.password)?)
+                                    }
+                                };
+                                session.extract_to_writer(index, &mut file)?;
+                            }
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(EXIT_OK))
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(), CliError> {
+        self.session
+            .map(r7z::ArchiveReadSession::finish)
+            .transpose()?;
+        Ok(())
     }
 }
 
@@ -1127,12 +1263,12 @@ fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
             "no archive entries were provided".to_string(),
         ));
     }
-    let delete_patterns = selected_patterns(&cli.operands);
+    let delete_patterns = EntryPatterns::from_paths(&cli.operands);
     let archive = open_archive(cli)?;
     let (entries, raw_folders) = preserved_rewrite_entries(
         &archive,
         cli.password.as_deref(),
-        |name| entry_is_selected(name, &delete_patterns),
+        |name| delete_patterns.matches(name),
         Vec::new(),
     )?;
     write_preserved_archive_entries_atomic(&cli.archive, entries, raw_folders, &cli.options)
@@ -1562,15 +1698,86 @@ fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, nanos as u32))
 }
 
-fn selected_patterns(paths: &[PathBuf]) -> Vec<String> {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .collect()
+enum EntryPatterns {
+    All,
+    Matching(Vec<String>),
 }
 
-fn entry_is_selected(name: &str, patterns: &[String]) -> bool {
-    patterns.is_empty() || patterns.iter().any(|pattern| wildcard_match(pattern, name))
+impl EntryPatterns {
+    fn from_paths(paths: &[PathBuf]) -> Self {
+        match paths {
+            [] => Self::All,
+            paths => Self::Matching(
+                paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Matching(patterns) => {
+                patterns.iter().any(|pattern| wildcard_match(pattern, name))
+            }
+        }
+    }
+
+    fn resolve_entries<'a>(
+        &'a self,
+        archive: &'a Archive,
+    ) -> Option<impl Iterator<Item = r7z::ArchiveEntryInfo> + 'a> {
+        let mut entries = archive
+            .entries()
+            .filter(|entry| self.matches(&entry.name))
+            .peekable();
+        match self {
+            Self::All => Some(entries),
+            Self::Matching(_) => {
+                entries.peek()?;
+                Some(entries)
+            }
+        }
+    }
+
+    fn resolve_listing<'a>(
+        &'a self,
+        entries: &'a [ArchiveListingEntry],
+    ) -> Option<SelectedListing<'a>> {
+        let entries = match self {
+            Self::All => entries,
+            Self::Matching(_) => {
+                let first = entries.iter().position(|entry| self.matches(&entry.path))?;
+                entries.split_at(first).1
+            }
+        };
+        Some(SelectedListing {
+            entries,
+            patterns: self,
+        })
+    }
+}
+
+/// A listing whose selection is either unrestricted or has at least one match.
+struct SelectedListing<'a> {
+    entries: &'a [ArchiveListingEntry],
+    patterns: &'a EntryPatterns,
+}
+
+impl SelectedListing<'_> {
+    fn folders(&self) -> impl Iterator<Item = (usize, impl Iterator<Item = usize>)> {
+        listing_folder_groups(self.entries).filter_map(|(folder, entries)| {
+            let mut indices = entries
+                .iter()
+                .filter(|entry| entry.block.is_some() && self.patterns.matches(&entry.path))
+                .map(|entry| entry.index)
+                .peekable();
+            indices.peek()?;
+            Some((folder, indices))
+        })
+    }
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -1762,6 +1969,63 @@ mod tests {
         assert_eq!(mode, OverwriteMode::Ask);
         assert_eq!(ui.prompts, vec!["exists.txt"]);
         assert!(ui.warned.is_empty());
+    }
+
+    #[test]
+    fn extraction_session_keeps_overwrite_prompts_in_entry_order_and_stops_on_quit() {
+        for answers in [
+            vec![OverwriteAnswer::No, OverwriteAnswer::Yes],
+            vec![OverwriteAnswer::Quit],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("solid.7z");
+            let bytes = r7z::ArchiveBuilder::new()
+                .compression(r7z::Codec::Copy)
+                .add_file("first", b"one")
+                .add_file("skip", b"two")
+                .add_file("last", b"three")
+                .build()
+                .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let output = root.path().join("out");
+            std::fs::create_dir(&output).unwrap();
+            std::fs::write(output.join("skip"), b"old-two").unwrap();
+            std::fs::write(output.join("last"), b"old-three").unwrap();
+            let cli = super::Cli::parse(vec![
+                "x".into(),
+                path.display().to_string(),
+                format!("-o{}", output.display()),
+            ])
+            .unwrap();
+            let quit = answers == [OverwriteAnswer::Quit];
+            let mut ui = FakeOverwriteUi::interactive(answers);
+            assert_eq!(
+                super::extract_archive_with_ui(&cli, false, &mut ui).unwrap(),
+                super::EXIT_WARNING
+            );
+            assert_eq!(std::fs::read(output.join("first")).unwrap(), b"one");
+            assert_eq!(std::fs::read(output.join("skip")).unwrap(), b"old-two");
+            assert_eq!(
+                std::fs::read(output.join("last")).unwrap(),
+                if quit {
+                    &b"old-three"[..]
+                } else {
+                    &b"three"[..]
+                }
+            );
+            let expected = if quit {
+                vec![output.join("skip")]
+            } else {
+                vec![output.join("skip"), output.join("last")]
+            };
+            assert_eq!(
+                ui.prompts,
+                expected
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     struct FakeOverwriteUi {
