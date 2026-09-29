@@ -444,6 +444,25 @@ fn partial_input_failure_prevents_finishing_or_reusing_the_writer() {
     }
 }
 
+#[test]
+fn encoder_memory_limit_failure_prevents_reusing_the_writer() {
+    let mut limited = options(Codec::Lzma2, false);
+    limited.compression.encoder_memory_limit = Some(1);
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), limited).unwrap();
+
+    assert!(matches!(
+        writer.append("file", FIRST),
+        Err(r7z::R7zError::LimitExceeded("encoder memory"))
+    ));
+    assert!(writer.append("another", SECOND).is_err());
+    assert!(writer.finish().is_err());
+
+    let mut next =
+        ArchiveWriter::new(Cursor::new(Vec::new()), options(Codec::Lzma2, false)).unwrap();
+    next.append("file", FIRST).unwrap();
+    next.finish().unwrap();
+}
+
 struct ControlledOutput {
     bytes: Cursor<Vec<u8>>,
     fail: std::rc::Rc<std::cell::Cell<bool>>,
