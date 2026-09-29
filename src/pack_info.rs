@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use nom::IResult;
 use nom::number::complete::le_u8;
+use nom::{IResult, Parser};
 use smallvec::SmallVec;
 
 use crate::folder::{FolderGraph, scan_folder};
@@ -273,7 +273,9 @@ impl UnpackInfo {
         idx: usize,
     ) -> Result<(Folder, FolderGraph), crate::R7zError> {
         let bytes = self.folder_bytes(idx)?;
-        let (_, folder) = Folder::parse(bytes).map_err(|_| crate::R7zError::Parse)?;
+        let (_, folder) = nom::combinator::all_consuming(Folder::parse)
+            .parse(bytes)
+            .map_err(|_| crate::R7zError::Parse)?;
         let graph = folder.graph()?;
         Ok((folder, graph))
     }
@@ -617,6 +619,17 @@ mod tests {
         assert_eq!(unpack.unpack_sizes.as_slice(), &[3]);
         assert_eq!(unpack.folder_bytes(0).unwrap(), &[0x01, 0x01, 0x00]);
         assert_eq!(unpack.parse_folder(0).unwrap().coders.len(), 1);
+    }
+
+    #[test]
+    fn parse_folder_rejects_trailing_bytes_in_its_indexed_slice() {
+        let input = [0x07u8, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x00];
+        let backing = Bytes::copy_from_slice(&input);
+        let (_, mut unpack) = UnpackInfo::parse(&backing, &backing).unwrap();
+        unpack.folder_data = Bytes::from_static(&[0x01, 0x01, 0x00, 0xde]);
+        unpack.folder_offsets[1] = 4;
+
+        assert!(unpack.parse_folder(0).is_err());
     }
 
     #[test]
