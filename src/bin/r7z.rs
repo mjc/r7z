@@ -12,6 +12,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
     num::NonZeroU64,
+    ops::ControlFlow,
     path::{Component, Path, PathBuf},
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -939,94 +940,178 @@ fn extract_archive_with_ui(
     let archive = open_archive(cli)?;
     fs::create_dir_all(&cli.output_dir)?;
     let selected = EntryPatterns::from_paths(&cli.operands);
-    let mut matched = 0usize;
-    let mut warnings = 0u8;
-    let mut overwrite_mode = cli.overwrite_mode;
-
-    let mut session: Option<r7z::ArchiveReadSession<'_>> = None;
-    'entries: for entry in archive.entries() {
-        if !selected.matches(&entry.name) {
-            continue;
-        }
-        matched += 1;
-        if entry.is_anti() {
-            continue;
-        }
-
-        let out_path = if flat {
-            let file_name = Path::new(&entry.name)
-                .file_name()
-                .filter(|part| !part.is_empty())
-                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))?;
-            cli.output_dir.join(file_name)
-        } else {
-            safe_join(&cli.output_dir, &entry.name)?
-        };
-
-        if entry.is_directory() {
-            if !flat {
-                if out_path.exists() && !out_path.is_dir() {
-                    match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
-                        CollisionAction::Overwrite => fs::remove_file(&out_path)?,
-                        CollisionAction::Skip { warning } => {
-                            if warning {
-                                warnings = EXIT_WARNING;
-                            }
-                            continue;
-                        }
-                        CollisionAction::Quit => {
-                            warnings = EXIT_WARNING;
-                            break 'entries;
-                        }
-                    }
-                }
-                fs::create_dir_all(&out_path)?;
-            }
-            continue;
-        }
-
-        if out_path.exists() {
-            if out_path.is_dir() {
-                ui.warn_skip_existing(&out_path)?;
-                warnings = EXIT_WARNING;
-                continue;
-            }
-            match decide_overwrite(&mut overwrite_mode, cli.assume_yes, ui, &out_path)? {
-                CollisionAction::Overwrite => fs::remove_file(&out_path)?,
-                CollisionAction::Skip { warning } => {
-                    if warning {
-                        warnings = EXIT_WARNING;
-                    }
-                    continue;
-                }
-                CollisionAction::Quit => {
-                    warnings = EXIT_WARNING;
-                    break 'entries;
-                }
-            }
-        }
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = fs::File::create(out_path)?;
-        if entry.has_data_stream() {
-            let session = match &mut session {
-                Some(session) => session,
-                empty @ None => empty.insert(archive.read_session(cli.password.as_deref())?),
+    match selected.resolve_entries(&archive) {
+        Some(entries) => {
+            let mut extraction = Extraction {
+                archive: &archive,
+                password: cli.password.as_deref(),
+                session: None,
+                overwrite_mode: cli.overwrite_mode,
+                assume_yes: cli.assume_yes,
+                ui,
             };
-            session.extract_to_writer(entry.index, &mut file)?;
+            let result = entries
+                .filter_map(|entry| ExtractionTarget::from_entry(entry, &cli.output_dir, flat))
+                .map(|target| target.and_then(|target| extraction.write(target)))
+                .try_fold(EXIT_OK, |warnings, result| match result {
+                    Ok(ControlFlow::Continue(warning)) => ControlFlow::Continue(warnings | warning),
+                    Ok(ControlFlow::Break(())) => ControlFlow::Break(Ok(EXIT_WARNING)),
+                    Err(error) => ControlFlow::Break(Err(error)),
+                });
+            let warnings = match result {
+                ControlFlow::Continue(warnings) => warnings,
+                ControlFlow::Break(result) => result?,
+            };
+            extraction.finish()?;
+            Ok(warnings)
         }
-    }
-
-    if let Some(session) = session {
-        session.finish()?;
-    }
-    match (selected, matched) {
-        (EntryPatterns::Matching(_), 0) => {
+        None => {
             eprintln!("No files to process");
             Ok(EXIT_WARNING)
         }
-        _ => Ok(warnings),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FileContents {
+    Empty,
+    Stream(usize),
+}
+
+#[derive(Clone, Copy)]
+enum ExtractionKind {
+    Directory,
+    File(FileContents),
+}
+
+/// An actionable entry with a destination checked for the selected extraction mode.
+struct ExtractionTarget {
+    path: PathBuf,
+    kind: ExtractionKind,
+}
+
+impl ExtractionTarget {
+    fn from_entry(
+        entry: r7z::ArchiveEntryInfo,
+        output_dir: &Path,
+        flat: bool,
+    ) -> Option<Result<Self, CliError>> {
+        let kind = match entry.entry_type {
+            r7z::EntryType::Anti => return None,
+            r7z::EntryType::Directory => ExtractionKind::Directory,
+            r7z::EntryType::EmptyFile | r7z::EntryType::EmptySymlink => {
+                ExtractionKind::File(FileContents::Empty)
+            }
+            r7z::EntryType::File | r7z::EntryType::Symlink => {
+                ExtractionKind::File(FileContents::Stream(entry.index))
+            }
+        };
+        let path = if flat {
+            Path::new(&entry.name)
+                .file_name()
+                .filter(|part| !part.is_empty())
+                .map(|name| output_dir.join(name))
+                .ok_or_else(|| CliError::Fatal(R7zError::UnsafePath(entry.name.clone())))
+        } else {
+            safe_join(output_dir, &entry.name)
+        };
+        match (path, kind, flat) {
+            (Err(error), _, _) => Some(Err(error)),
+            (Ok(_), ExtractionKind::Directory, true) => None,
+            (Ok(path), kind, _) => Some(Ok(Self { path, kind })),
+        }
+    }
+
+    fn prepare(
+        &self,
+        mode: &mut OverwriteMode,
+        assume_yes: bool,
+        ui: &mut impl OverwriteUi,
+    ) -> Result<CollisionAction, CliError> {
+        match (self.kind, Destination::at(&self.path)) {
+            (_, Destination::Missing) | (ExtractionKind::Directory, Destination::Directory) => {
+                Ok(CollisionAction::Overwrite)
+            }
+            (ExtractionKind::File(_), Destination::Directory) => {
+                ui.warn_skip_existing(&self.path)?;
+                Ok(CollisionAction::Skip { warning: true })
+            }
+            (_, Destination::Other) => {
+                let action = decide_overwrite(mode, assume_yes, ui, &self.path)?;
+                if matches!(action, CollisionAction::Overwrite) {
+                    fs::remove_file(&self.path)?;
+                }
+                Ok(action)
+            }
+        }
+    }
+}
+
+enum Destination {
+    Missing,
+    Directory,
+    Other,
+}
+
+impl Destination {
+    fn at(path: &Path) -> Self {
+        match path.metadata() {
+            Ok(metadata) => match metadata.is_dir() {
+                true => Self::Directory,
+                false => Self::Other,
+            },
+            Err(_) => Self::Missing,
+        }
+    }
+}
+
+/// Owns overwrite decisions and opens a decoder only when a data file is written.
+struct Extraction<'a, U> {
+    archive: &'a Archive,
+    password: Option<&'a str>,
+    session: Option<r7z::ArchiveReadSession<'a>>,
+    overwrite_mode: OverwriteMode,
+    assume_yes: bool,
+    ui: &'a mut U,
+}
+
+impl<U: OverwriteUi> Extraction<'_, U> {
+    fn write(&mut self, target: ExtractionTarget) -> Result<ControlFlow<(), u8>, CliError> {
+        match target.prepare(&mut self.overwrite_mode, self.assume_yes, self.ui)? {
+            CollisionAction::Skip { warning } => Ok(ControlFlow::Continue(u8::from(warning))),
+            CollisionAction::Quit => Ok(ControlFlow::Break(())),
+            CollisionAction::Overwrite => {
+                match target.kind {
+                    ExtractionKind::Directory => fs::create_dir_all(&target.path)?,
+                    ExtractionKind::File(contents) => {
+                        if let Some(parent) = target.path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let mut file = fs::File::create(&target.path)?;
+                        match contents {
+                            FileContents::Empty => {}
+                            FileContents::Stream(index) => {
+                                let session = match &mut self.session {
+                                    Some(session) => session,
+                                    empty @ None => {
+                                        empty.insert(self.archive.read_session(self.password)?)
+                                    }
+                                };
+                                session.extract_to_writer(index, &mut file)?;
+                            }
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(EXIT_OK))
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(), CliError> {
+        self.session
+            .map(r7z::ArchiveReadSession::finish)
+            .transpose()?;
+        Ok(())
     }
 }
 
@@ -1636,6 +1721,23 @@ impl EntryPatterns {
             Self::All => true,
             Self::Matching(patterns) => {
                 patterns.iter().any(|pattern| wildcard_match(pattern, name))
+            }
+        }
+    }
+
+    fn resolve_entries<'a>(
+        &'a self,
+        archive: &'a Archive,
+    ) -> Option<impl Iterator<Item = r7z::ArchiveEntryInfo> + 'a> {
+        let mut entries = archive
+            .entries()
+            .filter(|entry| self.matches(&entry.name))
+            .peekable();
+        match self {
+            Self::All => Some(entries),
+            Self::Matching(_) => {
+                entries.peek()?;
+                Some(entries)
             }
         }
     }

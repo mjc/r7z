@@ -1191,7 +1191,7 @@ fn cli_test_empty_archive_distinguishes_all_from_unmatched_patterns() {
 }
 
 #[test]
-fn cli_test_metadata_only_selection_does_not_open_encrypted_data() {
+fn cli_metadata_only_selection_does_not_open_encrypted_data() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("metadata.7z");
     let bytes = r7z::ArchiveBuilder::new()
@@ -1214,7 +1214,32 @@ fn cli_test_metadata_only_selection_does_not_open_encrypted_data() {
         .for_each(|name| {
             let output = run_r7z(&["t".into(), path.display().to_string(), name.into()]);
             assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
+            ["x", "e"].into_iter().for_each(|command| {
+                let destination = tmp.path().join(format!("{command}-{name}"));
+                run_r7z(&[
+                    command.into(),
+                    path.display().to_string(),
+                    name.into(),
+                    format!("-o{}", destination.display()),
+                ]);
+                match (command, name) {
+                    ("x", "directory") => assert!(destination.join(name).is_dir()),
+                    (_, "empty" | "empty-link") => {
+                        assert_eq!(fs::read(destination.join(name)).unwrap(), b"");
+                    }
+                    _ => assert!(!destination.join(name).exists()),
+                }
+                assert!(!destination.join("payload").exists());
+            });
         });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args(["x", path.to_str().unwrap(), "missing"])
+        .arg(format!("-o{}", tmp.path().join("unmatched").display()))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No files to process"));
 }
 
 #[test]
