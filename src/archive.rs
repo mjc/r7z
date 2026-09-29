@@ -3245,7 +3245,7 @@ mod selected_stream_tests {
         session.finish().unwrap();
     }
 
-    fn archive_with_folder_crc_failure() -> Archive {
+    fn archive_with_folder_crc_failure_bytes() -> Vec<u8> {
         let data = b"abcdef";
         let wrong_crc = crc32fast::hash(b"abcd") ^ 1;
         let mut header = vec![
@@ -3265,7 +3265,42 @@ mod selected_stream_tests {
         bytes.extend_from_slice(&start);
         bytes.extend_from_slice(data);
         bytes.extend_from_slice(&header);
-        Archive::from_bytes(bytes.into()).unwrap()
+        bytes
+    }
+
+    fn archive_with_folder_crc_failure() -> Archive {
+        Archive::from_bytes(archive_with_folder_crc_failure_bytes().into()).unwrap()
+    }
+
+    struct CountedReader {
+        cursor: std::io::Cursor<Vec<u8>>,
+        bytes_read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for CountedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.cursor.read(buffer)?;
+            self.bytes_read
+                .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountedReader {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(from)
+        }
+    }
+
+    fn counted_archive(
+        bytes: Vec<u8>,
+        bytes_read: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Archive {
+        Archive::from_reader(CountedReader {
+            cursor: std::io::Cursor::new(bytes),
+            bytes_read: std::sync::Arc::clone(bytes_read),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -3280,11 +3315,71 @@ mod selected_stream_tests {
 
         let mut output = Vec::new();
         let result = archive.stream_selected_files(&[0], |_, reader| {
-            reader.read_to_end(&mut output)?;
+            let mut first = [0];
+            reader.read_exact(&mut first)?;
+            output.extend_from_slice(&first);
             Ok(())
         });
-        assert_eq!(output, b"ab");
+        assert_eq!(output, b"a");
         assert!(matches!(result, Err(R7zError::Crc)));
+    }
+
+    #[test]
+    fn cancelled_read_drops_the_folder_and_keeps_later_folders_readable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bytes_read = std::sync::Arc::new(AtomicUsize::new(0));
+        let archive = counted_archive(archive_with_folder_crc_failure_bytes(), &bytes_read);
+        bytes_read.store(0, Ordering::Relaxed);
+        let mut visited = Vec::new();
+        let result = archive.stream_selected_files(&[0, 2], |entry, reader| {
+            visited.push(entry.index);
+            let mut first = [0];
+            reader.read_exact(&mut first)?;
+            Err(R7zError::InvalidOptions("cancelled"))
+        });
+
+        assert_eq!(visited, [0]);
+        assert!(matches!(result, Err(R7zError::InvalidOptions("cancelled"))));
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 1);
+        assert_eq!(archive.extract_to_memory(2).unwrap(), b"ef");
+    }
+
+    #[test]
+    fn dropping_read_session_leaves_the_unread_solid_tail_untouched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bytes_read = std::sync::Arc::new(AtomicUsize::new(0));
+        let archive = counted_archive(archive_with_folder_crc_failure_bytes(), &bytes_read);
+        bytes_read.store(0, Ordering::Relaxed);
+        let mut session = archive.read_session(None).unwrap();
+        session
+            .read_entry(0, |reader| {
+                let mut first = [0];
+                reader.read_exact(&mut first)?;
+                assert_eq!(first, [b'a']);
+                Ok(())
+            })
+            .unwrap();
+        drop(session);
+
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn selecting_the_same_corrupt_folder_again_rechecks_its_crc() {
+        let mut calls = 0;
+        let archive = archive_with_folder_crc_failure();
+        for _ in 0..2 {
+            let result = archive.stream_selected_files(&[0], |_, reader| {
+                calls += 1;
+                let mut first = [0];
+                reader.read_exact(&mut first)?;
+                Ok(())
+            });
+            assert!(matches!(result, Err(R7zError::Crc)));
+        }
+        assert_eq!(calls, 2);
     }
 
     #[test]
