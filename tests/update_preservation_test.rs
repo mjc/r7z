@@ -94,9 +94,11 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
     let entry = archive.entries().next().unwrap();
-    let raw = archive.raw_folder(r7z::FolderIndex::new(0)).unwrap();
+    let raw = archive
+        .raw_folder(r7z::update::v1::FolderIndex::new(0))
+        .unwrap();
     assert!(raw.packed_streams().len() > 1);
-    let output = r7z::write_archive_update(
+    let output = r7z::update::v1::write_archive_update(
         &archive,
         Cursor::new(Vec::new()),
         vec![r7z::PreservedArchiveEntry {
@@ -104,9 +106,9 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
             raw_name: entry.raw_name,
             kind: r7z::EntryKind::File,
             meta: r7z::EntryMeta::default(),
-            stream: r7z::PreservedEntryStream::Raw {
+            stream: r7z::update::v1::PreservedEntryStream::Raw {
                 folder: raw.handle(),
-                source_entry: r7z::ArchiveEntryIndex::new(0),
+                source_entry: r7z::update::v1::ArchiveEntryIndex::new(0),
                 size: data.len() as u64,
                 crc: Some(crc32fast::hash(&data)),
             },

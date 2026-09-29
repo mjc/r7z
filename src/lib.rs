@@ -79,6 +79,7 @@ mod pack_info;
 mod parsers;
 mod property;
 mod stream_info;
+pub mod update;
 mod write;
 
 pub use archive::{
