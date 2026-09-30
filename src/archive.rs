@@ -922,9 +922,7 @@ impl Archive {
 
         let files_info = self.try_files_info()?;
         let entries = FileStreams::new(files_info, self.num_files(), streams)?
-            .map_selected(EntrySelection::All(0..self.num_files()), |file| {
-                Ok(Self::listing_entry(file))
-            })
+            .map_all(|file| Ok(Self::listing_entry(file)))
             .try_fold(
                 Vec::with_capacity(self.num_files()),
                 |mut entries, entry| {
@@ -1421,14 +1419,25 @@ impl Archive {
             max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
             budget: DecodedByteBudget::new(config.options.max_total_decoded_bytes),
         };
-        files
-            .map_selected(selected, |file| {
-                ReadableEntry::from_file(file)
-                    .map(|entry| decoder.read(entry, &mut callback))
-                    .transpose()
-                    .map(|_| ())
-            })
-            .collect::<Result<(), _>>()?;
+        let result = match selected {
+            EntrySelection::All(_) => files
+                .map_all(|file| {
+                    ReadableEntry::from_file(file)
+                        .map(|entry| decoder.read(entry, &mut callback))
+                        .transpose()
+                        .map(|_| ())
+                })
+                .collect::<Result<(), _>>(),
+            selection => files
+                .map_selected(selection, |file| {
+                    ReadableEntry::from_file(file)
+                        .map(|entry| decoder.read(entry, &mut callback))
+                        .transpose()
+                        .map(|_| ())
+                })
+                .collect::<Result<(), _>>(),
+        };
+        result?;
         decoder.finish()
     }
 

@@ -103,6 +103,30 @@ impl<'a> FileStreams<'a> {
         })
     }
 
+    /// Map every entry and validate the folder tables when traversal ends.
+    pub(crate) fn map_all<T>(
+        mut self,
+        mut map: impl FnMut(FileStream<'_, 'a>) -> Result<T, R7zError>,
+    ) -> impl Iterator<Item = Result<T, R7zError>> {
+        let mut finished = false;
+        std::iter::from_fn(move || {
+            if finished {
+                return None;
+            }
+            match self.next() {
+                Ok(Some(file)) => Some(map(file)),
+                Ok(None) => {
+                    finished = true;
+                    None
+                }
+                Err(error) => {
+                    finished = true;
+                    Some(Err(error))
+                }
+            }
+        })
+    }
+
     /// Skip file metadata and advance only the data streams those entries own.
     pub(crate) fn nth(&mut self, n: usize) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
         let skipped_streams = self
@@ -117,14 +141,39 @@ impl<'a> FileStreams<'a> {
 
     /// The returned layout borrows the current folder until the next advance.
     pub(crate) fn next(&mut self) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
-        self.entries
-            .next()
-            .map(|entry| entry.bind(|()| self.streams.nth(0)))
-            .transpose()
+        match self.entries.next() {
+            Some(entry) => entry.bind(|()| self.streams.nth(0)).map(Some),
+            None => {
+                self.streams.finish()?;
+                Ok(None)
+            }
+        }
     }
 }
 
 impl<'a> StreamLocations<'a> {
+    fn finish(&mut self) -> Result<(), R7zError> {
+        if self
+            .current
+            .take()
+            .is_some_and(|folder| folder.streams.len() != 0)
+        {
+            return Err(R7zError::Parse);
+        }
+        self.folders
+            .iter_mut()
+            .flatten()
+            .try_for_each(|(_, folder)| {
+                let folder = folder?;
+                folder
+                    .substreams()
+                    .next()
+                    .is_none()
+                    .then_some(())
+                    .ok_or(R7zError::Parse)
+            })
+    }
+
     fn advance_by(&mut self, count: usize) -> Result<(), R7zError> {
         match count {
             0 => Ok(()),
@@ -300,5 +349,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn full_traversal_validates_the_final_folder_tables() {
+        let mut streams = mixed_folders();
+        streams
+            .substream_info
+            .as_mut()
+            .unwrap()
+            .unpack_sizes
+            .push(0);
+        let files = FileStreams::new(None, 3, Some(&streams)).unwrap();
+        assert!(matches!(
+            files.map_all(|_| Ok(())).collect::<Result<Vec<_>, _>>(),
+            Err(R7zError::Parse)
+        ));
     }
 }

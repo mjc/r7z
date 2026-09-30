@@ -1,7 +1,4 @@
-use super::{
-    encode,
-    model::{CompressionOptions, EncoderThreads},
-};
+use super::{encode, encode::ThreadRequest, model::CompressionOptions};
 use crate::R7zError;
 use lzma_rust2::{Lzma2Options, Lzma2Writer, Lzma2WriterMt};
 use std::io::{self, Write};
@@ -10,7 +7,7 @@ const MIB: u64 = 1024 * 1024;
 const DEFAULT_UNKNOWN_BUDGET: u64 = 512 * MIB;
 const MAX_AUTO_BUDGET: u64 = 8 * 1024 * MIB;
 const WORKER_OVERHEAD: u64 = 8 * MIB;
-const MAX_WORKERS: u32 = 256;
+pub(super) const MAX_WORKERS: u32 = 256;
 
 /// Includes encoder state, admitted input, output waiting for ordered emission,
 /// the producer chunk, and a per-thread allowance. Caller-owned buffers are separate.
@@ -101,6 +98,7 @@ fn select_workers(
     compression: &CompressionOptions,
     options: &Lzma2Options,
     known_size: Option<u64>,
+    thread_request: ThreadRequest,
 ) -> Result<u32, R7zError> {
     let chunk = options
         .chunk_size
@@ -108,20 +106,10 @@ fn select_workers(
         .get()
         .max(u64::from(options.lzma_options.dict_size));
     let blocks = known_size.map_or(u64::from(MAX_WORKERS), |size| size.div_ceil(chunk).max(1));
-    let requested = match compression.threads {
-        EncoderThreads::Single => 1,
-        EncoderThreads::Fixed(0) => {
-            return Err(R7zError::InvalidOptions(
-                "encoder thread count must be positive",
-            ));
-        }
-        EncoderThreads::Fixed(count) if count > MAX_WORKERS => {
-            return Err(R7zError::InvalidOptions(
-                "encoder thread count must be <= 256",
-            ));
-        }
-        EncoderThreads::Fixed(count) => count,
-        EncoderThreads::Auto => std::thread::available_parallelism()
+    let requested = match thread_request {
+        ThreadRequest::Single => 1,
+        ThreadRequest::Fixed(count) => count.get(),
+        ThreadRequest::Auto => std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .ok()
             .and_then(|count| u32::try_from(count).ok())
@@ -136,8 +124,8 @@ fn select_workers(
     if required_bytes(options, 1).is_none_or(|required| required > budget) {
         return Err(R7zError::LimitExceeded("encoder memory"));
     }
-    match compression.threads {
-        EncoderThreads::Auto => Ok((2..=requested)
+    match thread_request {
+        ThreadRequest::Auto => Ok((2..=requested)
             .rev()
             .find(|&workers| required_bytes(options, workers).is_some_and(|bytes| bytes <= budget))
             .unwrap_or(1)),
@@ -171,9 +159,10 @@ impl<W: Write> Encoder<W> {
         out: W,
         compression: &CompressionOptions,
         known_size: Option<u64>,
+        thread_request: ThreadRequest,
     ) -> Result<Self, R7zError> {
         let options = encode::lzma2_options(compression);
-        let workers = select_workers(compression, &options, known_size)?;
+        let workers = select_workers(compression, &options, known_size, thread_request)?;
         let state = if workers == 1 {
             State::Single(Box::new(Lzma2Writer::new(out, options)))
         } else {
@@ -266,7 +255,20 @@ impl<W: Write> Write for Encoder<W> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::EncoderThreads;
     use super::*;
+
+    fn prepared_threads(compression: &CompressionOptions) -> ThreadRequest {
+        let options = super::super::model::ArchiveOptions {
+            codec: super::super::model::Codec::Lzma2,
+            compression: compression.clone(),
+            ..Default::default()
+        };
+        match encode::validate_archive_options(&options).unwrap().codec {
+            encode::PreparedCodec::Lzma2(threads) => threads,
+            _ => unreachable!("the test selects the LZMA2 codec"),
+        }
+    }
 
     #[test]
     fn explicit_threads_respect_encoder_budget() {
@@ -276,13 +278,14 @@ mod tests {
             ..CompressionOptions::default()
         };
         let options = encode::lzma2_options(&compression);
+        let threads = prepared_threads(&compression);
         assert_eq!(
-            select_workers(&compression, &options, Some(256 * MIB)).unwrap(),
+            select_workers(&compression, &options, Some(256 * MIB), threads).unwrap(),
             4
         );
         compression.encoder_memory_limit = Some(256 * MIB);
         assert!(matches!(
-            select_workers(&compression, &options, Some(256 * MIB)),
+            select_workers(&compression, &options, Some(256 * MIB), threads),
             Err(R7zError::LimitExceeded("encoder memory"))
         ));
     }
@@ -295,8 +298,9 @@ mod tests {
             ..CompressionOptions::default()
         };
         let options = encode::lzma2_options(&compression);
+        let threads = prepared_threads(&compression);
         assert_eq!(
-            select_workers(&compression, &options, Some(1024)).unwrap(),
+            select_workers(&compression, &options, Some(1024), threads).unwrap(),
             1
         );
     }
@@ -305,16 +309,20 @@ mod tests {
     fn auto_limits_workers_to_the_estimated_memory_allowance() {
         let mut compression = CompressionOptions::default();
         let options = encode::lzma2_options(&compression);
+        let threads = prepared_threads(&compression);
         let single_worker = required_bytes(&options, 1).unwrap();
         let two_workers = required_bytes(&options, 2).unwrap();
         assert!(two_workers > single_worker);
 
         compression.encoder_memory_limit = Some(single_worker);
-        assert_eq!(select_workers(&compression, &options, None).unwrap(), 1);
+        assert_eq!(
+            select_workers(&compression, &options, None, threads).unwrap(),
+            1
+        );
 
         compression.encoder_memory_limit = Some(single_worker - 1);
         assert!(matches!(
-            select_workers(&compression, &options, None),
+            select_workers(&compression, &options, None, threads),
             Err(R7zError::LimitExceeded("encoder memory"))
         ));
     }

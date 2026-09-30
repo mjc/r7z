@@ -167,12 +167,13 @@ fn builder_lzma2_admission_uses_the_planned_folder_size() {
 }
 
 #[test]
-fn builders_preserve_empty_symlink_streams_before_non_solid_files() {
+fn builders_preserve_empty_symlink_streams_between_non_solid_files() {
     for codec in [Codec::Copy, Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
         let mut options = options(codec, false);
         options.compression.solid = SolidMode::NonSolid;
         let bytes = ArchiveBuilder::new()
             .options(options)
+            .add_file("before", b"prior")
             .add_symlink("empty-link", "", EntryMeta::default())
             .add_file("after", b"data")
             .build()
@@ -180,13 +181,15 @@ fn builders_preserve_empty_symlink_streams_before_non_solid_files() {
         let archive = Archive::from_bytes(bytes.into()).unwrap();
         let files = archive.raw_files_info().unwrap();
 
-        assert_eq!(files.entry_type(0), r7z::EntryType::Symlink, "{codec:?}");
+        assert_eq!(files.name(0).unwrap(), "before", "{codec:?}");
+        assert_eq!(files.entry_type(1), r7z::EntryType::Symlink, "{codec:?}");
         assert_eq!(
-            archive.symlink_target(0).unwrap().as_deref(),
+            archive.symlink_target(1).unwrap().as_deref(),
             Some(""),
             "{codec:?}"
         );
-        assert_eq!(archive.extract_to_memory(1).unwrap(), b"data", "{codec:?}");
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"prior", "{codec:?}");
+        assert_eq!(archive.extract_to_memory(2).unwrap(), b"data", "{codec:?}");
         assert_eq!(
             archive
                 .raw_streams_info()
@@ -195,7 +198,7 @@ fn builders_preserve_empty_symlink_streams_before_non_solid_files() {
                 .as_ref()
                 .unwrap()
                 .num_folders,
-            2,
+            3,
             "{codec:?}"
         );
     }

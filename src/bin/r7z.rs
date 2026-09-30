@@ -54,25 +54,36 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<String>) -> Result<u8, CliError> {
     let cli = Cli::parse(args)?;
-    match cli.command {
-        Command::List => {
-            list_archive(&cli)?;
+    match &cli.command {
+        Command::List(operands) => {
+            list_archive(&cli, operands)?;
             Ok(EXIT_OK)
         }
-        Command::Test => test_archive(&cli),
-        Command::ExtractFull => extract_archive(&cli, false),
-        Command::ExtractFlat => extract_archive(&cli, true),
-        Command::Add => create_archive(&cli, true),
-        Command::Update => update_archive(&cli),
-        Command::Delete => {
-            delete_from_archive(&cli)?;
+        Command::Test(operands) => test_archive(&cli, operands),
+        Command::ExtractFull(operands) => extract_archive(&cli, false, operands),
+        Command::ExtractFlat(operands) => extract_archive(&cli, true, operands),
+        Command::Add(operands) => create_archive(&cli, true, operands),
+        Command::Update(operands) => update_archive(&cli, operands),
+        Command::Delete(operands) => {
+            delete_from_archive(&cli, operands)?;
             Ok(EXIT_OK)
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Command {
+    List(Vec<PathBuf>),
+    Test(Vec<PathBuf>),
+    ExtractFull(Vec<PathBuf>),
+    ExtractFlat(Vec<PathBuf>),
+    Add(NonEmptyPaths),
+    Update(NonEmptyPaths),
+    Delete(NonEmptyPaths),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandKind {
     List,
     Test,
     ExtractFull,
@@ -80,6 +91,42 @@ enum Command {
     Add,
     Update,
     Delete,
+}
+
+impl CommandKind {
+    fn with_operands(self, paths: Vec<PathBuf>) -> Result<Command, CliError> {
+        match self {
+            Self::List => Ok(Command::List(paths)),
+            Self::Test => Ok(Command::Test(paths)),
+            Self::ExtractFull => Ok(Command::ExtractFull(paths)),
+            Self::ExtractFlat => Ok(Command::ExtractFlat(paths)),
+            Self::Add => {
+                NonEmptyPaths::new(paths, "no input files were provided").map(Command::Add)
+            }
+            Self::Update => {
+                NonEmptyPaths::new(paths, "no input files were provided").map(Command::Update)
+            }
+            Self::Delete => {
+                NonEmptyPaths::new(paths, "no archive entries were provided").map(Command::Delete)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NonEmptyPaths(Vec<PathBuf>);
+
+impl NonEmptyPaths {
+    fn new(paths: Vec<PathBuf>, empty_message: &'static str) -> Result<Self, CliError> {
+        if paths.is_empty() {
+            return Err(CliError::Usage(empty_message.to_string()));
+        }
+        Ok(Self(paths))
+    }
+
+    fn as_slice(&self) -> &[PathBuf] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +140,6 @@ enum OverwriteMode {
 struct Cli {
     command: Command,
     archive: PathBuf,
-    operands: Vec<PathBuf>,
     output_dir: PathBuf,
     password: Option<String>,
     options: ArchiveOptions,
@@ -110,13 +156,13 @@ impl Cli {
         }
 
         let command = match args.remove(0).as_str() {
-            "l" => Command::List,
-            "t" => Command::Test,
-            "x" => Command::ExtractFull,
-            "e" => Command::ExtractFlat,
-            "a" => Command::Add,
-            "u" => Command::Update,
-            "d" => Command::Delete,
+            "l" => CommandKind::List,
+            "t" => CommandKind::Test,
+            "x" => CommandKind::ExtractFull,
+            "e" => CommandKind::ExtractFlat,
+            "a" => CommandKind::Add,
+            "u" => CommandKind::Update,
+            "d" => CommandKind::Delete,
             other => return Err(CliError::Usage(format!("unsupported command: {other}"))),
         };
 
@@ -167,11 +213,11 @@ impl Cli {
                 "multiple encoder threads require LZMA2".to_string(),
             ));
         }
+        let command = command.with_operands(operands)?;
 
         Ok(Self {
             command,
             archive,
-            operands,
             output_dir: state.output_dir,
             password: state.password,
             options: state.options,
@@ -632,11 +678,11 @@ fn parse_attached_value<'a>(switch: &'a str, name: &str) -> Result<&'a str, CliE
     }
 }
 
-fn list_archive(cli: &Cli) -> Result<(), CliError> {
+fn list_archive(cli: &Cli, operands: &[PathBuf]) -> Result<(), CliError> {
     let archive = open_archive(cli)?;
     let physical_size = fs::metadata(&cli.archive).ok().map(|meta| meta.len());
     let listing = archive.listing(physical_size)?;
-    let selected = EntryPatterns::from_paths(&cli.operands);
+    let selected = EntryPatterns::from_paths(operands);
     if cli.technical {
         print_technical_listing(&listing, &cli.archive, &selected);
     } else {
@@ -863,9 +909,9 @@ fn summary_text(files: usize, folders: usize) -> String {
     }
 }
 
-fn test_archive(cli: &Cli) -> Result<u8, CliError> {
+fn test_archive(cli: &Cli, operands: &[PathBuf]) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
-    let selected = EntryPatterns::from_paths(&cli.operands);
+    let selected = EntryPatterns::from_paths(operands);
     let listing = archive.listing(None)?;
     match selected.resolve_listing(&listing.entries) {
         Some(selected) => test_selected_folders(&archive, cli.password.as_deref(), selected),
@@ -931,19 +977,20 @@ fn listing_folder_groups(
     })
 }
 
-fn extract_archive(cli: &Cli, flat: bool) -> Result<u8, CliError> {
+fn extract_archive(cli: &Cli, flat: bool, operands: &[PathBuf]) -> Result<u8, CliError> {
     let mut ui = TerminalOverwriteUi;
-    extract_archive_with_ui(cli, flat, &mut ui)
+    extract_archive_with_ui(cli, flat, operands, &mut ui)
 }
 
 fn extract_archive_with_ui(
     cli: &Cli,
     flat: bool,
+    operands: &[PathBuf],
     ui: &mut impl OverwriteUi,
 ) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     let destination = open_destination(&cli.output_dir)?;
-    let selected = EntryPatterns::from_paths(&cli.operands);
+    let selected = EntryPatterns::from_paths(operands);
     match selected.resolve_entries(&archive) {
         Some(entries) => {
             let mut extraction = Extraction {
@@ -1243,14 +1290,15 @@ fn parse_overwrite_answer(input: &str) -> Option<OverwriteAnswer> {
     }
 }
 
-fn create_archive(cli: &Cli, allow_existing_merge: bool) -> Result<u8, CliError> {
-    if cli.operands.is_empty() {
-        return Err(CliError::Usage("no input files were provided".to_string()));
-    }
+fn create_archive(
+    cli: &Cli,
+    allow_existing_merge: bool,
+    operands: &NonEmptyPaths,
+) -> Result<u8, CliError> {
     if allow_existing_merge && cli.archive.exists() {
-        return update_archive(cli);
+        return update_archive(cli, operands);
     }
-    let scan = scan_disk_operands(&cli.operands)?;
+    let scan = scan_disk_operands(operands.as_slice())?;
     let paths = scan.paths;
     let entries = collect_disk_entries(&paths)?;
     write_archive_entries(&cli.archive, entries, &cli.options, &cli.volume_sizes)?;
@@ -1262,14 +1310,11 @@ fn create_archive(cli: &Cli, allow_existing_merge: bool) -> Result<u8, CliError>
     })
 }
 
-fn update_archive(cli: &Cli) -> Result<u8, CliError> {
-    if cli.operands.is_empty() {
-        return Err(CliError::Usage("no input files were provided".to_string()));
-    }
+fn update_archive(cli: &Cli, operands: &NonEmptyPaths) -> Result<u8, CliError> {
     if !cli.archive.exists() {
-        return create_archive(cli, false);
+        return create_archive(cli, false, operands);
     }
-    let scan = scan_disk_operands(&cli.operands)?;
+    let scan = scan_disk_operands(operands.as_slice())?;
     let paths = scan.paths;
     let new_entries = collect_disk_entries(&paths)?;
     let new_names = new_entries
@@ -1313,13 +1358,8 @@ fn update_archive(cli: &Cli) -> Result<u8, CliError> {
     })
 }
 
-fn delete_from_archive(cli: &Cli) -> Result<(), CliError> {
-    if cli.operands.is_empty() {
-        return Err(CliError::Usage(
-            "no archive entries were provided".to_string(),
-        ));
-    }
-    let delete_patterns = EntryPatterns::from_paths(&cli.operands);
+fn delete_from_archive(cli: &Cli, operands: &NonEmptyPaths) -> Result<(), CliError> {
+    let delete_patterns = EntryPatterns::from_paths(operands.as_slice());
     let archive = open_archive(cli)?;
     let (entries, raw_folders) = preserved_rewrite_entries(
         &archive,
@@ -1519,24 +1559,38 @@ fn preserved_rewrite_entries(
         .iter()
         .map(|entry| !should_drop(entry))
         .collect::<Vec<_>>();
+    let mut actions = vec![RetainedEntryAction::Drop; archive_entries.len()];
     let mut folder_entries: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for entry in &listing.entries {
         if let Some(block) = entry.block {
             folder_entries.entry(block).or_default().push(entry.index);
+        } else if retained[entry.index] {
+            actions[entry.index] = RetainedEntryAction::NoStream;
         }
     }
 
-    let mut raw_folder_ids = BTreeSet::new();
-    let mut decode_indices = BTreeSet::new();
     for (folder, indices) in &folder_entries {
         let retained_count = indices.iter().filter(|&&idx| retained[idx]).count();
         if retained_count == indices.len() {
-            raw_folder_ids.insert(*folder);
+            for &index in indices {
+                actions[index] = RetainedEntryAction::CopyRaw(*folder);
+            }
         } else if retained_count > 0 {
-            decode_indices.extend(indices.iter().copied().filter(|&idx| retained[idx]));
+            for &index in indices.iter().filter(|&&idx| retained[idx]) {
+                actions[index] = RetainedEntryAction::Decode;
+            }
         }
     }
 
+    let raw_folder_ids = actions
+        .iter()
+        .filter_map(|action| match action {
+            RetainedEntryAction::CopyRaw(folder) => Some(*folder),
+            RetainedEntryAction::Drop
+            | RetainedEntryAction::NoStream
+            | RetainedEntryAction::Decode => None,
+        })
+        .collect::<BTreeSet<_>>();
     let raw_folders = raw_folder_ids
         .iter()
         .map(|&folder| archive.raw_folder(FolderIndex::new(folder)))
@@ -1547,28 +1601,22 @@ fn preserved_rewrite_entries(
         .collect::<BTreeMap<_, _>>();
 
     let mut entries = Vec::new();
-    for (listing_entry, &is_retained) in listing.entries.iter().zip(&retained) {
-        if !is_retained {
-            continue;
-        }
+    for (listing_entry, action) in listing.entries.iter().zip(&actions) {
         let i = listing_entry.index;
-        let archive_entry = &archive_entries[i];
-        let name = archive_entry.name.clone();
-        let raw_name = archive_entry.raw_name.clone();
-        let meta = entry_meta_from_archive(files, i);
-        let kind = preserved_entry_kind(listing_entry.kind);
-        let stream = if let Some(folder) = listing_entry.block {
-            if raw_folder_ids.contains(&folder) {
-                PreservedEntryStream::Raw {
-                    folder: raw_folder_handles
-                        .get(&folder)
-                        .cloned()
-                        .ok_or(R7zError::Parse)?,
-                    source_entry: ArchiveEntryIndex::new(i),
-                    size: listing_entry.size.ok_or(R7zError::Parse)?,
-                    crc: listing_entry.crc,
-                }
-            } else if decode_indices.contains(&i) {
+        let stream = match action {
+            RetainedEntryAction::Drop => continue,
+            RetainedEntryAction::NoStream => PreservedEntryStream::None,
+            RetainedEntryAction::CopyRaw(folder) => PreservedEntryStream::Raw {
+                folder: raw_folder_handles
+                    .get(folder)
+                    .cloned()
+                    .ok_or(R7zError::Parse)?,
+                source_entry: ArchiveEntryIndex::new(i),
+                size: listing_entry.size.ok_or(R7zError::Parse)?,
+                crc: listing_entry.crc,
+            },
+            RetainedEntryAction::Decode => {
+                let name = &archive_entries[i].name;
                 match archive.extract_to_memory_with_password(i, password) {
                     Ok(data) => PreservedEntryStream::Data(data),
                     Err(
@@ -1583,12 +1631,13 @@ fn preserved_rewrite_entries(
                     }
                     Err(err) => return Err(err.into()),
                 }
-            } else {
-                return Err(R7zError::Parse.into());
             }
-        } else {
-            PreservedEntryStream::None
         };
+        let archive_entry = &archive_entries[i];
+        let name = archive_entry.name.clone();
+        let raw_name = archive_entry.raw_name.clone();
+        let meta = entry_meta_from_archive(files, i);
+        let kind = preserved_entry_kind(listing_entry.kind);
         entries.push(PreservedArchiveEntry {
             name,
             raw_name,
@@ -1599,6 +1648,14 @@ fn preserved_rewrite_entries(
     }
     entries.extend(append_entries.into_iter().map(pending_to_preserved_entry));
     Ok((entries, raw_folders))
+}
+
+#[derive(Clone, Copy)]
+enum RetainedEntryAction {
+    Drop,
+    NoStream,
+    CopyRaw(usize),
+    Decode,
 }
 
 fn preserved_entry_kind(kind: ListingEntryKind) -> r7z::EntryKind {
@@ -1701,10 +1758,20 @@ fn write_volumes_from_file(
 ) -> Result<(), CliError> {
     let mut input = fs::File::open(archive_path)?;
     let input_len = input.metadata()?.len();
-    let mut written_total = 0u64;
     let mut idx = 0usize;
-    while written_total < input_len || (idx == 0 && input_len == 0) {
-        let size = sizes[idx.min(sizes.len() - 1)];
+    let mut offset = 0u64;
+    std::iter::from_fn(|| {
+        (offset < input_len || (idx == 0 && input_len == 0)).then(|| {
+            let start = offset;
+            let size = sizes[idx.min(sizes.len() - 1)];
+            let end = start.saturating_add(size).min(input_len);
+            let volume = (idx, end - start);
+            idx += 1;
+            offset = end;
+            volume
+        })
+    })
+    .map(|(idx, size)| {
         let path = PathBuf::from(format!("{}.{:03}", base.display(), idx + 1));
         let tmp_path = path.with_extension(format!(
             "{}.tmp-{}",
@@ -1712,21 +1779,17 @@ fn write_volumes_from_file(
             std::process::id()
         ));
         let mut output = fs::File::create(&tmp_path)?;
-        let written = {
-            let remaining = input_len.saturating_sub(written_total);
-            let limit = size.min(remaining);
-            let mut limited = Read::by_ref(&mut input).take(limit);
-            io::copy(&mut limited, &mut output)?
-        };
+        let mut limited = Read::by_ref(&mut input).take(size);
+        let written = io::copy(&mut limited, &mut output)?;
         output.flush()?;
         fs::rename(&tmp_path, &path)?;
-        written_total = written_total.checked_add(written).ok_or(R7zError::Parse)?;
-        idx += 1;
-        if written == 0 {
-            break;
-        }
-    }
-    Ok(())
+        Ok(written)
+    })
+    .take_while(|result| match result {
+        Ok(written) => *written > 0,
+        Err(_) => true,
+    })
+    .try_for_each(|result| result.map(|_| ()))
 }
 
 fn entry_meta_from_archive(files: &r7z::raw::FilesInfo, index: usize) -> EntryMeta {
@@ -1987,10 +2050,31 @@ impl From<io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CollisionAction, OverwriteAnswer, OverwriteMode, OverwriteUi, decide_overwrite,
-        parse_overwrite_answer, wildcard_match_raw,
+        Cli, CliError, CollisionAction, OverwriteAnswer, OverwriteMode, OverwriteUi,
+        decide_overwrite, parse_overwrite_answer, wildcard_match_raw,
     };
     use std::{collections::VecDeque, path::Path};
+
+    #[test]
+    fn parser_rejects_commands_without_required_operands() {
+        for (command, message) in [
+            ("a", "no input files were provided"),
+            ("u", "no input files were provided"),
+            ("d", "no archive entries were provided"),
+        ] {
+            assert!(matches!(
+                Cli::parse(vec![command.into(), "archive.7z".into()]),
+                Err(CliError::Usage(actual)) if actual == message
+            ));
+        }
+    }
+
+    #[test]
+    fn parser_allows_empty_selection_operands() {
+        for command in ["l", "t", "x", "e"] {
+            assert!(Cli::parse(vec![command.into(), "archive.7z".into()]).is_ok());
+        }
+    }
 
     #[test]
     fn raw_name_patterns_distinguish_unpaired_surrogates_from_replacement_characters() {
@@ -2125,8 +2209,11 @@ mod tests {
             .unwrap();
             let quit = answers == [OverwriteAnswer::Quit];
             let mut ui = FakeOverwriteUi::interactive(answers);
+            let super::Command::ExtractFull(operands) = &cli.command else {
+                panic!("x command must retain selection operands");
+            };
             assert_eq!(
-                super::extract_archive_with_ui(&cli, false, &mut ui).unwrap(),
+                super::extract_archive_with_ui(&cli, false, operands, &mut ui).unwrap(),
                 super::EXIT_WARNING
             );
             assert_eq!(std::fs::read(output.join("first")).unwrap(), b"one");

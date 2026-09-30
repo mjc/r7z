@@ -247,7 +247,10 @@ fn write_files_info(h: &mut Vec<u8>, entries: &[WriteEntry]) {
 }
 
 fn write_empty_properties(h: &mut Vec<u8>, entries: &[WriteEntry]) {
-    let empty: Vec<bool> = entries.iter().map(|entry| !entry.has_stream).collect();
+    let empty: Vec<bool> = entries
+        .iter()
+        .map(|entry| !entry.stream.has_stream())
+        .collect();
     if !empty.iter().any(|&v| v) {
         return;
     }
@@ -258,7 +261,7 @@ fn write_empty_properties(h: &mut Vec<u8>, entries: &[WriteEntry]) {
 
     let mut empty_files = Vec::new();
     let mut anti = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.has_stream) {
+    for entry in entries.iter().filter(|entry| !entry.stream.has_stream()) {
         empty_files.push(entry.kind == EntryKind::File);
         anti.push(entry.kind == EntryKind::Anti);
     }
@@ -386,7 +389,7 @@ fn system_time_to_filetime(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::build_header;
-    use crate::write::model::{EntryKind, EntryMeta, WriteEntry};
+    use crate::write::model::{EntryKind, EntryMeta, WriteEntry, WriteEntryStream, WriteFolderId};
     use bytes::Bytes;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -396,9 +399,12 @@ mod tests {
             raw_name: None,
             kind,
             meta,
-            has_stream,
-            data: has_stream.then(|| vec![0xAA]),
-            folder_id: 0,
+            stream: if has_stream {
+                WriteEntryStream::Buffered(vec![0xAA])
+            } else {
+                WriteEntryStream::Empty
+            },
+            folder_id: WriteFolderId::FIRST,
         }
     }
 

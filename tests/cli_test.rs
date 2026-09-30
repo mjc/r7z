@@ -28,6 +28,29 @@ fn cli_help_describes_encoder_thread_selection() {
 }
 
 #[test]
+fn cli_rejects_write_commands_without_operands_during_parsing() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("archive.7z");
+
+    for (command, message) in [
+        ("a", "no input files were provided"),
+        ("u", "no input files were provided"),
+        ("d", "no archive entries were provided"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+            .args([command, archive.to_str().unwrap()])
+            .output()
+            .expect("r7z binary should run");
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("Command Line Error: {message}\n")
+        );
+    }
+}
+
+#[test]
 fn cli_create_list_test_extract_update_delete() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");

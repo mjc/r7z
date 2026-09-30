@@ -51,7 +51,8 @@ impl EncodedHeader {
             self.unpack_info.num_folders_usize(),
         ) {
             (1, 1, 1, 1) => {
-                FolderLayouts::new(&self.pack_info, &self.unpack_info, None, metadata_limit)?
+                FolderLayouts::preflight(&self.pack_info, &self.unpack_info, None, metadata_limit)?
+                    .into_layouts()
                     .next()
                     .ok_or(R7zError::Parse)?
             }
@@ -534,11 +535,12 @@ mod tests {
         let external_folder = vec![Bytes::from_static(&[0x01, 0x01, 0x00])];
 
         assert!(Header::parse(&bytes).is_err());
+        assert!(Header::parse_with_external(&bytes, Vec::new()).is_err());
         assert!(matches!(
             Header::resolve_archive(&bytes),
             Ok(HeaderResolution::RequiresExternalFolders(_))
         ));
-        let (rest, header) = Header::parse_with_external(&bytes, external_folder).unwrap();
+        let (rest, header) = Header::parse_with_external(&bytes, external_folder.clone()).unwrap();
         assert_eq!(rest, b"");
         let streams = header.try_streams_info().unwrap().unwrap();
         let folder = streams
@@ -548,6 +550,17 @@ mod tests {
             .parse_folder(0)
             .unwrap();
         assert_eq!(folder.coders.len(), 1);
+
+        let mut invalid_reference = bytes.to_vec();
+        let reference = invalid_reference
+            .windows(5)
+            .position(|window| window == [0x07, 0x0b, 0x01, 0x01, 0x00])
+            .unwrap()
+            + 4;
+        invalid_reference[reference] = 1;
+        assert!(
+            Header::parse_with_external(&Bytes::from(invalid_reference), external_folder).is_err()
+        );
     }
 
     #[test]

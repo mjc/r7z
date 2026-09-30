@@ -2194,6 +2194,26 @@ fn build_streaming_volumes_splits_final_archive_bytes() {
 }
 
 #[test]
+fn build_streaming_volumes_rejects_empty_sizes_before_encoding_or_file_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("invalid.7z");
+    let entries = std::iter::from_fn(|| -> Option<(String, std::io::Empty)> {
+        panic!("invalid volume sizes must be rejected before reading entries")
+    });
+
+    let error = r7z::build_streaming_volumes(
+        entries,
+        &base,
+        r7z::ArchiveOptions::default(),
+        r7z::VolumeOptions { sizes: Vec::new() },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("at least one size"));
+    assert!(!tmp.path().join("invalid.7z.001").exists());
+}
+
+#[test]
 fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out");
