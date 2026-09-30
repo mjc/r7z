@@ -241,6 +241,10 @@ let archive = Archive::from_bytes(raw.into())?;
 
 `ArchiveEntryIndex` and `update::v1::FolderIndex` keep entry and folder positions distinct. `stream_selected_files` accepts a slice of `ArchiveEntryIndex` and validates all indices (including duplicates) before invoking the callback. It skips unselected folders, drains partially consumed selected entries, verifies a selected folder's CRC across unselected entries in that same folder, and skips unselected tails when no folder CRC requires them. Multi-pack folders are capped at 512 MiB before packed data is buffered. Decoder safeguards reject `LZMA`/`LZMA2` dictionaries or `PPMd` memory above 256 MiB, cap decoder chains at 64 coders and the aggregate decoder working set at 512 MiB, cap each AES encrypted/decrypted buffer at 128 MiB, cap `BCJ2` output at 256 MiB and combined packed/intermediate/final buffers at 512 MiB, and include live decoder state in that `BCJ2` budget. APIs that materialize decompressed folder output share a 512 MiB budget with decoder state. `extract_to_memory` intentionally allocates the requested member and remains limited only by the caller's memory; use a writer/streaming API or impose an application-level output limit for untrusted archives.
 
+Files in a solid folder share one compressed stream. Selecting a later file still
+requires decoding the preceding files in that folder to reach it; selecting
+several files from the same folder in one batch avoids decoding that folder again.
+
 A read session supports `read_entry(index: ArchiveEntryIndex, callback)` and `extract_to_writer(index: ArchiveEntryIndex, writer)`.
 Call `finish()` after the last request to verify the final folder. `finish_folder()` verifies
 and releases the current decoder without closing the session. Dropping a session does not

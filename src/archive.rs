@@ -1318,7 +1318,9 @@ impl Archive {
     /// fully consume an entry, r7z drains the rest of it. A selected folder with
     /// a folder CRC is drained and verified in full, including unselected entries
     /// in that folder. Without a folder CRC, unselected trailing entries are not
-    /// decoded. Folders with no selected entries are never opened.
+    /// decoded. Folders with no selected entries are never opened. Selecting a
+    /// later entry in a solid folder still requires decoding its preceding entries
+    /// to reach it.
     ///
     /// Duplicate or out-of-range indices return [`R7zError::InvalidOptions`]
     /// before any callback is invoked.
