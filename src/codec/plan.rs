@@ -1,5 +1,5 @@
 use super::*;
-use crate::folder::{Bcj2Layout, CoderIndex, FolderGraph, PackedStreamIndex};
+use crate::folder::{Bcj2Layout, FolderGraph, PackedStreamIndex};
 
 /// An executable topology with parsed codec properties and admitted memory usage.
 pub(crate) struct DecoderPlan<'a> {
@@ -38,11 +38,12 @@ impl WorkingSet {
 }
 
 enum Topology {
-    Chain(SmallVec<[DecodeStep; 4]>),
+    Chain(SmallVec<[DecodeStep; 2]>),
     Bcj2 {
-        main: DecodeStep,
-        call: Option<DecodeStep>,
-        jump: Option<DecodeStep>,
+        main: Vec<DecodeStep>,
+        call: Vec<DecodeStep>,
+        jump: Vec<DecodeStep>,
+        control: Vec<DecodeStep>,
         slots: Bcj2Slots,
         output_size: usize,
     },
@@ -60,21 +61,23 @@ pub(crate) struct ReadyDecoder<R> {
 
 enum BoundTopology<R> {
     Chain {
-        steps: SmallVec<[DecodeStep; 4]>,
+        steps: SmallVec<[DecodeStep; 2]>,
         input: R,
     },
-    Bcj2 {
-        main: BoundInput<R>,
-        call: BoundInput<R>,
-        jump: BoundInput<R>,
-        control: R,
-        output_size: usize,
-    },
+    Bcj2(Box<BoundBcj2<R>>),
+}
+
+struct BoundBcj2<R> {
+    main: BoundInput<R>,
+    call: BoundInput<R>,
+    jump: BoundInput<R>,
+    control: BoundInput<R>,
+    output_size: usize,
 }
 
 struct BoundInput<R> {
     input: R,
-    coder: Option<DecodeStep>,
+    coders: Vec<DecodeStep>,
 }
 
 /// An ordinal in the folder's packed-input list, independent of coder indexes.
@@ -244,7 +247,7 @@ impl<'a> DecoderPlan<'a> {
                         };
                         Ok(step)
                     })
-                    .collect::<Result<SmallVec<[_; 4]>, R7zError>>()?;
+                    .collect::<Result<SmallVec<[_; 2]>, R7zError>>()?;
                 steps.reverse();
                 let mut input_size = packed_size;
                 let steps = steps
@@ -254,7 +257,7 @@ impl<'a> DecoderPlan<'a> {
                         input_size = step.output;
                         Ok(step)
                     })
-                    .collect::<Result<SmallVec<[_; 4]>, R7zError>>()?;
+                    .collect::<Result<SmallVec<[_; 2]>, R7zError>>()?;
                 let memory = steps
                     .iter()
                     .try_fold(WorkingSet::default(), |total, step| {
@@ -270,59 +273,61 @@ impl<'a> DecoderPlan<'a> {
             DecoderTopology::Bcj2(layout) => {
                 let output_size = bcj2_output_size(unpack_size)?;
                 let slot = |packed: PackedStreamIndex| PackedInputSlot(packed.get());
-                let compile_channel = |coder: CoderIndex, packed: PackedInputSlot| {
-                    let index = coder.get();
-                    let coder = folder
-                        .coders
-                        .get(index)
-                        .ok_or(R7zError::InvalidFolderGraph)?;
-                    let size = sizes.get(index);
-                    SizedCoder::compile(coder, size)?
-                        .bind_size(OutputSize::Known(inputs.size(packed)? as u64))
-                };
+                let compile_channel =
+                    |channel: &crate::folder::Bcj2Channel, packed: PackedInputSlot| {
+                        let mut input_size = OutputSize::Known(inputs.size(packed)? as u64);
+                        channel
+                            .coders
+                            .iter()
+                            .map(|channel_coder| {
+                                let coder = folder
+                                    .coders
+                                    .get(channel_coder.index.get())
+                                    .ok_or(R7zError::InvalidFolderGraph)?;
+                                let step = SizedCoder::compile(
+                                    coder,
+                                    sizes.get(channel_coder.output.get()),
+                                )?
+                                .bind_size(input_size)?;
+                                input_size = step.output;
+                                Ok(step)
+                            })
+                            .collect::<Result<Vec<_>, R7zError>>()
+                    };
                 let slots = Bcj2Slots {
                     main: slot(layout.main.packed),
                     call: slot(layout.call.packed),
                     jump: slot(layout.jump.packed),
                     control: slot(layout.control.packed),
                 };
-                let main = compile_channel(
-                    layout.main.coder.ok_or(R7zError::InvalidFolderGraph)?,
-                    slots.main,
-                )?;
-                let call = layout
-                    .call
-                    .coder
-                    .map(|coder| compile_channel(coder, slots.call))
-                    .transpose()?;
-                let jump = layout
-                    .jump
-                    .coder
-                    .map(|coder| compile_channel(coder, slots.jump))
-                    .transpose()?;
-                let channels = [
-                    (Some(&main), slots.main),
-                    (call.as_ref(), slots.call),
-                    (jump.as_ref(), slots.jump),
+                let main = compile_channel(&layout.main, slots.main)?;
+                let call = compile_channel(&layout.call, slots.call)?;
+                let jump = compile_channel(&layout.jump, slots.jump)?;
+                let control = compile_channel(&layout.control, slots.control)?;
+                let data_channels = [
+                    (&main, slots.main),
+                    (&call, slots.call),
+                    (&jump, slots.jump),
                 ];
-                let (memory, declared) = channels.into_iter().try_fold(
-                    (WorkingSet::default(), 0u64),
-                    |(total, declared), (coder, slot)| {
-                        let (memory, output) = match coder {
-                            Some(coder) => (coder.working_set()?, coder.output.require()?),
-                            None => (WorkingSet::default(), inputs.size(slot)? as u64),
-                        };
-                        Ok::<_, R7zError>((
-                            total.add(memory)?,
-                            declared
-                                .checked_add(output)
-                                .ok_or(R7zError::Decompression)?,
-                        ))
-                    },
-                )?;
+                let declared =
+                    data_channels
+                        .into_iter()
+                        .try_fold(0u64, |total, (coders, slot)| {
+                            let output = coders.last().map_or_else(
+                                || Ok(inputs.size(slot)? as u64),
+                                |coder| coder.output.require(),
+                            )?;
+                            total.checked_add(output).ok_or(R7zError::Decompression)
+                        })?;
                 if declared != unpack_size {
                     return Err(R7zError::Decompression);
                 }
+                let memory = [&main, &call, &jump, &control]
+                    .into_iter()
+                    .flatten()
+                    .try_fold(WorkingSet::default(), |total, coder| {
+                        total.add(coder.working_set()?)
+                    })?;
                 ensure_bcj2_working_budget(output_size, memory.0)?;
                 let memory = memory
                     .add(WorkingSet(output_size))?
@@ -332,6 +337,7 @@ impl<'a> DecoderPlan<'a> {
                         main,
                         call,
                         jump,
+                        control,
                         slots,
                         output_size,
                     },
@@ -356,24 +362,28 @@ impl<'a> DecoderPlan<'a> {
                 main,
                 call,
                 jump,
+                control,
                 slots,
                 output_size,
-            } => BoundTopology::Bcj2 {
+            } => BoundTopology::Bcj2(Box::new(BoundBcj2 {
                 main: BoundInput {
                     input: inputs.take(slots.main)?,
-                    coder: Some(main),
+                    coders: main,
                 },
                 call: BoundInput {
                     input: inputs.take(slots.call)?,
-                    coder: call,
+                    coders: call,
                 },
                 jump: BoundInput {
                     input: inputs.take(slots.jump)?,
-                    coder: jump,
+                    coders: jump,
                 },
-                control: inputs.take(slots.control)?,
+                control: BoundInput {
+                    input: inputs.take(slots.control)?,
+                    coders: control,
+                },
                 output_size,
-            },
+            })),
         };
         Ok(ReadyDecoder {
             topology: bound,
@@ -387,18 +397,17 @@ impl<R: Read> BoundInput<R> {
     where
         R: 'a,
     {
-        let reader = Box::new(self.input) as Box<dyn Read>;
-        match self.coder {
-            Some(coder) => coder.open(reader, password),
-            None => Ok(reader),
-        }
+        self.coders.into_iter().try_fold(
+            Box::new(self.input) as Box<dyn Read + 'a>,
+            |reader, coder| coder.open(reader, password),
+        )
     }
 }
 
 impl<R: Read> ReadyDecoder<R> {
     pub(crate) fn eager_output_size(&self) -> Option<u64> {
         match &self.topology {
-            BoundTopology::Bcj2 { output_size, .. } => Some(*output_size as u64),
+            BoundTopology::Bcj2(bcj2) => Some(bcj2.output_size as u64),
             BoundTopology::Chain { steps, .. } => {
                 steps.iter().enumerate().rev().find_map(|(index, step)| {
                     let eager_final_output = matches!(&step.coder, CoderPlan::Aes(_))
@@ -436,18 +445,12 @@ impl<R: Read> ReadyDecoder<R> {
                 }
                 Ok(FolderReader::Stream(reader))
             }
-            BoundTopology::Bcj2 {
-                main,
-                call,
-                jump,
-                control,
-                output_size,
-            } => crate::bcj2::decode(
-                main.open(password)?,
-                call.open(password)?,
-                jump.open(password)?,
-                Box::new(control),
-                output_size,
+            BoundTopology::Bcj2(bcj2) => crate::bcj2::decode(
+                bcj2.main.open(password)?,
+                bcj2.call.open(password)?,
+                bcj2.jump.open(password)?,
+                bcj2.control.open(password)?,
+                bcj2.output_size,
             )
             .map(|bytes| FolderReader::Buffered(Cursor::new(bytes))),
         }
@@ -890,22 +893,15 @@ mod tests {
             }
             let plan = DecoderPlan::compile(&folder, &graph, 5, &outputs, &packed).unwrap();
             let ready = plan.bind(inputs(None)).unwrap();
-            let BoundTopology::Bcj2 {
-                main,
-                call,
-                jump,
-                control,
-                ..
-            } = ready.topology
-            else {
+            let BoundTopology::Bcj2(bcj2) = ready.topology else {
                 panic!("BCJ2 plan must bind BCJ2 channels");
             };
             assert_eq!(
                 [
-                    main.input.get_ref().0,
-                    call.input.get_ref().0,
-                    jump.input.get_ref().0,
-                    control.get_ref().0
+                    bcj2.main.input.get_ref().0,
+                    bcj2.call.input.get_ref().0,
+                    bcj2.jump.input.get_ref().0,
+                    bcj2.control.input.get_ref().0
                 ],
                 expected
             );
