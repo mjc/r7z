@@ -89,9 +89,17 @@ pub(super) fn default_budget() -> u64 {
 }
 
 pub(super) fn set_default_budget(options: &mut super::model::ArchiveOptions) {
-    if options.compression.encoder_memory_limit.is_none() {
-        options.compression.encoder_memory_limit = Some(default_budget());
-    }
+    let compression_limit = options
+        .compression
+        .encoder_memory_limit
+        .unwrap_or_else(default_budget);
+    options.compression.encoder_memory_limit = Some(
+        options
+            .streaming
+            .resource_limits
+            .max_encoder_working_set_bytes
+            .map_or(compression_limit, |limit| compression_limit.min(limit)),
+    );
 }
 
 fn select_workers(

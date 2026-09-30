@@ -3,7 +3,7 @@
 //! Write-interop tests: create archives with r7z, extract with p7zip, byte-compare.
 
 mod support;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use support::{assert_extracted_files, extract_with_p7zip, list_with_p7zip, run_7z};
@@ -2248,6 +2248,272 @@ fn memory_spool_does_not_use_temporary_storage_allowance() {
 }
 
 #[test]
+fn memory_spool_enforces_the_retained_output_limit() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = WriteOnly(Vec::new());
+    let result = r7z::build_streaming_to_writer(
+        [("payload".to_string(), b"memory spool".as_slice())],
+        &mut output,
+        r7z::ArchiveOptions {
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::Memory,
+                resource_limits: r7z::ResourceLimits {
+                    max_retained_output_bytes: Some(0),
+                    ..r7z::ResourceLimits::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "retained output",
+            limit: 0,
+        })
+    ));
+    assert!(output.0.is_empty());
+}
+
+#[test]
+fn resource_limits_cap_lzma2_encoder_memory() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = WriteOnly(Vec::new());
+    let result = r7z::build_streaming_to_writer(
+        [("payload".to_string(), b"encoder budget".as_slice())],
+        &mut output,
+        r7z::ArchiveOptions {
+            codec: r7z::Codec::Lzma2,
+            streaming: r7z::StreamingOptions {
+                resource_limits: r7z::ResourceLimits {
+                    max_encoder_working_set_bytes: Some(1),
+                    ..r7z::ResourceLimits::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(r7z::R7zError::LimitExceeded("encoder memory"))
+    ));
+    assert!(output.0.is_empty());
+}
+
+#[test]
+fn writer_kdf_limit_is_shared_across_non_solid_folders() {
+    let build = |max_total_kdf_cycles| {
+        r7z::ArchiveBuilder::new()
+            .options(r7z::ArchiveOptions {
+                header_mode: r7z::HeaderMode::Plain,
+                encryption: Some(r7z::EncryptionOptions {
+                    password: "secret".to_string(),
+                    encrypt_header: false,
+                    num_cycles_power: 0,
+                    salt_len: 0,
+                    iv_len: 16,
+                }),
+                compression: r7z::CompressionOptions {
+                    solid: r7z::SolidMode::NonSolid,
+                    ..Default::default()
+                },
+                streaming: r7z::StreamingOptions {
+                    resource_limits: r7z::ResourceLimits {
+                        max_total_kdf_cycles: Some(max_total_kdf_cycles),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .add_file("first.txt", b"first")
+            .add_file("second.txt", b"second")
+            .build()
+    };
+
+    assert!(build(2).is_ok());
+    assert!(matches!(
+        build(1),
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "AES KDF cycles",
+            limit: 1,
+        })
+    ));
+}
+
+#[test]
+fn memory_spool_accepts_the_exact_retained_output_limit() {
+    let entries = || [("payload".to_string(), b"memory spool boundary".as_slice())];
+    let options = |max_retained_output_bytes| r7z::ArchiveOptions {
+        streaming: r7z::StreamingOptions {
+            spool: r7z::SpoolMode::Memory,
+            resource_limits: r7z::ResourceLimits {
+                max_retained_output_bytes,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut expected = Vec::new();
+    r7z::build_streaming_to_writer(entries(), &mut expected, options(None)).unwrap();
+    let exact_limit = expected.len() as u64;
+
+    let mut output = Vec::new();
+    r7z::build_streaming_to_writer(entries(), &mut output, options(Some(exact_limit))).unwrap();
+    assert_eq!(output, expected);
+
+    let mut output = Vec::new();
+    assert!(matches!(
+        r7z::build_streaming_to_writer(entries(), &mut output, options(Some(exact_limit - 1))),
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "retained output",
+            limit,
+        }) if limit == exact_limit - 1
+    ));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn temp_file_spool_accepts_the_exact_cumulative_write_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let entries = || {
+        [(
+            "payload".to_string(),
+            b"temporary spool boundary".as_slice(),
+        )]
+    };
+    let expected_options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Copy,
+        ..Default::default()
+    };
+    let mut expected = Vec::new();
+    r7z::build_streaming_to_writer(entries(), &mut expected, expected_options).unwrap();
+    let exact_limit = expected.len() as u64 + 32;
+    let options = |max_temporary_storage_bytes| r7z::ArchiveOptions {
+        codec: r7z::Codec::Copy,
+        streaming: r7z::StreamingOptions {
+            spool: r7z::SpoolMode::TempFile {
+                dir: Some(tmp.path().to_path_buf()),
+            },
+            resource_limits: r7z::ResourceLimits {
+                max_temporary_storage_bytes,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut output = Vec::new();
+    r7z::build_streaming_to_writer(entries(), &mut output, options(Some(exact_limit))).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+    let mut output = Vec::new();
+    assert!(matches!(
+        r7z::build_streaming_to_writer(entries(), &mut output, options(Some(exact_limit - 1))),
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "temporary storage",
+            limit,
+        }) if limit == exact_limit - 1
+    ));
+    assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn auto_spool_spills_before_exceeding_its_retained_memory_limit() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = [0xA5; 48];
+    let options = |max_temporary_storage_bytes| r7z::ArchiveOptions {
+        codec: r7z::Codec::Copy,
+        streaming: r7z::StreamingOptions {
+            spool: r7z::SpoolMode::Auto {
+                memory_threshold: 16 * 1024,
+                dir: Some(tmp.path().to_path_buf()),
+            },
+            resource_limits: r7z::ResourceLimits {
+                max_temporary_storage_bytes,
+                max_retained_output_bytes: Some(32),
+                ..r7z::ResourceLimits::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut output = WriteOnly(Vec::new());
+    r7z::build_streaming_to_writer(
+        [("payload".to_string(), payload.as_slice())],
+        &mut output,
+        options(None),
+    )
+    .unwrap();
+    assert_eq!(
+        r7z::Archive::from_bytes(output.0.into())
+            .unwrap()
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        payload
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+    let mut output = WriteOnly(Vec::new());
+    let result = r7z::build_streaming_to_writer(
+        [("payload".to_string(), payload.as_slice())],
+        &mut output,
+        options(Some(0)),
+    );
+
+    assert!(matches!(
+        result,
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "temporary storage",
+            limit: 0,
+        })
+    ));
+    assert!(output.0.is_empty());
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn build_streaming_volumes_splits_final_archive_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("split.7z");
@@ -2255,6 +2521,13 @@ fn build_streaming_volumes_splits_final_archive_bytes() {
     let entries = vec![("payload.bin".to_string(), payload.as_slice())];
     let options = r7z::ArchiveOptions {
         codec: r7z::Codec::Copy,
+        streaming: r7z::StreamingOptions {
+            resource_limits: r7z::ResourceLimits {
+                max_open_volumes: NonZeroUsize::new(1).unwrap(),
+                ..r7z::ResourceLimits::default()
+            },
+            ..Default::default()
+        },
         ..Default::default()
     };
     let paths = r7z::build_streaming_volumes(
@@ -2280,6 +2553,103 @@ fn build_streaming_volumes_splits_final_archive_bytes() {
             .unwrap(),
         payload
     );
+}
+
+#[test]
+fn volume_spool_limit_failure_removes_temporary_and_volume_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spool_dir = tmp.path().join("spool");
+    let base = tmp.path().join("limited.7z");
+    let result = r7z::build_streaming_volumes(
+        [("payload".to_string(), b"volume spool".as_slice())],
+        &base,
+        r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::TempFile {
+                    dir: Some(spool_dir.clone()),
+                },
+                resource_limits: r7z::ResourceLimits {
+                    max_temporary_storage_bytes: Some(0),
+                    ..r7z::ResourceLimits::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        r7z::VolumeOptions {
+            sizes: vec![NonZeroU64::new(1024).unwrap()],
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "temporary storage",
+            limit: 0,
+        })
+    ));
+    assert!(!tmp.path().join("limited.7z.001").exists());
+    assert_eq!(std::fs::read_dir(spool_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn volume_count_limit_stops_before_creating_the_excess_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exact_base = tmp.path().join("exactly-one.7z");
+    let exact_paths = r7z::build_streaming_volumes(
+        [("payload".to_string(), b"one volume".as_slice())],
+        &exact_base,
+        r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::Memory,
+                resource_limits: r7z::ResourceLimits {
+                    max_volume_count: NonZeroUsize::new(1),
+                    ..r7z::ResourceLimits::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        r7z::VolumeOptions {
+            sizes: vec![NonZeroU64::new(4096).unwrap()],
+        },
+    )
+    .unwrap();
+    assert_eq!(exact_paths.len(), 1);
+    assert!(exact_paths[0].exists());
+
+    let base = tmp.path().join("counted.7z");
+    let result = r7z::build_streaming_volumes(
+        [("payload".to_string(), [0xA5; 48].as_slice())],
+        &base,
+        r7z::ArchiveOptions {
+            codec: r7z::Codec::Copy,
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::Memory,
+                resource_limits: r7z::ResourceLimits {
+                    max_volume_count: NonZeroUsize::new(1),
+                    ..r7z::ResourceLimits::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        r7z::VolumeOptions {
+            sizes: vec![NonZeroU64::new(32).unwrap()],
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "archive volume count",
+            limit: 1,
+        })
+    ));
+    assert!(tmp.path().join("counted.7z.001").exists());
+    assert!(!tmp.path().join("counted.7z.002").exists());
 }
 
 #[test]

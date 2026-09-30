@@ -129,6 +129,52 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
 }
 
 #[test]
+fn update_rejects_retained_data_over_the_operation_limit() {
+    let source = r7z::Archive::from_bytes(
+        r7z::ArchiveBuilder::new()
+            .add_file("old.txt", b"old")
+            .build()
+            .unwrap()
+            .into(),
+    )
+    .unwrap();
+    let mut output = Cursor::new(Vec::new());
+    let options = r7z::ArchiveOptions {
+        streaming: r7z::StreamingOptions {
+            resource_limits: r7z::ResourceLimits {
+                max_retained_output_bytes: Some(4),
+                ..r7z::ResourceLimits::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let result = r7z::update::v1::write_archive_update(
+        &source,
+        &mut output,
+        vec![r7z::update::v1::PreservedArchiveEntry {
+            name: "new.txt".to_owned(),
+            raw_name: None,
+            kind: r7z::EntryKind::File,
+            meta: r7z::EntryMeta::default(),
+            stream: r7z::update::v1::PreservedEntryStream::Data(b"payload".to_vec()),
+        }],
+        vec![],
+        &options,
+    );
+
+    assert!(matches!(
+        result,
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "retained output",
+            limit: 4,
+        })
+    ));
+    assert!(output.get_ref().is_empty());
+}
+
+#[test]
 fn raw_folder_handles_cannot_cross_archive_updates() {
     let data = b"archive-owned raw data".repeat(128);
     let bytes = r7z::ArchiveBuilder::new()

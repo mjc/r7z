@@ -138,7 +138,7 @@ fn open_split_archive_first_volume_reads_siblings() {
     assert!(matches!(
         r7z::Archive::open_with_options(&first, r7z::ArchiveOpenOptions { ..limits },),
         Err(r7z::R7zError::ResourceLimitExceeded {
-            resource: "archive volume count",
+            resource: "open archive volumes",
             limit: 2,
         })
     ));
@@ -191,6 +191,46 @@ fn open_prepended_archive_finds_embedded_signature() {
             .unwrap(),
         b"embedded"
     );
+}
+
+#[test]
+fn signature_scan_limit_includes_the_complete_signature_magic() {
+    let prefix = b"embedded archive prefix";
+    let mut bytes = prefix.to_vec();
+    bytes.extend_from_slice(
+        &r7z::ArchiveBuilder::new()
+            .add_file("payload.txt", b"embedded")
+            .build()
+            .unwrap(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let archive_path = tmp.path().join("embedded.7z");
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let exact_limit = prefix.len() as u64 + 6;
+    let archive = r7z::Archive::open_with_options(
+        &archive_path,
+        r7z::ArchiveOpenOptions {
+            max_signature_scan_bytes: exact_limit,
+            ..r7z::ArchiveOpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(archive.num_files(), 1);
+
+    assert!(matches!(
+        r7z::Archive::open_with_options(
+            &archive_path,
+            r7z::ArchiveOpenOptions {
+                max_signature_scan_bytes: exact_limit - 1,
+                ..r7z::ArchiveOpenOptions::default()
+            },
+        ),
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "signature scan",
+            limit,
+        }) if limit == exact_limit - 1
+    ));
 }
 
 #[test]

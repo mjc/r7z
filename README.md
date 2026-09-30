@@ -188,9 +188,35 @@ let archive = Archive::from_reader(file)?;
 ```
 
 `ResourceLimits` configures limits for archive opening, reading, and writing.
-Defaults preserve built-in decoder safeguards and limit split archives to 128
-open volumes. Callers can configure metadata, decoded-output, KDF, retained
-output, and temporary-storage limits:
+The defaults are:
+
+| Limit | Default | Scope |
+|-------|---------|-------|
+| `max_signature_scan_bytes` | 64 MiB | Prefix scanned to find the 7z signature |
+| `max_metadata_bytes` | 64 MiB | Header data, external metadata, and stream slots combined |
+| `max_decoder_working_set_bytes` | `None` | Uses the built-in 512 MiB decoder working-set cap |
+| `max_encoder_working_set_bytes` | `None` | Uses `CompressionOptions::encoder_memory_limit` |
+| `max_total_decoded_bytes` | `None` | Cumulative decoded bytes per read operation |
+| `max_total_kdf_cycles` | `None` | Cumulative AES key-derivation work per operation |
+| `max_retained_output_bytes` | `None` | Peak output bytes retained in memory per operation |
+| `max_temporary_storage_bytes` | `None` | Cumulative bytes written to temporary spools per operation |
+| `max_volume_count` | `None` | Number of volumes created by one write operation |
+| `max_open_volumes` | 128 | Split archive volume files open at once |
+
+`None` means that this configurable limit is not applied. The decoder still
+enforces its built-in 512 MiB working-set cap, 256 MiB LZMA/LZMA2 dictionary
+cap, and 256 MiB PPMd memory cap. If both encoder limits are set, the lower one
+applies. When neither is set, automatic LZMA2 encoding uses at most half of
+available memory, capped at 8 GiB; if available memory cannot be read, it uses
+a 512 MiB budget.
+
+Decoded bytes, KDF work, and temporary-spool writes are cumulative across
+nested work in one operation. Decoder working set and retained output are peak
+limits. Open volumes count simultaneous file handles; volume count counts
+files created over the whole write. A signature scan that reaches its limit
+before finding a signature returns `ResourceLimitExceeded`.
+
+Callers can override any limit with a struct update:
 
 Decoded output, KDF work, and bytes written to temporary spools are cumulative
 per operation. Decoder working-set and retained-output limits bound peak use.
@@ -200,7 +226,8 @@ use r7z::{Archive, ResourceLimits};
 use std::path::Path;
 
 let limits = ResourceLimits {
-    max_metadata_bytes: 64 * 1024 * 1024,
+    max_metadata_bytes: 32 * 1024 * 1024,
+    max_total_decoded_bytes: Some(2 * 1024 * 1024 * 1024),
     ..ResourceLimits::default()
 };
 let archive = Archive::open_with_options(
