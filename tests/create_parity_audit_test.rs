@@ -96,7 +96,9 @@ fn create_parity_audit_p7zip_compression_switches_open_with_r7z() {
             .position(|name| name == "payload.bin")
             .unwrap_or_else(|| panic!("payload.bin missing from {label}: {names:?}"));
         assert_eq!(
-            archive.extract_to_memory(payload_idx).unwrap(),
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(payload_idx))
+                .unwrap(),
             std::fs::read(dir.join("payload.bin")).unwrap(),
             "{label}"
         );
@@ -141,7 +143,9 @@ fn create_parity_audit_p7zip_volumes_concatenate_to_unsplit_archive() {
     let archive = r7z::Archive::open(&dir.join("split.7z.001")).unwrap();
     assert_eq!(archive.num_files(), 1);
     assert_eq!(
-        archive.extract_to_memory(0).unwrap(),
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
         std::fs::read(dir.join("payload.bin")).unwrap()
     );
 }
@@ -181,10 +185,23 @@ fn create_parity_audit_p7zip_link_payloads_and_metadata() {
         r7z::EntryType::File | r7z::EntryType::Symlink
     ));
     assert_eq!(fi.entry_type(hard_idx), r7z::EntryType::File);
-    assert_eq!(archive.extract_to_memory(link_idx).unwrap(), b"target.txt");
     assert_eq!(
-        archive.symlink_target(link_idx).unwrap().as_deref(),
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(link_idx))
+            .unwrap(),
+        b"target.txt"
+    );
+    assert_eq!(
+        archive
+            .symlink_target(r7z::ArchiveEntryIndex::new(link_idx))
+            .unwrap()
+            .as_deref(),
         fi.is_symlink(link_idx).then_some("target.txt")
     );
-    assert_eq!(archive.extract_to_memory(hard_idx).unwrap(), b"target");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(hard_idx))
+            .unwrap(),
+        b"target"
+    );
 }

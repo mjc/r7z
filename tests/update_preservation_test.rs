@@ -120,7 +120,12 @@ fn preserved_raw_multi_pack_folder_uses_the_shared_folder_writer() {
     )
     .unwrap();
     let rewritten = r7z::Archive::from_bytes(output.into_inner().into()).unwrap();
-    assert_eq!(rewritten.extract_to_memory(0).unwrap(), data);
+    assert_eq!(
+        rewritten
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        data
+    );
 }
 
 #[test]
@@ -176,9 +181,7 @@ fn raw_folder_updates_require_complete_contiguous_source_entries() {
     let listing = source.listing(None).unwrap();
     assert_eq!(listing.entries[0].block, listing.entries[1].block);
     let folder_index = listing.entries[0].block.unwrap();
-    let raw = source
-        .raw_folder(r7z::update::v1::FolderIndex::new(folder_index))
-        .unwrap();
+    let raw = source.raw_folder(folder_index).unwrap();
     let raw_entry = |name: &str, source_entry: usize| r7z::update::v1::PreservedArchiveEntry {
         name: name.to_owned(),
         raw_name: None,
@@ -300,13 +303,13 @@ fn preserved_raw_folder_can_share_an_archive_with_streamed_ppmd_data() {
     let rewritten = r7z::Archive::open_with_password(&archive_path, Some("Secret123")).unwrap();
     assert_eq!(
         rewritten
-            .extract_to_memory_with_password(0, Some("Secret123"))
+            .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("Secret123"))
             .unwrap(),
         kept
     );
     assert_eq!(
         rewritten
-            .extract_to_memory_with_password(1, Some("Secret123"))
+            .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(1), Some("Secret123"))
             .unwrap(),
         added
     );

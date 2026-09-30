@@ -104,7 +104,9 @@ fn decompress_bcj_lzma2_fixture() {
     assert_eq!(folder.bind_pairs.len(), 1, "expected 1 bind pair");
 
     // Extract the file and validate against fixture-local invariants.
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
     assert_eq!(extracted.len(), 4096, "expected 4096 bytes");
     assert_eq!(crc32fast::hash(&extracted), 0x5723_650d);
 }

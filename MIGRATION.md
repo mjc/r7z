@@ -18,11 +18,15 @@ Archive header fields are private; raw inspection uses borrowed accessors.
 | `archive.files_info()` / `archive.streams_info()` | `archive.entries()` for normal use; `archive.raw_files_info()` / `archive.raw_streams_info()` for format tools |
 | `archive.header`, `archive.signature`, `archive.encoded_header` | `archive.raw_header()`, `archive.raw_signature()`, `archive.raw_encoded_header()` |
 | `archive.raw_folder_block(index)` | `archive.raw_folder(r7z::update::v1::FolderIndex::new(index))` |
-| `FolderIndex`, `ArchiveEntryIndex`, preserved-folder types and writer functions | `r7z::update::v1` |
+| `FolderIndex`, preserved-folder types and writer functions | `r7z::update::v1` |
+| entry-index parameters and fields using `usize` | `r7z::ArchiveEntryIndex::new(index)` |
+| `ArchiveEntryIndex` for raw updates | `r7z::update::v1::ArchiveEntryIndex` (same type as the root export) |
 
 `ArchiveEntryInfo` carries the entry's display name, original UTF-16 name, type,
-and safe normalized path. Use it for listing and selection. Use `r7z::raw` only
-when code needs the 7z format representation itself.
+and safe normalized path. Its `index` and all high-level entry-index parameters
+use `ArchiveEntryIndex`; listing folder references use `FolderIndex`. Construct
+these explicitly from zero-based positions. Use `r7z::raw` only when code needs
+the 7z format representation itself.
 
 Raw update inputs are tied to the archive that produced them. Use handles from
 `Archive::raw_folder` with the versioned update API; do not construct a handle

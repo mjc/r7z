@@ -50,7 +50,9 @@ fn assert_archive_files_read_and_extract_all(
             .iter()
             .position(|n| n == &archive_name)
             .unwrap_or_else(|| panic!("{archive_name} not found in archive"));
-        let extracted = archive.extract_to_memory(idx).unwrap();
+        let extracted = archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(idx))
+            .unwrap();
         assert_eq!(extracted, *original, "mismatch for {archive_name}");
     }
 
@@ -179,7 +181,9 @@ fn p7zip_read_interop_single_lzma() {
     let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "hello.txt");
 
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
     assert_eq!(extracted, original);
 }
 
@@ -229,7 +233,9 @@ fn p7zip_read_interop_multi_file_lzma2() {
             .iter()
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} not found in archive"));
-        let extracted = archive.extract_to_memory(idx).unwrap();
+        let extracted = archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(idx))
+            .unwrap();
         assert_eq!(extracted.as_slice(), *original, "mismatch for {name}");
     }
 }
@@ -273,7 +279,10 @@ fn p7zip_read_interop_multi_file_lzma2_non_solid() {
     for (name, original) in &files {
         let idx = names.iter().position(|n| n == name).unwrap();
         assert_eq!(
-            archive.extract_to_memory(idx).unwrap().as_slice(),
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(idx))
+                .unwrap()
+                .as_slice(),
             *original
         );
     }
@@ -304,7 +313,12 @@ fn p7zip_read_interop_copy_codec() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), original);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        original
+    );
 }
 
 #[test]
@@ -408,8 +422,18 @@ fn p7zip_read_interop_names_with_spaces_unicode_and_nested_paths() {
         .iter()
         .position(|n| n == "nested dir/unicode-\u{2603}.txt")
         .unwrap();
-    assert_eq!(archive.extract_to_memory(space_idx).unwrap(), b"space");
-    assert_eq!(archive.extract_to_memory(unicode_idx).unwrap(), b"unicode");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(space_idx))
+            .unwrap(),
+        b"space"
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(unicode_idx))
+            .unwrap(),
+        b"unicode"
+    );
 }
 /// p7zip creates a BCJ+LZMA2 archive; r7z extracts it correctly.
 #[test]
@@ -456,7 +480,9 @@ fn p7zip_read_interop_bcj_lzma2() {
     let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 2, "expected BCJ + LZMA2");
 
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
     assert_eq!(extracted, data, "extracted data should match original");
 }
 
@@ -789,7 +815,7 @@ fn aes_decrypt_fixture_correct_password() {
     assert_eq!(fi.name(0).unwrap(), "encrypted_test.txt");
 
     let extracted = archive
-        .extract_to_memory_with_password(0, Some("test123"))
+        .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("test123"))
         .expect("decryption should succeed");
     assert_eq!(
         extracted, b"Hello from an encrypted 7z archive!\n",
@@ -802,7 +828,9 @@ fn aes_decrypt_fixture_correct_password() {
 fn aes_decrypt_no_password_returns_error() {
     let archive = r7z::Archive::open(std::path::Path::new("tests/fixtures/aes256.7z")).unwrap();
 
-    let err = archive.extract_to_memory(0).unwrap_err();
+    let err = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap_err();
     assert!(
         matches!(err, r7z::R7zError::PasswordRequired),
         "expected PasswordRequired, got {err:?}"
@@ -850,17 +878,19 @@ fn p7zip_aes_round_trip() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let err = archive.extract_to_memory(0).unwrap_err();
+    let err = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap_err();
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
     let err = archive
-        .extract_to_memory_with_password(0, Some("wrong"))
+        .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("wrong"))
         .unwrap_err();
     assert!(matches!(
         err,
         r7z::R7zError::Decompression | r7z::R7zError::Crc
     ));
     let extracted = archive
-        .extract_to_memory_with_password(0, Some("MyS3cret!"))
+        .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("MyS3cret!"))
         .expect("round-trip decryption failed");
     assert_eq!(extracted, original.as_slice());
 }
@@ -899,7 +929,7 @@ fn p7zip_aes_encrypted_headers_round_trip() {
     let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "header_secret.txt");
     let extracted = archive
-        .extract_to_memory_with_password(0, Some("HeaderPass!"))
+        .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("HeaderPass!"))
         .unwrap();
     assert_eq!(extracted, b"header encrypted");
 }
@@ -931,7 +961,9 @@ fn p7zip_unsupported_codecs_return_unsupported_codec() {
         }
 
         let archive = r7z::Archive::open(&archive_path).unwrap();
-        let err = archive.extract_to_memory(0).unwrap_err();
+        let err = archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap_err();
         assert!(
             matches!(err, r7z::R7zError::UnsupportedCodec(_)),
             "expected UnsupportedCodec for {method}, got {err:?}"
@@ -950,7 +982,9 @@ fn p7zip_ppmd_extracts_with_r7z() {
     create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=PPMd"]);
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
 
     assert_eq!(extracted, original);
 }
@@ -966,7 +1000,9 @@ fn p7zip_bzip2_extracts_with_r7z() {
     create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=BZip2"]);
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
 
     assert_eq!(extracted, original);
 }
@@ -982,7 +1018,9 @@ fn p7zip_deflate_extracts_with_r7z() {
     create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=Deflate"]);
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
 
     assert_eq!(extracted, original);
 }
@@ -998,7 +1036,9 @@ fn p7zip_deflate64_extracts_with_r7z() {
     create_p7zip_archive(dir, &archive_path, &["payload.txt"], &["-m0=Deflate64"]);
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
 
     assert_eq!(extracted, original);
 }
@@ -1019,7 +1059,9 @@ fn p7zip_delta_lzma2_extracts_with_r7z() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
 
     assert_eq!(extracted, original);
 }
@@ -1042,7 +1084,9 @@ fn p7zip_byte_swap_filters_extract_with_r7z() {
         );
 
         let archive = r7z::Archive::open(&archive_path).unwrap();
-        let extracted = archive.extract_to_memory(0).unwrap();
+        let extracted = archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap();
 
         assert_eq!(extracted, original, "mismatch for {method}");
     }
@@ -1066,7 +1110,9 @@ fn p7zip_branch_filters_extract_with_r7z() {
         );
 
         let archive = r7z::Archive::open(&archive_path).unwrap();
-        let extracted = archive.extract_to_memory(0).unwrap();
+        let extracted = archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap();
 
         assert_eq!(extracted, original, "mismatch for {method}");
     }
@@ -1088,7 +1134,9 @@ fn p7zip_bcj2_lzma2_extracts_with_r7z() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let extracted = archive.extract_to_memory(0).unwrap();
+    let extracted = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap();
 
     assert_eq!(extracted, original);
 }

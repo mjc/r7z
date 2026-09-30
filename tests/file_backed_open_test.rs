@@ -67,7 +67,12 @@ fn from_reader_accepts_cursor() {
 
     let archive = r7z::Archive::from_reader(Cursor::new(bytes)).unwrap();
 
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"cursor-backed");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"cursor-backed"
+    );
 }
 
 #[test]
@@ -105,7 +110,11 @@ fn seek_open_reports_file_truncated_after_open() {
         .set_len(32)
         .unwrap();
 
-    assert!(archive.extract_to_memory(0).is_err());
+    assert!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .is_err()
+    );
 }
 
 #[test]
@@ -134,9 +143,16 @@ fn open_split_archive_first_volume_reads_siblings() {
         .position(|name| name == "nested/beta.txt")
         .unwrap();
 
-    assert_eq!(archive.extract_to_memory(alpha_idx).unwrap(), b"alpha");
     assert_eq!(
-        archive.extract_to_memory(beta_idx).unwrap(),
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(alpha_idx))
+            .unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(beta_idx))
+            .unwrap(),
         vec![0x5Au8; 4096]
     );
 }
@@ -157,7 +173,12 @@ fn open_prepended_archive_finds_embedded_signature() {
     let archive = r7z::Archive::open(&archive_path).unwrap();
 
     assert_eq!(archive.num_files(), 1);
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"embedded");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"embedded"
+    );
 }
 
 #[test]
@@ -259,8 +280,12 @@ fn extract_to_writer_from_seek_source_matches_from_bytes() {
 
     let mut expected = Vec::new();
     let mut actual = Vec::new();
-    from_bytes.extract_to_writer(0, &mut expected).unwrap();
-    from_reader.extract_to_writer(0, &mut actual).unwrap();
+    from_bytes
+        .extract_to_writer(r7z::ArchiveEntryIndex::new(0), &mut expected)
+        .unwrap();
+    from_reader
+        .extract_to_writer(r7z::ArchiveEntryIndex::new(0), &mut actual)
+        .unwrap();
 
     assert_eq!(actual, expected);
 }
@@ -293,8 +318,18 @@ fn source_adapters_decode_the_same_entries() {
 
     for archive in archives {
         assert_eq!(archive.num_files(), 2);
-        assert_eq!(archive.extract_to_memory(0).unwrap(), b"first payload");
-        assert_eq!(archive.extract_to_memory(1).unwrap(), b"second payload");
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"first payload"
+        );
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
+                .unwrap(),
+            b"second payload"
+        );
     }
 }
 
@@ -313,7 +348,9 @@ fn copy_builder_avoids_copying_the_payload_during_build() {
         codec: r7z::Codec::Copy,
         ..Default::default()
     };
-    let mut writer = r7z::ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(Cursor::new(Vec::new()), options)
+        .unwrap()
+        .start();
     reset_allocated_bytes();
     writer
         .append_file(
@@ -349,7 +386,9 @@ fn extract_to_writer_non_aes_does_not_read_packed_stream_in_one_request() {
 
     max_read_request.store(0, Ordering::Relaxed);
     let mut out = Vec::new();
-    archive.extract_to_writer(0, &mut out).unwrap();
+    archive
+        .extract_to_writer(r7z::ArchiveEntryIndex::new(0), &mut out)
+        .unwrap();
 
     assert_eq!(out, payload);
     assert!(

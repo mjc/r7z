@@ -694,7 +694,7 @@ impl ArchiveBuilder {
                     *folder_size = folder_size.checked_add(size).ok_or(R7zError::Parse)?;
                 }
             }
-            let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)?;
+            let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)?.start();
             for entry in entries {
                 let folder_size = folder_sizes.get(&entry.folder_id).copied().unwrap_or(0);
                 match entry.folder_id.cmp(&writer.next_folder_id()?) {
@@ -771,8 +771,10 @@ fn validate_raw_folder_update(
     }
 
     let listing = source.listing(None)?;
-    let mut raw_entries =
-        std::collections::BTreeMap::<crate::archive::FolderIndex, Vec<usize>>::new();
+    let mut raw_entries = std::collections::BTreeMap::<
+        crate::archive::FolderIndex,
+        Vec<crate::archive::ArchiveEntryIndex>,
+    >::new();
     for preserved in entries {
         let PreservedEntryStream::Raw {
             folder,
@@ -783,17 +785,17 @@ fn validate_raw_folder_update(
         else {
             continue;
         };
-        let source_entry_index = source_entry.get();
+        let source_entry_index = *source_entry;
         let folder_index = folder.index();
         let source_info = listing
             .entries
-            .get(source_entry_index)
+            .get(source_entry_index.get())
             .filter(|source_info| source_info.index == source_entry_index)
             .ok_or(R7zError::InvalidRawFolderLayout)?;
         if !folder.belongs_to(source) || !raw_folders.iter().any(|raw| raw.handle() == *folder) {
             return Err(R7zError::ArchiveMismatch);
         }
-        if source_info.block != Some(folder_index.get())
+        if source_info.block != Some(folder_index)
             || source_info.size != Some(*size)
             || source_info.crc != *crc
         {
@@ -809,7 +811,7 @@ fn validate_raw_folder_update(
         let source_entries = listing
             .entries
             .iter()
-            .filter(|source_entry| source_entry.block == Some(folder_index.get()))
+            .filter(|source_entry| source_entry.block == Some(folder_index))
             .map(|source_entry| source_entry.index)
             .collect::<Vec<_>>();
         if entries.into_iter().ne(source_entries) {
@@ -1199,13 +1201,13 @@ impl StagedDataFolders {
     }
 }
 
-pub struct ArchiveWriter<W: Write + Seek> {
+pub struct ArchiveWriter<W: Write + Seek, const STARTED: bool = false> {
     state: WriterState<W>,
     entries: Vec<WriteEntry>,
     prepared: encode::PreparedArchiveOptions,
 }
 
-impl<W: Write + Seek> ArchiveWriter<W> {
+impl<W: Write + Seek> ArchiveWriter<W, false> {
     pub fn new(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
         let mut options = options;
         lzma2::set_default_budget(&mut options);
@@ -1228,54 +1230,31 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         Self::new(out, ArchiveOptions::default())
     }
 
+    /// Lock the archive options and enable streaming entry methods.
+    #[must_use]
+    pub fn start(self) -> ArchiveWriter<W, true> {
+        ArchiveWriter {
+            state: self.state,
+            entries: self.entries,
+            prepared: self.prepared,
+        }
+    }
+
     pub fn compression(mut self, codec: Codec) -> Result<Self, R7zError> {
         self.set_compression(codec)?;
         Ok(self)
     }
 
     pub fn set_compression(&mut self, codec: Codec) -> Result<(), R7zError> {
-        if matches!(self.state, WriterState::Failed) {
-            return Err(writer_failed());
-        }
-        if self.entries.iter().any(|entry| entry.stream.has_stream()) {
-            return Err(R7zError::InvalidOptions(
-                "cannot change compression after appending nonempty file data",
-            ));
-        }
         let mut options = self.prepared.archive().clone();
         options.codec = codec;
         lzma2::set_default_budget(&mut options);
         self.prepared = encode::prepare_archive_options(options)?;
         Ok(())
     }
+}
 
-    pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
-        self.append_file(name, reader, EntryMeta::default())
-    }
-
-    pub fn append_entry(
-        &mut self,
-        name: &str,
-        reader: impl Read,
-        meta: EntryMeta,
-    ) -> Result<(), R7zError> {
-        self.append_file(name, reader, meta)
-    }
-
-    pub fn append_archive_entry(
-        &mut self,
-        entry: ArchiveEntry,
-        reader: impl Read,
-    ) -> Result<(), R7zError> {
-        let ArchiveEntry { name, kind, meta } = entry;
-        if kind != EntryKind::File {
-            return Err(R7zError::InvalidOptions(
-                "only file entries can have stream data",
-            ));
-        }
-        self.append_file(&name, reader, meta)
-    }
-
+impl<W: Write + Seek, const STARTED: bool> ArchiveWriter<W, STARTED> {
     pub fn append_empty_entry(&mut self, entry: ArchiveEntry) -> Result<(), R7zError> {
         let folder_id = self.next_folder_id()?;
         self.entries.push(WriteEntry {
@@ -1297,7 +1276,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             WriterState::Failed => Err(writer_failed()),
         }
     }
+}
 
+impl<W: Write + Seek> ArchiveWriter<W, true> {
     pub fn append_file(
         &mut self,
         name: &str,
@@ -1347,6 +1328,35 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             kind: EntryKind::Anti,
             meta,
         })
+    }
+}
+
+impl<W: Write + Seek> ArchiveWriter<W, true> {
+    pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
+        self.append_file(name, reader, EntryMeta::default())
+    }
+
+    pub fn append_entry(
+        &mut self,
+        name: &str,
+        reader: impl Read,
+        meta: EntryMeta,
+    ) -> Result<(), R7zError> {
+        self.append_file(name, reader, meta)
+    }
+
+    pub fn append_archive_entry(
+        &mut self,
+        entry: ArchiveEntry,
+        reader: impl Read,
+    ) -> Result<(), R7zError> {
+        let ArchiveEntry { name, kind, meta } = entry;
+        if kind != EntryKind::File {
+            return Err(R7zError::InvalidOptions(
+                "only file entries can have stream data",
+            ));
+        }
+        self.append_file(&name, reader, meta)
     }
 
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
@@ -1654,7 +1664,7 @@ where
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    let mut writer = ArchiveWriter::new_prepared(out, prepared);
+    let mut writer = ArchiveWriter::new_prepared(out, prepared).start();
     for (name, reader) in entries {
         writer.append(&name, reader)?;
     }

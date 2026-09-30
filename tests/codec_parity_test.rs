@@ -83,7 +83,9 @@ fn official_7zip_2603_branch_archives_extract() {
             "{name}"
         );
         assert_eq!(
-            archive.extract_to_memory(0).unwrap(),
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
             branch_payload(arm64),
             "{name}"
         );
@@ -249,7 +251,12 @@ fn p7zip_lzma2_property_values_extract_with_r7z() {
             "p7zip emitted unsupported LZMA2 property {} for {dict_arg}",
             properties[0]
         );
-        assert_eq!(archive.extract_to_memory(0).unwrap(), payload);
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            payload
+        );
     }
 }
 

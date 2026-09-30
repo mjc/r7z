@@ -208,14 +208,22 @@ fn r7z_open_10mb(c: &mut Criterion) {
 fn r7z_extract_1mb(c: &mut Criterion) {
     let archive = r7z::Archive::from_bytes(archive_1mb_bytes()).unwrap();
     c.bench_function("r7z_extract_1mb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
+        b.iter(|| {
+            archive
+                .extract_to_memory(black_box(r7z::ArchiveEntryIndex::new(0)))
+                .unwrap()
+        });
     });
 }
 
 fn r7z_extract_10mb(c: &mut Criterion) {
     let archive = r7z::Archive::from_bytes(archive_10mb_bytes()).unwrap();
     c.bench_function("r7z_extract_10mb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
+        b.iter(|| {
+            archive
+                .extract_to_memory(black_box(r7z::ArchiveEntryIndex::new(0)))
+                .unwrap()
+        });
     });
 }
 
@@ -263,7 +271,11 @@ fn r7z_extract_1gb(c: &mut Criterion) {
     }
     let archive = r7z::Archive::from_bytes(archive_1gb_bytes()).unwrap();
     c.bench_function("r7z_extract_1gb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
+        b.iter(|| {
+            archive
+                .extract_to_memory(black_box(r7z::ArchiveEntryIndex::new(0)))
+                .unwrap()
+        });
     });
 }
 
@@ -273,7 +285,11 @@ fn r7z_extract_10gb(c: &mut Criterion) {
     }
     let archive = r7z::Archive::from_bytes(archive_10gb_bytes()).unwrap();
     c.bench_function("r7z_extract_10gb", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(0)).unwrap());
+        b.iter(|| {
+            archive
+                .extract_to_memory(black_box(r7z::ArchiveEntryIndex::new(0)))
+                .unwrap()
+        });
     });
 }
 
@@ -410,7 +426,11 @@ fn r7z_extract_n64(c: &mut Criterion) {
         .and_then(|fi| (0..archive.num_files()).find(|&i| !fi.is_empty_stream(i)))
         .unwrap_or(0);
     c.bench_function("r7z_extract_n64", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(idx)).unwrap());
+        b.iter(|| {
+            archive
+                .extract_to_memory(black_box(r7z::ArchiveEntryIndex::new(idx)))
+                .unwrap()
+        });
     });
 }
 

@@ -405,7 +405,10 @@ fn entries_and_name_based_extraction_use_safe_names() {
     assert!(entries[3].is_anti());
     let payload_path = PathBuf::from("dir").join("payload.txt");
     assert_eq!(entries[1].safe_path(), Some(payload_path.as_path()));
-    assert_eq!(archive.safe_name(1).unwrap(), payload_path);
+    assert_eq!(
+        archive.safe_name(r7z::ArchiveEntryIndex::new(1)).unwrap(),
+        payload_path
+    );
 
     let mut out = Vec::new();
     let written = archive
@@ -453,12 +456,19 @@ fn stream_files_visits_file_entries_and_drains_solid_folders() {
 fn copy_codec_extracts_and_detects_packed_data_crc_mismatch() {
     let archive_bytes = build_copy_archive("plain.txt", b"copy codec payload");
     let archive = r7z::Archive::from_bytes(archive_bytes.clone().into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"copy codec payload");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"copy codec payload"
+    );
 
     let mut corrupted = archive_bytes;
     corrupted[32] ^= 0x01;
     let archive = r7z::Archive::from_bytes(corrupted.into()).unwrap();
-    let err = archive.extract_to_memory(0).unwrap_err();
+    let err = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap_err();
     assert!(matches!(err, r7z::R7zError::Crc));
 }
 
@@ -466,7 +476,12 @@ fn copy_codec_extracts_and_detects_packed_data_crc_mismatch() {
 fn external_folder_definitions_are_loaded_from_additional_streams() {
     let bytes = build_archive_with_external_folder_definition("external.txt", b"external data");
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"external data");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"external data"
+    );
 }
 
 #[test]
@@ -478,7 +493,12 @@ fn external_file_names_are_loaded_from_additional_streams() {
         archive.raw_files_info().unwrap().name(0).as_deref(),
         Some("external-name.txt")
     );
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"external data");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"external data"
+    );
 }
 
 #[test]
@@ -492,7 +512,12 @@ fn external_metadata_matches_official_7zip_fixture() {
     assert_eq!(files.name(0).as_deref(), Some("external-metadata.txt"));
     assert_eq!(files.ctimes, [Some(132_223_104_000_000_000)]);
     assert_eq!(files.attributes, [Some(0x20)]);
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b""
+    );
 }
 
 #[test]
@@ -501,18 +526,28 @@ fn packed_stream_crc_is_checked_independently_of_unpacked_crc() {
     let expected_crc = crc32fast::hash(data);
     let good = build_copy_archive_with_pack_crc("plain.txt", data, Some(expected_crc));
     let archive = r7z::Archive::from_bytes(good.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        data
+    );
 
     let bad = build_copy_archive_with_pack_crc("plain.txt", data, Some(expected_crc ^ 1));
     let archive = r7z::Archive::from_bytes(bad.into()).unwrap();
     assert!(matches!(
-        archive.extract_to_memory(0),
+        archive.extract_to_memory(r7z::ArchiveEntryIndex::new(0)),
         Err(r7z::R7zError::Crc)
     ));
 
     let no_crc = build_copy_archive_with_pack_crc("plain.txt", data, None);
     let archive = r7z::Archive::from_bytes(no_crc.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        data
+    );
 }
 
 #[test]
@@ -522,7 +557,12 @@ fn encoded_header_pack_crc_is_checked_before_header_decode() {
     let packed_header = &encoded_header[32 + data.len()..];
     let good = build_encoded_copy_archive("file.txt", data, crc32fast::hash(packed_header));
     let archive = r7z::Archive::from_bytes(good.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        data
+    );
 
     let bad = build_encoded_copy_archive("file.txt", data, crc32fast::hash(packed_header) ^ 1);
     assert!(matches!(
@@ -542,7 +582,12 @@ fn additional_metadata_pack_crc_is_checked_when_opening() {
         crc32fast::hash(additional),
     );
     let archive = r7z::Archive::from_bytes(good.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        data
+    );
 
     let bad = build_copy_archive_with_additional_crc(
         "file.txt",

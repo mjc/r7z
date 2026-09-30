@@ -33,8 +33,18 @@ fn payload() -> Vec<u8> {
 
 fn assert_two_files(bytes: Vec<u8>, first: &[u8], second: &[u8]) {
     let archive = Archive::from_bytes(bytes.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), first);
-    assert_eq!(archive.extract_to_memory(1).unwrap(), second);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
+            .unwrap(),
+        second
+    );
 }
 
 #[test]
@@ -52,7 +62,7 @@ fn buffered_and_incremental_writers_encode_multiple_blocks_in_order() {
     assert_two_files(bytes, first, second);
 
     let mut output = Cursor::new(Vec::new());
-    let mut writer = ArchiveWriter::new(&mut output, opts).unwrap();
+    let mut writer = ArchiveWriter::new(&mut output, opts).unwrap().start();
     writer.append("first.bin", first).unwrap();
     writer.append("second.bin", second).unwrap();
     writer.finish().unwrap();
@@ -78,7 +88,12 @@ fn staged_bcj_writer_preserves_bytes_across_parallel_blocks() {
     )
     .unwrap();
     let archive = Archive::from_bytes(output.into_inner().into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), data);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        data
+    );
 }
 
 #[test]
@@ -94,7 +109,10 @@ fn encrypted_buffered_archive_round_trips_with_parallel_encoder() {
     let archive = Archive::from_bytes_with_password(bytes.into(), Some("parallel-secret")).unwrap();
     assert_eq!(
         archive
-            .extract_to_memory_with_password(0, Some("parallel-secret"))
+            .extract_to_memory_with_password(
+                r7z::ArchiveEntryIndex::new(0),
+                Some("parallel-secret")
+            )
             .unwrap(),
         data
     );
@@ -126,9 +144,24 @@ fn empty_file_and_non_solid_folders_round_trip() {
         .build()
         .unwrap();
     let archive = Archive::from_bytes(bytes.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"");
-    assert_eq!(archive.extract_to_memory(1).unwrap(), first);
-    assert_eq!(archive.extract_to_memory(2).unwrap(), second);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b""
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(2))
+            .unwrap(),
+        second
+    );
 }
 
 struct FailingOutput(Cursor<Vec<u8>>);
@@ -158,7 +191,8 @@ fn parallel_writer_propagates_output_error_and_joins_workers() {
         let mut writer = ArchiveWriter::new(
             FailingOutput(Cursor::new(Vec::new())),
             options(Codec::Lzma2),
-        )?;
+        )?
+        .start();
         writer.append("file.bin", Cursor::new(payload()))?;
         writer.finish().map(|_| ())
     })();

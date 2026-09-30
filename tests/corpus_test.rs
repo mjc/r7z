@@ -89,7 +89,7 @@ fn extract_all_file_entries(archive: &r7z::Archive, password: Option<&str>, path
             continue;
         }
         archive
-            .extract_to_memory_with_password(idx, password)
+            .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(idx), password)
             .unwrap_or_else(|err| {
                 panic!(
                     "failed to extract corpus entry {} from {}: {err}",

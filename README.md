@@ -34,7 +34,7 @@ r7z = "0.1"
 ### Reading — list and extract files
 
 ```rust
-use r7z::Archive;
+use r7z::{Archive, ArchiveEntryIndex};
 use std::path::Path;
 
 let archive = Archive::open(Path::new("example.7z"))?;
@@ -46,12 +46,13 @@ for entry in archive.entries() {
 
 // Extract first file to an in-memory buffer.
 // Directories are reported as R7zError::Directory; zero-byte files return an empty Vec.
-let data = archive.extract_to_memory(0)?;
+let first_entry = ArchiveEntryIndex::new(0);
+let data = archive.extract_to_memory(first_entry)?;
 println!("{} bytes", data.len());
 
 // Stream a file directly to any writer.
 let mut out = std::fs::File::create("/tmp/first-file.bin")?;
-let written = archive.extract_to_writer(0, &mut out)?;
+let written = archive.extract_to_writer(first_entry, &mut out)?;
 println!("{written} bytes written");
 ```
 
@@ -222,25 +223,25 @@ let archive = Archive::from_bytes(raw.into())?;
 | `Archive::from_bytes_with_password(data, password)` | `Result<Archive, R7zError>` | Decode password-protected bytes |
 | `archive.num_files()` | `usize` | Number of entries (files and directories) |
 | `archive.entries()` | `Iterator<Item = ArchiveEntryInfo>` | High-level entry metadata with type and safe normalized name |
-| `archive.entry(index)` | `Option<ArchiveEntryInfo>` | High-level metadata for one entry |
-| `archive.safe_name(index)` | `Result<PathBuf, R7zError>` | Reject unsafe names and normalize a relative archive path |
+| `archive.entry(index: ArchiveEntryIndex)` | `Option<ArchiveEntryInfo>` | High-level metadata for one entry |
+| `archive.safe_name(index: ArchiveEntryIndex)` | `Result<PathBuf, R7zError>` | Reject unsafe names and normalize a relative archive path |
 | `archive.raw_files_info()` | `Option<&raw::FilesInfo>` | Low-level file metadata for format tools |
 | `archive.raw_streams_info()` | `Option<&raw::StreamInfo>` | Low-level stream and pack metadata for format tools |
-| `archive.extract_to_memory(index: usize)` | `Result<Vec<u8>, R7zError>` | Decompress file at `index` (0-based) |
-| `archive.extract_to_memory_with_password(index, password)` | `Result<Vec<u8>, R7zError>` | Decrypt/decompress file at `index` |
+| `archive.extract_to_memory(index: ArchiveEntryIndex)` | `Result<Vec<u8>, R7zError>` | Decompress file at `index` (0-based) |
+| `archive.extract_to_memory_with_password(index: ArchiveEntryIndex, password)` | `Result<Vec<u8>, R7zError>` | Decrypt/decompress file at `index` |
 | `archive.extract_to_memory_by_name(name)` | `Result<Vec<u8>, R7zError>` | Decompress file by exact or normalized safe name |
-| `archive.extract_to_writer(index, writer)` | `Result<u64, R7zError>` | Stream file at `index` into a writer |
-| `archive.extract_to_writer_with_password(index, writer, password)` | `Result<u64, R7zError>` | Stream encrypted file data into a writer |
+| `archive.extract_to_writer(index: ArchiveEntryIndex, writer)` | `Result<u64, R7zError>` | Stream file at `index` into a writer |
+| `archive.extract_to_writer_with_password(index: ArchiveEntryIndex, writer, password)` | `Result<u64, R7zError>` | Stream encrypted file data into a writer |
 | `archive.extract_by_name(name, writer)` | `Result<u64, R7zError>` | Stream file selected by exact or normalized safe name |
 | `archive.stream_files(callback)` | `Result<(), R7zError>` | Stream all file-like entries while decoding each solid folder once |
-| `archive.stream_selected_files(indices, callback)` | `Result<(), R7zError>` | Stream selected file-like entries in archive order, decoding each selected solid folder once |
-| `archive.read_session(password)` | `Result<ArchiveReadSession, R7zError>` | Read entries incrementally in increasing index order while retaining the current solid-folder decoder |
+| `archive.stream_selected_files(indices: &[ArchiveEntryIndex], callback)` | `Result<(), R7zError>` | Stream selected file-like entries in archive order, decoding each selected solid folder once |
+| `archive.read_session(password)` | `Result<ArchiveReadSession, R7zError>` | Read entries incrementally in increasing `ArchiveEntryIndex` order while retaining the current solid-folder decoder |
 | `archive.extract_all(dest: &Path)` | `Result<(), R7zError>` | Extract all files; creates subdirectories as needed |
 | `archive.extract_all_with_password(dest, password)` | `Result<(), R7zError>` | Extract all files from an encrypted archive |
 
-`stream_selected_files` validates all indices (including duplicates) before invoking the callback. It skips unselected folders, drains partially consumed selected entries, verifies a selected folder's CRC across unselected entries in that same folder, and skips unselected tails when no folder CRC requires them. Multi-pack folders are capped at 512 MiB before packed data is buffered. Decoder safeguards reject `LZMA`/`LZMA2` dictionaries or `PPMd` memory above 256 MiB, cap decoder chains at 64 coders and the aggregate decoder working set at 512 MiB, cap each AES encrypted/decrypted buffer at 128 MiB, cap `BCJ2` output at 256 MiB and combined packed/intermediate/final buffers at 512 MiB, and include live decoder state in that `BCJ2` budget. APIs that materialize decompressed folder output share a 512 MiB budget with decoder state. `extract_to_memory` intentionally allocates the requested member and remains limited only by the caller's memory; use a writer/streaming API or impose an application-level output limit for untrusted archives.
+`ArchiveEntryIndex` and `update::v1::FolderIndex` keep entry and folder positions distinct. `stream_selected_files` accepts a slice of `ArchiveEntryIndex` and validates all indices (including duplicates) before invoking the callback. It skips unselected folders, drains partially consumed selected entries, verifies a selected folder's CRC across unselected entries in that same folder, and skips unselected tails when no folder CRC requires them. Multi-pack folders are capped at 512 MiB before packed data is buffered. Decoder safeguards reject `LZMA`/`LZMA2` dictionaries or `PPMd` memory above 256 MiB, cap decoder chains at 64 coders and the aggregate decoder working set at 512 MiB, cap each AES encrypted/decrypted buffer at 128 MiB, cap `BCJ2` output at 256 MiB and combined packed/intermediate/final buffers at 512 MiB, and include live decoder state in that `BCJ2` budget. APIs that materialize decompressed folder output share a 512 MiB budget with decoder state. `extract_to_memory` intentionally allocates the requested member and remains limited only by the caller's memory; use a writer/streaming API or impose an application-level output limit for untrusted archives.
 
-A read session supports `read_entry(index, callback)` and `extract_to_writer(index, writer)`.
+A read session supports `read_entry(index: ArchiveEntryIndex, callback)` and `extract_to_writer(index: ArchiveEntryIndex, writer)`.
 Call `finish()` after the last request to verify the final folder. `finish_folder()` verifies
 and releases the current decoder without closing the session. Dropping a session does not
 verify its remaining data. Failed data reads release the decoder, allowing a later request
@@ -282,14 +283,16 @@ still selects the algorithm.
 
 ### `ArchiveWriter` and `build_streaming` — file-backed builders
 
-`ArchiveWriter<W: Write + Seek>` writes one or more compression folders and can store optional per-entry metadata. It also accepts explicit `ArchiveEntry` values through `.append_archive_entry(...)` and `.append_empty_entry(...)`:
+`ArchiveWriter<W>` is configured before `.start()`. Starting locks compression settings and enables streaming file methods at compile time. It writes one or more compression folders and can store optional per-entry metadata. It also accepts explicit `ArchiveEntry` values through `.append_archive_entry(...)` and `.append_empty_entry(...)`:
 
 ```rust
 use r7z::{ArchiveOptions, ArchiveWriter, Codec, EntryMeta};
 use std::fs::File;
 
 let file = File::create("out.7z")?;
-let mut writer = ArchiveWriter::new(file, ArchiveOptions::default())?.compression(Codec::Lzma2);
+let mut writer = ArchiveWriter::new(file, ArchiveOptions::default())?
+    .compression(Codec::Lzma2)?
+    .start();
 writer.append_file("a.txt", &mut b"hello".as_ref(), EntryMeta::default())?;
 writer.append_empty_file("empty.txt", EntryMeta::default())?;
 writer.new_folder()?;

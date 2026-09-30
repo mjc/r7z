@@ -78,7 +78,11 @@ fn bench_extract_to_memory(c: &mut Criterion) {
         .find(|&i| !fi.is_empty_stream(i))
         .unwrap_or(0);
     c.bench_function("Archive::extract_to_memory", |b| {
-        b.iter(|| archive.extract_to_memory(black_box(idx)).unwrap())
+        b.iter(|| {
+            archive
+                .extract_to_memory(black_box(r7z::ArchiveEntryIndex::new(idx)))
+                .unwrap()
+        })
     });
 }
 
@@ -93,7 +97,7 @@ fn bench_extract_to_writer_seek_backed(c: &mut Criterion) {
         b.iter(|| {
             let mut sink = std::io::sink();
             archive
-                .extract_to_writer(black_box(idx), &mut sink)
+                .extract_to_writer(black_box(r7z::ArchiveEntryIndex::new(idx)), &mut sink)
                 .unwrap();
         })
     });
