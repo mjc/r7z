@@ -1141,6 +1141,53 @@ fn p7zip_bcj2_lzma2_extracts_with_r7z() {
     assert_eq!(extracted, original);
 }
 
+#[test]
+fn p7zip_bcj2_encrypted_branches_extract_with_r7z() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let original = executable_payload(16 * 1024);
+    std::fs::write(dir.join("payload.bin"), &original).unwrap();
+
+    let archive_path = dir.join("bcj2-encrypted.7z");
+    create_p7zip_archive(
+        dir,
+        &archive_path,
+        &["payload.bin"],
+        &["-m0=BCJ2", "-m1=LZMA2", "-pbranch-pass", "-mhe=off"],
+    );
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    let folder = archive
+        .raw_streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap()
+        .parse_folder(0)
+        .unwrap();
+    assert_eq!(
+        folder
+            .coders
+            .iter()
+            .filter(|coder| coder.codec_id.as_slice() == r7z::CODEC_AES_256_SHA_256)
+            .count(),
+        4,
+        "expected AES on every BCJ2 input branch"
+    );
+    let error = archive
+        .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+        .unwrap_err();
+    assert!(
+        matches!(error, r7z::R7zError::PasswordRequired),
+        "expected password requirement, got {error:?}"
+    );
+    let extracted = archive
+        .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("branch-pass"))
+        .unwrap();
+
+    assert_eq!(extracted, original);
+}
+
 /// Decrypt a file from a large real-world AES-encrypted archive.
 /// Requires /mnt/emulation/Nintendo64Archive.7z to be present.
 #[test]

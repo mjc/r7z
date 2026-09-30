@@ -105,13 +105,19 @@ pub(crate) struct FolderGraph {
     input_sources: Vec<Option<OutputStreamIndex>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Bcj2Channel {
-    pub(crate) coder: Option<CoderIndex>,
+    pub(crate) coders: Vec<Bcj2Coder>,
     pub(crate) packed: PackedStreamIndex,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Bcj2Coder {
+    pub(crate) index: CoderIndex,
+    pub(crate) output: OutputStreamIndex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Bcj2Layout {
     pub(crate) main: Bcj2Channel,
     pub(crate) call: Bcj2Channel,
@@ -200,11 +206,10 @@ impl FolderGraph {
             jump: jump?,
             control: control?,
         };
-        let channel_coders = [layout.main.coder, layout.call.coder, layout.jump.coder];
-        let channel_coders = channel_coders
+        let channel_coders = [&layout.main, &layout.call, &layout.jump, &layout.control]
             .into_iter()
-            .flatten()
-            .collect::<SmallVec<[_; 3]>>();
+            .flat_map(|channel| channel.coders.iter().map(|coder| coder.index))
+            .collect::<SmallVec<[_; 4]>>();
         let unique_coders = channel_coders
             .iter()
             .enumerate()
@@ -215,11 +220,7 @@ impl FolderGraph {
             .enumerate()
             .map(|(index, _)| CoderIndex(index))
             .all(|coder| coder == CoderIndex(index) || channel_coders.contains(&coder));
-        if layout.main.coder.is_none()
-            || layout.control.coder.is_some()
-            || !unique_coders
-            || !all_coders_are_channels
-        {
+        if !unique_coders || !all_coders_are_channels {
             return Err(R7zError::InvalidFolderGraph);
         }
         Ok(Some(layout))
@@ -237,43 +238,43 @@ impl FolderGraph {
                 .find_map(|(slot, candidate)| (*candidate == input).then_some(*slot))
                 .ok_or(R7zError::InvalidFolderGraph)
         };
-        let source = *self
-            .input_sources
-            .get(input.0)
-            .ok_or(R7zError::InvalidFolderGraph)?;
-        match source {
-            None => Ok(Bcj2Channel {
-                coder: None,
-                packed: packed_slot(input)?,
-            }),
-            Some(output) => {
-                let coder = *self
-                    .output_owners
-                    .get(output.0)
-                    .ok_or(R7zError::InvalidFolderGraph)?;
-                let info = folder
-                    .coders
-                    .get(coder.0)
-                    .ok_or(R7zError::InvalidFolderGraph)?;
-                let arity = StreamArity::try_from(info)?;
-                if coder == bcj2 || arity.inputs != 1 || arity.outputs != 1 {
-                    return Err(R7zError::InvalidFolderGraph);
+        let mut input = input;
+        let mut coders = Vec::new();
+        let packed = loop {
+            match self
+                .input_sources
+                .get(input.0)
+                .ok_or(R7zError::InvalidFolderGraph)?
+            {
+                None => break packed_slot(input)?,
+                Some(output) => {
+                    let coder = *self
+                        .output_owners
+                        .get(output.0)
+                        .ok_or(R7zError::InvalidFolderGraph)?;
+                    let info = folder
+                        .coders
+                        .get(coder.0)
+                        .ok_or(R7zError::InvalidFolderGraph)?;
+                    let arity = StreamArity::try_from(info)?;
+                    if coder == bcj2 || arity.inputs != 1 || arity.outputs != 1 {
+                        return Err(R7zError::InvalidFolderGraph);
+                    }
+                    input = self
+                        .input_owners
+                        .iter()
+                        .position(|owner| *owner == coder)
+                        .map(InputStreamIndex)
+                        .ok_or(R7zError::InvalidFolderGraph)?;
+                    coders.push(Bcj2Coder {
+                        index: coder,
+                        output: *output,
+                    });
                 }
-                let producer_input = self
-                    .input_owners
-                    .iter()
-                    .position(|owner| *owner == coder)
-                    .map(InputStreamIndex)
-                    .ok_or(R7zError::InvalidFolderGraph)?;
-                if self.input_sources.get(producer_input.0) != Some(&None) {
-                    return Err(R7zError::InvalidFolderGraph);
-                }
-                Ok(Bcj2Channel {
-                    coder: Some(coder),
-                    packed: packed_slot(producer_input)?,
-                })
             }
-        }
+        };
+        coders.reverse();
+        Ok(Bcj2Channel { coders, packed })
     }
 }
 
@@ -910,10 +911,10 @@ mod tests {
                     packed_indices: smallvec![0, 2, 3, 4],
                 },
                 [
-                    (Some(CoderIndex(0)), PackedStreamIndex(0)),
-                    (None, PackedStreamIndex(1)),
-                    (None, PackedStreamIndex(2)),
-                    (None, PackedStreamIndex(3)),
+                    (vec![CoderIndex(0)], PackedStreamIndex(0)),
+                    (vec![], PackedStreamIndex(1)),
+                    (vec![], PackedStreamIndex(2)),
+                    (vec![], PackedStreamIndex(3)),
                 ],
             ),
             (
@@ -923,24 +924,33 @@ mod tests {
                     packed_indices: smallvec![2, 6, 1, 0],
                 },
                 [
-                    (Some(CoderIndex(2)), PackedStreamIndex(0)),
-                    (Some(CoderIndex(1)), PackedStreamIndex(2)),
-                    (Some(CoderIndex(0)), PackedStreamIndex(3)),
-                    (None, PackedStreamIndex(1)),
+                    (vec![CoderIndex(2)], PackedStreamIndex(0)),
+                    (vec![CoderIndex(1)], PackedStreamIndex(2)),
+                    (vec![CoderIndex(0)], PackedStreamIndex(3)),
+                    (vec![], PackedStreamIndex(1)),
                 ],
             ),
         ];
         for (folder, expected) in layouts {
             let graph = folder.graph().unwrap();
             let layout = graph.bcj2_layout(&folder).unwrap().unwrap();
-            let actual = [layout.main, layout.call, layout.jump, layout.control]
-                .map(|channel| (channel.coder, channel.packed));
+            let actual =
+                [&layout.main, &layout.call, &layout.jump, &layout.control].map(|channel| {
+                    (
+                        channel
+                            .coders
+                            .iter()
+                            .map(|coder| coder.index)
+                            .collect::<Vec<_>>(),
+                        channel.packed,
+                    )
+                });
             assert_eq!(actual, expected);
         }
     }
 
     #[test]
-    fn graph_rejects_unsupported_bcj2_connections() {
+    fn graph_collects_chained_bcj2_channel_coders_in_execution_order() {
         let bcj2_coder = || {
             let mut coder = copy_coder();
             coder.codec_id = ArrayVec::from_iter(SevenZMethod::Bcj2.id().iter().copied());
@@ -953,6 +963,19 @@ mod tests {
             packed_indices: smallvec![0, 3, 4, 5],
         };
         let graph = chained_main.graph().unwrap();
-        assert!(graph.bcj2_layout(&chained_main).is_err());
+        let layout = graph.bcj2_layout(&chained_main).unwrap().unwrap();
+        assert_eq!(
+            layout
+                .main
+                .coders
+                .iter()
+                .map(|coder| (coder.index, coder.output))
+                .collect::<Vec<_>>(),
+            vec![
+                (CoderIndex(0), OutputStreamIndex(0)),
+                (CoderIndex(1), OutputStreamIndex(1)),
+            ]
+        );
+        assert_eq!(layout.main.packed, PackedStreamIndex(0));
     }
 }
