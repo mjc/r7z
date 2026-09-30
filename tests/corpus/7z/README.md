@@ -38,6 +38,20 @@ R7Z_EXTERNAL_7Z_CORPUS_MANIFEST="$manifest" cargo test --test corpus_test
 The Apache Commons Compress corpus fetcher uses the project's GitHub test
 resources as an external source.
 
+## Reference executable inventory
+
+Record the pinned p7zip oracle and official 7-Zip 26.03 executable, their
+versions, SHA-256 hashes, and supported formats/methods with:
+
+```sh
+devenv shell -- bash scripts/record_7z_oracles.sh
+```
+
+The report and full method output are written under `target/oracle-inventory/`.
+Interop test processes print the selected p7zip executable's canonical path,
+version, and SHA-256 on first use; use `-- --nocapture` to include that line in
+successful test output. `P7ZIP_BIN` selects that executable.
+
 ## Official 7-Zip branch-filter fixtures
 
 `arm64*.7z` and `riscv*.7z` were created with official 7-Zip 26.03
