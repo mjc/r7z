@@ -908,6 +908,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bcj2_working_set_includes_the_control_branch_decoder() {
+        let aes = || coder(&[0x24, 6, 0xf1, 7, 1, 2, 0, 0]);
+        let bcj2 = || coder(&[0x14, 3, 3, 1, 0x1b, 4, 1]);
+        let folder = Folder {
+            coders: smallvec::smallvec![aes(), aes(), aes(), aes(), bcj2()],
+            bind_pairs: smallvec::smallvec![(4, 0), (5, 1), (6, 2), (7, 3)],
+            packed_indices: smallvec::smallvec![0, 1, 2, 3],
+        };
+        let graph = folder.graph().unwrap();
+        let outputs = [3, 1, 1, 1, 5];
+        let packed = [16, 16, 16, 16];
+        let one_aes = AES_CBC_WORKING_SET_BYTES + DECODER_OVERHEAD_BYTES;
+        let limit = one_aes * 3 + 10;
+
+        assert!(matches!(
+            DecoderPlan::compile_with_working_set_limit(
+                &folder,
+                &graph,
+                5,
+                &outputs,
+                &packed,
+                Some(limit as u64),
+            ),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "decoder working set",
+                limit: actual,
+            }) if actual == limit as u64
+        ));
+    }
+
     fn coder(bytes: &[u8]) -> crate::CoderInfo {
         crate::CoderInfo::parse(bytes).unwrap().1
     }
