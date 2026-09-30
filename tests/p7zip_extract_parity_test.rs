@@ -92,7 +92,9 @@ fn streaming_extract_reports_corrupt_lzma_and_lzma2_payloads() {
 
         let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
         let mut out = Vec::new();
-        let err = archive.extract_to_writer(0, &mut out).unwrap_err();
+        let err = archive
+            .extract_to_writer(r7z::ArchiveEntryIndex::new(0), &mut out)
+            .unwrap_err();
         assert!(matches!(
             err,
             r7z::R7zError::Crc | r7z::R7zError::Decompression
@@ -131,7 +133,9 @@ fn streaming_extract_stops_after_target_when_folder_crc_is_absent() {
 
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let mut out = Vec::new();
-    let written = archive.extract_to_writer(0, &mut out).unwrap();
+    let written = archive
+        .extract_to_writer(r7z::ArchiveEntryIndex::new(0), &mut out)
+        .unwrap();
     assert_eq!(written, 5);
     assert_eq!(out, b"first");
 }
@@ -152,10 +156,18 @@ fn assert_archive_file_apis_match_source(archive_path: &Path, source_root: &Path
             .unwrap_or(name.as_str());
         let expected = std::fs::read(source_root.join(relative)).unwrap();
 
-        assert_eq!(archive.extract_to_memory(i).unwrap(), expected, "{name}");
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(i))
+                .unwrap(),
+            expected,
+            "{name}"
+        );
 
         let mut out = Vec::new();
-        let written = archive.extract_to_writer(i, &mut out).unwrap();
+        let written = archive
+            .extract_to_writer(r7z::ArchiveEntryIndex::new(i), &mut out)
+            .unwrap();
         assert_eq!(written, expected.len() as u64, "{name}");
         assert_eq!(out, expected, "{name}");
     }
@@ -183,7 +195,8 @@ fn write_with_archive_writer(
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .unwrap()
         .compression(codec)
-        .expect("codec selection failed");
+        .expect("codec selection failed")
+        .start();
     for (idx, (path, data)) in files.iter().enumerate() {
         if multi_folder && idx == files.len() / 2 {
             writer.new_folder().unwrap();

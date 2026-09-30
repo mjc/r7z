@@ -171,7 +171,7 @@ pub struct ArchiveListing {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveListingEntry {
-    pub index: usize,
+    pub index: ArchiveEntryIndex,
     pub path: String,
     pub kind: ListingEntryKind,
     pub size: Option<u64>,
@@ -181,7 +181,7 @@ pub struct ArchiveListingEntry {
     pub crc: Option<u32>,
     pub encrypted: bool,
     pub methods: Vec<String>,
-    pub block: Option<usize>,
+    pub block: Option<FolderIndex>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,7 +196,7 @@ pub enum ListingEntryKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveEntryInfo {
     /// Zero-based index in the 7z `FilesInfo` table.
-    pub index: usize,
+    pub index: ArchiveEntryIndex,
     /// Display form of the archive entry name.
     pub name: String,
     /// Original UTF-16LE name code units, when the header contains a name.
@@ -216,7 +216,7 @@ impl ArchiveEntryInfo {
         let name = metadata.name();
         let safe_name = safe_archive_name(&name).ok();
         Self {
-            index: metadata.index.get(),
+            index: ArchiveEntryIndex::new(metadata.index.get()),
             name,
             raw_name: metadata.name.clone(),
             safe_name,
@@ -304,16 +304,19 @@ impl ArchiveReadSession<'_> {
     /// [`R7zError::ResourceLimitExceeded`].
     pub fn read_entry(
         &mut self,
-        index: usize,
+        index: ArchiveEntryIndex,
         callback: impl FnOnce(&mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<(), R7zError> {
         let next_index = self.count - self.files.len();
-        if !(next_index..self.count).contains(&index) {
+        if !(next_index..self.count).contains(&index.get()) {
             return Err(R7zError::InvalidOptions(
                 "read session requires increasing valid entry indexes",
             ));
         }
-        let file = self.files.nth(index - next_index)?.ok_or(R7zError::Parse)?;
+        let file = self
+            .files
+            .nth(index.get() - next_index)?
+            .ok_or(R7zError::Parse)?;
         let entry = ReadableEntry::from_file(file).ok_or(R7zError::Directory)?;
         self.decoder.read(entry, |_, reader| callback(reader))
     }
@@ -324,7 +327,7 @@ impl ArchiveReadSession<'_> {
     /// Returns the errors from [`read_entry`](Self::read_entry), or a writer error.
     pub fn extract_to_writer<W: Write + ?Sized>(
         &mut self,
-        index: usize,
+        index: ArchiveEntryIndex,
         writer: &mut W,
     ) -> Result<u64, R7zError> {
         let mut written = 0;
@@ -496,7 +499,7 @@ impl RawFolderBlock {
     }
 }
 
-/// Zero-based folder index scoped to one archive.
+/// Zero-based folder index in an archive.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FolderIndex(usize);
 
@@ -512,7 +515,7 @@ impl FolderIndex {
     }
 }
 
-/// Zero-based entry index scoped to one archive.
+/// Zero-based entry index in an archive.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ArchiveEntryIndex(usize);
 
@@ -838,9 +841,9 @@ impl Archive {
 
     /// Return high-level metadata for entry `index`.
     #[must_use]
-    pub fn entry(&self, index: usize) -> Option<ArchiveEntryInfo> {
+    pub fn entry(&self, index: ArchiveEntryIndex) -> Option<ArchiveEntryInfo> {
         Entries::new(self.header.files_info(), self.num_files())
-            .nth(index)
+            .nth(index.get())
             .map(|entry| ArchiveEntryInfo::from_entry(&entry))
     }
 
@@ -859,7 +862,7 @@ impl Archive {
     /// Returns [`R7zError::Parse`] when `index` is out of range and
     /// [`R7zError::UnsafePath`] when the stored name is absolute, contains parent
     /// traversal, uses a Windows drive/UNC prefix, or normalizes to an empty path.
-    pub fn safe_name(&self, index: usize) -> Result<PathBuf, R7zError> {
+    pub fn safe_name(&self, index: ArchiveEntryIndex) -> Result<PathBuf, R7zError> {
         let entry = self.entry(index).ok_or(R7zError::Parse)?;
         safe_archive_name(&entry.name)
     }
@@ -867,7 +870,7 @@ impl Archive {
     /// Return the normalized safe relative path for entry `index`, or `None` if
     /// the name is unsafe or the index is out of range.
     #[must_use]
-    pub fn enclosed_name(&self, index: usize) -> Option<PathBuf> {
+    pub fn enclosed_name(&self, index: ArchiveEntryIndex) -> Option<PathBuf> {
         self.safe_name(index).ok()
     }
 
@@ -995,7 +998,7 @@ impl Archive {
     /// Returns [`R7zError::Decompression`] if decompression fails.
     /// Returns [`R7zError::PasswordRequired`] if the archive is encrypted.
     /// Returns [`R7zError::ResourceLimitExceeded`] if a decoder resource cap is exceeded.
-    pub fn extract_to_memory(&self, file_index: usize) -> Result<Vec<u8>, R7zError> {
+    pub fn extract_to_memory(&self, file_index: ArchiveEntryIndex) -> Result<Vec<u8>, R7zError> {
         self.extract_to_memory_with_options(file_index, ArchiveReadConfig::default())
     }
 
@@ -1005,7 +1008,7 @@ impl Archive {
     /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
     pub fn extract_to_memory_with_options(
         &self,
-        file_index: usize,
+        file_index: ArchiveEntryIndex,
         config: ArchiveReadConfig<'_>,
     ) -> Result<Vec<u8>, R7zError> {
         let mut output = LimitedOutput::new(config.options.max_retained_output_bytes);
@@ -1027,7 +1030,7 @@ impl Archive {
     /// [`R7zError::ResourceLimitExceeded`] if a decoder resource cap is exceeded.
     pub fn extract_to_memory_with_password(
         &self,
-        file_index: usize,
+        file_index: ArchiveEntryIndex,
         password: Option<&str>,
     ) -> Result<Vec<u8>, R7zError> {
         self.extract_to_memory_with_options(
@@ -1095,7 +1098,7 @@ impl Archive {
     /// writer failures and [`R7zError::ResourceLimitExceeded`] for decoder caps.
     pub fn extract_to_writer<W: Write + ?Sized>(
         &self,
-        file_index: usize,
+        file_index: ArchiveEntryIndex,
         writer: &mut W,
     ) -> Result<u64, R7zError> {
         self.extract_to_writer_with_options(file_index, writer, ArchiveReadConfig::default())
@@ -1107,12 +1110,12 @@ impl Archive {
     /// Returns [`R7zError::ResourceLimitExceeded`] if a decoder limit is exceeded.
     pub fn extract_to_writer_with_options<W: Write + ?Sized>(
         &self,
-        file_index: usize,
+        file_index: ArchiveEntryIndex,
         writer: &mut W,
         config: ArchiveReadConfig<'_>,
     ) -> Result<u64, R7zError> {
         let entry = Entries::new(self.try_files_info()?, self.num_files())
-            .nth(file_index)
+            .nth(file_index.get())
             .ok_or(R7zError::Parse)?;
         match entry.kind {
             EntryKind::Directory | EntryKind::Anti => return Err(R7zError::Directory),
@@ -1194,7 +1197,7 @@ impl Archive {
     /// writer failures.
     pub fn extract_to_writer_with_password<W: Write + ?Sized>(
         &self,
-        file_index: usize,
+        file_index: ArchiveEntryIndex,
         writer: &mut W,
         password: Option<&str>,
     ) -> Result<u64, R7zError> {
@@ -1324,7 +1327,11 @@ impl Archive {
     ///
     /// Returns archive parse, codec, password, CRC, resource-limit, and callback
     /// errors.
-    pub fn stream_selected_files<F>(&self, indices: &[usize], callback: F) -> Result<(), R7zError>
+    pub fn stream_selected_files<F>(
+        &self,
+        indices: &[ArchiveEntryIndex],
+        callback: F,
+    ) -> Result<(), R7zError>
     where
         F: FnMut(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     {
@@ -1336,7 +1343,7 @@ impl Archive {
     /// Returns [`R7zError::ResourceLimitExceeded`] when a limit is exceeded.
     pub fn stream_selected_files_with_options<F>(
         &self,
-        indices: &[usize],
+        indices: &[ArchiveEntryIndex],
         config: ArchiveReadConfig<'_>,
         callback: F,
     ) -> Result<(), R7zError>
@@ -1362,7 +1369,7 @@ impl Archive {
     /// exceeded.
     pub fn stream_selected_files_with_password<F>(
         &self,
-        indices: &[usize],
+        indices: &[ArchiveEntryIndex],
         password: Option<&str>,
         callback: F,
     ) -> Result<(), R7zError>
@@ -1378,7 +1385,7 @@ impl Archive {
 
     fn stream_files_impl<F>(
         &self,
-        indices: Option<&[usize]>,
+        indices: Option<&[ArchiveEntryIndex]>,
         config: ArchiveReadConfig<'_>,
         callback: F,
     ) -> Result<(), R7zError>
@@ -1441,7 +1448,10 @@ impl Archive {
         decoder.finish()
     }
 
-    pub fn symlink_target(&self, file_index: usize) -> Result<Option<String>, R7zError> {
+    pub fn symlink_target(
+        &self,
+        file_index: ArchiveEntryIndex,
+    ) -> Result<Option<String>, R7zError> {
         self.symlink_target_with_options(file_index, ArchiveReadConfig::default())
     }
 
@@ -1451,10 +1461,11 @@ impl Archive {
     /// Returns [`R7zError::ResourceLimitExceeded`] if a configured limit is exceeded.
     pub fn symlink_target_with_options(
         &self,
-        file_index: usize,
+        file_index: ArchiveEntryIndex,
         config: ArchiveReadConfig<'_>,
     ) -> Result<Option<String>, R7zError> {
-        let Some(entry) = Entries::new(self.try_files_info()?, self.num_files()).nth(file_index)
+        let Some(entry) =
+            Entries::new(self.try_files_info()?, self.num_files()).nth(file_index.get())
         else {
             return Ok(None);
         };
@@ -1477,7 +1488,7 @@ impl Archive {
             EntryType::Anti => ListingEntryKind::Anti,
         };
         let mut entry = ArchiveListingEntry {
-            index: file.metadata.index.get(),
+            index: ArchiveEntryIndex::new(file.metadata.index.get()),
             path: file.metadata.name(),
             kind,
             size: None,
@@ -1499,7 +1510,7 @@ impl Archive {
                 entry.crc = location.stream.digest;
                 entry.methods = folder_method_names(location.folder.folder());
                 entry.encrypted = folder_is_encrypted(location.folder.folder());
-                entry.block = Some(location.folder_index.get());
+                entry.block = Some(FolderIndex::new(location.folder_index.get()));
             }
             EntryKind::EmptyFile | EntryKind::EmptySymlink => {
                 entry.size = Some(0);
@@ -1511,7 +1522,7 @@ impl Archive {
         entry
     }
 
-    fn entry_index_by_name(&self, name: &str) -> Result<usize, R7zError> {
+    fn entry_index_by_name(&self, name: &str) -> Result<ArchiveEntryIndex, R7zError> {
         if let Some(entry) = self.entries().find(|entry| entry.name == name) {
             return Ok(entry.index);
         }
@@ -2326,7 +2337,7 @@ mod selected_stream_tests {
         let mut visited = Vec::new();
 
         let result = archive.stream_selected_files_with_options(
-            &[0, 1],
+            &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(1)],
             ArchiveReadConfig::new(ArchiveReadOptions {
                 max_decoder_working_set_bytes: None,
                 max_total_decoded_bytes: Some(6),
@@ -2347,7 +2358,7 @@ mod selected_stream_tests {
                 limit: 6,
             })
         ));
-        assert_eq!(visited, [(0, 4)]);
+        assert_eq!(visited, [(ArchiveEntryIndex::new(0), 4)]);
     }
 
     #[test]
@@ -2368,7 +2379,7 @@ mod selected_stream_tests {
         let mut callback_called = false;
 
         let result = archive.stream_selected_files_with_options(
-            &[0],
+            &[ArchiveEntryIndex::new(0)],
             ArchiveReadConfig::new(ArchiveReadOptions {
                 max_decoder_working_set_bytes: Some(0),
                 ..ArchiveReadOptions::default()
@@ -2399,7 +2410,7 @@ mod selected_stream_tests {
         let archive = Archive::from_bytes(bytes.into()).unwrap();
 
         let result = archive.extract_to_memory_with_options(
-            0,
+            ArchiveEntryIndex::new(0),
             ArchiveReadConfig::new(ArchiveReadOptions {
                 max_decoder_working_set_bytes: None,
                 max_total_decoded_bytes: None,
@@ -2437,7 +2448,7 @@ mod selected_stream_tests {
         let mut callback_called = false;
 
         let result = archive.stream_selected_files_with_options(
-            &[0],
+            &[ArchiveEntryIndex::new(0)],
             ArchiveReadConfig::new(ArchiveReadOptions {
                 max_decoder_working_set_bytes: None,
                 max_total_decoded_bytes: Some(2),
@@ -2464,7 +2475,7 @@ mod selected_stream_tests {
     fn symlink_target_options_apply_retained_output_limit() {
         let archive = mixed_entry_archive();
         let result = archive.symlink_target_with_options(
-            6,
+            ArchiveEntryIndex::new(6),
             ArchiveReadConfig::new(ArchiveReadOptions {
                 max_decoder_working_set_bytes: None,
                 max_total_decoded_bytes: None,
@@ -2580,15 +2591,24 @@ mod selected_stream_tests {
         let mut seen = Vec::new();
 
         archive
-            .stream_selected_files(&[1, 0], |entry, reader| {
-                let mut first_byte = [0; 1];
-                reader.read_exact(&mut first_byte)?;
-                seen.push((entry.index, first_byte[0]));
-                Ok(())
-            })
+            .stream_selected_files(
+                &[ArchiveEntryIndex::new(1), ArchiveEntryIndex::new(0)],
+                |entry, reader| {
+                    let mut first_byte = [0; 1];
+                    reader.read_exact(&mut first_byte)?;
+                    seen.push((entry.index, first_byte[0]));
+                    Ok(())
+                },
+            )
             .unwrap();
 
-        assert_eq!(seen, vec![(0, b'f'), (1, b's')]);
+        assert_eq!(
+            seen,
+            vec![
+                (ArchiveEntryIndex::new(0), b'f'),
+                (ArchiveEntryIndex::new(1), b's')
+            ]
+        );
     }
 
     #[test]
@@ -2603,7 +2623,9 @@ mod selected_stream_tests {
         for solid in modes {
             let (bytes, expected) = archive_with_many_files(solid);
             let archive = Archive::from_bytes(Bytes::from(bytes)).unwrap();
-            let mut indices = (0..expected.len()).collect::<Vec<_>>();
+            let mut indices = (0..expected.len())
+                .map(ArchiveEntryIndex::new)
+                .collect::<Vec<_>>();
             indices.reverse();
             let mut seen = Vec::new();
             archive
@@ -2617,7 +2639,7 @@ mod selected_stream_tests {
 
             assert_eq!(seen.len(), expected.len());
             for (index, data) in seen {
-                assert_eq!(data, expected[index]);
+                assert_eq!(data, expected[index.get()]);
             }
 
             let listing = archive.listing(None).unwrap();
@@ -2659,18 +2681,27 @@ mod selected_stream_tests {
 
         let mut seen = Vec::new();
         archive
-            .stream_selected_files(&[0, 1], |entry, reader| {
-                let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes).map_err(R7zError::Io)?;
-                seen.push((entry.index, bytes));
-                Ok(())
-            })
+            .stream_selected_files(
+                &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(1)],
+                |entry, reader| {
+                    let mut bytes = Vec::new();
+                    reader.read_to_end(&mut bytes).map_err(R7zError::Io)?;
+                    seen.push((entry.index, bytes));
+                    Ok(())
+                },
+            )
             .unwrap();
 
-        assert_eq!(seen, [(0, Vec::new()), (1, b"payload".to_vec())]);
+        assert_eq!(
+            seen,
+            [
+                (ArchiveEntryIndex::new(0), Vec::new()),
+                (ArchiveEntryIndex::new(1), b"payload".to_vec())
+            ]
+        );
         let listing = archive.listing(None).unwrap();
         assert_eq!(listing.entries[0].block, None);
-        assert_eq!(listing.entries[1].block, Some(0));
+        assert_eq!(listing.entries[1].block, Some(FolderIndex::new(0)));
         assert_eq!(listing.entries[1].size, Some(7));
         assert_eq!(listing.entries[1].packed_size, Some(7));
     }
@@ -2699,12 +2730,15 @@ mod selected_stream_tests {
 
         let mut seen = Vec::new();
         archive
-            .stream_selected_files(&[selected_index], |_entry, reader| {
-                let mut first_byte = [0; 1];
-                reader.read_exact(&mut first_byte)?;
-                seen.push(first_byte[0]);
-                Ok(())
-            })
+            .stream_selected_files(
+                &[ArchiveEntryIndex::new(selected_index)],
+                |_entry, reader| {
+                    let mut first_byte = [0; 1];
+                    reader.read_exact(&mut first_byte)?;
+                    seen.push(first_byte[0]);
+                    Ok(())
+                },
+            )
             .unwrap();
 
         assert_eq!(seen, vec![b'f']);
@@ -2720,13 +2754,16 @@ mod selected_stream_tests {
         };
 
         assert!(matches!(
-            archive.stream_selected_files(&[3], &mut callback),
+            archive.stream_selected_files(&[ArchiveEntryIndex::new(3)], &mut callback),
             Err(R7zError::InvalidOptions(
                 "selected entry index out of bounds"
             ))
         ));
         assert!(matches!(
-            archive.stream_selected_files(&[1, 1], &mut callback),
+            archive.stream_selected_files(
+                &[ArchiveEntryIndex::new(1), ArchiveEntryIndex::new(1)],
+                &mut callback
+            ),
             Err(R7zError::InvalidOptions("duplicate selected entry index"))
         ));
         assert_eq!(calls, 0);
@@ -2763,17 +2800,28 @@ mod selected_stream_tests {
         let mut seen = Vec::new();
 
         archive
-            .stream_selected_files(&[2, 1, 0], |entry, reader| {
-                let mut first_byte = [0; 1];
-                let n = reader.read(&mut first_byte)?;
-                seen.push((entry.index, first_byte[..n].to_vec()));
-                Ok(())
-            })
+            .stream_selected_files(
+                &[
+                    ArchiveEntryIndex::new(2),
+                    ArchiveEntryIndex::new(1),
+                    ArchiveEntryIndex::new(0),
+                ],
+                |entry, reader| {
+                    let mut first_byte = [0; 1];
+                    let n = reader.read(&mut first_byte)?;
+                    seen.push((entry.index, first_byte[..n].to_vec()));
+                    Ok(())
+                },
+            )
             .unwrap();
 
         assert_eq!(
             seen,
-            vec![(0, b"f".to_vec()), (1, Vec::new()), (2, b"l".to_vec())]
+            vec![
+                (ArchiveEntryIndex::new(0), b"f".to_vec()),
+                (ArchiveEntryIndex::new(1), Vec::new()),
+                (ArchiveEntryIndex::new(2), b"l".to_vec())
+            ]
         );
     }
 
@@ -2810,8 +2858,8 @@ mod selected_stream_tests {
             archive.entries().zip(&listing.entries).zip(expected)
         {
             assert_eq!(entry.entry_type, kind);
-            assert_eq!(files.entry_type(entry.index), kind);
-            assert_eq!(files.is_directory(entry.index), entry.is_directory());
+            assert_eq!(files.entry_type(entry.index.get()), kind);
+            assert_eq!(files.is_directory(entry.index.get()), entry.is_directory());
             assert_eq!(entry.has_data_stream(), has_stream);
             assert_eq!(listing.kind, listing_kind);
             assert_eq!(listing.path, entry.name);
@@ -2824,14 +2872,32 @@ mod selected_stream_tests {
                 assert!(matches!(extracted, Err(R7zError::Directory)));
             }
         }
-        assert_eq!(archive.symlink_target(2).unwrap().as_deref(), Some(""));
-        assert_eq!(archive.symlink_target(3).unwrap().as_deref(), Some(""));
-        assert_eq!(archive.symlink_target(4).unwrap(), None);
         assert_eq!(
-            archive.symlink_target(6).unwrap().as_deref(),
+            archive
+                .symlink_target(ArchiveEntryIndex::new(2))
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            archive
+                .symlink_target(ArchiveEntryIndex::new(3))
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            archive.symlink_target(ArchiveEntryIndex::new(4)).unwrap(),
+            None
+        );
+        assert_eq!(
+            archive
+                .symlink_target(ArchiveEntryIndex::new(6))
+                .unwrap()
+                .as_deref(),
             Some("target")
         );
-        assert!(archive.entry(7).is_none());
+        assert!(archive.entry(ArchiveEntryIndex::new(7)).is_none());
     }
 
     #[test]
@@ -2839,21 +2905,36 @@ mod selected_stream_tests {
         let archive = mixed_entry_archive();
         let mut seen = Vec::new();
         archive
-            .stream_selected_files(&[6, 4, 3, 2, 1, 0, 5], |entry, reader| {
-                let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes)?;
-                seen.push((entry.index, entry.name.clone(), bytes));
-                Ok(())
-            })
+            .stream_selected_files(
+                &[
+                    ArchiveEntryIndex::new(6),
+                    ArchiveEntryIndex::new(4),
+                    ArchiveEntryIndex::new(3),
+                    ArchiveEntryIndex::new(2),
+                    ArchiveEntryIndex::new(1),
+                    ArchiveEntryIndex::new(0),
+                    ArchiveEntryIndex::new(5),
+                ],
+                |entry, reader| {
+                    let mut bytes = Vec::new();
+                    reader.read_to_end(&mut bytes)?;
+                    seen.push((entry.index, entry.name.clone(), bytes));
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(
             seen,
             [
-                (1, "empty".into(), Vec::new()),
-                (2, "empty-link".into(), Vec::new()),
-                (3, "mode-link".into(), Vec::new()),
-                (5, "data".into(), b"payload".to_vec()),
-                (6, "link".into(), b"target".to_vec()),
+                (ArchiveEntryIndex::new(1), "empty".into(), Vec::new()),
+                (ArchiveEntryIndex::new(2), "empty-link".into(), Vec::new()),
+                (ArchiveEntryIndex::new(3), "mode-link".into(), Vec::new()),
+                (
+                    ArchiveEntryIndex::new(5),
+                    "data".into(),
+                    b"payload".to_vec()
+                ),
+                (ArchiveEntryIndex::new(6), "link".into(), b"target".to_vec()),
             ]
         );
         let destination = tempfile::tempdir().unwrap();
@@ -2920,7 +3001,7 @@ mod selected_stream_tests {
             let public_entry = public.nth(skip).unwrap();
             assert_eq!(raw_entry.metadata.index.get(), index);
             assert_eq!(raw_entry.metadata.name(), name);
-            assert_eq!(public_entry.index, index);
+            assert_eq!(public_entry.index, ArchiveEntryIndex::new(index));
             assert_eq!(public_entry.name, name);
             assert_eq!(raw.len(), 6 - index);
             assert_eq!(public.len(), 6 - index);
@@ -2931,7 +3012,7 @@ mod selected_stream_tests {
         assert_eq!(public.len(), 0);
         assert!(raw.next().is_none());
         assert!(public.next().is_none());
-        assert!(archive.entry(usize::MAX).is_none());
+        assert!(archive.entry(ArchiveEntryIndex::new(usize::MAX)).is_none());
     }
 
     #[test]
@@ -2964,24 +3045,33 @@ mod selected_stream_tests {
         .unwrap();
         count.store(0, Ordering::Relaxed);
         archive
-            .stream_selected_files(&[0, 1], |_, _| Ok(()))
+            .stream_selected_files(
+                &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(1)],
+                |_, _| Ok(()),
+            )
             .unwrap();
         let batched = count.swap(0, Ordering::Relaxed);
         let mut session = archive.read_session(None).unwrap();
         session
-            .read_entry(0, |reader| {
+            .read_entry(ArchiveEntryIndex::new(0), |reader| {
                 let mut first = [0];
                 reader.read_exact(&mut first)?;
                 Ok(())
             })
             .unwrap();
-        session.read_entry(1, |_| Ok(())).unwrap();
+        session
+            .read_entry(ArchiveEntryIndex::new(1), |_| Ok(()))
+            .unwrap();
         session.finish().unwrap();
         let reused = count.swap(0, Ordering::Relaxed);
         assert!(reused > 0);
         assert_eq!(reused, batched);
-        archive.extract_to_writer(0, &mut std::io::sink()).unwrap();
-        archive.extract_to_writer(1, &mut std::io::sink()).unwrap();
+        archive
+            .extract_to_writer(ArchiveEntryIndex::new(0), &mut std::io::sink())
+            .unwrap();
+        archive
+            .extract_to_writer(ArchiveEntryIndex::new(1), &mut std::io::sink())
+            .unwrap();
         assert!(count.load(Ordering::Relaxed) > reused);
     }
 
@@ -2989,39 +3079,53 @@ mod selected_stream_tests {
     fn read_session_rejects_invalid_order_without_consuming_valid_requests() {
         let archive = mixed_entry_archive();
         archive
-            .stream_selected_files(&[0, 4], |_, _| panic!("non-file batch callback"))
+            .stream_selected_files(
+                &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(4)],
+                |_, _| panic!("non-file batch callback"),
+            )
             .unwrap();
         let mut session = archive.read_session(None).unwrap();
         assert!(matches!(
-            session.read_entry(usize::MAX, |_| panic!("invalid index")),
+            session.read_entry(ArchiveEntryIndex::new(usize::MAX), |_| panic!(
+                "invalid index"
+            )),
             Err(R7zError::InvalidOptions(_))
         ));
         assert!(matches!(
-            session.read_entry(0, |_| panic!("directory")),
+            session.read_entry(ArchiveEntryIndex::new(0), |_| panic!("directory")),
             Err(R7zError::Directory)
         ));
         for index in [1, 2, 3] {
             assert_eq!(
-                session.extract_to_writer(index, &mut Vec::new()).unwrap(),
+                session
+                    .extract_to_writer(ArchiveEntryIndex::new(index), &mut Vec::new())
+                    .unwrap(),
                 0
             );
         }
         assert!(matches!(
-            session.read_entry(4, |_| panic!("anti-item")),
+            session.read_entry(ArchiveEntryIndex::new(4), |_| panic!("anti-item")),
             Err(R7zError::Directory)
         ));
         assert!(matches!(
-            session.read_entry(3, |_| panic!("backward")),
+            session.read_entry(ArchiveEntryIndex::new(3), |_| panic!("backward")),
             Err(R7zError::InvalidOptions(_))
         ));
         let mut data = Vec::new();
-        assert_eq!(session.extract_to_writer(5, &mut data).unwrap(), 7);
+        assert_eq!(
+            session
+                .extract_to_writer(ArchiveEntryIndex::new(5), &mut data)
+                .unwrap(),
+            7
+        );
         assert_eq!(data, b"payload");
         assert!(matches!(
-            session.read_entry(5, |_| panic!("repeated")),
+            session.read_entry(ArchiveEntryIndex::new(5), |_| panic!("repeated")),
             Err(R7zError::InvalidOptions(_))
         ));
-        session.extract_to_writer(6, &mut std::io::sink()).unwrap();
+        session
+            .extract_to_writer(ArchiveEntryIndex::new(6), &mut std::io::sink())
+            .unwrap();
         session.finish().unwrap();
     }
 
@@ -3030,13 +3134,17 @@ mod selected_stream_tests {
         let archive = mixed_entry_archive();
         let mut session = archive.read_session(None).unwrap();
         let mut data = Vec::new();
-        session.extract_to_writer(5, &mut data).unwrap();
+        session
+            .extract_to_writer(ArchiveEntryIndex::new(5), &mut data)
+            .unwrap();
         assert_eq!(data, b"payload");
         assert!(matches!(
-            session.read_entry(4, |_| panic!("skipped index")),
+            session.read_entry(ArchiveEntryIndex::new(4), |_| panic!("skipped index")),
             Err(R7zError::InvalidOptions(_))
         ));
-        session.extract_to_writer(6, &mut std::io::sink()).unwrap();
+        session
+            .extract_to_writer(ArchiveEntryIndex::new(6), &mut std::io::sink())
+            .unwrap();
         session.finish().unwrap();
     }
 
@@ -3049,7 +3157,7 @@ mod selected_stream_tests {
             }
             let archive = Archive::from_bytes(bytes.into()).unwrap();
             let mut session = archive.read_session(None).unwrap();
-            let result = session.read_entry(0, |reader| {
+            let result = session.read_entry(ArchiveEntryIndex::new(0), |reader| {
                 if !corrupt {
                     return Err(R7zError::InvalidOptions("callback failure"));
                 }
@@ -3059,8 +3167,15 @@ mod selected_stream_tests {
             assert!(result.is_err());
             session.finish_folder().unwrap();
             let mut data = Vec::new();
-            session.extract_to_writer(2, &mut data).unwrap();
-            assert_eq!(data, archive.extract_to_memory(2).unwrap());
+            session
+                .extract_to_writer(ArchiveEntryIndex::new(2), &mut data)
+                .unwrap();
+            assert_eq!(
+                data,
+                archive
+                    .extract_to_memory(ArchiveEntryIndex::new(2))
+                    .unwrap()
+            );
             session.finish().unwrap();
         }
     }
@@ -3071,7 +3186,9 @@ mod selected_stream_tests {
         corrupt_stream_data(&mut bytes, 1);
         let archive = Archive::from_bytes(bytes.into()).unwrap();
         let mut session = archive.read_session(None).unwrap();
-        session.extract_to_writer(0, &mut std::io::sink()).unwrap();
+        session
+            .extract_to_writer(ArchiveEntryIndex::new(0), &mut std::io::sink())
+            .unwrap();
         session.finish().unwrap();
     }
 
@@ -3138,13 +3255,15 @@ mod selected_stream_tests {
         let archive = archive_with_folder_crc_failure();
         let mut session = archive.read_session(None).unwrap();
         let mut output = Vec::new();
-        session.extract_to_writer(0, &mut output).unwrap();
+        session
+            .extract_to_writer(ArchiveEntryIndex::new(0), &mut output)
+            .unwrap();
         assert_eq!(output, b"ab");
         assert!(matches!(session.finish_folder(), Err(R7zError::Crc)));
         session.finish().unwrap();
 
         let mut output = Vec::new();
-        let result = archive.stream_selected_files(&[0], |_, reader| {
+        let result = archive.stream_selected_files(&[ArchiveEntryIndex::new(0)], |_, reader| {
             let mut first = [0];
             reader.read_exact(&mut first)?;
             output.extend_from_slice(&first);
@@ -3162,17 +3281,25 @@ mod selected_stream_tests {
         let archive = counted_archive(archive_with_folder_crc_failure_bytes(), &bytes_read);
         bytes_read.store(0, Ordering::Relaxed);
         let mut visited = Vec::new();
-        let result = archive.stream_selected_files(&[0, 2], |entry, reader| {
-            visited.push(entry.index);
-            let mut first = [0];
-            reader.read_exact(&mut first)?;
-            Err(R7zError::InvalidOptions("cancelled"))
-        });
+        let result = archive.stream_selected_files(
+            &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(2)],
+            |entry, reader| {
+                visited.push(entry.index);
+                let mut first = [0];
+                reader.read_exact(&mut first)?;
+                Err(R7zError::InvalidOptions("cancelled"))
+            },
+        );
 
-        assert_eq!(visited, [0]);
+        assert_eq!(visited, [ArchiveEntryIndex::new(0)]);
         assert!(matches!(result, Err(R7zError::InvalidOptions("cancelled"))));
         assert_eq!(bytes_read.load(Ordering::Relaxed), 1);
-        assert_eq!(archive.extract_to_memory(2).unwrap(), b"ef");
+        assert_eq!(
+            archive
+                .extract_to_memory(ArchiveEntryIndex::new(2))
+                .unwrap(),
+            b"ef"
+        );
     }
 
     #[test]
@@ -3184,7 +3311,7 @@ mod selected_stream_tests {
         bytes_read.store(0, Ordering::Relaxed);
         let mut session = archive.read_session(None).unwrap();
         session
-            .read_entry(0, |reader| {
+            .read_entry(ArchiveEntryIndex::new(0), |reader| {
                 let mut first = [0];
                 reader.read_exact(&mut first)?;
                 assert_eq!(first, [b'a']);
@@ -3201,12 +3328,13 @@ mod selected_stream_tests {
         let mut calls = 0;
         let archive = archive_with_folder_crc_failure();
         for _ in 0..2 {
-            let result = archive.stream_selected_files(&[0], |_, reader| {
-                calls += 1;
-                let mut first = [0];
-                reader.read_exact(&mut first)?;
-                Ok(())
-            });
+            let result =
+                archive.stream_selected_files(&[ArchiveEntryIndex::new(0)], |_, reader| {
+                    calls += 1;
+                    let mut first = [0];
+                    reader.read_exact(&mut first)?;
+                    Ok(())
+                });
             assert!(matches!(result, Err(R7zError::Crc)));
         }
         assert_eq!(calls, 2);
@@ -3216,9 +3344,11 @@ mod selected_stream_tests {
     fn folder_switch_reports_completion_failure_before_the_next_callback() {
         let archive = archive_with_folder_crc_failure();
         let mut session = archive.read_session(None).unwrap();
-        session.extract_to_writer(0, &mut std::io::sink()).unwrap();
+        session
+            .extract_to_writer(ArchiveEntryIndex::new(0), &mut std::io::sink())
+            .unwrap();
         assert!(matches!(
-            session.read_entry(2, |_| panic!(
+            session.read_entry(ArchiveEntryIndex::new(2), |_| panic!(
                 "next folder callback after failed completion"
             )),
             Err(R7zError::Crc)
@@ -3226,12 +3356,20 @@ mod selected_stream_tests {
         session.finish().unwrap();
 
         let mut visited = Vec::new();
-        let result = archive.stream_selected_files(&[0, 2], |entry, _| {
-            visited.push(entry.index);
-            Ok(())
-        });
-        assert_eq!(visited, [0]);
+        let result = archive.stream_selected_files(
+            &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(2)],
+            |entry, _| {
+                visited.push(entry.index);
+                Ok(())
+            },
+        );
+        assert_eq!(visited, [ArchiveEntryIndex::new(0)]);
         assert!(matches!(result, Err(R7zError::Crc)));
-        assert_eq!(archive.extract_to_memory(2).unwrap(), b"ef");
+        assert_eq!(
+            archive
+                .extract_to_memory(ArchiveEntryIndex::new(2))
+                .unwrap(),
+            b"ef"
+        );
     }
 }

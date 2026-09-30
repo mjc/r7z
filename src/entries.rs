@@ -1,5 +1,5 @@
 use crate::files_info::FilesInfoNameSlices;
-use crate::{EntryType, FilesInfo, R7zError};
+use crate::{ArchiveEntryIndex, EntryType, FilesInfo, R7zError};
 use bytes::Bytes;
 use std::borrow::Cow;
 
@@ -207,19 +207,22 @@ pub(crate) enum EntrySelection<'a> {
     Empty,
     All(std::ops::Range<usize>),
     Selected {
-        indices: Cow<'a, [usize]>,
+        indices: Cow<'a, [ArchiveEntryIndex]>,
         position: usize,
     },
 }
 
 impl<'a> EntrySelection<'a> {
-    pub(crate) fn new(indices: Option<&'a [usize]>, count: usize) -> Result<Self, R7zError> {
+    pub(crate) fn new(
+        indices: Option<&'a [ArchiveEntryIndex]>,
+        count: usize,
+    ) -> Result<Self, R7zError> {
         let indices = match indices {
             None => return Ok(Self::All(0..count)),
             Some([]) => return Ok(Self::Empty),
             Some(indices) => indices,
         };
-        if indices.iter().any(|&index| index >= count) {
+        if indices.iter().any(|index| index.get() >= count) {
             return Err(R7zError::InvalidOptions(
                 "selected entry index out of bounds",
             ));
@@ -251,7 +254,7 @@ impl Iterator for EntrySelection<'_> {
             Self::Selected { indices, position } => {
                 let index = *indices.get(*position)?;
                 *position += 1;
-                Some(EntryIndex(index))
+                Some(EntryIndex(index.get()))
             }
         }
     }
@@ -288,7 +291,13 @@ mod tests {
 
     #[test]
     fn selection_borrows_sorted_inputs_and_owns_only_reordered_inputs() {
-        for indices in [&[1][..], &[0, 2, 4][..]] {
+        let one = [ArchiveEntryIndex::new(1)];
+        let ascending = [
+            ArchiveEntryIndex::new(0),
+            ArchiveEntryIndex::new(2),
+            ArchiveEntryIndex::new(4),
+        ];
+        for indices in [&one[..], &ascending[..]] {
             let selection = EntrySelection::new(Some(indices), 5).unwrap();
             assert!(matches!(
                 selection,
@@ -298,7 +307,11 @@ mod tests {
                 }
             ));
         }
-        let indices = [4, 0, 2];
+        let indices = [
+            ArchiveEntryIndex::new(4),
+            ArchiveEntryIndex::new(0),
+            ArchiveEntryIndex::new(2),
+        ];
         let selection = EntrySelection::new(Some(&indices), 5).unwrap();
         assert!(matches!(
             selection,
@@ -309,34 +322,45 @@ mod tests {
         ));
         let selected = selection.map(EntryIndex::get).collect::<Vec<_>>();
         assert_eq!(selected, [0, 2, 4]);
-        assert_eq!(indices, [4, 0, 2]);
+        assert_eq!(indices.map(ArchiveEntryIndex::get), [4, 0, 2]);
     }
 
     #[test]
     fn selection_iterator_tracks_remaining_indexes() {
-        [None, Some(&[2, 0, 1][..])]
-            .into_iter()
-            .for_each(|indices| {
-                let mut selection = EntrySelection::new(indices, 3).unwrap();
-                assert_eq!(selection.size_hint(), (3, Some(3)));
-                assert_eq!(selection.next().map(EntryIndex::get), Some(0));
-                assert_eq!(selection.len(), 2);
-                assert_eq!(selection.nth(1).map(EntryIndex::get), Some(2));
-                assert_eq!(selection.size_hint(), (0, Some(0)));
-                assert!(selection.next().is_none());
-                assert!(selection.next().is_none());
-            });
+        let indices = [
+            ArchiveEntryIndex::new(2),
+            ArchiveEntryIndex::new(0),
+            ArchiveEntryIndex::new(1),
+        ];
+        [None, Some(&indices[..])].into_iter().for_each(|indices| {
+            let mut selection = EntrySelection::new(indices, 3).unwrap();
+            assert_eq!(selection.size_hint(), (3, Some(3)));
+            assert_eq!(selection.next().map(EntryIndex::get), Some(0));
+            assert_eq!(selection.len(), 2);
+            assert_eq!(selection.nth(1).map(EntryIndex::get), Some(2));
+            assert_eq!(selection.size_hint(), (0, Some(0)));
+            assert!(selection.next().is_none());
+            assert!(selection.next().is_none());
+        });
     }
 
     #[test]
     fn selection_rejects_duplicate_and_out_of_range_indices() {
-        for indices in [&[1, 1][..], &[2, 0, 2][..]] {
+        let duplicate = [ArchiveEntryIndex::new(1), ArchiveEntryIndex::new(1)];
+        let repeated = [
+            ArchiveEntryIndex::new(2),
+            ArchiveEntryIndex::new(0),
+            ArchiveEntryIndex::new(2),
+        ];
+        for indices in [&duplicate[..], &repeated[..]] {
             assert!(matches!(
                 EntrySelection::new(Some(indices), 3),
                 Err(R7zError::InvalidOptions("duplicate selected entry index"))
             ));
         }
-        for indices in [&[3][..], &[usize::MAX][..]] {
+        let out_of_range = [ArchiveEntryIndex::new(3)];
+        let too_large = [ArchiveEntryIndex::new(usize::MAX)];
+        for indices in [&out_of_range[..], &too_large[..]] {
             assert!(matches!(
                 EntrySelection::new(Some(indices), 3),
                 Err(R7zError::InvalidOptions(

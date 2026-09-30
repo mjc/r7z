@@ -335,7 +335,12 @@ fn cli_create_accepts_p7zip_method_chain_options() {
         .find(|coder| coder.codec_id.as_slice() == r7z::CODEC_LZMA2)
         .unwrap();
     assert_eq!(lzma2.properties.as_deref(), Some(&[16][..]));
-    assert_eq!(archive.extract_to_memory(0).unwrap(), vec![0x5Au8; 4096]);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        vec![0x5Au8; 4096]
+    );
 }
 
 #[test]
@@ -364,14 +369,14 @@ fn cli_create_accepts_lzma_match_finder_options() {
     assert_eq!(
         r7z::Archive::open(&scoped)
             .unwrap()
-            .extract_to_memory(0)
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
             .unwrap(),
         b"match finder payload"
     );
     assert_eq!(
         r7z::Archive::open(&standalone)
             .unwrap()
-            .extract_to_memory(0)
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
             .unwrap(),
         b"match finder payload"
     );
@@ -404,14 +409,14 @@ fn cli_create_accepts_lzma_algorithm_and_match_cycles_options() {
     assert_eq!(
         r7z::Archive::open(&scoped)
             .unwrap()
-            .extract_to_memory(0)
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
             .unwrap(),
         b"algorithm cycle payload"
     );
     assert_eq!(
         r7z::Archive::open(&standalone)
             .unwrap()
-            .extract_to_memory(0)
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
             .unwrap(),
         b"algorithm cycle payload"
     );
@@ -479,14 +484,14 @@ fn cli_create_accepts_lzma2_chunk_size_options() {
     assert_eq!(
         r7z::Archive::open(&scoped)
             .unwrap()
-            .extract_to_memory(0)
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
             .unwrap(),
         vec![0x5Au8; 64 * 1024]
     );
     assert_eq!(
         r7z::Archive::open(&standalone)
             .unwrap()
-            .extract_to_memory(0)
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
             .unwrap(),
         vec![0x5Au8; 64 * 1024]
     );
@@ -545,7 +550,12 @@ fn cli_create_split_volumes_from_path_backed_input() {
         idx += 1;
     }
     let archive = r7z::Archive::from_bytes(joined.into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), payload);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        payload
+    );
 }
 
 #[test]
@@ -601,7 +611,9 @@ fn cli_create_accepts_lzma_literal_position_options() {
         .unwrap();
     assert_eq!(lzma.properties.as_deref().map(|props| props[0]), Some(0x38));
     assert_eq!(
-        archive.extract_to_memory(0).unwrap(),
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
         b"literal position payload"
     );
 }
@@ -691,7 +703,9 @@ fn cli_create_accepts_ppmd_method() {
         .unwrap();
     assert_eq!(folder.coders[0].codec_id.as_slice(), r7z::CODEC_PPMD);
     assert_eq!(
-        archive.extract_to_memory(0).unwrap(),
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
         b"ppmd payload from cli"
     );
 }
@@ -711,7 +725,12 @@ fn cli_create_accepts_single_method_thread() {
             input.join("payload.bin").display().to_string(),
         ]);
         let archive = r7z::Archive::open(&archive).unwrap();
-        assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"payload"
+        );
     }
 }
 
@@ -769,7 +788,12 @@ fn cli_create_accepts_p7zip_standalone_compression_options() {
         .find(|coder| coder.codec_id.as_slice() == r7z::CODEC_LZMA2)
         .unwrap();
     assert_eq!(lzma2.properties.as_deref(), Some(&[16][..]));
-    assert_eq!(archive.extract_to_memory(0).unwrap(), vec![0xA5u8; 4096]);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        vec![0xA5u8; 4096]
+    );
 }
 
 #[test]
@@ -788,7 +812,12 @@ fn cli_create_accepts_single_thread_switches() {
             input.join("payload.bin").display().to_string(),
         ]);
         let archive = r7z::Archive::open(&archive).unwrap();
-        assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"payload"
+        );
     }
 }
 
@@ -817,7 +846,7 @@ fn cli_encoder_thread_switches_create_readable_archives() {
         assert_eq!(
             r7z::Archive::open(&archive)
                 .unwrap()
-                .extract_to_memory(0)
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
                 .unwrap(),
             data
         );
@@ -876,7 +905,12 @@ fn cli_create_accepts_p7zip_output_control_switches_as_noop() {
     ]);
 
     let archive = r7z::Archive::open(&archive).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"payload");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"payload"
+    );
 }
 
 #[test]
@@ -908,8 +942,18 @@ fn cli_create_accepts_p7zip_solid_file_limit() {
             .num_folders,
         2
     );
-    assert_eq!(archive.extract_to_memory(0).unwrap(), b"alpha");
-    assert_eq!(archive.extract_to_memory(1).unwrap(), b"bravo");
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
+            .unwrap(),
+        b"bravo"
+    );
 }
 
 #[test]
@@ -941,8 +985,18 @@ fn cli_create_accepts_p7zip_solid_byte_limit() {
             .num_folders,
         2
     );
-    assert_eq!(archive.extract_to_memory(0).unwrap(), vec![b'a'; 6 * 1024]);
-    assert_eq!(archive.extract_to_memory(1).unwrap(), vec![b'b'; 6 * 1024]);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        vec![b'a'; 6 * 1024]
+    );
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
+            .unwrap(),
+        vec![b'b'; 6 * 1024]
+    );
 }
 
 #[test]
@@ -1459,7 +1513,8 @@ fn cli_test_accepts_wildcard_entry_patterns() {
         let mut writer = r7z::ArchiveWriter::new(&mut cursor, r7z::ArchiveOptions::default())
             .unwrap()
             .compression(r7z::Codec::Copy)
-            .expect("codec selection failed");
+            .expect("codec selection failed")
+            .start();
         writer.append("good.txt", &b"good-payload"[..]).unwrap();
         writer.new_folder().unwrap();
         writer

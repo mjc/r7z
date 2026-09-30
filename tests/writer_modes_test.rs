@@ -37,7 +37,9 @@ fn options(codec: Codec, encrypted: bool) -> ArchiveOptions {
 }
 
 fn write_files(options: ArchiveOptions, explicit_boundaries: bool) -> Vec<u8> {
-    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)
+        .unwrap()
+        .start();
     writer.new_folder().unwrap();
     writer
         .append_directory("dir", EntryMeta::default())
@@ -81,7 +83,10 @@ fn archive_bytes_preserve_each_writer_mode() {
             for (index, expected) in [(1, &[][..]), (2, FIRST), (3, &[][..]), (4, SECOND)] {
                 assert_eq!(
                     archive
-                        .extract_to_memory_with_password(index, Some("secret"))
+                        .extract_to_memory_with_password(
+                            r7z::ArchiveEntryIndex::new(index),
+                            Some("secret")
+                        )
                         .unwrap(),
                     expected
                 );
@@ -101,7 +106,7 @@ fn streaming_writer_encrypts_encoded_headers() {
     for (index, expected) in [(1, &[][..]), (2, FIRST), (3, &[][..]), (4, SECOND)] {
         assert_eq!(
             archive
-                .extract_to_memory_with_password(index, Some("secret"))
+                .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(index), Some("secret"))
                 .unwrap(),
             expected
         );
@@ -162,7 +167,12 @@ fn builder_lzma2_admission_uses_the_planned_folder_size() {
             .build()
             .unwrap();
         let archive = Archive::from_bytes(bytes.into()).unwrap();
-        assert_eq!(archive.extract_to_memory(0).unwrap(), b"small folder");
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"small folder"
+        );
     }
 }
 
@@ -184,12 +194,27 @@ fn builders_preserve_empty_symlink_streams_between_non_solid_files() {
         assert_eq!(files.name(0).unwrap(), "before", "{codec:?}");
         assert_eq!(files.entry_type(1), r7z::EntryType::Symlink, "{codec:?}");
         assert_eq!(
-            archive.symlink_target(1).unwrap().as_deref(),
+            archive
+                .symlink_target(r7z::ArchiveEntryIndex::new(1))
+                .unwrap()
+                .as_deref(),
             Some(""),
             "{codec:?}"
         );
-        assert_eq!(archive.extract_to_memory(0).unwrap(), b"prior", "{codec:?}");
-        assert_eq!(archive.extract_to_memory(2).unwrap(), b"data", "{codec:?}");
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"prior",
+            "{codec:?}"
+        );
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(2))
+                .unwrap(),
+            b"data",
+            "{codec:?}"
+        );
         assert_eq!(
             archive
                 .raw_streams_info()
@@ -244,17 +269,20 @@ fn codec_selection_before_data_preserves_metadata_and_selects_the_new_mode() {
                 selected_options.codec = selected;
                 let mut writer =
                     ArchiveWriter::new(Cursor::new(Vec::new()), initial_options).unwrap();
+                writer.set_compression(selected).unwrap();
+                let mut writer = writer.start();
                 writer
                     .append_directory("dir", EntryMeta::default())
                     .unwrap();
-                writer.append("empty", &[][..]).unwrap();
-                writer.new_folder().unwrap();
-                writer.set_compression(selected).unwrap();
+                writer
+                    .append_empty_file("empty", EntryMeta::default())
+                    .unwrap();
                 writer.append("file", FIRST).unwrap();
                 let actual = writer.finish().unwrap().into_inner();
 
-                let mut direct =
-                    ArchiveWriter::new(Cursor::new(Vec::new()), selected_options).unwrap();
+                let mut direct = ArchiveWriter::new(Cursor::new(Vec::new()), selected_options)
+                    .unwrap()
+                    .start();
                 direct
                     .append_directory("dir", EntryMeta::default())
                     .unwrap();
@@ -297,9 +325,12 @@ fn codec_selection_revalidates_codec_specific_options() {
         assert!(
             matches!(writer.set_compression(codec), Err(r7z::R7zError::InvalidOptions(message)) if message == expected)
         );
+        let mut writer = writer.start();
         writer.append("file", FIRST).unwrap();
 
-        let mut unchanged = ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+        let mut unchanged = ArchiveWriter::new(Cursor::new(Vec::new()), options)
+            .unwrap()
+            .start();
         unchanged.append("file", FIRST).unwrap();
         assert_eq!(
             writer.finish().unwrap().into_inner(),
@@ -309,22 +340,18 @@ fn codec_selection_revalidates_codec_specific_options() {
 }
 
 #[test]
-fn codec_selection_is_locked_after_data_including_closed_folders() {
+fn selected_codec_is_used_across_explicit_folder_boundaries() {
     for codec in CODECS {
         for encrypted in [false, true] {
             for close_folder in [false, true] {
                 let mut writer =
-                    ArchiveWriter::new(Cursor::new(Vec::new()), options(codec, encrypted)).unwrap();
+                    ArchiveWriter::new(Cursor::new(Vec::new()), options(codec, encrypted))
+                        .unwrap()
+                        .start();
                 writer.append("file", FIRST).unwrap();
                 if close_folder {
                     writer.new_folder().unwrap();
                 }
-                assert!(matches!(
-                    writer.set_compression(Codec::Lzma2),
-                    Err(r7z::R7zError::InvalidOptions(
-                        "cannot change compression after appending nonempty file data"
-                    ))
-                ));
                 writer.append("second", SECOND).unwrap();
                 let bytes = writer.finish().unwrap().into_inner();
                 let archive =
@@ -332,7 +359,10 @@ fn codec_selection_is_locked_after_data_including_closed_folders() {
                 for (index, expected) in [FIRST, SECOND].into_iter().enumerate() {
                     assert_eq!(
                         archive
-                            .extract_to_memory_with_password(index, Some("secret"))
+                            .extract_to_memory_with_password(
+                                r7z::ArchiveEntryIndex::new(index),
+                                Some("secret")
+                            )
                             .unwrap(),
                         expected
                     );
@@ -354,8 +384,9 @@ fn empty_and_metadata_only_archives_match_the_builder() {
                 for metadata in [false, true] {
                     let mut options = options(codec, encrypted);
                     options.header_mode = header_mode;
-                    let mut writer =
-                        ArchiveWriter::new(Cursor::new(Vec::new()), options.clone()).unwrap();
+                    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options.clone())
+                        .unwrap()
+                        .start();
                     let mut builder = r7z::ArchiveBuilder::new().options(options);
                     if metadata {
                         writer.append("empty", &[][..]).unwrap();
@@ -409,8 +440,9 @@ impl std::io::Read for FailingReader {
 #[test]
 fn input_failure_before_data_prevents_reusing_the_writer() {
     for codec in CODECS {
-        let mut writer =
-            ArchiveWriter::new(Cursor::new(Vec::new()), options(codec, false)).unwrap();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options(codec, false))
+            .unwrap()
+            .start();
         let error = writer.append("file", FailingReader).unwrap_err();
         assert!(matches!(error, r7z::R7zError::Io(error) if error.to_string() == "input failed"));
         assert!(writer.append("another", SECOND).is_err());
@@ -423,18 +455,13 @@ fn partial_input_failure_prevents_finishing_or_reusing_the_writer() {
     use std::io::Read;
 
     for codec in CODECS {
-        let mut writer =
-            ArchiveWriter::new(Cursor::new(Vec::new()), options(codec, false)).unwrap();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options(codec, false))
+            .unwrap()
+            .start();
         let error = writer
             .append("file", FIRST.chain(FailingReader))
             .unwrap_err();
         assert!(matches!(error, r7z::R7zError::Io(error) if error.to_string() == "input failed"));
-        assert!(matches!(
-            writer.set_compression(Codec::Copy),
-            Err(r7z::R7zError::InvalidOptions(
-                "archive writer cannot be reused after an I/O or encoder failure"
-            ))
-        ));
         assert!(writer.append("another", SECOND).is_err());
         assert!(writer.append("empty", &[][..]).is_err());
         assert!(
@@ -451,7 +478,9 @@ fn partial_input_failure_prevents_finishing_or_reusing_the_writer() {
 fn encoder_memory_limit_failure_prevents_reusing_the_writer() {
     let mut limited = options(Codec::Lzma2, false);
     limited.compression.encoder_memory_limit = Some(1);
-    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), limited).unwrap();
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), limited)
+        .unwrap()
+        .start();
 
     assert!(matches!(
         writer.append("file", FIRST),
@@ -460,8 +489,9 @@ fn encoder_memory_limit_failure_prevents_reusing_the_writer() {
     assert!(writer.append("another", SECOND).is_err());
     assert!(writer.finish().is_err());
 
-    let mut next =
-        ArchiveWriter::new(Cursor::new(Vec::new()), options(Codec::Lzma2, false)).unwrap();
+    let mut next = ArchiveWriter::new(Cursor::new(Vec::new()), options(Codec::Lzma2, false))
+        .unwrap()
+        .start();
     next.append("file", FIRST).unwrap();
     next.finish().unwrap();
 }
@@ -532,11 +562,18 @@ fn short_output_writes_preserve_file_checksums() {
             fail: Default::default(),
             max_write: 3,
         };
-        let mut writer = ArchiveWriter::new(out, options(codec, false)).unwrap();
+        let mut writer = ArchiveWriter::new(out, options(codec, false))
+            .unwrap()
+            .start();
         writer.append("file", FIRST).unwrap();
         let bytes = writer.finish().unwrap().bytes.into_inner();
         let archive = Archive::from_bytes(bytes.into()).unwrap();
-        assert_eq!(archive.extract_to_memory(0).unwrap(), FIRST);
+        assert_eq!(
+            archive
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            FIRST
+        );
     }
 }
 
@@ -549,7 +586,9 @@ fn folder_finalization_failure_prevents_reusing_the_writer() {
             fail: fail.clone(),
             max_write: usize::MAX,
         };
-        let mut writer = ArchiveWriter::new(out, options(codec, false)).unwrap();
+        let mut writer = ArchiveWriter::new(out, options(codec, false))
+            .unwrap()
+            .start();
         writer.append("file", FIRST).unwrap();
         fail.set(true);
         assert!(
@@ -569,7 +608,9 @@ fn encrypted_payload_write_failure_prevents_finishing_or_reusing_the_writer() {
         bytes: Cursor::new(Vec::new()),
         remaining: 8192,
     };
-    let mut writer = ArchiveWriter::new(out, options(Codec::Copy, true)).unwrap();
+    let mut writer = ArchiveWriter::new(out, options(Codec::Copy, true))
+        .unwrap()
+        .start();
     let input = vec![0xA5; 64 * 1024];
     assert!(matches!(
         writer.append("file", input.as_slice()),
@@ -589,7 +630,7 @@ fn parallel_lzma2_write_failure_drops_the_folder_and_allows_a_new_writer() {
         bytes: Cursor::new(Vec::new()),
         remaining: 96,
     };
-    let mut writer = ArchiveWriter::new(out, options.clone()).unwrap();
+    let mut writer = ArchiveWriter::new(out, options.clone()).unwrap().start();
     let input = vec![0xA5; 64 * 1024];
 
     assert!(matches!(
@@ -599,10 +640,17 @@ fn parallel_lzma2_write_failure_drops_the_folder_and_allows_a_new_writer() {
     assert!(writer.append("another", SECOND).is_err());
     assert!(writer.finish().is_err());
 
-    let mut next = ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    let mut next = ArchiveWriter::new(Cursor::new(Vec::new()), options)
+        .unwrap()
+        .start();
     next.append("file", input.as_slice()).unwrap();
     let archive = Archive::from_bytes(next.finish().unwrap().into_inner().into()).unwrap();
-    assert_eq!(archive.extract_to_memory(0).unwrap(), input);
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        input
+    );
 }
 
 #[test]
@@ -614,7 +662,9 @@ fn archive_finalization_preserves_output_errors() {
             fail: fail.clone(),
             max_write: usize::MAX,
         };
-        let mut writer = ArchiveWriter::new(out, options(codec, false)).unwrap();
+        let mut writer = ArchiveWriter::new(out, options(codec, false))
+            .unwrap()
+            .start();
         writer.append("file", FIRST).unwrap();
         fail.set(true);
         assert!(

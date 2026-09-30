@@ -7,7 +7,7 @@
 //! ```rust,no_run
 //! let archive = r7z::Archive::open(std::path::Path::new("my.7z")).unwrap();
 //! println!("{} files", archive.num_files());
-//! let bytes = archive.extract_to_memory(0).unwrap();
+//! let bytes = archive.extract_to_memory(r7z::ArchiveEntryIndex::new(0)).unwrap();
 //! ```
 //!
 //! Password-protected archives can be opened and extracted with the password-aware
@@ -16,7 +16,9 @@
 //! ```rust,no_run
 //! let archive =
 //!     r7z::Archive::open_with_password(std::path::Path::new("secret.7z"), Some("pass")).unwrap();
-//! let bytes = archive.extract_to_memory_with_password(0, Some("pass")).unwrap();
+//! let bytes = archive
+//!     .extract_to_memory_with_password(r7z::ArchiveEntryIndex::new(0), Some("pass"))
+//!     .unwrap();
 //! ```
 //!
 //! `Archive::open` is file-backed by default. Generic reader input must be
@@ -61,6 +63,23 @@
 //! ```rust
 //! let _: Option<r7z::raw::Folder> = None;
 //! let _: Option<r7z::update::v1::FolderIndex> = None;
+//! ```
+//!
+//! Folder indices cannot be passed where an entry index is expected:
+//!
+//! ```compile_fail
+//! let archive = r7z::Archive::from_bytes(bytes::Bytes::new()).unwrap();
+//! let folder = r7z::update::v1::FolderIndex::new(0);
+//! archive.extract_to_memory(folder).unwrap();
+//! ```
+//!
+//! Writer settings are unavailable after the writer starts accepting entries:
+//!
+//! ```compile_fail
+//! let mut writer = r7z::ArchiveWriter::new_default(std::io::Cursor::new(Vec::new()))
+//!     .unwrap()
+//!     .start();
+//! writer.set_compression(r7z::Codec::Copy).unwrap();
 //! ```
 //!
 //! ## Writing
@@ -109,9 +128,9 @@ pub mod update;
 mod write;
 
 pub use archive::{
-    Archive, ArchiveEntries, ArchiveEntryInfo, ArchiveListing, ArchiveListingEntry,
-    ArchiveOpenOptions, ArchiveReadConfig, ArchiveReadOptions, ArchiveReadSession,
-    ListingEntryKind, safe_archive_name,
+    Archive, ArchiveEntries, ArchiveEntryIndex, ArchiveEntryInfo, ArchiveListing,
+    ArchiveListingEntry, ArchiveOpenOptions, ArchiveReadConfig, ArchiveReadOptions,
+    ArchiveReadSession, ListingEntryKind, safe_archive_name,
 };
 pub use codec::{
     CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_ARM64, CODEC_BCJ_IA64,
@@ -133,7 +152,7 @@ pub use write::{
     build_streaming_with_options,
 };
 
-pub(crate) use archive::{ArchiveEntryIndex, RawFolderBlock, RawFolderHandle};
+pub(crate) use archive::{RawFolderBlock, RawFolderHandle};
 pub(crate) use coder_info::CoderInfo;
 pub(crate) use entries::RawEntryName;
 pub(crate) use files_info::FilesInfo;

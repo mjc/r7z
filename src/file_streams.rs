@@ -262,7 +262,11 @@ mod tests {
     fn selected_mapping_skips_gaps_and_stops_consuming_on_callback_error() {
         let streams = mixed_folders();
         let files = FileStreams::new(None, 3, Some(&streams)).unwrap();
-        let selected = EntrySelection::new(Some(&[2, 0]), 3).unwrap();
+        let selected_indices = [
+            crate::ArchiveEntryIndex::new(2),
+            crate::ArchiveEntryIndex::new(0),
+        ];
+        let selected = EntrySelection::new(Some(&selected_indices), 3).unwrap();
         let mapped = files
             .map_selected(selected, |file| {
                 let crate::entries::EntryKind::File(location) = file.kind else {

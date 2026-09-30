@@ -1,8 +1,8 @@
 use cap_std::fs::Dir;
 use chrono::{DateTime, Local};
 use r7z::update::v1::{
-    ArchiveEntryIndex, FolderIndex, PreservedArchiveEntry, PreservedEntryStream, RawFolderBlock,
-    write_archive_update, write_archive_with_preserved_folders,
+    PreservedArchiveEntry, PreservedEntryStream, RawFolderBlock, write_archive_update,
+    write_archive_with_preserved_folders,
 };
 use r7z::{
     Archive, ArchiveListing, ArchiveListingEntry, ArchiveOptions, Codec, CompressionLevel,
@@ -771,7 +771,7 @@ fn print_technical_listing(
             "Block = {}",
             entry
                 .block
-                .map_or_else(String::new, |block| block.to_string())
+                .map_or_else(String::new, |block| block.get().to_string())
         );
         println!();
     }
@@ -941,7 +941,7 @@ fn test_selected_folders(
             match result {
                 Ok(()) => warnings,
                 Err(error) => {
-                    eprintln!("Testing block {folder} failed: {error}");
+                    eprintln!("Testing block {} failed: {error}", folder.get());
                     EXIT_WARNING
                 }
             }
@@ -960,7 +960,7 @@ fn test_selected_folders(
 /// Borrow each folder's contiguous listing range, including intervening empty entries.
 fn listing_folder_groups(
     mut entries: &[ArchiveListingEntry],
-) -> impl Iterator<Item = (usize, &[ArchiveListingEntry])> {
+) -> impl Iterator<Item = (r7z::update::v1::FolderIndex, &[ArchiveListingEntry])> {
     std::iter::from_fn(move || {
         let (start, folder) = entries
             .iter()
@@ -1027,7 +1027,7 @@ fn extract_archive_with_ui(
 #[derive(Clone, Copy)]
 enum FileContents {
     Empty,
-    Stream(usize),
+    Stream(r7z::ArchiveEntryIndex),
 }
 
 #[derive(Clone, Copy)]
@@ -1560,24 +1560,25 @@ fn preserved_rewrite_entries(
         .map(|entry| !should_drop(entry))
         .collect::<Vec<_>>();
     let mut actions = vec![RetainedEntryAction::Drop; archive_entries.len()];
-    let mut folder_entries: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut folder_entries =
+        BTreeMap::<r7z::update::v1::FolderIndex, Vec<r7z::ArchiveEntryIndex>>::new();
     for entry in &listing.entries {
         if let Some(block) = entry.block {
             folder_entries.entry(block).or_default().push(entry.index);
-        } else if retained[entry.index] {
-            actions[entry.index] = RetainedEntryAction::NoStream;
+        } else if retained[entry.index.get()] {
+            actions[entry.index.get()] = RetainedEntryAction::NoStream;
         }
     }
 
     for (folder, indices) in &folder_entries {
-        let retained_count = indices.iter().filter(|&&idx| retained[idx]).count();
+        let retained_count = indices.iter().filter(|&&idx| retained[idx.get()]).count();
         if retained_count == indices.len() {
             for &index in indices {
-                actions[index] = RetainedEntryAction::CopyRaw(*folder);
+                actions[index.get()] = RetainedEntryAction::CopyRaw(*folder);
             }
         } else if retained_count > 0 {
-            for &index in indices.iter().filter(|&&idx| retained[idx]) {
-                actions[index] = RetainedEntryAction::Decode;
+            for &index in indices.iter().filter(|&&idx| retained[idx.get()]) {
+                actions[index.get()] = RetainedEntryAction::Decode;
             }
         }
     }
@@ -1593,16 +1594,16 @@ fn preserved_rewrite_entries(
         .collect::<BTreeSet<_>>();
     let raw_folders = raw_folder_ids
         .iter()
-        .map(|&folder| archive.raw_folder(FolderIndex::new(folder)))
+        .map(|folder| archive.raw_folder(*folder))
         .collect::<Result<Vec<_>, _>>()?;
     let raw_folder_handles = raw_folders
         .iter()
-        .map(|folder| (folder.folder_index().get(), folder.handle()))
+        .map(|folder| (folder.folder_index(), folder.handle()))
         .collect::<BTreeMap<_, _>>();
 
     let mut entries = Vec::new();
     for (listing_entry, action) in listing.entries.iter().zip(&actions) {
-        let i = listing_entry.index;
+        let i = listing_entry.index.get();
         let stream = match action {
             RetainedEntryAction::Drop => continue,
             RetainedEntryAction::NoStream => PreservedEntryStream::None,
@@ -1611,13 +1612,13 @@ fn preserved_rewrite_entries(
                     .get(folder)
                     .cloned()
                     .ok_or(R7zError::Parse)?,
-                source_entry: ArchiveEntryIndex::new(i),
+                source_entry: listing_entry.index,
                 size: listing_entry.size.ok_or(R7zError::Parse)?,
                 crc: listing_entry.crc,
             },
             RetainedEntryAction::Decode => {
                 let name = &archive_entries[i].name;
-                match archive.extract_to_memory_with_password(i, password) {
+                match archive.extract_to_memory_with_password(listing_entry.index, password) {
                     Ok(data) => PreservedEntryStream::Data(data),
                     Err(
                         err @ (R7zError::UnsupportedCodec(_)
@@ -1654,7 +1655,7 @@ fn preserved_rewrite_entries(
 enum RetainedEntryAction {
     Drop,
     NoStream,
-    CopyRaw(usize),
+    CopyRaw(r7z::update::v1::FolderIndex),
     Decode,
 }
 
@@ -1924,7 +1925,14 @@ struct SelectedListing<'a> {
 }
 
 impl SelectedListing<'_> {
-    fn folders(&self) -> impl Iterator<Item = (usize, impl Iterator<Item = usize>)> {
+    fn folders(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            r7z::update::v1::FolderIndex,
+            impl Iterator<Item = r7z::ArchiveEntryIndex>,
+        ),
+    > {
         listing_folder_groups(self.entries).filter_map(|(folder, entries)| {
             let mut indices = entries
                 .iter()

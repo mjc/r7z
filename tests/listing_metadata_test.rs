@@ -42,7 +42,7 @@ fn listing_metadata_single_file_uses_header_sizes_without_extraction() {
     assert_eq!(entry.kind, ListingEntryKind::File);
     assert_eq!(entry.size, Some(22));
     assert!(entry.packed_size.is_some());
-    assert_eq!(entry.block, Some(0));
+    assert_eq!(entry.block, Some(r7z::update::v1::FolderIndex::new(0)));
     assert_eq!(method_bases(&entry.methods), BTreeSet::from(["LZMA2"]));
     assert!(!entry.encrypted);
     assert!(listing.headers_size.is_some());
@@ -60,8 +60,14 @@ fn listing_metadata_marks_only_first_solid_entry_with_packed_size() {
 
     assert_eq!(listing.blocks, 1);
     assert!(listing.solid);
-    assert_eq!(listing.entries[0].block, Some(0));
-    assert_eq!(listing.entries[1].block, Some(0));
+    assert_eq!(
+        listing.entries[0].block,
+        Some(r7z::update::v1::FolderIndex::new(0))
+    );
+    assert_eq!(
+        listing.entries[1].block,
+        Some(r7z::update::v1::FolderIndex::new(0))
+    );
     assert!(listing.entries[0].packed_size.is_some());
     assert_eq!(listing.entries[1].packed_size, None);
 }
@@ -85,8 +91,14 @@ fn listing_metadata_tracks_non_solid_blocks() {
 
     assert_eq!(listing.blocks, 2);
     assert!(!listing.solid);
-    assert_eq!(listing.entries[0].block, Some(0));
-    assert_eq!(listing.entries[1].block, Some(1));
+    assert_eq!(
+        listing.entries[0].block,
+        Some(r7z::update::v1::FolderIndex::new(0))
+    );
+    assert_eq!(
+        listing.entries[1].block,
+        Some(r7z::update::v1::FolderIndex::new(1))
+    );
     assert!(listing.entries[0].packed_size.is_some());
     assert!(listing.entries[1].packed_size.is_some());
 }
