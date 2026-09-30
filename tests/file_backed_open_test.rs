@@ -131,6 +131,15 @@ fn open_split_archive_first_volume_reads_siblings() {
     std::fs::write(tmp.path().join("split.7z.002"), &bytes[chunk..chunk * 2]).unwrap();
     std::fs::write(tmp.path().join("split.7z.003"), &bytes[chunk * 2..]).unwrap();
 
+    let limits = r7z::ResourceLimits {
+        max_open_volumes: std::num::NonZeroUsize::new(2).unwrap(),
+        ..r7z::ResourceLimits::default()
+    };
+    assert!(matches!(
+        r7z::Archive::open_with_options(&first, r7z::ArchiveOpenOptions { ..limits },),
+        Err(r7z::R7zError::LimitExceeded("archive volume count"))
+    ));
+
     let archive = r7z::Archive::open(&first).unwrap();
     let names = archive
         .raw_files_info()
@@ -222,6 +231,7 @@ fn metadata_limit_rejects_oversized_next_header() {
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: 1,
+            ..r7z::ArchiveOpenOptions::default()
         },
     ) {
         Ok(_) => panic!("archive opened despite metadata limit"),
@@ -253,6 +263,7 @@ fn metadata_limit_rejects_oversized_decoded_header() {
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: next_header_size + 16,
+            ..r7z::ArchiveOpenOptions::default()
         },
     ) {
         Ok(_) => panic!("archive opened despite decoded metadata limit"),

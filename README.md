@@ -187,17 +187,21 @@ let file = std::fs::File::open("example.7z")?;
 let archive = Archive::from_reader(file)?;
 ```
 
-`ArchiveOpenOptions` controls the metadata limit:
+`ResourceLimits` configures the same limits for archive opening, reading, and
+writing. Defaults preserve the built-in byte safeguards and limit split archives
+to 128 open volumes. Callers can configure per-operation byte limits:
 
 ```rust
-use r7z::{Archive, ArchiveOpenOptions};
+use r7z::{Archive, ResourceLimits};
 use std::path::Path;
 
+let limits = ResourceLimits {
+    max_metadata_bytes: 64 * 1024 * 1024,
+    ..ResourceLimits::default()
+};
 let archive = Archive::open_with_options(
     Path::new("example.7z"),
-    ArchiveOpenOptions {
-        max_metadata_bytes: 64 * 1024 * 1024,
-    },
+    limits,
 )?;
 ```
 

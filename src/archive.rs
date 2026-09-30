@@ -9,6 +9,7 @@ use crate::folder_decode::{
     FolderLayout, FolderLayouts, MetadataBudget, PackedStream, VerifiedExternalData,
 };
 use crate::headers::{HeaderResolution, NextHeader};
+use crate::resources::ResourceLimits;
 use crate::{
     EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
     codec, find_next_property_id,
@@ -24,42 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Budget for retained header buffers, decoded external metadata, and stream slots.
-/// Extracted file data and decoder working memory have separate limits.
-const DEFAULT_MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+/// Resource limits applied while opening an archive.
+pub type ArchiveOpenOptions = ResourceLimits;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArchiveOpenOptions {
-    /// Combined limit for header buffers, decoded external metadata, and its stream slots.
-    /// Decoder working memory and parsed metadata tables are bounded separately.
-    pub max_metadata_bytes: u64,
-}
-
-impl Default for ArchiveOpenOptions {
-    fn default() -> Self {
-        Self {
-            max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
-        }
-    }
-}
-
-/// Limits applied while reading file data from an archive.
-/// The byte count spans an entire one-shot call and persists across every entry
-/// read through an `ArchiveReadSession`. It includes skipped streams needed to
-/// reach a selection, checksum drains, and eagerly decoded output.
-/// `None` leaves each optional limit unset. The retained-output limit applies
-/// only to the `Vec` returned by an in-memory extraction; writer and streaming
-/// APIs are governed by total decoded bytes and decoder working-set limits.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ArchiveReadOptions {
-    /// Maximum estimated live decoder working set. Values above the built-in
-    /// safety cap do not raise it; `None` uses the built-in cap.
-    pub max_decoder_working_set_bytes: Option<u64>,
-    /// Maximum total decoded bytes, defaulting to no cumulative cap.
-    pub max_total_decoded_bytes: Option<u64>,
-    /// Maximum bytes returned by an in-memory extraction, defaulting to no cap.
-    pub max_retained_output_bytes: Option<u64>,
-}
+/// Resource limits applied while reading an archive.
+pub type ArchiveReadOptions = ResourceLimits;
 
 /// Password and limits used for one archive read operation.
 #[derive(Clone, Copy)]
@@ -604,7 +574,7 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        let source = ArchiveSource::from_file(path)?;
+        let source = ArchiveSource::from_file(path, options.max_open_volumes)?;
         Self::from_source_with_password(source, password, options)
     }
 
@@ -623,9 +593,9 @@ impl Archive {
         }
     }
 
-    /// Open an archive with a password and metadata limit using a memory map
+    /// Open an archive with a password and resource limits using a memory map
     /// when it is a single file. Split archives use positioned reads for each
-    /// volume.
+    /// volume and obey `max_open_volumes`.
     ///
     /// # Safety
     ///
@@ -637,7 +607,9 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        if let Some(source) = ArchiveSource::from_split_first_volume(path)? {
+        if let Some(source) =
+            ArchiveSource::from_split_first_volume(path, options.max_open_volumes)?
+        {
             return Self::from_source_with_password(source, password, options);
         }
         let file = std::fs::File::open(path)?;
@@ -737,7 +709,7 @@ impl Archive {
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
         let source_len = source.len()?;
-        let (base_offset, signature) = source.find_signature(DEFAULT_MAX_METADATA_BYTES)?;
+        let (base_offset, signature) = source.find_signature(options.max_signature_scan_bytes)?;
 
         if signature.next_header_size > options.max_metadata_bytes {
             return Err(R7zError::ResourceLimitExceeded {
@@ -2341,9 +2313,8 @@ mod selected_stream_tests {
         let result = archive.stream_selected_files_with_options(
             &[ArchiveEntryIndex::new(0), ArchiveEntryIndex::new(1)],
             ArchiveReadConfig::new(ArchiveReadOptions {
-                max_decoder_working_set_bytes: None,
                 max_total_decoded_bytes: Some(6),
-                max_retained_output_bytes: None,
+                ..ArchiveReadOptions::default()
             }),
             |entry, reader| {
                 let mut bytes = Vec::new();
@@ -2414,9 +2385,8 @@ mod selected_stream_tests {
         let result = archive.extract_to_memory_with_options(
             ArchiveEntryIndex::new(0),
             ArchiveReadConfig::new(ArchiveReadOptions {
-                max_decoder_working_set_bytes: None,
-                max_total_decoded_bytes: None,
                 max_retained_output_bytes: Some(2),
+                ..ArchiveReadOptions::default()
             }),
         );
 
@@ -2452,9 +2422,8 @@ mod selected_stream_tests {
         let result = archive.stream_selected_files_with_options(
             &[ArchiveEntryIndex::new(0)],
             ArchiveReadConfig::new(ArchiveReadOptions {
-                max_decoder_working_set_bytes: None,
                 max_total_decoded_bytes: Some(2),
-                max_retained_output_bytes: None,
+                ..ArchiveReadOptions::default()
             })
             .with_password("secret"),
             |_, _| {
@@ -2479,9 +2448,8 @@ mod selected_stream_tests {
         let result = archive.symlink_target_with_options(
             ArchiveEntryIndex::new(6),
             ArchiveReadConfig::new(ArchiveReadOptions {
-                max_decoder_working_set_bytes: None,
-                max_total_decoded_bytes: None,
                 max_retained_output_bytes: Some(2),
+                ..ArchiveReadOptions::default()
             }),
         );
 
@@ -2510,6 +2478,7 @@ mod selected_stream_tests {
                         None,
                         ArchiveOpenOptions {
                             max_metadata_bytes: limit,
+                            ..ArchiveOpenOptions::default()
                         },
                     )
                 };

@@ -1685,7 +1685,11 @@ where
     let mut options = options;
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
-    let max_temporary_storage_bytes = prepared.archive().streaming.max_temporary_storage_bytes;
+    let max_temporary_storage_bytes = prepared
+        .archive()
+        .streaming
+        .resource_limits
+        .max_temporary_storage_bytes;
     match prepared.archive().streaming.spool.clone() {
         SpoolMode::Memory => {
             let mut spool = Cursor::new(Vec::new());

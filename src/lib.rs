@@ -123,6 +123,7 @@ mod pack_info;
 mod parsers;
 mod property;
 pub mod raw;
+mod resources;
 mod stream_info;
 pub mod update;
 mod write;
@@ -144,6 +145,7 @@ pub use method::{
     ALL_METHODS, METHOD_REGISTRY, MethodInfo, MethodKind, MethodSupport, P7ZIP_ORACLE_SHA,
     SevenZMethod, method_from_id, method_from_name, method_info,
 };
+pub use resources::ResourceLimits;
 pub use write::{
     ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec, CompressionLevel,
     CompressionOptions, EncoderThreads, EncryptionOptions, EntryKind, EntryMeta, HeaderMode,

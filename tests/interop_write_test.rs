@@ -2167,7 +2167,10 @@ fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
             r7z::ArchiveOptions {
                 streaming: r7z::StreamingOptions {
                     spool,
-                    max_temporary_storage_bytes: Some(spool_limit),
+                    resource_limits: r7z::ResourceLimits {
+                        max_temporary_storage_bytes: Some(spool_limit),
+                        ..r7z::ResourceLimits::default()
+                    },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2191,7 +2194,10 @@ fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
             r7z::ArchiveOptions {
                 streaming: r7z::StreamingOptions {
                     spool: exact_limit_spool,
-                    max_temporary_storage_bytes: Some(expected.get_ref().len() as u64),
+                    resource_limits: r7z::ResourceLimits {
+                        max_temporary_storage_bytes: Some(expected.get_ref().len() as u64),
+                        ..r7z::ResourceLimits::default()
+                    },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2227,7 +2233,10 @@ fn memory_spool_does_not_use_temporary_storage_allowance() {
         r7z::ArchiveOptions {
             streaming: r7z::StreamingOptions {
                 spool: r7z::SpoolMode::Memory,
-                max_temporary_storage_bytes: Some(0),
+                resource_limits: r7z::ResourceLimits {
+                    max_temporary_storage_bytes: Some(0),
+                    ..r7z::ResourceLimits::default()
+                },
                 ..Default::default()
             },
             ..Default::default()

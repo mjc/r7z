@@ -34,3 +34,8 @@ from a folder index or reuse one with another archive. Stream reads verify
 checksums as the requested folder is drained. Call `ArchiveReadSession::finish`
 when the final folder must be verified; dropping a session leaves unread data
 unverified.
+
+Configure open and read limits with `ResourceLimits`, also exported as
+`ArchiveOpenOptions` and `ArchiveReadOptions`. Writer spooling limits move to
+`StreamingOptions::resource_limits`. When customizing limits, use struct update
+syntax with `ResourceLimits::default()` so unspecified limits keep their defaults.

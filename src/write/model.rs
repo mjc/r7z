@@ -1,3 +1,4 @@
+use crate::resources::ResourceLimits;
 use std::{num::NonZeroU64, path::PathBuf, time::SystemTime};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,8 +113,8 @@ pub enum SolidMode {
 pub struct StreamingOptions {
     pub buffer_size: usize,
     pub spool: SpoolMode,
-    /// Maximum size of a temporary archive spool. Memory-only spools do not use this limit.
-    pub max_temporary_storage_bytes: Option<u64>,
+    /// Resource limits applied while building this archive.
+    pub resource_limits: ResourceLimits,
 }
 
 impl Default for StreamingOptions {
@@ -124,7 +125,7 @@ impl Default for StreamingOptions {
                 memory_threshold: 16 * 1024 * 1024,
                 dir: None,
             },
-            max_temporary_storage_bytes: None,
+            resource_limits: ResourceLimits::default(),
         }
     }
 }
