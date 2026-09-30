@@ -191,6 +191,7 @@ pub fn decompress_folder_with_password_and_sizes(
         }],
         unpack_size,
         coder_unpack_sizes,
+        &mut budget,
     )?
     .materialize(password, &mut budget)
 }
@@ -245,6 +246,7 @@ fn prepare_folder_decoder<R: Read>(
     packed_streams: SmallVec<[PackedInput<R>; 4]>,
     unpack_size: u64,
     coder_unpack_sizes: &[u64],
+    budget: &mut OperationBudget,
 ) -> Result<ReadyDecoder<R>, R7zError> {
     let graph = folder.graph()?;
     let sizes = CoderOutputSizes::partial(folder, &graph, unpack_size, coder_unpack_sizes)?;
@@ -252,7 +254,7 @@ fn prepare_folder_decoder<R: Read>(
         .iter()
         .map(|input| input.size as u64)
         .collect::<SmallVec<[_; 4]>>();
-    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes, None)?
+    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes, budget)?
         .bind(packed_streams)
 }
 
@@ -475,7 +477,7 @@ mod bounded_reader_tests {
                 })
                 .collect();
             let mut budget = OperationBudget::new(ResourceLimits::default());
-            let output = prepare_folder_decoder(&folder, inputs, 5, sizes)
+            let output = prepare_folder_decoder(&folder, inputs, 5, sizes, &mut budget)
                 .unwrap()
                 .start(None, &mut budget)
                 .unwrap()

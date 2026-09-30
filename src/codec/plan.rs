@@ -1,6 +1,8 @@
 use super::*;
 use crate::folder::{Bcj2Layout, FolderGraph, PackedStreamIndex};
-use crate::resources::OperationBudget;
+#[cfg(test)]
+use crate::resources::ResourceLimits;
+use crate::resources::{DecoderWorkingSetBytes, OperationBudget};
 
 /// An executable topology with parsed codec properties and admitted memory usage.
 pub(crate) struct DecoderPlan<'a> {
@@ -20,13 +22,9 @@ impl WorkingSet {
             .ok_or(R7zError::Decompression)
     }
 
-    fn admit(self, configured_limit: Option<u64>) -> Result<Self, R7zError> {
-        let limit = configured_limit.map_or(MAX_DECODER_WORKING_SET_BYTES as u64, |limit| {
-            limit.min(MAX_DECODER_WORKING_SET_BYTES as u64)
-        }) as usize;
-        if self.0 > limit {
-            return Err(resource_limit("decoder working set", limit));
-        }
+    fn admit(self, budget: &mut OperationBudget) -> Result<Self, R7zError> {
+        let bytes = u64::try_from(self.0).map_err(|_| R7zError::Decompression)?;
+        budget.admit_decoder_working_set(DecoderWorkingSetBytes::new(bytes))?;
         Ok(self)
     }
 
@@ -185,9 +183,17 @@ impl<'a> DecoderPlan<'a> {
         sizes: &[u64],
         packed_sizes: &'a [u64],
     ) -> Result<Self, R7zError> {
-        Self::compile_with_working_set_limit(folder, graph, unpack_size, sizes, packed_sizes, None)
+        Self::compile_with_budget(
+            folder,
+            graph,
+            unpack_size,
+            sizes,
+            packed_sizes,
+            &mut OperationBudget::new(ResourceLimits::default()),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn compile_with_working_set_limit(
         folder: &Folder,
         graph: &FolderGraph,
@@ -196,15 +202,29 @@ impl<'a> DecoderPlan<'a> {
         packed_sizes: &'a [u64],
         max_working_set_bytes: Option<u64>,
     ) -> Result<Self, R7zError> {
-        let sizes = CoderOutputSizes::complete(folder, graph, unpack_size, sizes)?;
-        Self::with_output_sizes(
+        Self::compile_with_budget(
             folder,
             graph,
             unpack_size,
             sizes,
             packed_sizes,
-            max_working_set_bytes,
+            &mut OperationBudget::new(ResourceLimits {
+                max_decoder_working_set_bytes: max_working_set_bytes,
+                ..ResourceLimits::default()
+            }),
         )
+    }
+
+    pub(crate) fn compile_with_budget(
+        folder: &Folder,
+        graph: &FolderGraph,
+        unpack_size: u64,
+        sizes: &[u64],
+        packed_sizes: &'a [u64],
+        budget: &mut OperationBudget,
+    ) -> Result<Self, R7zError> {
+        let sizes = CoderOutputSizes::complete(folder, graph, unpack_size, sizes)?;
+        Self::with_output_sizes(folder, graph, unpack_size, sizes, packed_sizes, budget)
     }
 
     pub(super) fn with_output_sizes(
@@ -213,7 +233,7 @@ impl<'a> DecoderPlan<'a> {
         unpack_size: u64,
         sizes: CoderOutputSizes<'_>,
         packed_sizes: &'a [u64],
-        max_working_set_bytes: Option<u64>,
+        budget: &mut OperationBudget,
     ) -> Result<Self, R7zError> {
         validate_folder_coder_count(folder)?;
         if graph.packed_stream_count() != packed_sizes.len() {
@@ -264,7 +284,7 @@ impl<'a> DecoderPlan<'a> {
                     .try_fold(WorkingSet::default(), |total, step| {
                         total.add(step.working_set()?)
                     })?
-                    .admit(max_working_set_bytes)?;
+                    .admit(budget)?;
                 Ok(Self {
                     topology: Topology::Chain(steps),
                     memory,
@@ -330,9 +350,7 @@ impl<'a> DecoderPlan<'a> {
                         total.add(coder.working_set()?)
                     })?;
                 ensure_bcj2_working_budget(output_size, memory.0)?;
-                let memory = memory
-                    .add(WorkingSet(output_size))?
-                    .admit(max_working_set_bytes)?;
+                let memory = memory.add(WorkingSet(output_size))?.admit(budget)?;
                 Ok(Self {
                     topology: Topology::Bcj2 {
                         main,
@@ -1198,7 +1216,8 @@ mod tests {
                     size: 3
                 }],
                 7,
-                &[]
+                &[],
+                &mut operation_budget(),
             ),
             Err(R7zError::InvalidOptions("coder requires an output size"))
         ));
@@ -1211,6 +1230,7 @@ mod tests {
             }],
             7,
             &[],
+            &mut operation_budget(),
         )
         .unwrap();
         let BoundTopology::Chain { steps, .. } = ready.topology else {
@@ -1231,7 +1251,8 @@ mod tests {
                         size: 3
                     }],
                     3,
-                    sizes
+                    sizes,
+                    &mut operation_budget(),
                 )
                 .is_err()
             );
@@ -1262,7 +1283,8 @@ mod tests {
                         size: 16
                     }],
                     0,
-                    sizes
+                    sizes,
+                    &mut operation_budget(),
                 )
                 .is_ok()
             );

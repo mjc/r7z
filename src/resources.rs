@@ -116,11 +116,9 @@ impl RetainedOutputBytes {
 }
 
 /// Decoder memory simultaneously reserved by nested work.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DecoderWorkingSetBytes(u64);
 
-#[allow(dead_code)]
 impl DecoderWorkingSetBytes {
     pub(crate) const fn new(bytes: u64) -> Self {
         Self(bytes)
@@ -136,7 +134,6 @@ pub(crate) struct OperationBudget {
     limits: ResourceLimits,
     metadata: MetadataBytes,
     decoded: DecodedBytes,
-    decoder_working_set: DecoderWorkingSetBytes,
     peak_decoder_working_set: DecoderWorkingSetBytes,
     kdf_cycles: KdfCycles,
     temporary_storage: TemporaryStorageBytes,
@@ -151,7 +148,6 @@ impl OperationBudget {
             limits,
             metadata: MetadataBytes::new(0),
             decoded: DecodedBytes::new(0),
-            decoder_working_set: DecoderWorkingSetBytes::new(0),
             peak_decoder_working_set: DecoderWorkingSetBytes::new(0),
             kdf_cycles: KdfCycles::new(0),
             temporary_storage: TemporaryStorageBytes::new(0),
@@ -270,30 +266,20 @@ impl OperationBudget {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_decoder_reservation<T>(
+    pub(crate) fn admit_decoder_working_set(
         &mut self,
         bytes: DecoderWorkingSetBytes,
-        operation: impl FnOnce(&mut Self) -> Result<T, R7zError>,
-    ) -> Result<T, R7zError> {
+    ) -> Result<(), R7zError> {
         let hard_limit = crate::codec::MAX_DECODER_WORKING_SET_BYTES as u64;
         let limit = self
             .limits
             .max_decoder_working_set_bytes
             .map_or(hard_limit, |configured| configured.min(hard_limit));
-        let Some(reserved) = self.decoder_working_set.get().checked_add(bytes.get()) else {
-            return Err(self.decoder_working_set_error(limit));
-        };
-        if reserved > limit {
+        if bytes.get() > limit {
             return Err(self.decoder_working_set_error(limit));
         }
-
-        let previous = self.decoder_working_set;
-        self.decoder_working_set = DecoderWorkingSetBytes::new(reserved);
-        self.peak_decoder_working_set = self.peak_decoder_working_set.max(self.decoder_working_set);
-        let result = operation(self);
-        self.decoder_working_set = previous;
-        result
+        self.peak_decoder_working_set = self.peak_decoder_working_set.max(bytes);
+        Ok(())
     }
 
     fn decoder_working_set_error(&self, limit: u64) -> R7zError {
@@ -469,31 +455,26 @@ mod tests {
     }
 
     #[test]
-    fn nested_decoder_reservations_share_the_peak_working_set_limit() {
+    fn decoder_working_set_admission_tracks_the_peak_and_enforces_the_limit() {
         let mut budget = OperationBudget::new(ResourceLimits {
             max_decoder_working_set_bytes: Some(10),
             ..ResourceLimits::default()
         });
-        let mut child_started = false;
-
-        let result = budget.with_decoder_reservation(DecoderWorkingSetBytes::new(6), |budget| {
-            budget.with_decoder_reservation(DecoderWorkingSetBytes::new(5), |_| {
-                child_started = true;
-                Ok(())
-            })
-        });
 
         assert!(matches!(
-            result,
+            budget.admit_decoder_working_set(DecoderWorkingSetBytes::new(11)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "decoder working set",
                 limit: 10,
             })
         ));
-        assert!(!child_started);
         budget
-            .with_decoder_reservation(DecoderWorkingSetBytes::new(10), |_| Ok(()))
+            .admit_decoder_working_set(DecoderWorkingSetBytes::new(6))
             .unwrap();
+        budget
+            .admit_decoder_working_set(DecoderWorkingSetBytes::new(10))
+            .unwrap();
+        assert_eq!(budget.peak_decoder_working_set.get(), 10);
     }
 
     #[test]

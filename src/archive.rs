@@ -1220,7 +1220,6 @@ impl Archive {
             current: None,
             password: config.password,
             mode: CompletionMode::SelectedStreams,
-            max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
             budget: OperationBudget::new(config.options),
         };
         Ok(ArchiveReadSession {
@@ -1402,7 +1401,6 @@ impl Archive {
             current: None,
             password: config.password,
             mode,
-            max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
             budget: OperationBudget::new(config.options),
         };
         let result = match selected {
@@ -1741,7 +1739,6 @@ struct EntryDecoder<'a> {
     current: Option<(ReadFolderIndex, ActiveFolder<'a, 'a>)>,
     password: Option<&'a str>,
     mode: CompletionMode,
-    max_decoder_working_set_bytes: Option<u64>,
     budget: OperationBudget,
 }
 
@@ -1770,10 +1767,7 @@ impl<'a> EntryDecoder<'a> {
                 self.complete(previous)?;
                 location
                     .folder
-                    .bind(
-                        |stream| self.source.reader(&stream),
-                        self.max_decoder_working_set_bytes,
-                    )?
+                    .bind(|stream| self.source.reader(&stream), &mut self.budget)?
                     .start(self.password, &mut self.budget)?
             }
         };
@@ -1809,7 +1803,7 @@ fn decode_metadata_folder<'a>(
     budget: &mut OperationBudget,
 ) -> Result<DecodedFolder<'a>, R7zError> {
     folder
-        .bind(|stream| packs.reader(&stream), None)?
+        .bind(|stream| packs.reader(&stream), budget)?
         .collect(password, metadata_limit, budget)
 }
 

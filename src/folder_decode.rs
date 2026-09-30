@@ -47,9 +47,10 @@ impl<'a> ExternalFolderPlan<'a> {
         let output_limit = self.output_limit;
         let mut output = ExternalFolderData::reserve(self.folders.stream_count())?;
         for folder in self.folders {
-            let decoded = folder?
-                .bind(&mut open, None)?
-                .collect(password, output_limit, budget)?;
+            let decoded =
+                folder?
+                    .bind(&mut open, budget)?
+                    .collect(password, output_limit, budget)?;
             output = output.append(decoded)?;
         }
         output.finish()
@@ -285,15 +286,15 @@ impl<'a> FolderLayout<'a> {
     pub(crate) fn bind<R: Read>(
         &self,
         mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
-        max_working_set_bytes: Option<u64>,
+        budget: &mut OperationBudget,
     ) -> Result<ReadyFolder<'a, R>, R7zError> {
-        let plan = codec::DecoderPlan::compile_with_working_set_limit(
+        let plan = codec::DecoderPlan::compile_with_budget(
             &self.state.folder,
             &self.state.graph,
             self.state.unpack_size,
             self.state.coder_sizes,
             self.state.streams.sizes,
-            max_working_set_bytes,
+            budget,
         )?;
         let inputs = self
             .state
@@ -1068,6 +1069,7 @@ mod tests {
             },
             layout: FolderStreamLayout::new(5, 1, &[], &[]).unwrap(),
         };
+        let mut budget = OperationBudget::for_decoded_limit(Some(4));
         let ready = layout
             .bind(
                 |stream| {
@@ -1076,10 +1078,9 @@ mod tests {
                         size: stream.range.len() as usize,
                     })
                 },
-                None,
+                &mut budget,
             )
             .unwrap();
-        let mut budget = OperationBudget::for_decoded_limit(Some(4));
 
         assert!(matches!(
             ready.start(None, &mut budget),
@@ -1337,7 +1338,7 @@ mod tests {
         folder.state.folder.coders[0].properties = Some(smallvec::smallvec![41]);
         let result = folder.bind::<std::io::Empty>(
             |_| panic!("invalid properties must precede source reads"),
-            None,
+            &mut OperationBudget::for_decoded_limit(None),
         );
         assert!(matches!(result, Err(R7zError::Decompression)));
     }
