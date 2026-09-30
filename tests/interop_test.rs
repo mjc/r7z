@@ -947,6 +947,22 @@ fn p7zip_aes_encrypted_headers_round_trip() {
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
 
+    let limited = r7z::Archive::open_with_password_and_options(
+        &archive_path,
+        Some("HeaderPass!"),
+        r7z::ArchiveOpenOptions {
+            max_total_kdf_cycles: Some(0),
+            ..r7z::ArchiveOpenOptions::default()
+        },
+    );
+    assert!(matches!(
+        limited,
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "AES KDF cycles",
+            limit: 0,
+        })
+    ));
+
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderPass!")).unwrap();
     let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "header_secret.txt");
