@@ -15,7 +15,7 @@ pub struct ResourceLimits {
     pub max_metadata_bytes: u64,
     /// Maximum estimated live decoder working set. `None` uses the built-in cap.
     pub max_decoder_working_set_bytes: Option<u64>,
-    /// Maximum estimated live encoder working set. `None` uses compression settings.
+    /// Maximum estimated working set for `LZMA`, `LZMA2`, and `PPMd` encoders.
     pub max_encoder_working_set_bytes: Option<u64>,
     /// Maximum total decoded bytes for one read operation. `None` is unlimited.
     pub max_total_decoded_bytes: Option<u64>,
@@ -150,8 +150,8 @@ impl VolumeCountBudget {
         Self { created: 0, limit }
     }
 
-    pub(crate) fn charge(&mut self) -> Result<(), R7zError> {
-        let Some(created) = self.created.checked_add(1) else {
+    pub(crate) fn charge(&mut self, count: usize) -> Result<(), R7zError> {
+        let Some(created) = self.created.checked_add(count) else {
             return Err(OperationBudget::resource_limit(
                 "archive volume count",
                 self.limit.map_or(u64::MAX, |limit| limit.get() as u64),

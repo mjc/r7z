@@ -246,13 +246,13 @@ impl ArchiveSource {
                 .ok_or(R7zError::Parse)?;
         }
 
-        if source_len > limit {
+        if saw_bad_signature {
+            Err(R7zError::Crc)
+        } else if source_len > limit {
             Err(R7zError::ResourceLimitExceeded {
                 resource: "signature scan",
                 limit,
             })
-        } else if saw_bad_signature {
-            Err(R7zError::Crc)
         } else {
             Err(R7zError::Parse)
         }

@@ -246,6 +246,7 @@ impl<W: Write> StreamingFolder<W> {
         prepared: &encode::PreparedArchiveOptions,
         budget: &mut KdfBudget,
     ) -> Result<Self, R7zError> {
+        prepared.validate_encoder_working_set()?;
         let options = prepared.archive();
         let settings = prepared.settings();
         let payload = PayloadWriter::new(out, prepared, budget)?;
@@ -1864,6 +1865,10 @@ fn write_volume_files<R: Read + Seek>(
     open_volume_budget: &mut OpenVolumeBudget,
     volume_count_budget: &mut VolumeCountBudget,
 ) -> Result<Vec<PathBuf>, R7zError> {
+    let total_size = archive.seek(SeekFrom::End(0))?;
+    let volume_count = required_volume_count(total_size, volume_sizes)?;
+    volume_count_budget.charge(volume_count)?;
+
     archive.seek(SeekFrom::Start(0))?;
     let mut next = [0u8; 1];
     let mut has_next = archive.read(&mut next)? != 0;
@@ -1872,7 +1877,6 @@ fn write_volume_files<R: Read + Seek>(
 
     if !has_next {
         let path = volume_path(base, volume_index);
-        volume_count_budget.charge()?;
         write_volume_file(&path, open_volume_budget, |_| Ok(()))?;
         paths.push(path);
         return Ok(paths);
@@ -1882,7 +1886,6 @@ fn write_volume_files<R: Read + Seek>(
         let size = volume_sizes[volume_index.min(volume_sizes.len() - 1)].get();
         let path = volume_path(base, volume_index);
         let remaining = size - 1;
-        volume_count_budget.charge()?;
         let copied = write_volume_file(&path, open_volume_budget, |file| {
             file.write_all(&next)?;
             let copied = io::copy(&mut archive.take(remaining), file)?;
@@ -1898,6 +1901,36 @@ fn write_volume_files<R: Read + Seek>(
     }
 
     Ok(paths)
+}
+
+fn required_volume_count(total_size: u64, volume_sizes: &[NonZeroU64]) -> Result<usize, R7zError> {
+    let Some(last_size) = volume_sizes.last() else {
+        return Err(R7zError::InvalidOptions(
+            "volume options require at least one size",
+        ));
+    };
+    if total_size == 0 {
+        return Ok(1);
+    }
+
+    let mut remaining = total_size;
+    for (index, size) in volume_sizes.iter().enumerate() {
+        let count = index + 1;
+        if remaining <= size.get() {
+            return Ok(count);
+        }
+        remaining -= size.get();
+    }
+
+    let tail_count = remaining.div_ceil(last_size.get());
+    let count = u64::try_from(volume_sizes.len())
+        .ok()
+        .and_then(|count| count.checked_add(tail_count))
+        .ok_or(R7zError::Parse)?;
+    usize::try_from(count).map_err(|_| R7zError::ResourceLimitExceeded {
+        resource: "archive volume count",
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })
 }
 
 fn write_volume_file<T>(
