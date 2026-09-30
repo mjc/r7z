@@ -1,7 +1,7 @@
 use nom::{IResult, error::ErrorKind};
 use num::FromPrimitive;
 
-#[derive(PartialEq, Debug, FromPrimitive)]
+#[derive(Clone, Copy, PartialEq, Debug, FromPrimitive)]
 pub enum Property {
     END = 0x00,
     Header = 0x01,

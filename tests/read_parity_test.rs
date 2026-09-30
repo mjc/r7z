@@ -234,6 +234,45 @@ fn build_copy_archive_with_additional_crc(
     archive
 }
 
+fn build_copy_archive_with_external_name(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut external_name = Vec::new();
+    for unit in name.encode_utf16() {
+        external_name.extend_from_slice(&unit.to_le_bytes());
+    }
+    external_name.extend_from_slice(&[0, 0]);
+
+    let mut archive = build_copy_archive_with_additional_crc(
+        name,
+        data,
+        &external_name,
+        crc32fast::hash(&external_name),
+    );
+    let header_start = 32 + data.len() + external_name.len();
+    let mut inline_name_property = vec![0x11];
+    inline_name_property.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
+        1 + external_name.len() as u64,
+    ));
+    inline_name_property.push(0x00);
+    inline_name_property.extend_from_slice(&external_name);
+    let name_property_start = archive[header_start..]
+        .windows(inline_name_property.len())
+        .position(|window| window == inline_name_property)
+        .map(|offset| header_start + offset)
+        .unwrap();
+    archive.splice(
+        name_property_start..name_property_start + inline_name_property.len(),
+        [0x11, 0x02, 0x22, 0x00],
+    );
+
+    let header_size = (archive.len() - header_start) as u64;
+    let header_crc = crc32fast::hash(&archive[header_start..]);
+    archive[20..28].copy_from_slice(&header_size.to_le_bytes());
+    archive[28..32].copy_from_slice(&header_crc.to_le_bytes());
+    let start_header_crc = crc32fast::hash(&archive[12..32]);
+    archive[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
+    archive
+}
+
 #[test]
 fn extract_all_rejects_parent_path() {
     let bytes = r7z::ArchiveBuilder::new()
@@ -408,6 +447,18 @@ fn copy_codec_extracts_and_detects_packed_data_crc_mismatch() {
 fn external_folder_definitions_are_loaded_from_additional_streams() {
     let bytes = build_archive_with_external_folder_definition("external.txt", b"external data");
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"external data");
+}
+
+#[test]
+fn external_file_names_are_loaded_from_additional_streams() {
+    let bytes = build_copy_archive_with_external_name("external-name.txt", b"external data");
+    let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
+
+    assert_eq!(
+        archive.raw_files_info().unwrap().name(0).as_deref(),
+        Some("external-name.txt")
+    );
     assert_eq!(archive.extract_to_memory(0).unwrap(), b"external data");
 }
 
