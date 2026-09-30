@@ -596,6 +596,7 @@ mod tests {
                         })
                     },
                     None,
+                    &mut budget,
                 )
             })
             .unwrap();
@@ -679,6 +680,7 @@ mod tests {
                         })
                     },
                     None,
+                    &mut budget,
                 )
             })
         };

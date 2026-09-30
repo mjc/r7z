@@ -1,8 +1,8 @@
 use crate::byte_range::ArchiveSourceRange;
+use crate::resources::OperationBudget;
 use crate::{R7zError, SignatureHeader, codec};
 use bytes::Bytes;
 use std::io::{Read, Seek, SeekFrom};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -53,11 +53,12 @@ impl ArchiveSource {
         })
     }
 
-    pub(crate) fn from_file(path: &Path, max_open_volumes: NonZeroUsize) -> Result<Self, R7zError> {
-        if let Some(source) = Self::from_split_first_volume(path, max_open_volumes)? {
+    pub(crate) fn from_file(path: &Path, budget: &mut OperationBudget) -> Result<Self, R7zError> {
+        if let Some(source) = Self::from_split_first_volume(path, budget)? {
             return Ok(source);
         }
 
+        budget.charge_open_volume()?;
         let file = PositionedFile::open(path)?;
         let len = file.len()?;
         Ok(Self {
@@ -67,7 +68,7 @@ impl ArchiveSource {
 
     pub(crate) fn from_split_first_volume(
         path: &Path,
-        max_open_volumes: NonZeroUsize,
+        budget: &mut OperationBudget,
     ) -> Result<Option<Self>, R7zError> {
         if !is_split_first_volume(path) {
             return Ok(None);
@@ -80,9 +81,7 @@ impl ArchiveSource {
             if !path.exists() {
                 break;
             }
-            if readers.len() == max_open_volumes.get() {
-                return Err(R7zError::LimitExceeded("archive volume count"));
-            }
+            budget.charge_open_volume()?;
             let file = PositionedFile::open(&path)?;
             let volume_len = file.len()?;
             let start = len;
@@ -99,6 +98,7 @@ impl ArchiveSource {
                 kind: ArchiveSourceKind::Volumes { readers, len },
             }))
         } else {
+            budget.release_open_volume();
             Ok(None)
         }
     }

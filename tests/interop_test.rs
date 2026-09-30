@@ -851,6 +851,28 @@ fn aes_extract_all_with_password() {
     assert_eq!(content, b"Hello from an encrypted 7z archive!\n");
 }
 
+#[test]
+fn aes_kdf_work_respects_the_read_operation_limit() {
+    let archive = r7z::Archive::open(std::path::Path::new("tests/fixtures/aes256.7z")).unwrap();
+    let config = r7z::ArchiveReadConfig::new(r7z::ResourceLimits {
+        max_total_kdf_cycles: Some(0),
+        ..r7z::ResourceLimits::default()
+    })
+    .with_password("test123");
+
+    let error = archive
+        .stream_files_with_options(config, |_, _| Ok(()))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        r7z::R7zError::ResourceLimitExceeded {
+            resource: "AES KDF cycles",
+            limit: 0,
+        }
+    ));
+}
+
 /// p7zip creates an AES+LZMA2 archive on the fly; r7z decrypts it.
 #[test]
 fn p7zip_aes_round_trip() {

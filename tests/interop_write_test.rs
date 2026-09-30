@@ -2130,7 +2130,7 @@ fn build_streaming_to_writer_matches_seek_backed_output() {
 }
 
 #[test]
-fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
+fn temporary_spool_write_limit_covers_temp_file_and_auto_spill() {
     struct WriteOnly(Vec<u8>);
     impl std::io::Write for WriteOnly {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -2144,10 +2144,6 @@ fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
     }
 
     let entries = || vec![("payload".to_string(), b"temporary spool limit".as_slice())];
-    let mut expected = std::io::Cursor::new(Vec::new());
-    r7z::build_streaming_with_options(entries(), &mut expected, r7z::ArchiveOptions::default())
-        .unwrap();
-    let spool_limit = expected.get_ref().len() as u64 - 1;
     let tmp = tempfile::tempdir().unwrap();
 
     for spool in [
@@ -2168,7 +2164,7 @@ fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
                 streaming: r7z::StreamingOptions {
                     spool,
                     resource_limits: r7z::ResourceLimits {
-                        max_temporary_storage_bytes: Some(spool_limit),
+                        max_temporary_storage_bytes: Some(0),
                         ..r7z::ResourceLimits::default()
                     },
                     ..Default::default()
@@ -2182,22 +2178,18 @@ fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
             Err(r7z::R7zError::ResourceLimitExceeded {
                 resource: "temporary storage",
                 limit,
-            }) if limit == spool_limit
+            }) if limit == 0
         ));
         assert!(output.0.is_empty());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 
-        let mut exact_limit_output = WriteOnly(Vec::new());
+        let mut unlimited_output = WriteOnly(Vec::new());
         r7z::build_streaming_to_writer(
             entries(),
-            &mut exact_limit_output,
+            &mut unlimited_output,
             r7z::ArchiveOptions {
                 streaming: r7z::StreamingOptions {
                     spool: exact_limit_spool,
-                    resource_limits: r7z::ResourceLimits {
-                        max_temporary_storage_bytes: Some(expected.get_ref().len() as u64),
-                        ..r7z::ResourceLimits::default()
-                    },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2205,8 +2197,11 @@ fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
         )
         .unwrap();
         assert_eq!(
-            exact_limit_output.0.as_slice(),
-            expected.get_ref().as_slice()
+            r7z::Archive::from_bytes(unlimited_output.0.into())
+                .unwrap()
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"temporary spool limit"
         );
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }

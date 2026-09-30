@@ -42,13 +42,14 @@ impl<'a> ExternalFolderPlan<'a> {
         self,
         mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
         password: Option<&str>,
+        budget: &mut OperationBudget,
     ) -> Result<VerifiedExternalData, R7zError> {
         let output_limit = self.output_limit;
         let mut output = ExternalFolderData::reserve(self.folders.stream_count())?;
         for folder in self.folders {
             let decoded = folder?
                 .bind(&mut open, None)?
-                .collect(password, output_limit)?;
+                .collect(password, output_limit, budget)?;
             output = output.append(decoded)?;
         }
         output.finish()
@@ -326,6 +327,7 @@ impl<'a, R: Read> ReadyFolder<'a, R> {
         self,
         password: Option<&str>,
         limit: u64,
+        budget: &mut OperationBudget,
     ) -> Result<DecodedFolder<'a>, R7zError> {
         let capacity =
             usize::try_from(self.unpack_size).map_err(|_| R7zError::LimitExceeded("metadata"))?;
@@ -338,7 +340,7 @@ impl<'a, R: Read> ReadyFolder<'a, R> {
         }
         let bytes = self
             .decoder
-            .start(password)?
+            .start(password, budget)?
             .read_bounded_to_vec(capacity, read_limit)?;
         verify_folder_output(self.layout, self.unpack_size, self.crc, Bytes::from(bytes))
     }
@@ -353,10 +355,10 @@ impl<'a, R: Read> ReadyFolder<'a, R> {
     {
         let eager_output_size = self.decoder.eager_output_size();
         let reader = match eager_output_size {
-            Some(size) => budget.with_eager_decoded_output(DecodedBytes::new(size), || {
-                self.decoder.start(password)
+            Some(size) => budget.with_eager_decoded_output(DecodedBytes::new(size), |budget| {
+                self.decoder.start(password, budget)
             })?,
-            None => self.decoder.start(password)?,
+            None => self.decoder.start(password, budget)?,
         };
         Ok(ActiveFolder {
             reader,
@@ -996,22 +998,35 @@ mod tests {
 
     #[test]
     fn failed_eager_start_does_not_consume_decoded_budget() {
-        let mut budget = OperationBudget::for_decoded_limit(Some(8));
+        let mut budget = OperationBudget::new(crate::resources::ResourceLimits {
+            max_total_decoded_bytes: Some(8),
+            max_total_kdf_cycles: Some(0),
+            ..crate::resources::ResourceLimits::default()
+        });
 
         assert!(matches!(
-            budget.with_eager_decoded_output(DecodedBytes::new(5), || {
+            budget.with_eager_decoded_output(DecodedBytes::new(5), |_| {
                 Err::<(), _>(R7zError::PasswordRequired)
             }),
             Err(R7zError::PasswordRequired)
         ));
         assert!(matches!(
-            budget.with_eager_decoded_output(DecodedBytes::new(5), || {
+            budget.with_eager_decoded_output(DecodedBytes::new(5), |budget| {
+                budget.charge_kdf_cycles(crate::resources::KdfCycles::new(1))
+            }),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "AES KDF cycles",
+                limit: 0,
+            })
+        ));
+        assert!(matches!(
+            budget.with_eager_decoded_output(DecodedBytes::new(5), |_| {
                 Err::<(), _>(R7zError::Decompression)
             }),
             Err(R7zError::Decompression)
         ));
         assert!(matches!(
-            budget.with_eager_decoded_output(DecodedBytes::new(4), || Ok(())),
+            budget.with_eager_decoded_output(DecodedBytes::new(4), |_| Ok(())),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "total decoded output",
                 limit: 8,
@@ -1211,6 +1226,7 @@ mod tests {
                     })
                 },
                 None,
+                &mut budget,
             )
             .unwrap()
             .into_data();
@@ -1263,6 +1279,7 @@ mod tests {
                     })
                 },
                 None,
+                &mut budget,
             )
             .unwrap()
             .into_data();

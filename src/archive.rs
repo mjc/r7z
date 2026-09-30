@@ -574,8 +574,9 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        let source = ArchiveSource::from_file(path, options.max_open_volumes)?;
-        Self::from_source_with_password(source, password, options)
+        let mut budget = OperationBudget::new(options);
+        let source = ArchiveSource::from_file(path, &mut budget)?;
+        Self::from_source_with_budget(source, password, options, budget)
     }
 
     /// Open an archive using a memory map when it is a single file.
@@ -607,16 +608,16 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        if let Some(source) =
-            ArchiveSource::from_split_first_volume(path, options.max_open_volumes)?
-        {
-            return Self::from_source_with_password(source, password, options);
+        let mut budget = OperationBudget::new(options);
+        if let Some(source) = ArchiveSource::from_split_first_volume(path, &mut budget)? {
+            return Self::from_source_with_budget(source, password, options, budget);
         }
+        budget.charge_open_volume()?;
         let file = std::fs::File::open(path)?;
         // SAFETY: The caller guarantees the mapped file remains unchanged.
         let mmap = unsafe { Mmap::map(&file)? };
         let source = ArchiveSource::from_bytes(Bytes::from_owner(mmap));
-        Self::from_source_with_password(source, password, options)
+        Self::from_source_with_budget(source, password, options, budget)
     }
 
     /// Decode a seekable [`Read`] source as a 7z archive.
@@ -708,7 +709,15 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
-        let mut budget = OperationBudget::new(options);
+        Self::from_source_with_budget(source, password, options, OperationBudget::new(options))
+    }
+
+    fn from_source_with_budget(
+        source: ArchiveSource,
+        password: Option<&str>,
+        options: ArchiveOpenOptions,
+        mut budget: OperationBudget,
+    ) -> Result<Archive, R7zError> {
         let source_len = source.len()?;
         let (base_offset, signature) = source.find_signature(options.max_signature_scan_bytes)?;
 
@@ -1627,9 +1636,14 @@ fn decode_encoded_header(
         .folder(budget.metadata_remaining().get())
         .map_err(|error| budget.map_metadata_error(error))?;
     let packs = PackedSource::new(source, base_offset, encoded.pack_info.pack_pos)?;
-    let decoded =
-        decode_metadata_folder(&packs, folder, password, budget.metadata_remaining().get())
-            .map_err(|error| budget.map_metadata_error(error))?;
+    let decoded = decode_metadata_folder(
+        &packs,
+        folder,
+        password,
+        budget.metadata_remaining().get(),
+        budget,
+    )
+    .map_err(|error| budget.map_metadata_error(error))?;
     parse_header_with_external_data(source, base_offset, decoded.as_bytes(), budget, password)
 }
 
@@ -1661,7 +1675,7 @@ fn decode_additional_folder_data(
 ) -> Result<VerifiedExternalData, R7zError> {
     let plan = ExternalFolderPlan::new(streams, budget)?;
     let packs = PackedSource::new(source, base_offset, plan.pack_pos())?;
-    plan.decode(|stream| packs.reader(&stream), password)
+    plan.decode(|stream| packs.reader(&stream), password, budget)
 }
 
 struct PackedSource<'a> {
@@ -1792,10 +1806,11 @@ fn decode_metadata_folder<'a>(
     folder: FolderLayout<'a>,
     password: Option<&str>,
     metadata_limit: u64,
+    budget: &mut OperationBudget,
 ) -> Result<DecodedFolder<'a>, R7zError> {
     folder
         .bind(|stream| packs.reader(&stream), None)?
-        .collect(password, metadata_limit)
+        .collect(password, metadata_limit, budget)
 }
 
 fn verify_additional_stream_crcs(

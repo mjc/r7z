@@ -1,5 +1,6 @@
 use super::*;
 use crate::folder::{Bcj2Layout, FolderGraph, PackedStreamIndex};
+use crate::resources::OperationBudget;
 
 /// An executable topology with parsed codec properties and admitted memory usage.
 pub(crate) struct DecoderPlan<'a> {
@@ -393,13 +394,17 @@ impl<'a> DecoderPlan<'a> {
 }
 
 impl<R: Read> BoundInput<R> {
-    fn open<'a>(self, password: Option<&str>) -> Result<Box<dyn Read + 'a>, R7zError>
+    fn open<'a>(
+        self,
+        password: Option<&str>,
+        budget: &mut OperationBudget,
+    ) -> Result<Box<dyn Read + 'a>, R7zError>
     where
         R: 'a,
     {
         self.coders.into_iter().try_fold(
             Box::new(self.input) as Box<dyn Read + 'a>,
-            |reader, coder| coder.open(reader, password),
+            |reader, coder| coder.open(reader, password, budget),
         )
     }
 }
@@ -425,15 +430,23 @@ impl<R: Read> ReadyDecoder<R> {
         }
     }
 
-    pub(super) fn materialize(self, password: Option<&str>) -> Result<Vec<u8>, R7zError> {
+    pub(super) fn materialize(
+        self,
+        password: Option<&str>,
+        budget: &mut OperationBudget,
+    ) -> Result<Vec<u8>, R7zError> {
         let limit = self.memory.output_limit()?;
-        let mut reader = self.start(password)?;
+        let mut reader = self.start(password, budget)?;
         let mut output = Vec::new();
         read_to_end_bounded(&mut reader, &mut output, limit, "materialized output")?;
         Ok(output)
     }
 
-    pub(crate) fn start<'a>(self, password: Option<&str>) -> Result<FolderReader<'a>, R7zError>
+    pub(crate) fn start<'a>(
+        self,
+        password: Option<&str>,
+        budget: &mut OperationBudget,
+    ) -> Result<FolderReader<'a>, R7zError>
     where
         R: 'a,
     {
@@ -441,15 +454,15 @@ impl<R: Read> ReadyDecoder<R> {
             BoundTopology::Chain { steps, input } => {
                 let mut reader: Box<dyn Read + 'a> = Box::new(input);
                 for step in steps {
-                    reader = step.open(reader, password)?;
+                    reader = step.open(reader, password, budget)?;
                 }
                 Ok(FolderReader::Stream(reader))
             }
             BoundTopology::Bcj2(bcj2) => crate::bcj2::decode(
-                bcj2.main.open(password)?,
-                bcj2.call.open(password)?,
-                bcj2.jump.open(password)?,
-                bcj2.control.open(password)?,
+                bcj2.main.open(password, budget)?,
+                bcj2.call.open(password, budget)?,
+                bcj2.jump.open(password, budget)?,
+                bcj2.control.open(password, budget)?,
                 bcj2.output_size,
             )
             .map(|bytes| FolderReader::Buffered(Cursor::new(bytes))),
@@ -501,8 +514,10 @@ impl DecodeStep {
         self,
         input: Box<dyn Read + 'r>,
         password: Option<&str>,
+        budget: &mut OperationBudget,
     ) -> Result<Box<dyn Read + 'r>, R7zError> {
-        self.coder.open(input, self.input, self.output, password)
+        self.coder
+            .open(input, self.input, self.output, password, budget)
     }
 }
 
@@ -642,6 +657,7 @@ impl CoderPlan {
         input_size: OutputSize,
         output: OutputSize,
         password: Option<&str>,
+        budget: &mut OperationBudget,
     ) -> Result<Box<dyn Read + 'a>, R7zError> {
         Ok(match self {
             Self::Copy => match output {
@@ -691,7 +707,7 @@ impl CoderPlan {
                 checked_reader(crate::byte_swap::ByteSwapReader::new(input, width), output)
             }
             Self::Aes(properties) => checked_reader(
-                aes_coder_reader(properties, input, input_size, output, password)?,
+                aes_coder_reader(properties, input, input_size, output, password, budget)?,
                 output,
             ),
         })
@@ -753,6 +769,10 @@ impl LzmaProperties {
 mod tests {
     use super::*;
 
+    fn operation_budget() -> OperationBudget {
+        OperationBudget::new(crate::resources::ResourceLimits::default())
+    }
+
     struct Unreadable(usize);
 
     impl Read for Unreadable {
@@ -788,6 +808,7 @@ mod tests {
         let folder = Folder::parse(&[1, 1, 0]).unwrap().1;
         let graph = folder.graph().unwrap();
         let plan = DecoderPlan::compile(&folder, &graph, 3, &[3], &[3]).unwrap();
+        let mut budget = operation_budget();
         let mut input = Cursor::new(b"abcEXTRA");
         let output = plan
             .bind(smallvec::smallvec![PackedInput {
@@ -795,19 +816,20 @@ mod tests {
                 size: 3
             }])
             .unwrap()
-            .materialize(None)
+            .materialize(None, &mut budget)
             .unwrap();
         assert_eq!(output, b"abc");
         assert_eq!(input.position(), 3);
 
         let plan = DecoderPlan::compile(&folder, &graph, 0, &[0], &[0]).unwrap();
+        let mut budget = operation_budget();
         let output = plan
             .bind(smallvec::smallvec![PackedInput {
                 reader: Unreadable(0),
                 size: 0
             }])
             .unwrap()
-            .materialize(None)
+            .materialize(None, &mut budget)
             .unwrap();
         assert!(output.is_empty());
     }
@@ -1086,7 +1108,8 @@ mod tests {
             ready.memory.output_limit().unwrap(),
             (MAX_MATERIALIZED_OUTPUT_BYTES - expected.0) / 2
         );
-        assert!(ready.materialize(None).unwrap().is_empty());
+        let mut budget = operation_budget();
+        assert!(ready.materialize(None, &mut budget).unwrap().is_empty());
     }
 
     fn pair(first: crate::CoderInfo, second: crate::CoderInfo) -> Folder {

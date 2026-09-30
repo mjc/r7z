@@ -6,6 +6,7 @@ pub use crate::method::{
     CODEC_COPY, CODEC_DEFLATE, CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2, CODEC_PPMD,
     CODEC_SWAP2, CODEC_SWAP4,
 };
+use crate::resources::{KdfCycles, OperationBudget, ResourceLimits};
 use crate::{Folder, R7zError};
 use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
@@ -24,7 +25,7 @@ const MAX_LZMA2_PROBABILITY_BYTES: usize = 24 * 1024;
 const MAX_PPMD_MEMORY_BYTES: u32 = 256 * 1024 * 1024;
 const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BCJ2_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
 const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
 const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
 const AES_CBC_WORKING_SET_BYTES: usize = 1024;
@@ -181,6 +182,7 @@ pub fn decompress_folder_with_password_and_sizes(
     coder_unpack_sizes: &[u64],
     password: Option<&str>,
 ) -> Result<Vec<u8>, R7zError> {
+    let mut budget = OperationBudget::new(ResourceLimits::default());
     prepare_folder_decoder(
         folder,
         smallvec::smallvec![PackedInput {
@@ -190,7 +192,7 @@ pub fn decompress_folder_with_password_and_sizes(
         unpack_size,
         coder_unpack_sizes,
     )?
-    .materialize(password)
+    .materialize(password, &mut budget)
 }
 
 pub(crate) struct PackedInput<R> {
@@ -260,8 +262,15 @@ fn aes_coder_reader<'a>(
     input_size: OutputSize,
     unpack_size: OutputSize,
     password: Option<&str>,
+    budget: &mut OperationBudget,
 ) -> Result<crate::aes::Aes256CbcDecryptReader<Box<dyn Read + 'a>>, R7zError> {
     let password = password.ok_or(R7zError::PasswordRequired)?;
+    let cycles = match props.num_cycles_power {
+        0x3F => 0,
+        power if power <= crate::aes::MAX_AES_NUM_CYCLES_POWER => 1u64 << power,
+        _ => return Err(R7zError::Decompression),
+    };
+    budget.charge_kdf_cycles(KdfCycles::new(cycles))?;
     let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
     let ciphertext_size = match input_size {
         OutputSize::Known(size) => Some(size),
@@ -465,9 +474,10 @@ mod bounded_reader_tests {
                     size: bytes.len(),
                 })
                 .collect();
+            let mut budget = OperationBudget::new(ResourceLimits::default());
             let output = prepare_folder_decoder(&folder, inputs, 5, sizes)
                 .unwrap()
-                .start(None)
+                .start(None, &mut budget)
                 .unwrap()
                 .read_bounded_to_vec(5, 6)
                 .unwrap();
@@ -515,6 +525,7 @@ mod tests {
         ExactSizeReader, compress_lzma, decompress_lzma2, lzma2_dict_size, ppmd_properties,
     };
     use crate::R7zError;
+    use crate::resources::{OperationBudget, ResourceLimits};
     use std::io::{Cursor, ErrorKind, Read};
 
     #[test]
@@ -705,6 +716,7 @@ mod tests {
         use super::{OutputSize, aes_coder_reader};
         let key = crate::aes::derive_key("password", &[], 0).unwrap();
         let encrypted = crate::aes::encrypt_aes256_cbc_zero_pad(&[], &key, &[0; 16]).unwrap();
+        let mut budget = OperationBudget::new(ResourceLimits::default());
         for (output_size, expected) in [(OutputSize::Known(0), 0), (OutputSize::Unknown, 16)] {
             let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
             let mut reader = aes_coder_reader(
@@ -713,6 +725,7 @@ mod tests {
                 OutputSize::Known(encrypted.len() as u64),
                 output_size,
                 Some("password"),
+                &mut budget,
             )
             .unwrap();
             let mut output = Vec::new();
@@ -722,17 +735,48 @@ mod tests {
     }
 
     #[test]
+    fn aes_coders_share_the_operation_kdf_limit() {
+        use super::{OutputSize, aes_coder_reader};
+
+        let mut budget = OperationBudget::new(ResourceLimits {
+            max_total_kdf_cycles: Some(1),
+            ..ResourceLimits::default()
+        });
+        let open = |budget: &mut OperationBudget| {
+            aes_coder_reader(
+                crate::aes::AesProperties::parse(&[0, 0]).unwrap(),
+                Box::new(Cursor::new([0; 16])),
+                OutputSize::Known(16),
+                OutputSize::Known(16),
+                Some("password"),
+                budget,
+            )
+        };
+
+        drop(open(&mut budget).unwrap());
+        assert!(matches!(
+            open(&mut budget),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "AES KDF cycles",
+                limit: 1,
+            })
+        ));
+    }
+
+    #[test]
     fn aes_coder_reader_streams_inputs_over_256_mib() {
         use super::{OutputSize, aes_coder_reader};
 
         let size = 256 * 1024 * 1024 + 16;
         let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
+        let mut budget = OperationBudget::new(ResourceLimits::default());
         let mut reader = aes_coder_reader(
             props,
             Box::new(std::io::repeat(0).take(size)),
             OutputSize::Known(size),
             OutputSize::Known(size),
             Some("password"),
+            &mut budget,
         )
         .unwrap();
         let mut output = [0; 8192];

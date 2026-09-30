@@ -187,9 +187,13 @@ let file = std::fs::File::open("example.7z")?;
 let archive = Archive::from_reader(file)?;
 ```
 
-`ResourceLimits` configures the same limits for archive opening, reading, and
-writing. Defaults preserve the built-in byte safeguards and limit split archives
-to 128 open volumes. Callers can configure per-operation byte limits:
+`ResourceLimits` configures limits for archive opening, reading, and writing.
+Defaults preserve built-in decoder safeguards and limit split archives to 128
+open volumes. Callers can configure metadata, decoded-output, KDF, retained
+output, and temporary-storage limits:
+
+Decoded output, KDF work, and bytes written to temporary spools are cumulative
+per operation. Decoder working-set and retained-output limits bound peak use.
 
 ```rust
 use r7z::{Archive, ResourceLimits};

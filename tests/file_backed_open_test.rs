@@ -137,7 +137,10 @@ fn open_split_archive_first_volume_reads_siblings() {
     };
     assert!(matches!(
         r7z::Archive::open_with_options(&first, r7z::ArchiveOpenOptions { ..limits },),
-        Err(r7z::R7zError::LimitExceeded("archive volume count"))
+        Err(r7z::R7zError::ResourceLimitExceeded {
+            resource: "archive volume count",
+            limit: 2,
+        })
     ));
 
     let archive = r7z::Archive::open(&first).unwrap();
