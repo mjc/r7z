@@ -9,6 +9,7 @@ use super::model::{
     EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, PreparedFolder, SolidMode,
     WriteEntry, WriteEntryIndex,
 };
+use crate::resources::{KdfBudget, KdfCycles, OperationBudget};
 use crate::{R7zError, aes, bcj, codec};
 use lzma_rust2::{EncodeMode, Lzma2Options, LzmaOptions, LzmaWriter, MfType};
 use ppmd_rust::{
@@ -160,12 +161,15 @@ pub(crate) fn build_archive(
     options: &ArchiveOptions,
 ) -> Result<Vec<u8>, R7zError> {
     let prepared = prepare_archive_options(options.clone())?;
-    build_archive_with_settings(entries, &prepared)
+    let budget = OperationBudget::new(options.streaming.resource_limits);
+    let mut kdf_budget = budget.into_writer_budgets().kdf;
+    build_archive_with_settings(entries, &prepared, &mut kdf_budget)
 }
 
 pub(super) fn build_archive_with_settings(
     entries: &[WriteEntry],
     prepared: &PreparedArchiveOptions,
+    budget: &mut KdfBudget,
 ) -> Result<Vec<u8>, R7zError> {
     let mut folders = Vec::new();
     let mut by_folder: BTreeMap<super::model::WriteFolderId, Vec<WriteEntryIndex>> =
@@ -180,17 +184,18 @@ pub(super) fn build_archive_with_settings(
     }
 
     for file_indices in by_folder.into_values() {
-        let folder = encode_folder(entries, file_indices, prepared)?;
+        let folder = encode_folder(entries, file_indices, prepared, budget)?;
         folders.push(folder);
     }
 
-    build_archive_from_prepared(entries, &folders, prepared)
+    build_archive_from_prepared(entries, &folders, prepared, budget)
 }
 
 pub(crate) fn build_archive_from_prepared(
     entries: &[WriteEntry],
     folders: &[PreparedFolder],
     prepared: &PreparedArchiveOptions,
+    budget: &mut KdfBudget,
 ) -> Result<Vec<u8>, R7zError> {
     let options = &prepared.archive;
     let mut packed_data = Vec::new();
@@ -219,7 +224,7 @@ pub(crate) fn build_archive_from_prepared(
     };
 
     let (next_header, next_header_offset) = if should_encode {
-        let encoded = encode_header_stream(&raw_header, prepared)?;
+        let encoded = encode_header_stream(&raw_header, prepared, budget)?;
         let pack_pos = packed_data.len() as u64;
         packed_data.extend_from_slice(encoded.packed.as_slice());
         let descriptor = build_encoded_header_descriptor(
@@ -472,6 +477,7 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     entries: &[WriteEntry],
     folders: &[CompletedFolder],
     prepared: &PreparedArchiveOptions,
+    budget: &mut KdfBudget,
 ) -> Result<W, R7zError> {
     let options = &prepared.archive;
     let packed_size = folders.iter().try_fold(0u64, |acc, folder| {
@@ -488,7 +494,7 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     };
 
     let (next_header, next_header_offset) = if should_encode {
-        let encoded = encode_header_stream(&raw_header, prepared)?;
+        let encoded = encode_header_stream(&raw_header, prepared, budget)?;
         out.seek(SeekFrom::Start(32 + packed_size))?;
         out.write_all(encoded.packed.as_slice())?;
         let descriptor = build_encoded_header_descriptor(
@@ -515,6 +521,7 @@ pub(crate) fn encode_folder(
     entries: &[WriteEntry],
     file_indices: Vec<WriteEntryIndex>,
     prepared: &PreparedArchiveOptions,
+    budget: &mut KdfBudget,
 ) -> Result<PreparedFolder, R7zError> {
     let mut data = Vec::new();
     let mut file_sizes = Vec::new();
@@ -532,7 +539,7 @@ pub(crate) fn encode_folder(
     let mut encoded = encode_payload_with_options(&data, prepared)?;
 
     if let Some(encryption) = prepared.encryption() {
-        let aes = make_aes_material(encryption)?;
+        let aes = make_aes_material(encryption, budget)?;
         let before_padding = encoded.packed.len() as u64;
         encoded.packed = PackedBytes(aes::encrypt_aes256_cbc_zero_pad(
             encoded.packed.as_slice(),
@@ -617,6 +624,7 @@ fn encode_payload_with_options(
 fn encode_header_stream(
     raw_header: &[u8],
     prepared: &PreparedArchiveOptions,
+    budget: &mut KdfBudget,
 ) -> Result<EncodedHeader, R7zError> {
     let (props, compressed) = codec::compress_lzma(raw_header)?;
     let coder_info = encode_coder_info_lzma(&props);
@@ -633,7 +641,7 @@ fn encode_header_stream(
         });
     };
 
-    let aes = make_aes_material(encryption)?;
+    let aes = make_aes_material(encryption, budget)?;
     let before_padding = compressed.len() as u64;
     let encrypted = aes::encrypt_aes256_cbc_zero_pad(&compressed, &aes.key, &aes.iv)?;
     let coder_info = encode_coder_info_aes_then(&[CoderSpec::Lzma(props)], &aes.props);
@@ -856,6 +864,7 @@ pub(super) struct AesMaterial {
 
 pub(super) fn make_aes_material(
     encryption: PreparedEncryption<'_>,
+    budget: &mut KdfBudget,
 ) -> Result<AesMaterial, R7zError> {
     let PreparedEncryption { options, settings } = encryption;
     let mut salt = vec![0u8; usize::from(settings.salt_len)];
@@ -869,6 +878,10 @@ pub(super) fn make_aes_material(
     let mut iv = [0u8; 16];
     let iv_copy_len = iv_bytes.len().min(16);
     iv[..iv_copy_len].copy_from_slice(&iv_bytes[..iv_copy_len]);
+    let cycles = 1u64
+        .checked_shl(u32::from(settings.cycles_power))
+        .ok_or(R7zError::Decompression)?;
+    budget.charge(KdfCycles::new(cycles))?;
     let key = aes::derive_key(&options.password, &salt, settings.cycles_power)?;
     let props = aes::encode_aes_properties(settings.cycles_power, &salt, &iv_bytes);
     Ok(AesMaterial { key, iv, props })

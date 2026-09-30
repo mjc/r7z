@@ -15,14 +15,18 @@ pub struct ResourceLimits {
     pub max_metadata_bytes: u64,
     /// Maximum estimated live decoder working set. `None` uses the built-in cap.
     pub max_decoder_working_set_bytes: Option<u64>,
+    /// Maximum estimated live encoder working set. `None` uses compression settings.
+    pub max_encoder_working_set_bytes: Option<u64>,
     /// Maximum total decoded bytes for one read operation. `None` is unlimited.
     pub max_total_decoded_bytes: Option<u64>,
     /// Maximum aggregate AES key-derivation work for one operation. `None` is unlimited.
     pub max_total_kdf_cycles: Option<u64>,
-    /// Maximum bytes retained by an in-memory extraction. `None` is unlimited.
+    /// Maximum bytes retained in memory by one archive operation. `None` is unlimited.
     pub max_retained_output_bytes: Option<u64>,
     /// Maximum cumulative bytes written to temporary archive spools. `None` is unlimited.
     pub max_temporary_storage_bytes: Option<u64>,
+    /// Maximum number of volumes created for one archive. `None` is unlimited.
+    pub max_volume_count: Option<NonZeroUsize>,
     /// Maximum number of split archive volumes held open at once.
     pub max_open_volumes: NonZeroUsize,
 }
@@ -33,10 +37,12 @@ impl Default for ResourceLimits {
             max_signature_scan_bytes: DEFAULT_METADATA_BYTES,
             max_metadata_bytes: DEFAULT_METADATA_BYTES,
             max_decoder_working_set_bytes: None,
+            max_encoder_working_set_bytes: None,
             max_total_decoded_bytes: None,
             max_total_kdf_cycles: None,
             max_retained_output_bytes: None,
             max_temporary_storage_bytes: None,
+            max_volume_count: None,
             max_open_volumes: NonZeroUsize::new(DEFAULT_OPEN_VOLUMES).unwrap(),
         }
     }
@@ -100,6 +106,129 @@ impl TemporaryStorageBytes {
     }
 }
 
+pub(crate) struct KdfBudget {
+    used: KdfCycles,
+    limit: Option<u64>,
+}
+
+impl KdfBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            used: KdfCycles::new(0),
+            limit,
+        }
+    }
+
+    pub(crate) fn charge(&mut self, cycles: KdfCycles) -> Result<(), R7zError> {
+        self.used = KdfCycles::new(OperationBudget::next_total(
+            self.used.get(),
+            cycles.get(),
+            self.limit,
+            "AES KDF cycles",
+        )?);
+        Ok(())
+    }
+}
+
+pub(crate) struct TemporaryStorageBudget {
+    written: TemporaryStorageBytes,
+    limit: Option<u64>,
+}
+
+pub(crate) struct OpenVolumeBudget {
+    open: usize,
+    limit: NonZeroUsize,
+}
+
+pub(crate) struct VolumeCountBudget {
+    created: usize,
+    limit: Option<NonZeroUsize>,
+}
+
+impl VolumeCountBudget {
+    fn new(limit: Option<NonZeroUsize>) -> Self {
+        Self { created: 0, limit }
+    }
+
+    pub(crate) fn charge(&mut self) -> Result<(), R7zError> {
+        let Some(created) = self.created.checked_add(1) else {
+            return Err(OperationBudget::resource_limit(
+                "archive volume count",
+                self.limit.map_or(u64::MAX, |limit| limit.get() as u64),
+            ));
+        };
+        if self.limit.is_some_and(|limit| created > limit.get()) {
+            return Err(OperationBudget::resource_limit(
+                "archive volume count",
+                self.limit.map_or(u64::MAX, |limit| limit.get() as u64),
+            ));
+        }
+        self.created = created;
+        Ok(())
+    }
+}
+
+impl OpenVolumeBudget {
+    fn new(limit: NonZeroUsize) -> Self {
+        Self { open: 0, limit }
+    }
+
+    pub(crate) fn charge(&mut self) -> Result<(), R7zError> {
+        let limit = self.limit.get();
+        let Some(open) = self.open.checked_add(1) else {
+            return Err(OperationBudget::resource_limit(
+                "open archive volumes",
+                limit as u64,
+            ));
+        };
+        if open > limit {
+            return Err(OperationBudget::resource_limit(
+                "open archive volumes",
+                limit as u64,
+            ));
+        }
+        self.open = open;
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.open = self.open.saturating_sub(1);
+    }
+}
+
+impl TemporaryStorageBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            written: TemporaryStorageBytes::new(0),
+            limit,
+        }
+    }
+
+    pub(crate) fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+
+    pub(crate) fn check_write(&self, bytes: TemporaryStorageBytes) -> Result<(), R7zError> {
+        OperationBudget::next_total(
+            self.written.get(),
+            bytes.get(),
+            self.limit,
+            "temporary storage",
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn charge_write(&mut self, bytes: TemporaryStorageBytes) -> Result<(), R7zError> {
+        self.written = TemporaryStorageBytes::new(OperationBudget::next_total(
+            self.written.get(),
+            bytes.get(),
+            self.limit,
+            "temporary storage",
+        )?);
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RetainedOutputBytes(u64);
@@ -112,6 +241,71 @@ impl RetainedOutputBytes {
 
     const fn get(self) -> u64 {
         self.0
+    }
+}
+
+pub(crate) struct RetainedOutputBudget {
+    retained: RetainedOutputBytes,
+    limit: Option<u64>,
+}
+
+pub(crate) struct SpoolBudget {
+    pub(crate) temporary_storage: TemporaryStorageBudget,
+    pub(crate) retained_output: RetainedOutputBudget,
+}
+
+pub(crate) struct WriterBudgets {
+    pub(crate) kdf: KdfBudget,
+    pub(crate) spool: SpoolBudget,
+    pub(crate) open_volumes: OpenVolumeBudget,
+    pub(crate) volume_count: VolumeCountBudget,
+}
+
+impl RetainedOutputBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            retained: RetainedOutputBytes::new(0),
+            limit,
+        }
+    }
+
+    pub(crate) fn check_resize(
+        &self,
+        current: RetainedOutputBytes,
+        next: RetainedOutputBytes,
+    ) -> Result<(), R7zError> {
+        self.resized_total(current, next).map(|_| ())
+    }
+
+    fn resized_total(
+        &self,
+        current: RetainedOutputBytes,
+        next: RetainedOutputBytes,
+    ) -> Result<u64, R7zError> {
+        let retained = self.retained.get().saturating_sub(current.get());
+        OperationBudget::next_total(retained, next.get(), self.limit, "retained output")
+    }
+
+    pub(crate) fn resize(
+        &mut self,
+        current: RetainedOutputBytes,
+        next: RetainedOutputBytes,
+    ) -> Result<(), R7zError> {
+        let retained = self.resized_total(current, next)?;
+        self.retained = RetainedOutputBytes::new(retained);
+        Ok(())
+    }
+
+    pub(crate) fn reserve(&mut self, bytes: RetainedOutputBytes) -> Result<(), R7zError> {
+        self.resize(RetainedOutputBytes::new(0), bytes)
+    }
+
+    pub(crate) fn release(&mut self, bytes: RetainedOutputBytes) {
+        self.retained = RetainedOutputBytes::new(self.retained.get().saturating_sub(bytes.get()));
+    }
+
+    pub(crate) fn limit(&self) -> Option<u64> {
+        self.limit
     }
 }
 
@@ -135,11 +329,11 @@ pub(crate) struct OperationBudget {
     metadata: MetadataBytes,
     decoded: DecodedBytes,
     peak_decoder_working_set: DecoderWorkingSetBytes,
-    kdf_cycles: KdfCycles,
-    temporary_storage: TemporaryStorageBytes,
-    retained_output: RetainedOutputBytes,
-    peak_retained_output: RetainedOutputBytes,
-    open_volumes: usize,
+    kdf: KdfBudget,
+    temporary_storage: TemporaryStorageBudget,
+    retained_output: RetainedOutputBudget,
+    open_volumes: OpenVolumeBudget,
+    volume_count: VolumeCountBudget,
 }
 
 impl OperationBudget {
@@ -149,11 +343,23 @@ impl OperationBudget {
             metadata: MetadataBytes::new(0),
             decoded: DecodedBytes::new(0),
             peak_decoder_working_set: DecoderWorkingSetBytes::new(0),
-            kdf_cycles: KdfCycles::new(0),
-            temporary_storage: TemporaryStorageBytes::new(0),
-            retained_output: RetainedOutputBytes::new(0),
-            peak_retained_output: RetainedOutputBytes::new(0),
-            open_volumes: 0,
+            kdf: KdfBudget::new(limits.max_total_kdf_cycles),
+            temporary_storage: TemporaryStorageBudget::new(limits.max_temporary_storage_bytes),
+            retained_output: RetainedOutputBudget::new(limits.max_retained_output_bytes),
+            open_volumes: OpenVolumeBudget::new(limits.max_open_volumes),
+            volume_count: VolumeCountBudget::new(limits.max_volume_count),
+        }
+    }
+
+    pub(crate) fn into_writer_budgets(self) -> WriterBudgets {
+        WriterBudgets {
+            kdf: self.kdf,
+            spool: SpoolBudget {
+                temporary_storage: self.temporary_storage,
+                retained_output: self.retained_output,
+            },
+            open_volumes: self.open_volumes,
+            volume_count: self.volume_count,
         }
     }
 
@@ -290,41 +496,7 @@ impl OperationBudget {
     }
 
     pub(crate) fn charge_kdf_cycles(&mut self, cycles: KdfCycles) -> Result<(), R7zError> {
-        let used = Self::next_total(
-            self.kdf_cycles.get(),
-            cycles.get(),
-            self.limits.max_total_kdf_cycles,
-            "AES KDF cycles",
-        )?;
-        self.kdf_cycles = KdfCycles::new(used);
-        Ok(())
-    }
-
-    pub(crate) fn check_temporary_storage_write(
-        &self,
-        bytes: TemporaryStorageBytes,
-    ) -> Result<(), R7zError> {
-        Self::next_total(
-            self.temporary_storage.get(),
-            bytes.get(),
-            self.limits.max_temporary_storage_bytes,
-            "temporary storage",
-        )
-        .map(|_| ())
-    }
-
-    pub(crate) fn charge_temporary_storage_write(
-        &mut self,
-        bytes: TemporaryStorageBytes,
-    ) -> Result<(), R7zError> {
-        let written = Self::next_total(
-            self.temporary_storage.get(),
-            bytes.get(),
-            self.limits.max_temporary_storage_bytes,
-            "temporary storage",
-        )?;
-        self.temporary_storage = TemporaryStorageBytes::new(written);
-        Ok(())
+        self.kdf.charge(cycles)
     }
 
     #[allow(dead_code)]
@@ -333,36 +505,18 @@ impl OperationBudget {
         bytes: RetainedOutputBytes,
         operation: impl FnOnce(&mut Self) -> Result<T, R7zError>,
     ) -> Result<T, R7zError> {
-        let limit = self.limits.max_retained_output_bytes.unwrap_or(u64::MAX);
-        let Some(reserved) = self.retained_output.get().checked_add(bytes.get()) else {
-            return Err(Self::resource_limit("retained output", limit));
-        };
-        if reserved > limit {
-            return Err(Self::resource_limit("retained output", limit));
-        }
-
-        let previous = self.retained_output;
-        self.retained_output = RetainedOutputBytes::new(reserved);
-        self.peak_retained_output = self.peak_retained_output.max(self.retained_output);
+        self.retained_output.reserve(bytes)?;
         let result = operation(self);
-        self.retained_output = previous;
+        self.retained_output.release(bytes);
         result
     }
 
     pub(crate) fn charge_open_volume(&mut self) -> Result<(), R7zError> {
-        let limit = self.limits.max_open_volumes.get();
-        let Some(open_volumes) = self.open_volumes.checked_add(1) else {
-            return Err(Self::resource_limit("archive volume count", limit as u64));
-        };
-        if open_volumes > limit {
-            return Err(Self::resource_limit("archive volume count", limit as u64));
-        }
-        self.open_volumes = open_volumes;
-        Ok(())
+        self.open_volumes.charge()
     }
 
     pub(crate) fn release_open_volume(&mut self) {
-        self.open_volumes = self.open_volumes.saturating_sub(1);
+        self.open_volumes.release();
     }
 
     fn next_total(
@@ -395,6 +549,22 @@ mod tests {
     };
     use crate::R7zError;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn defaults_match_documented_resource_limits() {
+        let limits = ResourceLimits::default();
+
+        assert_eq!(limits.max_signature_scan_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_metadata_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_decoder_working_set_bytes, None);
+        assert_eq!(limits.max_encoder_working_set_bytes, None);
+        assert_eq!(limits.max_total_decoded_bytes, None);
+        assert_eq!(limits.max_total_kdf_cycles, None);
+        assert_eq!(limits.max_retained_output_bytes, None);
+        assert_eq!(limits.max_temporary_storage_bytes, None);
+        assert_eq!(limits.max_volume_count, None);
+        assert_eq!(limits.max_open_volumes, NonZeroUsize::new(128).unwrap());
+    }
 
     fn nested_decode(budget: &mut OperationBudget, bytes: DecodedBytes) -> Result<(), R7zError> {
         budget.charge_decoded(bytes)
@@ -479,28 +649,36 @@ mod tests {
 
     #[test]
     fn kdf_work_and_temporary_storage_have_independent_limits() {
-        let mut budget = OperationBudget::new(ResourceLimits {
+        let budget = OperationBudget::new(ResourceLimits {
             max_total_kdf_cycles: Some(8),
             max_temporary_storage_bytes: Some(8),
             ..ResourceLimits::default()
         });
+        let mut budgets = budget.into_writer_budgets();
 
-        budget.charge_kdf_cycles(KdfCycles::new(6)).unwrap();
+        budgets.kdf.charge(KdfCycles::new(6)).unwrap();
         assert!(matches!(
-            budget.charge_kdf_cycles(KdfCycles::new(3)),
+            budgets.kdf.charge(KdfCycles::new(3)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "AES KDF cycles",
                 limit: 8,
             })
         ));
-        budget
-            .charge_temporary_storage_write(TemporaryStorageBytes::new(5))
+        budgets
+            .spool
+            .temporary_storage
+            .charge_write(TemporaryStorageBytes::new(5))
             .unwrap();
-        budget
-            .charge_temporary_storage_write(TemporaryStorageBytes::new(3))
+        budgets
+            .spool
+            .temporary_storage
+            .charge_write(TemporaryStorageBytes::new(3))
             .unwrap();
         assert!(matches!(
-            budget.charge_temporary_storage_write(TemporaryStorageBytes::new(1)),
+            budgets
+                .spool
+                .temporary_storage
+                .charge_write(TemporaryStorageBytes::new(1)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "temporary storage",
                 limit: 8,
@@ -541,7 +719,7 @@ mod tests {
         assert!(matches!(
             budget.charge_open_volume(),
             Err(R7zError::ResourceLimitExceeded {
-                resource: "archive volume count",
+                resource: "open archive volumes",
                 limit: 2,
             })
         ));

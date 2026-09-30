@@ -6,7 +6,10 @@ mod lzma2;
 mod model;
 
 use crate::aes::Aes256CbcEncryptWriter;
-use crate::resources::{OperationBudget, TemporaryStorageBytes};
+use crate::resources::{
+    KdfBudget, OpenVolumeBudget, OperationBudget, RetainedOutputBytes, SpoolBudget,
+    TemporaryStorageBudget, TemporaryStorageBytes, VolumeCountBudget, WriterBudgets,
+};
 use crate::{
     Archive, ArchiveEntryIndex, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle,
     bcj::BcjX86Writer,
@@ -20,6 +23,7 @@ use ppmd_rust::Ppmd7Encoder;
 use std::{
     fs::{File, OpenOptions},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
@@ -115,10 +119,14 @@ struct PayloadCompletion<W: Write> {
 }
 
 impl<W: Write> PayloadWriter<W> {
-    fn new(out: W, prepared: &encode::PreparedArchiveOptions) -> Result<Self, R7zError> {
+    fn new(
+        out: W,
+        prepared: &encode::PreparedArchiveOptions,
+        budget: &mut KdfBudget,
+    ) -> Result<Self, R7zError> {
         match prepared.encryption() {
             Some(encryption) => {
-                let aes = encode::make_aes_material(encryption)?;
+                let aes = encode::make_aes_material(encryption, budget)?;
                 Ok(Self::Aes {
                     writer: Box::new(Aes256CbcEncryptWriter::new(
                         CountingWriter {
@@ -236,10 +244,11 @@ impl<W: Write> StreamingFolder<W> {
         out: W,
         known_size: Option<u64>,
         prepared: &encode::PreparedArchiveOptions,
+        budget: &mut KdfBudget,
     ) -> Result<Self, R7zError> {
         let options = prepared.archive();
         let settings = prepared.settings();
-        let payload = PayloadWriter::new(out, prepared)?;
+        let payload = PayloadWriter::new(out, prepared, budget)?;
         let encoder = match settings.codec {
             encode::PreparedCodec::Copy => StreamingEncoder::Copy(payload),
             encode::PreparedCodec::Lzma2(threads) => StreamingEncoder::Lzma2(lzma2::Encoder::new(
@@ -832,6 +841,17 @@ fn write_preserved_archive<W: Write + Seek>(
     let mut options = options.clone();
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
+    let budget = OperationBudget::new(prepared.archive().streaming.resource_limits);
+    let writer_budgets = budget.into_writer_budgets();
+    let mut kdf_budget = writer_budgets.kdf;
+    let mut retained_output_budget = writer_budgets.spool.retained_output;
+    for entry in &entries {
+        if let PreservedEntryStream::Data(data) = &entry.stream {
+            retained_output_budget.reserve(RetainedOutputBytes::new(
+                u64::try_from(data.len()).unwrap_or(u64::MAX),
+            ))?;
+        }
+    }
     let StagedPreserved {
         entries,
         folder_order,
@@ -866,6 +886,7 @@ fn write_preserved_archive<W: Write + Seek>(
                 &entries,
                 file_indices,
                 &prepared,
+                &mut kdf_budget,
             )?);
         }
     }
@@ -874,7 +895,7 @@ fn write_preserved_archive<W: Write + Seek>(
         .into_iter()
         .map(StagedEntry::into_write_entry)
         .collect::<Vec<_>>();
-    encode::finish_streamed_archive(out, &write_entries, &completed, &prepared)
+    encode::finish_streamed_archive(out, &write_entries, &completed, &prepared, &mut kdf_budget)
 }
 
 enum StagedStream {
@@ -1064,6 +1085,7 @@ fn write_encoded_folder_streaming<W: Write>(
     streams: &[StagedEntry],
     file_indices: Vec<WriteEntryIndex>,
     prepared: &encode::PreparedArchiveOptions,
+    budget: &mut KdfBudget,
 ) -> Result<model::CompletedFolder, R7zError> {
     let data_entries = file_indices
         .into_iter()
@@ -1087,7 +1109,7 @@ fn write_encoded_folder_streaming<W: Write>(
         })
         .collect::<Result<Vec<_>, R7zError>>()?;
     let known_size = staged_folder_size(&data_entries)?;
-    let mut folder = StreamingFolder::encoded(out, Some(known_size), prepared)?;
+    let mut folder = StreamingFolder::encoded(out, Some(known_size), prepared, budget)?;
     for entry in data_entries {
         let (size, checksum) = write_staged_stream_to(&entry.source, &mut folder)?;
         folder.record_stream(entry.index, size, checksum)?;
@@ -1206,6 +1228,7 @@ pub struct ArchiveWriter<W: Write + Seek, const STARTED: bool = false> {
     state: WriterState<W>,
     entries: Vec<WriteEntry>,
     prepared: encode::PreparedArchiveOptions,
+    budget: KdfBudget,
 }
 
 impl<W: Write + Seek> ArchiveWriter<W, false> {
@@ -1213,10 +1236,16 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
         let mut options = options;
         lzma2::set_default_budget(&mut options);
         let prepared = encode::prepare_archive_options(options)?;
-        Ok(Self::new_prepared(out, prepared))
+        let budget = OperationBudget::new(prepared.archive().streaming.resource_limits);
+        let kdf_budget = budget.into_writer_budgets().kdf;
+        Ok(Self::new_prepared(out, prepared, kdf_budget))
     }
 
-    fn new_prepared(out: W, prepared: encode::PreparedArchiveOptions) -> Self {
+    fn new_prepared(
+        out: W,
+        prepared: encode::PreparedArchiveOptions,
+        kdf_budget: KdfBudget,
+    ) -> Self {
         Self {
             state: WriterState::Ready {
                 output: out,
@@ -1224,6 +1253,7 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
             },
             entries: Vec::new(),
             prepared,
+            budget: kdf_budget,
         }
     }
 
@@ -1238,6 +1268,7 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
             state: self.state,
             entries: self.entries,
             prepared: self.prepared,
+            budget: self.budget,
         }
     }
 
@@ -1395,11 +1426,18 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         else {
             return Err(writer_failed());
         };
-        encode::finish_streamed_archive(out, &self.entries, &folders, &self.prepared)
+        encode::finish_streamed_archive(
+            out,
+            &self.entries,
+            &folders,
+            &self.prepared,
+            &mut self.budget,
+        )
     }
 
     fn finish_buffered(mut self) -> Result<W, R7zError> {
-        let bytes = encode::build_archive_with_settings(&self.entries, &self.prepared)?;
+        let bytes =
+            encode::build_archive_with_settings(&self.entries, &self.prepared, &mut self.budget)?;
         let WriterState::Ready {
             output: mut out, ..
         } = std::mem::replace(&mut self.state, WriterState::Failed)
@@ -1543,7 +1581,8 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
             FolderPlan::Automatic => None,
             FolderPlan::Preplanned { folder_size } => Some(folder_size),
         };
-        let folder = StreamingFolder::encoded(output, known_size, &self.prepared)?;
+        let folder =
+            StreamingFolder::encoded(output, known_size, &self.prepared, &mut self.budget)?;
         self.state = WriterState::Active {
             folder: Box::new(folder),
             completed,
@@ -1652,20 +1691,23 @@ where
     let mut options = options;
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
-    build_streaming_with_prepared_options(entries, out, prepared)
+    let budget = OperationBudget::new(prepared.archive().streaming.resource_limits);
+    let kdf_budget = budget.into_writer_budgets().kdf;
+    build_streaming_with_prepared_options(entries, out, prepared, kdf_budget)
 }
 
 fn build_streaming_with_prepared_options<W, I, R>(
     entries: I,
     out: W,
     prepared: encode::PreparedArchiveOptions,
+    kdf_budget: KdfBudget,
 ) -> Result<(), R7zError>
 where
     W: Write + Seek,
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    let mut writer = ArchiveWriter::new_prepared(out, prepared).start();
+    let mut writer = ArchiveWriter::new_prepared(out, prepared, kdf_budget).start();
     for (name, reader) in entries {
         writer.append(&name, reader)?;
     }
@@ -1687,52 +1729,44 @@ where
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
     let resource_limits = prepared.archive().streaming.resource_limits;
-    let max_temporary_storage_bytes = resource_limits.max_temporary_storage_bytes;
+    let budget = OperationBudget::new(resource_limits);
+    let all_budgets = budget.into_writer_budgets();
+    let streaming_budgets = StreamingWriteBudgets {
+        kdf: all_budgets.kdf,
+        spool: all_budgets.spool,
+    };
     match prepared.archive().streaming.spool.clone() {
         SpoolMode::Memory => {
-            let mut spool = Cursor::new(Vec::new());
-            build_streaming_with_prepared_options(entries, &mut spool, prepared)?;
-            out.write_all(spool.get_ref())?;
-            out.flush()?;
-            Ok(())
+            build_streaming_via_spool(entries, &mut out, None, None, streaming_budgets, prepared)
         }
         SpoolMode::Auto {
             memory_threshold,
             dir,
-        } => {
-            let mut budget = OperationBudget::new(resource_limits);
-            build_streaming_with_temp_spool(
-                entries,
-                &mut out,
-                memory_threshold,
-                dir,
-                max_temporary_storage_bytes,
-                &mut budget,
-                prepared,
-            )
-        }
+        } => build_streaming_via_spool(
+            entries,
+            &mut out,
+            Some(memory_threshold),
+            dir,
+            streaming_budgets,
+            prepared,
+        ),
         SpoolMode::TempFile { dir } => {
-            let mut budget = OperationBudget::new(resource_limits);
-            build_streaming_with_temp_spool(
-                entries,
-                &mut out,
-                0,
-                dir,
-                max_temporary_storage_bytes,
-                &mut budget,
-                prepared,
-            )
+            build_streaming_via_spool(entries, &mut out, Some(0), dir, streaming_budgets, prepared)
         }
     }
 }
 
-fn build_streaming_with_temp_spool<W, I, R>(
+struct StreamingWriteBudgets {
+    kdf: KdfBudget,
+    spool: SpoolBudget,
+}
+
+fn build_streaming_via_spool<W, I, R>(
     entries: I,
     out: &mut W,
-    memory_threshold: u64,
+    memory_threshold: Option<u64>,
     dir: Option<PathBuf>,
-    max_temporary_storage_bytes: Option<u64>,
-    budget: &mut OperationBudget,
+    budgets: StreamingWriteBudgets,
     prepared: encode::PreparedArchiveOptions,
 ) -> Result<(), R7zError>
 where
@@ -1740,22 +1774,20 @@ where
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    let mut spool = AutoSpool::new(memory_threshold, dir, budget)?;
+    let StreamingWriteBudgets { kdf, spool } = budgets;
+    let mut spool = AutoSpool::new(memory_threshold, dir, spool)?;
     let result = (|| {
-        build_streaming_with_prepared_options(entries, &mut spool, prepared)?;
+        build_streaming_with_prepared_options(entries, &mut spool, prepared, kdf)?;
         spool.seek(SeekFrom::Start(0))?;
         io::copy(&mut spool, out)?;
         out.flush()?;
         Ok(())
     })();
-    let limit_exceeded = spool.limit_exceeded;
+    let limit_error = spool.limit_error();
     let cleanup_result = spool.cleanup();
 
-    if limit_exceeded {
-        return Err(R7zError::ResourceLimitExceeded {
-            resource: "temporary storage",
-            limit: max_temporary_storage_bytes.expect("limit exceeded only when configured"),
-        });
+    if let Some(error) = limit_error {
+        return Err(error);
     }
 
     match (result, cleanup_result) {
@@ -1776,52 +1808,117 @@ where
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    if volume_options.sizes.is_empty() {
+    let VolumeOptions { sizes } = volume_options;
+    if sizes.is_empty() {
         return Err(R7zError::InvalidOptions(
             "volume options require at least one size",
         ));
     }
-    let volume_sizes = volume_options
-        .sizes
-        .iter()
-        .map(|size| {
-            usize::try_from(size.get())
-                .map_err(|_| R7zError::InvalidOptions("volume size is too large"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut archive_options = archive_options;
+    lzma2::set_default_budget(&mut archive_options);
+    let prepared = encode::prepare_archive_options(archive_options)?;
+    let resource_limits = prepared.archive().streaming.resource_limits;
+    let budget = OperationBudget::new(resource_limits);
+    let WriterBudgets {
+        kdf: kdf_budget,
+        spool,
+        open_volumes: mut open_volume_budget,
+        volume_count: mut volume_count_budget,
+    } = budget.into_writer_budgets();
+    let (memory_threshold, dir) = match prepared.archive().streaming.spool.clone() {
+        SpoolMode::Memory => (None, None),
+        SpoolMode::Auto {
+            memory_threshold,
+            dir,
+        } => (Some(memory_threshold), dir),
+        SpoolMode::TempFile { dir } => (Some(0), dir),
+    };
+    let mut archive = AutoSpool::new(memory_threshold, dir, spool)?;
+    let result = (|| {
+        build_streaming_with_prepared_options(entries, &mut archive, prepared, kdf_budget)?;
+        write_volume_files(
+            &mut archive,
+            base_path.as_ref(),
+            &sizes,
+            &mut open_volume_budget,
+            &mut volume_count_budget,
+        )
+    })();
+    let limit_error = archive.limit_error();
+    let cleanup_result = archive.cleanup();
 
-    let mut archive = Vec::new();
-    build_streaming_to_writer(entries, &mut archive, archive_options)?;
+    if let Some(error) = limit_error {
+        return Err(error);
+    }
+    match (result, cleanup_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(paths), Ok(())) => Ok(paths),
+    }
+}
 
-    let base = base_path.as_ref();
-    let mut offset = 0usize;
-    let mut volume_idx = 0usize;
-    std::iter::from_fn(|| {
-        if offset >= archive.len() && !(archive.is_empty() && volume_idx == 0) {
-            return None;
-        }
-        let size = volume_sizes[volume_idx.min(volume_sizes.len() - 1)];
-        let start = offset;
-        let end = start.saturating_add(size).min(archive.len());
-        offset = end;
-        let index = volume_idx;
-        volume_idx += 1;
-        Some((index, start..end))
-    })
-    .try_fold(Vec::new(), |mut paths, (volume_idx, range)| {
-        let path = PathBuf::from(format!("{}.{:03}", base.display(), volume_idx + 1));
-        let mut file = File::create(&path)?;
-        file.write_all(&archive[range])?;
-        file.flush()?;
+fn write_volume_files<R: Read + Seek>(
+    archive: &mut R,
+    base: &Path,
+    volume_sizes: &[NonZeroU64],
+    open_volume_budget: &mut OpenVolumeBudget,
+    volume_count_budget: &mut VolumeCountBudget,
+) -> Result<Vec<PathBuf>, R7zError> {
+    archive.seek(SeekFrom::Start(0))?;
+    let mut next = [0u8; 1];
+    let mut has_next = archive.read(&mut next)? != 0;
+    let mut volume_index = 0usize;
+    let mut paths = Vec::new();
+
+    if !has_next {
+        let path = volume_path(base, volume_index);
+        volume_count_budget.charge()?;
+        write_volume_file(&path, open_volume_budget, |_| Ok(()))?;
         paths.push(path);
-        Ok(paths)
-    })
+        return Ok(paths);
+    }
+
+    while has_next {
+        let size = volume_sizes[volume_index.min(volume_sizes.len() - 1)].get();
+        let path = volume_path(base, volume_index);
+        let remaining = size - 1;
+        volume_count_budget.charge()?;
+        let copied = write_volume_file(&path, open_volume_budget, |file| {
+            file.write_all(&next)?;
+            let copied = io::copy(&mut archive.take(remaining), file)?;
+            file.flush()?;
+            Ok(copied)
+        })?;
+        paths.push(path);
+        if copied < remaining {
+            break;
+        }
+        has_next = archive.read(&mut next)? != 0;
+        volume_index += 1;
+    }
+
+    Ok(paths)
+}
+
+fn write_volume_file<T>(
+    path: &Path,
+    budget: &mut OpenVolumeBudget,
+    write: impl FnOnce(&mut File) -> Result<T, R7zError>,
+) -> Result<T, R7zError> {
+    budget.charge()?;
+    let result = File::create(path)
+        .map_err(R7zError::from)
+        .and_then(|mut file| write(&mut file));
+    budget.release();
+    result
+}
+
+fn volume_path(base: &Path, index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{:03}", base.display(), index + 1))
 }
 
 fn create_temp_spool(dir: Option<&Path>) -> Result<(File, PathBuf), R7zError> {
-    let dir = dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
     std::fs::create_dir_all(&dir)?;
     for attempt in 0..100u32 {
         let mut random = [0u8; 8];
@@ -1839,7 +1936,7 @@ fn create_temp_spool(dir: Option<&Path>) -> Result<(File, PathBuf), R7zError> {
             .open(&path)
         {
             Ok(file) => return Ok((file, path)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err.into()),
         }
     }
@@ -1851,21 +1948,22 @@ enum AutoSpoolInner {
     TempFile { file: File, path: PathBuf },
 }
 
-struct AutoSpool<'budget> {
-    memory_threshold: u64,
+struct AutoSpool {
+    memory_threshold: Option<u64>,
     dir: Option<PathBuf>,
-    budget: &'budget mut OperationBudget,
-    limit_exceeded: bool,
+    budget: SpoolBudget,
+    temporary_storage_limit_exceeded: bool,
+    retained_output_limit_exceeded: bool,
     inner: AutoSpoolInner,
 }
 
-impl<'budget> AutoSpool<'budget> {
+impl AutoSpool {
     fn new(
-        memory_threshold: u64,
+        memory_threshold: Option<u64>,
         dir: Option<PathBuf>,
-        budget: &'budget mut OperationBudget,
+        budget: SpoolBudget,
     ) -> Result<Self, R7zError> {
-        let inner = if memory_threshold == 0 {
+        let inner = if memory_threshold == Some(0) {
             let (file, path) = create_temp_spool(dir.as_deref())?;
             AutoSpoolInner::TempFile { file, path }
         } else {
@@ -1875,7 +1973,8 @@ impl<'budget> AutoSpool<'budget> {
             memory_threshold,
             dir,
             budget,
-            limit_exceeded: false,
+            temporary_storage_limit_exceeded: false,
+            retained_output_limit_exceeded: false,
             inner,
         })
     }
@@ -1890,14 +1989,25 @@ impl<'budget> AutoSpool<'budget> {
             .position()
             .saturating_add(write_len)
             .max(cursor.get_ref().len() as u64);
-        if projected_len <= self.memory_threshold {
+        let exceeds_memory_threshold = self
+            .memory_threshold
+            .is_some_and(|threshold| projected_len > threshold);
+        let exceeds_retained_limit = self
+            .budget
+            .retained_output
+            .limit()
+            .is_some_and(|limit| projected_len > limit);
+        if !exceeds_memory_threshold && !exceeds_retained_limit {
+            return Ok(());
+        }
+        if self.memory_threshold.is_none() {
             return Ok(());
         }
         let migration_bytes = cursor.get_ref().len() as u64;
         let write_bytes = write_len;
         check_temporary_storage_write(
-            self.budget,
-            &mut self.limit_exceeded,
+            &mut self.budget.temporary_storage,
+            &mut self.temporary_storage_limit_exceeded,
             migration_bytes.saturating_add(write_bytes),
         )?;
 
@@ -1911,7 +2021,14 @@ impl<'budget> AutoSpool<'budget> {
             let _ = std::fs::remove_file(&path);
             return Err(error);
         }
-        charge_temporary_storage_write(self.budget, &mut self.limit_exceeded, migration_bytes)?;
+        charge_temporary_storage_write(
+            &mut self.budget.temporary_storage,
+            &mut self.temporary_storage_limit_exceeded,
+            migration_bytes,
+        )?;
+        self.budget
+            .retained_output
+            .release(RetainedOutputBytes::new(migration_bytes));
         self.inner = AutoSpoolInner::TempFile { file, path };
         Ok(())
     }
@@ -1924,7 +2041,11 @@ impl<'budget> AutoSpool<'budget> {
             return Ok(());
         };
         let write_len = u64::try_from(write_len).unwrap_or(u64::MAX);
-        check_temporary_storage_write(self.budget, &mut self.limit_exceeded, write_len)
+        check_temporary_storage_write(
+            &mut self.budget.temporary_storage,
+            &mut self.temporary_storage_limit_exceeded,
+            write_len,
+        )
     }
 
     fn charge_temporary_file_write(&mut self, written: usize) -> io::Result<()> {
@@ -1932,7 +2053,68 @@ impl<'budget> AutoSpool<'budget> {
             return Ok(());
         }
         let written = u64::try_from(written).unwrap_or(u64::MAX);
-        charge_temporary_storage_write(self.budget, &mut self.limit_exceeded, written)
+        charge_temporary_storage_write(
+            &mut self.budget.temporary_storage,
+            &mut self.temporary_storage_limit_exceeded,
+            written,
+        )
+    }
+
+    fn check_retained_memory_write(&mut self, write_len: usize) -> io::Result<()> {
+        let AutoSpoolInner::Memory(cursor) = &self.inner else {
+            return Ok(());
+        };
+        let current_len = cursor.get_ref().len() as u64;
+        let projected_len = cursor
+            .position()
+            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX))
+            .max(current_len);
+        self.budget
+            .retained_output
+            .check_resize(
+                RetainedOutputBytes::new(current_len),
+                RetainedOutputBytes::new(projected_len),
+            )
+            .map_err(|_| {
+                self.retained_output_limit_exceeded = true;
+                io::Error::other("retained output limit exceeded")
+            })
+    }
+
+    fn charge_retained_memory_write(&mut self, previous_len: u64) -> io::Result<()> {
+        let AutoSpoolInner::Memory(cursor) = &self.inner else {
+            return Ok(());
+        };
+        self.budget
+            .retained_output
+            .resize(
+                RetainedOutputBytes::new(previous_len),
+                RetainedOutputBytes::new(cursor.get_ref().len() as u64),
+            )
+            .map_err(|_| {
+                self.retained_output_limit_exceeded = true;
+                io::Error::other("retained output limit exceeded")
+            })
+    }
+
+    fn limit_error(&self) -> Option<R7zError> {
+        if self.retained_output_limit_exceeded {
+            return self.budget.retained_output.limit().map(|limit| {
+                R7zError::ResourceLimitExceeded {
+                    resource: "retained output",
+                    limit,
+                }
+            });
+        }
+        self.temporary_storage_limit_exceeded
+            .then(|| R7zError::ResourceLimitExceeded {
+                resource: "temporary storage",
+                limit: self
+                    .budget
+                    .temporary_storage
+                    .limit()
+                    .expect("limit exceeded only when configured"),
+            })
     }
 
     fn cleanup(self) -> io::Result<()> {
@@ -1944,12 +2126,12 @@ impl<'budget> AutoSpool<'budget> {
 }
 
 fn check_temporary_storage_write(
-    budget: &mut OperationBudget,
+    budget: &mut TemporaryStorageBudget,
     limit_exceeded: &mut bool,
     bytes: u64,
 ) -> io::Result<()> {
     budget
-        .check_temporary_storage_write(TemporaryStorageBytes::new(bytes))
+        .check_write(TemporaryStorageBytes::new(bytes))
         .map_err(|_| {
             *limit_exceeded = true;
             io::Error::other("temporary storage limit exceeded")
@@ -1957,27 +2139,35 @@ fn check_temporary_storage_write(
 }
 
 fn charge_temporary_storage_write(
-    budget: &mut OperationBudget,
+    budget: &mut TemporaryStorageBudget,
     limit_exceeded: &mut bool,
     bytes: u64,
 ) -> io::Result<()> {
     budget
-        .charge_temporary_storage_write(TemporaryStorageBytes::new(bytes))
+        .charge_write(TemporaryStorageBytes::new(bytes))
         .map_err(|_| {
             *limit_exceeded = true;
             io::Error::other("temporary storage limit exceeded")
         })
 }
 
-impl Write for AutoSpool<'_> {
+impl Write for AutoSpool {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check_temporary_file_write(buf.len())?;
         self.maybe_roll_to_file(buf.len())?;
+        let previous_len = match &self.inner {
+            AutoSpoolInner::Memory(cursor) => Some(cursor.get_ref().len() as u64),
+            AutoSpoolInner::TempFile { .. } => None,
+        };
+        self.check_retained_memory_write(buf.len())?;
         let written = match &mut self.inner {
             AutoSpoolInner::Memory(cursor) => cursor.write(buf),
             AutoSpoolInner::TempFile { file, .. } => file.write(buf),
         }?;
         self.charge_temporary_file_write(written)?;
+        if let Some(previous_len) = previous_len {
+            self.charge_retained_memory_write(previous_len)?;
+        }
         Ok(written)
     }
 
@@ -1989,7 +2179,7 @@ impl Write for AutoSpool<'_> {
     }
 }
 
-impl Read for AutoSpool<'_> {
+impl Read for AutoSpool {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
             AutoSpoolInner::Memory(cursor) => cursor.read(buf),
@@ -1998,7 +2188,7 @@ impl Read for AutoSpool<'_> {
     }
 }
 
-impl Seek for AutoSpool<'_> {
+impl Seek for AutoSpool {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match &mut self.inner {
             AutoSpoolInner::Memory(cursor) => cursor.seek(pos),
