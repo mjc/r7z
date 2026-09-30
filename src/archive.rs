@@ -5,11 +5,11 @@ use crate::file_streams::{
     FileStream, FileStreams, FolderIndex as ReadFolderIndex, StreamLocation,
 };
 use crate::folder_decode::{
-    ActiveFolder, CompletionMode, DecodedByteBudget, DecodedFolder, ExternalFolderPlan,
-    FolderLayout, FolderLayouts, MetadataBudget, PackedStream, VerifiedExternalData,
+    ActiveFolder, CompletionMode, DecodedFolder, ExternalFolderPlan, FolderLayout, FolderLayouts,
+    PackedStream, VerifiedExternalData,
 };
 use crate::headers::{HeaderResolution, NextHeader};
-use crate::resources::ResourceLimits;
+use crate::resources::{MetadataBytes, OperationBudget, ResourceLimits};
 use crate::{
     EncodedHeader, EntryType, FilesInfo, Header, Property, R7zError, SignatureHeader, StreamInfo,
     codec, find_next_property_id,
@@ -708,6 +708,7 @@ impl Archive {
         password: Option<&str>,
         options: ArchiveOpenOptions,
     ) -> Result<Archive, R7zError> {
+        let mut budget = OperationBudget::new(options);
         let source_len = source.len()?;
         let (base_offset, signature) = source.find_signature(options.max_signature_scan_bytes)?;
 
@@ -734,20 +735,15 @@ impl Archive {
                     &source,
                     base_offset,
                     &next_header,
-                    MetadataBudget::new(options.max_metadata_bytes),
+                    &mut budget,
                     password,
                 )?,
                 None,
             ),
             NextHeader::Encoded(encoded) => {
-                let header = decode_encoded_header(
-                    &source,
-                    base_offset,
-                    &encoded,
-                    password,
-                    MetadataBudget::new(options.max_metadata_bytes)
-                        .charge(next_header.len() as u64)?,
-                )?;
+                budget.charge_metadata(MetadataBytes::new(next_header.len() as u64))?;
+                let header =
+                    decode_encoded_header(&source, base_offset, &encoded, password, &mut budget)?;
                 (header, Some(*encoded))
             }
         };
@@ -1216,7 +1212,7 @@ impl Archive {
             password: config.password,
             mode: CompletionMode::SelectedStreams,
             max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
-            budget: DecodedByteBudget::new(config.options.max_total_decoded_bytes),
+            budget: OperationBudget::new(config.options),
         };
         Ok(ArchiveReadSession {
             files,
@@ -1398,7 +1394,7 @@ impl Archive {
             password: config.password,
             mode,
             max_decoder_working_set_bytes: config.options.max_decoder_working_set_bytes,
-            budget: DecodedByteBudget::new(config.options.max_total_decoded_bytes),
+            budget: OperationBudget::new(config.options),
         };
         let result = match selected {
             EntrySelection::All(_) => files
@@ -1625,14 +1621,15 @@ fn decode_encoded_header(
     base_offset: u64,
     encoded: &EncodedHeader,
     password: Option<&str>,
-    budget: MetadataBudget,
+    budget: &mut OperationBudget,
 ) -> Result<Header, R7zError> {
     let folder = encoded
-        .folder(budget.remaining())
-        .map_err(|error| budget.map_error(error))?;
+        .folder(budget.metadata_remaining().get())
+        .map_err(|error| budget.map_metadata_error(error))?;
     let packs = PackedSource::new(source, base_offset, encoded.pack_info.pack_pos)?;
-    let decoded = decode_metadata_folder(&packs, folder, password, budget.remaining())
-        .map_err(|error| budget.map_error(error))?;
+    let decoded =
+        decode_metadata_folder(&packs, folder, password, budget.metadata_remaining().get())
+            .map_err(|error| budget.map_metadata_error(error))?;
     parse_header_with_external_data(source, base_offset, decoded.as_bytes(), budget, password)
 }
 
@@ -1640,10 +1637,10 @@ fn parse_header_with_external_data(
     source: &ArchiveSource,
     base_offset: u64,
     bytes: &Bytes,
-    budget: MetadataBudget,
+    budget: &mut OperationBudget,
     password: Option<&str>,
 ) -> Result<Header, R7zError> {
-    let budget = budget.charge(bytes.len() as u64)?;
+    budget.charge_metadata(MetadataBytes::new(bytes.len() as u64))?;
     match Header::resolve_archive(bytes)? {
         HeaderResolution::Complete(header) => {
             verify_additional_stream_crcs(source, base_offset, &header)?;
@@ -1659,7 +1656,7 @@ fn decode_additional_folder_data(
     source: &ArchiveSource,
     base_offset: u64,
     streams: &StreamInfo,
-    budget: MetadataBudget,
+    budget: &mut OperationBudget,
     password: Option<&str>,
 ) -> Result<VerifiedExternalData, R7zError> {
     let plan = ExternalFolderPlan::new(streams, budget)?;
@@ -1731,7 +1728,7 @@ struct EntryDecoder<'a> {
     password: Option<&'a str>,
     mode: CompletionMode,
     max_decoder_working_set_bytes: Option<u64>,
-    budget: DecodedByteBudget,
+    budget: OperationBudget,
 }
 
 impl<'a> EntryDecoder<'a> {

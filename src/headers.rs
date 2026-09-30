@@ -585,13 +585,10 @@ mod tests {
             panic!("external file metadata must suspend the header scan");
         };
 
+        let mut budget = crate::resources::OperationBudget::for_metadata_limit(1024);
         let header = pending
             .resolve_with(|additional| {
-                crate::folder_decode::ExternalFolderPlan::new(
-                    additional,
-                    crate::folder_decode::MetadataBudget::new(1024),
-                )?
-                .decode(
+                crate::folder_decode::ExternalFolderPlan::new(additional, &mut budget)?.decode(
                     |_| {
                         Ok(crate::codec::PackedInput {
                             reader: std::io::Cursor::new([b'A', 0, 0, 0]),
@@ -672,12 +669,9 @@ mod tests {
             else {
                 panic!("external definitions must suspend the scan");
             };
+            let mut budget = crate::resources::OperationBudget::for_metadata_limit(1024);
             pending.resolve_with(|additional| {
-                crate::folder_decode::ExternalFolderPlan::new(
-                    additional,
-                    crate::folder_decode::MetadataBudget::new(1024),
-                )?
-                .decode(
+                crate::folder_decode::ExternalFolderPlan::new(additional, &mut budget)?.decode(
                     |_| {
                         Ok(crate::codec::PackedInput {
                             reader: std::io::Cursor::new([1, 1, 0]),
