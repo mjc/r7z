@@ -195,7 +195,7 @@ The defaults are:
 | `max_signature_scan_bytes` | 64 MiB | Prefix scanned to find the 7z signature |
 | `max_metadata_bytes` | 64 MiB | Header data, external metadata, and stream slots combined |
 | `max_decoder_working_set_bytes` | `None` | Uses the built-in 512 MiB decoder working-set cap |
-| `max_encoder_working_set_bytes` | `None` | Uses `CompressionOptions::encoder_memory_limit` |
+| `max_encoder_working_set_bytes` | `None` | Estimated working set for LZMA, LZMA2, and PPMd encoders |
 | `max_total_decoded_bytes` | `None` | Cumulative decoded bytes per read operation |
 | `max_total_kdf_cycles` | `None` | Cumulative AES key-derivation work per operation |
 | `max_retained_output_bytes` | `None` | Peak output bytes retained in memory per operation |
@@ -217,9 +217,6 @@ files created over the whole write. A signature scan that reaches its limit
 before finding a signature returns `ResourceLimitExceeded`.
 
 Callers can override any limit with a struct update:
-
-Decoded output, KDF work, and bytes written to temporary spools are cumulative
-per operation. Decoder working-set and retained-output limits bound peak use.
 
 ```rust
 use r7z::{Archive, ResourceLimits};

@@ -234,6 +234,29 @@ fn signature_scan_limit_includes_the_complete_signature_magic() {
 }
 
 #[test]
+fn invalid_signature_crc_precedes_signature_scan_limit_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("bad-signature.7z");
+    let mut bytes = r7z::ArchiveBuilder::new()
+        .add_file("payload.txt", b"payload")
+        .build()
+        .unwrap();
+    bytes[8] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+
+    assert!(matches!(
+        r7z::Archive::open_with_options(
+            &path,
+            r7z::ArchiveOpenOptions {
+                max_signature_scan_bytes: 6,
+                ..r7z::ArchiveOpenOptions::default()
+            },
+        ),
+        Err(r7z::R7zError::Crc)
+    ));
+}
+
+#[test]
 fn sparse_seek_open_does_not_read_whole_file() {
     let tmp = tempfile::tempdir().unwrap();
     let archive_path = tmp.path().join("sparse.7z");

@@ -2327,6 +2327,46 @@ fn resource_limits_cap_lzma2_encoder_memory() {
 }
 
 #[test]
+fn resource_limits_cap_lzma_and_ppmd_encoder_memory() {
+    for codec in [r7z::Codec::Lzma, r7z::Codec::Ppmd] {
+        let options = r7z::ArchiveOptions {
+            codec,
+            compression: r7z::CompressionOptions {
+                dictionary_size: Some(1 << 20),
+                ..Default::default()
+            },
+            streaming: r7z::StreamingOptions {
+                resource_limits: r7z::ResourceLimits {
+                    max_encoder_working_set_bytes: Some(1),
+                    ..r7z::ResourceLimits::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut output = Vec::new();
+        assert!(matches!(
+            r7z::build_streaming_to_writer(
+                [("payload".to_string(), b"encoder budget".as_slice())],
+                &mut output,
+                options.clone(),
+            ),
+            Err(r7z::R7zError::LimitExceeded("encoder memory"))
+        ));
+        assert!(output.is_empty());
+
+        assert!(matches!(
+            r7z::ArchiveBuilder::new()
+                .options(options)
+                .add_file("payload", b"encoder budget")
+                .build(),
+            Err(r7z::R7zError::LimitExceeded("encoder memory"))
+        ));
+    }
+}
+
+#[test]
 fn writer_kdf_limit_is_shared_across_non_solid_folders() {
     let build = |max_total_kdf_cycles| {
         r7z::ArchiveBuilder::new()
@@ -2648,7 +2688,7 @@ fn volume_count_limit_stops_before_creating_the_excess_volume() {
             limit: 1,
         })
     ));
-    assert!(tmp.path().join("counted.7z.001").exists());
+    assert!(!tmp.path().join("counted.7z.001").exists());
     assert!(!tmp.path().join("counted.7z.002").exists());
 }
 

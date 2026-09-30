@@ -87,6 +87,9 @@ pub(super) struct PreparedArchiveOptions {
     settings: PreparedSettings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EncoderWorkingSetBytes(u64);
+
 impl PreparedArchiveOptions {
     pub(super) fn archive(&self) -> &ArchiveOptions {
         &self.archive
@@ -104,6 +107,36 @@ impl PreparedArchiveOptions {
                 options,
                 settings: self.settings.aes,
             })
+    }
+
+    pub(super) fn validate_encoder_working_set(&self) -> Result<(), R7zError> {
+        let Some(limit) = self
+            .archive
+            .streaming
+            .resource_limits
+            .max_encoder_working_set_bytes
+        else {
+            return Ok(());
+        };
+
+        let estimate = match self.settings.codec {
+            PreparedCodec::Lzma => EncoderWorkingSetBytes(
+                u64::from(lzma_options(&self.archive.compression).get_memory_usage())
+                    .checked_mul(1024)
+                    .ok_or(R7zError::LimitExceeded("encoder memory"))?,
+            ),
+            PreparedCodec::Ppmd(PpmdSettings { memory_size, .. }) => {
+                EncoderWorkingSetBytes(u64::from(memory_size))
+            }
+            PreparedCodec::Copy | PreparedCodec::Lzma2(_) | PreparedCodec::Lzma2Bcj(_) => {
+                return Ok(());
+            }
+        };
+
+        if estimate.0 > limit {
+            return Err(R7zError::LimitExceeded("encoder memory"));
+        }
+        Ok(())
     }
 }
 
@@ -571,6 +604,7 @@ fn encode_payload_with_options(
     data: &[u8],
     prepared: &PreparedArchiveOptions,
 ) -> Result<EncodedPayload, R7zError> {
+    prepared.validate_encoder_working_set()?;
     let options = &prepared.archive;
     let compression = &options.compression;
     match prepared.settings.codec {
