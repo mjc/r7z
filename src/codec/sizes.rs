@@ -23,13 +23,6 @@ impl OutputSize {
             Self::Unknown => Err(R7zError::InvalidOptions("coder requires an output size")),
         }
     }
-
-    pub(super) fn buffered_bytes(self, cap: usize) -> usize {
-        match self {
-            Self::Known(size) => usize::try_from(size).unwrap_or(usize::MAX).min(cap),
-            Self::Unknown => cap,
-        }
-    }
 }
 
 /// Borrows the caller's table and supplies the independently declared final size.

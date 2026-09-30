@@ -50,9 +50,15 @@ jobs:
       - name: Build p7zip-zstd oracle
         run: |
           export P7ZIP_ORACLE_DIR="$HOME/.cache/r7z-p7zip-oracle"
+          echo "P7ZIP_ORACLE_DIR=$P7ZIP_ORACLE_DIR" >> "$GITHUB_ENV"
           bin="$(scripts/ensure_p7zip_oracle.sh)"
           echo "P7ZIP_BIN=$bin" >> "$GITHUB_ENV"
           "$bin" i
+
+      - name: Record archive oracle inventory
+        run: |
+          scripts/record_7z_oracles.sh
+          cat target/oracle-inventory/README.md
 
       - name: Test
         run: |

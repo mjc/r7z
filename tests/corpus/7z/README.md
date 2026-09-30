@@ -38,6 +38,20 @@ R7Z_EXTERNAL_7Z_CORPUS_MANIFEST="$manifest" cargo test --test corpus_test
 The Apache Commons Compress corpus fetcher uses the project's GitHub test
 resources as an external source.
 
+## Reference executable inventory
+
+Record the pinned p7zip oracle and official 7-Zip 26.03 executable, their
+versions, SHA-256 hashes, and supported formats/methods with:
+
+```sh
+devenv shell -- bash scripts/record_7z_oracles.sh
+```
+
+The report and full method output are written under `target/oracle-inventory/`.
+Interop test processes print the selected p7zip executable's canonical path,
+version, and SHA-256 on first use; use `-- --nocapture` to include that line in
+successful test output. `P7ZIP_BIN` selects that executable.
+
 ## Official 7-Zip branch-filter fixtures
 
 `arm64*.7z` and `riscv*.7z` were created with official 7-Zip 26.03
@@ -67,3 +81,13 @@ The checked-in archives have SHA-256 values:
 | `arm64_offset4.7z` | `cc30388a53c537d61ff4017c9be1eea4068436b69f66390182e6bb1dd112cf9a` |
 | `riscv.7z` | `0bf1512b2f6756118987baf1c747cf4ca0137531b0a451db47073cce0ef3e66e` |
 | `riscv_offset2.7z` | `9a7101b59363e384daf64ab0012ed0d831325d633d556cdb194b33b646a65118` |
+
+## External FilesInfo fixture
+
+`external_metadata.7z` is a small synthetic archive with its name, creation
+time, and Windows attributes stored in separate additional streams. Official
+7-Zip 26.03 (`7z2603-linux-x64.tar.xz`, SHA-256
+`dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695`) lists it
+as `external-metadata.txt`, created at FILETIME `132223104000000000`, with
+attribute `A`. Its SHA-256 is
+`0bd05f1fb0007d3cc8ca77573908ee7b9db747c5065397608fd2e09f9abcf957`.

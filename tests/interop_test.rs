@@ -19,7 +19,7 @@ fn fixture_args(files: &[(PathBuf, Vec<u8>)]) -> Vec<String> {
 }
 
 fn assert_names_include(archive: &r7z::Archive, expected: &[String]) {
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let names: Vec<String> = fi.names().collect();
     for name in expected {
         assert!(
@@ -39,7 +39,7 @@ fn assert_archive_files_read_and_extract_all(
     let expected_names = fixture_args(expected);
     assert_names_include(&archive, &expected_names);
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let names: Vec<String> = fi.names().collect();
     for (name, original) in expected {
         if original.is_empty() {
@@ -61,7 +61,7 @@ fn assert_archive_files_read_and_extract_all(
 }
 
 fn assert_every_folder_uses(archive: &r7z::Archive, codec_id: &[u8]) {
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     assert!(ui.num_folders_usize() > 0, "expected at least one folder");
     for folder_idx in 0..ui.num_folders_usize() {
@@ -76,7 +76,7 @@ fn assert_every_folder_uses(archive: &r7z::Archive, codec_id: &[u8]) {
 }
 
 fn assert_every_folder_includes_bcj_lzma2(archive: &r7z::Archive) {
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     assert!(ui.num_folders_usize() > 0, "expected at least one folder");
     for folder_idx in 0..ui.num_folders_usize() {
@@ -176,7 +176,7 @@ fn p7zip_read_interop_single_lzma() {
         r7z::Archive::open(&archive_path).expect("r7z failed to open p7zip-created archive");
 
     assert_eq!(archive.num_files(), 1);
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "hello.txt");
 
     let extracted = archive.extract_to_memory(0).unwrap();
@@ -222,7 +222,7 @@ fn p7zip_read_interop_multi_file_lzma2() {
         r7z::Archive::open(&archive_path).expect("r7z failed to open p7zip LZMA2 archive");
 
     assert_eq!(archive.num_files(), 3);
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let names: Vec<String> = fi.names().collect();
     for (name, original) in &files {
         let idx = names
@@ -268,7 +268,7 @@ fn p7zip_read_interop_multi_file_lzma2_non_solid() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let names: Vec<String> = fi.names().collect();
     for (name, original) in &files {
         let idx = names.iter().position(|n| n == name).unwrap();
@@ -401,7 +401,7 @@ fn p7zip_read_interop_names_with_spaces_unicode_and_nested_paths() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let names: Vec<String> = fi.names().collect();
     let space_idx = names.iter().position(|n| n == "space name.txt").unwrap();
     let unicode_idx = names
@@ -451,7 +451,7 @@ fn p7zip_read_interop_bcj_lzma2() {
     assert_eq!(archive.num_files(), 1);
 
     // Verify that the folder has 2 coders (BCJ + LZMA2)
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 2, "expected BCJ + LZMA2");
@@ -785,7 +785,7 @@ fn aes_decrypt_fixture_correct_password() {
 
     assert_eq!(archive.num_files(), 1);
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "encrypted_test.txt");
 
     let extracted = archive
@@ -896,7 +896,7 @@ fn p7zip_aes_encrypted_headers_round_trip() {
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
 
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderPass!")).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "header_secret.txt");
     let extracted = archive
         .extract_to_memory_with_password(0, Some("HeaderPass!"))
@@ -1110,7 +1110,7 @@ fn aes_decrypt_n64_archive() {
     eprintln!("N64 archive: {num} files");
     assert!(num > 600, "expected 600+ files, got {num}");
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     for i in 0..5.min(num) {
         eprintln!("  [{i}] {:?}", fi.name(i));
     }

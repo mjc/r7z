@@ -3,10 +3,12 @@ use std::{
     num::NonZeroU64,
 };
 
+use r7z::update::v1::{
+    PreservedArchiveEntry, PreservedEntryStream, write_archive_with_preserved_folders,
+};
 use r7z::{
     Archive, ArchiveBuilder, ArchiveOptions, ArchiveWriter, Codec, EncoderThreads,
-    EncryptionOptions, EntryKind, EntryMeta, PreservedArchiveEntry, PreservedEntryStream, R7zError,
-    SolidMode, write_archive_with_preserved_folders,
+    EncryptionOptions, EntryKind, EntryMeta, R7zError, SolidMode,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -63,6 +65,7 @@ fn staged_bcj_writer_preserves_bytes_across_parallel_blocks() {
     data[MIB - 2..MIB + 3].copy_from_slice(&[0x90, 0xE8, 0, 0, 0]);
     let entries = vec![PreservedArchiveEntry {
         name: "program.bin".to_string(),
+        raw_name: None,
         kind: EntryKind::File,
         meta: EntryMeta::default(),
         stream: PreservedEntryStream::Data(data.clone()),

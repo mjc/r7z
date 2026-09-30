@@ -28,6 +28,29 @@ fn cli_help_describes_encoder_thread_selection() {
 }
 
 #[test]
+fn cli_rejects_write_commands_without_operands_during_parsing() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("archive.7z");
+
+    for (command, message) in [
+        ("a", "no input files were provided"),
+        ("u", "no input files were provided"),
+        ("d", "no archive entries were provided"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+            .args([command, archive.to_str().unwrap()])
+            .output()
+            .expect("r7z binary should run");
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("Command Line Error: {message}\n")
+        );
+    }
+}
+
+#[test]
 fn cli_create_list_test_extract_update_delete() {
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input");
@@ -299,7 +322,7 @@ fn cli_create_accepts_p7zip_method_chain_options() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -564,7 +587,7 @@ fn cli_create_accepts_lzma_literal_position_options() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -603,7 +626,7 @@ fn cli_create_accepts_standalone_lzma_literal_position_switches() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -659,7 +682,7 @@ fn cli_create_accepts_ppmd_method() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -733,7 +756,7 @@ fn cli_create_accepts_p7zip_standalone_compression_options() {
 
     let archive = r7z::Archive::open(&archive).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -877,7 +900,7 @@ fn cli_create_accepts_p7zip_solid_file_limit() {
     let archive = r7z::Archive::open(&archive).unwrap();
     assert_eq!(
         archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -910,7 +933,7 @@ fn cli_create_accepts_p7zip_solid_byte_limit() {
     let archive = r7z::Archive::open(&archive).unwrap();
     assert_eq!(
         archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -1070,6 +1093,36 @@ fn cli_extract_flat_duplicate_basenames_use_overwrite_policy() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("Skipping existing path"));
 }
 
+#[cfg(windows)]
+#[test]
+fn cli_extract_case_insensitive_name_collisions_use_overwrite_policy() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("case-collisions.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("Name.txt", b"first")
+        .add_file("name.txt", b"second")
+        .build()
+        .unwrap();
+    fs::write(&archive, bytes).unwrap();
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
+        .args([
+            "x",
+            "-y",
+            archive.to_str().unwrap(),
+            &format!("-o{}", out.display()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(fs::read(out.join("Name.txt")).unwrap(), b"second");
+    assert_eq!(fs::read_dir(out).unwrap().count(), 1);
+}
+
 #[test]
 fn cli_extract_directory_over_file_replaces_file_with_yes() {
     let tmp = tempdir().unwrap();
@@ -1180,6 +1233,37 @@ fn cli_extract_applies_overwrite_policy_to_destination_symlinks() {
                 }
             });
         });
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_extract_replaces_hard_links_without_modifying_the_linked_file() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("hard-link-destination.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("entry.txt", b"archive contents")
+        .build()
+        .unwrap();
+    fs::write(&archive, bytes).unwrap();
+    let output = tmp.path().join("out");
+    fs::create_dir(&output).unwrap();
+    let outside = tmp.path().join("outside.txt");
+    fs::write(&outside, b"outside contents").unwrap();
+    fs::hard_link(&outside, output.join("entry.txt")).unwrap();
+
+    run_r7z(&[
+        "x".into(),
+        "-y".into(),
+        archive.display().to_string(),
+        format!("-o{}", output.display()),
+    ]);
+
+    assert_eq!(fs::read(outside).unwrap(), b"outside contents");
+    assert_eq!(
+        fs::read(output.join("entry.txt")).unwrap(),
+        b"archive contents"
+    );
 }
 
 #[test]

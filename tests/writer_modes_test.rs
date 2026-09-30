@@ -1,8 +1,8 @@
 use std::{io::Cursor, num::NonZeroU64};
 
 use r7z::{
-    Archive, ArchiveOptions, ArchiveWriter, Codec, EncoderThreads, EncryptionOptions, EntryMeta,
-    HeaderMode, SolidMode,
+    Archive, ArchiveBuilder, ArchiveOptions, ArchiveWriter, Codec, EncoderThreads,
+    EncryptionOptions, EntryMeta, HeaderMode, SolidMode,
 };
 
 const CODECS: [Codec; 5] = [
@@ -87,6 +87,120 @@ fn archive_bytes_preserve_each_writer_mode() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn streaming_writer_encrypts_encoded_headers() {
+    let mut options = options(Codec::Lzma2, true);
+    options.header_mode = HeaderMode::Encoded;
+    options.encryption.as_mut().unwrap().encrypt_header = true;
+    let bytes = write_files(options, false);
+    let archive = Archive::from_bytes_with_password(bytes.into(), Some("secret")).unwrap();
+
+    for (index, expected) in [(1, &[][..]), (2, FIRST), (3, &[][..]), (4, SECOND)] {
+        assert_eq!(
+            archive
+                .extract_to_memory_with_password(index, Some("secret"))
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn copy_builder_and_streaming_writer_emit_the_same_archive() {
+    let options = options(Codec::Copy, false);
+    let streaming = write_files(options.clone(), false);
+    let built = ArchiveBuilder::new()
+        .options(options)
+        .add_directory("dir", EntryMeta::default())
+        .add_empty_file("empty", EntryMeta::default())
+        .add_file("first", FIRST)
+        .add_empty_file("empty2", EntryMeta::default())
+        .add_file("second", SECOND)
+        .add_anti_item("deleted", EntryMeta::default())
+        .build()
+        .unwrap();
+
+    assert_eq!(built, streaming);
+}
+
+#[test]
+fn copy_builder_preserves_preplanned_byte_limit_folders() {
+    let mut options = options(Codec::Copy, false);
+    options.compression.solid = SolidMode::Limit {
+        max_files: None,
+        max_bytes: NonZeroU64::new(10),
+    };
+    let bytes = ArchiveBuilder::new()
+        .options(options)
+        .add_file("first", b"123456")
+        .add_file("second", b"abcdef")
+        .build()
+        .unwrap();
+    let archive = Archive::from_bytes(bytes.into()).unwrap();
+    let unpack = archive
+        .raw_streams_info()
+        .unwrap()
+        .unpack_info
+        .as_ref()
+        .unwrap();
+
+    assert_eq!(unpack.num_folders, 2);
+}
+
+#[test]
+fn builder_lzma2_admission_uses_the_planned_folder_size() {
+    for codec in [Codec::Lzma2, Codec::Lzma2Bcj] {
+        let mut options = options(codec, false);
+        options.compression.threads = EncoderThreads::Fixed(4);
+        options.compression.encoder_memory_limit = Some(256 * 1024 * 1024);
+        let bytes = ArchiveBuilder::new()
+            .options(options)
+            .add_file("small", b"small folder")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"small folder");
+    }
+}
+
+#[test]
+fn builders_preserve_empty_symlink_streams_between_non_solid_files() {
+    for codec in [Codec::Copy, Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
+        let mut options = options(codec, false);
+        options.compression.solid = SolidMode::NonSolid;
+        let bytes = ArchiveBuilder::new()
+            .options(options)
+            .add_file("before", b"prior")
+            .add_symlink("empty-link", "", EntryMeta::default())
+            .add_file("after", b"data")
+            .build()
+            .unwrap();
+        let archive = Archive::from_bytes(bytes.into()).unwrap();
+        let files = archive.raw_files_info().unwrap();
+
+        assert_eq!(files.name(0).unwrap(), "before", "{codec:?}");
+        assert_eq!(files.entry_type(1), r7z::EntryType::Symlink, "{codec:?}");
+        assert_eq!(
+            archive.symlink_target(1).unwrap().as_deref(),
+            Some(""),
+            "{codec:?}"
+        );
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"prior", "{codec:?}");
+        assert_eq!(archive.extract_to_memory(2).unwrap(), b"data", "{codec:?}");
+        assert_eq!(
+            archive
+                .raw_streams_info()
+                .unwrap()
+                .unpack_info
+                .as_ref()
+                .unwrap()
+                .num_folders,
+            3,
+            "{codec:?}"
+        );
     }
 }
 
@@ -333,6 +447,25 @@ fn partial_input_failure_prevents_finishing_or_reusing_the_writer() {
     }
 }
 
+#[test]
+fn encoder_memory_limit_failure_prevents_reusing_the_writer() {
+    let mut limited = options(Codec::Lzma2, false);
+    limited.compression.encoder_memory_limit = Some(1);
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), limited).unwrap();
+
+    assert!(matches!(
+        writer.append("file", FIRST),
+        Err(r7z::R7zError::LimitExceeded("encoder memory"))
+    ));
+    assert!(writer.append("another", SECOND).is_err());
+    assert!(writer.finish().is_err());
+
+    let mut next =
+        ArchiveWriter::new(Cursor::new(Vec::new()), options(Codec::Lzma2, false)).unwrap();
+    next.append("file", FIRST).unwrap();
+    next.finish().unwrap();
+}
+
 struct ControlledOutput {
     bytes: Cursor<Vec<u8>>,
     fail: std::rc::Rc<std::cell::Cell<bool>>,
@@ -361,6 +494,36 @@ impl std::io::Seek for ControlledOutput {
     }
 }
 
+struct FailAfterBytes {
+    bytes: Cursor<Vec<u8>>,
+    remaining: usize,
+}
+
+impl std::io::Write for FailAfterBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "output failed",
+            ));
+        }
+        let written = bytes.len().min(self.remaining);
+        let written = self.bytes.write(&bytes[..written])?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for FailAfterBytes {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.bytes.seek(position)
+    }
+}
+
 #[test]
 fn short_output_writes_preserve_file_checksums() {
     for codec in CODECS {
@@ -379,7 +542,7 @@ fn short_output_writes_preserve_file_checksums() {
 
 #[test]
 fn folder_finalization_failure_prevents_reusing_the_writer() {
-    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
+    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj, Codec::Ppmd] {
         let fail = std::rc::Rc::new(std::cell::Cell::new(false));
         let out = ControlledOutput {
             bytes: Cursor::new(Vec::new()),
@@ -401,8 +564,50 @@ fn folder_finalization_failure_prevents_reusing_the_writer() {
 }
 
 #[test]
+fn encrypted_payload_write_failure_prevents_finishing_or_reusing_the_writer() {
+    let out = FailAfterBytes {
+        bytes: Cursor::new(Vec::new()),
+        remaining: 8192,
+    };
+    let mut writer = ArchiveWriter::new(out, options(Codec::Copy, true)).unwrap();
+    let input = vec![0xA5; 64 * 1024];
+    assert!(matches!(
+        writer.append("file", input.as_slice()),
+        Err(r7z::R7zError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+    ));
+    assert!(writer.append("another", SECOND).is_err());
+    assert!(writer.finish().is_err());
+}
+
+#[test]
+fn parallel_lzma2_write_failure_drops_the_folder_and_allows_a_new_writer() {
+    let mut options = options(Codec::Lzma2, false);
+    options.compression.threads = EncoderThreads::Fixed(2);
+    options.compression.lzma2_chunk_size = NonZeroU64::new(4096);
+
+    let out = FailAfterBytes {
+        bytes: Cursor::new(Vec::new()),
+        remaining: 96,
+    };
+    let mut writer = ArchiveWriter::new(out, options.clone()).unwrap();
+    let input = vec![0xA5; 64 * 1024];
+
+    assert!(matches!(
+        writer.append("file", input.as_slice()),
+        Err(r7z::R7zError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+    ));
+    assert!(writer.append("another", SECOND).is_err());
+    assert!(writer.finish().is_err());
+
+    let mut next = ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    next.append("file", input.as_slice()).unwrap();
+    let archive = Archive::from_bytes(next.finish().unwrap().into_inner().into()).unwrap();
+    assert_eq!(archive.extract_to_memory(0).unwrap(), input);
+}
+
+#[test]
 fn archive_finalization_preserves_output_errors() {
-    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj] {
+    for codec in [Codec::Lzma, Codec::Lzma2, Codec::Lzma2Bcj, Codec::Ppmd] {
         let fail = std::rc::Rc::new(std::cell::Cell::new(false));
         let out = ControlledOutput {
             bytes: Cursor::new(Vec::new()),

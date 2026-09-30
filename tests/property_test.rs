@@ -1,5 +1,5 @@
 use nom::ToUsize;
-use r7z::Property;
+use r7z::raw::Property;
 
 mod support;
 
@@ -12,8 +12,8 @@ fn choose_property() {
 #[test]
 fn parse_property_id_from_offset() {
     let buf = support::valid_7z_string();
-    let (input, header) = r7z::SignatureHeader::parse(&buf).unwrap();
+    let (input, header) = r7z::raw::SignatureHeader::parse(&buf).unwrap();
     let offset = header.next_header_offset.to_usize();
-    let (_input, property_id) = r7z::find_next_property_id(input, offset).unwrap();
+    let (_input, property_id) = r7z::raw::find_next_property_id(input, offset).unwrap();
     assert_eq!(property_id, Property::EncodedHeader);
 }

@@ -1,7 +1,13 @@
-use crate::{Property, entries::EntryKind, parsers::bitmap_is_set, sevenzip_varuint64_decode};
+use crate::{
+    Property,
+    entries::EntryKind,
+    parsers::{bitmap_is_set, bytes_subslice},
+    sevenzip_varuint64_decode,
+};
 use bytes::Bytes;
 use nom::{IResult, bytes::complete::take};
 
+/// Decode UTF-16LE, replacing unpaired surrogates with U+FFFD.
 pub(crate) fn decode_name(data: &[u8]) -> String {
     char::decode_utf16(
         data.chunks_exact(2)
@@ -49,15 +55,15 @@ pub enum EntryType {
     EmptySymlink,
 }
 
-pub(crate) struct FilesInfoNameSlices<'a> {
-    data: &'a [u8],
+pub(crate) struct FilesInfoNameSlices {
+    data: Bytes,
     count: usize,
     position: usize,
     index: usize,
 }
 
-impl<'a> Iterator for FilesInfoNameSlices<'a> {
-    type Item = Option<&'a [u8]>;
+impl Iterator for FilesInfoNameSlices {
+    type Item = Option<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.count {
@@ -72,7 +78,7 @@ impl<'a> Iterator for FilesInfoNameSlices<'a> {
             let is_null = self.data[self.position] == 0 && self.data[self.position + 1] == 0;
             self.position += 2;
             if is_null {
-                return Some(Some(&self.data[start..self.position - 2]));
+                return Some(Some(self.data.slice(start..self.position - 2)));
             }
         }
         Some(None)
@@ -82,7 +88,7 @@ impl<'a> Iterator for FilesInfoNameSlices<'a> {
 impl FilesInfo {
     /// Decode the name of entry `i` on demand (UTF-16LE, null-terminated).
     pub fn name(&self, i: usize) -> Option<String> {
-        self.name_slices().nth(i)?.map(decode_name)
+        self.name_slices().nth(i)?.as_deref().map(decode_name)
     }
 
     /// Iterator over all decoded names (in archive order).
@@ -91,12 +97,13 @@ impl FilesInfo {
     ///
     /// Panics if `num_files` exceeds `usize::MAX` (impossible in practice).
     pub fn names(&self) -> impl Iterator<Item = String> + '_ {
-        self.name_slices().filter_map(|name| name.map(decode_name))
+        self.name_slices()
+            .filter_map(|name| name.as_deref().map(decode_name))
     }
 
-    pub(crate) fn name_slices(&self) -> FilesInfoNameSlices<'_> {
+    pub(crate) fn name_slices(&self) -> FilesInfoNameSlices {
         FilesInfoNameSlices {
-            data: &self.name_data,
+            data: self.name_data.clone(),
             count: usize::try_from(self.num_files).expect("num_files fits in usize"),
             position: 0,
             index: 0,
@@ -169,14 +176,19 @@ impl FilesInfo {
     /// # Errors
     ///
     /// Returns a nom error if the input is truncated, malformed, or does not start
-    /// with the `FilesInfo` property tag.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a block size encoded in the archive exceeds `usize::MAX`, which
-    /// cannot happen in practice on any platform that can hold the archive in memory.
+    /// with the `FilesInfo` property tag, or if retained property bytes are not
+    /// contained in `backing`. Repeated supported properties, mismatched name
+    /// counts, and external references with invalid indices or payload sizes fail.
     #[allow(clippy::too_many_lines)]
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], FilesInfo> {
+        Self::parse_with_external(input, backing, &[])
+    }
+
+    pub(crate) fn parse_with_external<'a>(
+        input: &'a [u8],
+        backing: &Bytes,
+        external_data: &[Bytes],
+    ) -> IResult<&'a [u8], FilesInfo> {
         let orig_input = input;
         let (input, tag) = Property::parse(input)?;
         if tag != Property::FilesInfo {
@@ -204,11 +216,35 @@ impl FilesInfo {
         let mut empty_streams = Bytes::new();
         let mut empty_files = Bytes::new();
         let mut anti_items = Bytes::new();
+        let mut seen_properties = 0u32;
         let mut input = input;
 
         loop {
             let (i, tag) = Property::parse(input)?;
             input = i;
+            if tag != Property::END {
+                let property_mask = match tag {
+                    Property::Name
+                    | Property::CTime
+                    | Property::ATime
+                    | Property::MTime
+                    | Property::StartPos
+                    | Property::Attributes
+                    | Property::EmptyStream
+                    | Property::EmptyFile
+                    | Property::Anti => Some(1u32 << tag as u8),
+                    _ => None,
+                };
+                if let Some(property_mask) = property_mask {
+                    if seen_properties & property_mask != 0 {
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::Verify,
+                        )));
+                    }
+                    seen_properties |= property_mask;
+                }
+            }
             match tag {
                 Property::END => break,
                 Property::Name => {
@@ -226,8 +262,11 @@ impl FilesInfo {
                             nom::error::ErrorKind::Eof,
                         )));
                     }
-                    // block[0] is the external flag; block[1..] is the raw UTF-16LE name data.
-                    name_data = backing.slice_ref(&block[1..]);
+                    name_data = match block[0] {
+                        0 => bytes_subslice(backing, &block[1..], input)?,
+                        _ => external_property_data(input, &block[1..], external_data)?,
+                    };
+                    validate_name_data(&name_data, n, input)?;
                     input = i;
                 }
                 Property::CTime | Property::ATime | Property::MTime | Property::StartPos => {
@@ -239,7 +278,19 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    let values = parse_defined_u64_property(input, block, n)?;
+                    let (all_defined, bitmap, data_start) =
+                        defined_property_layout(input, block, n)?;
+                    let value_data = match block[data_start - 1] {
+                        0 => bytes_subslice(backing, &block[data_start..], input)?,
+                        _ => external_property_data(input, &block[data_start..], external_data)?,
+                    };
+                    let values = parse_defined_u64_values(
+                        input,
+                        all_defined,
+                        bitmap,
+                        value_data.as_ref(),
+                        n,
+                    )?;
                     match tag {
                         Property::CTime => ctimes = values,
                         Property::ATime => atimes = values,
@@ -258,7 +309,19 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    attributes = parse_defined_u32_property(input, block, n)?;
+                    let (all_defined, bitmap, data_start) =
+                        defined_property_layout(input, block, n)?;
+                    let value_data = match block[data_start - 1] {
+                        0 => bytes_subslice(backing, &block[data_start..], input)?,
+                        _ => external_property_data(input, &block[data_start..], external_data)?,
+                    };
+                    attributes = parse_defined_u32_values(
+                        input,
+                        all_defined,
+                        bitmap,
+                        value_data.as_ref(),
+                        n,
+                    )?;
                     input = i;
                 }
                 Property::EmptyStream => {
@@ -270,7 +333,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    empty_streams = backing.slice_ref(block);
+                    empty_streams = bytes_subslice(backing, block, input)?;
                     input = i;
                 }
                 Property::EmptyFile => {
@@ -282,7 +345,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    empty_files = backing.slice_ref(block);
+                    empty_files = bytes_subslice(backing, block, input)?;
                     input = i;
                 }
                 Property::Anti => {
@@ -294,7 +357,7 @@ impl FilesInfo {
                         ))
                     })?;
                     let (i, block) = take(sz)(i)?;
-                    anti_items = backing.slice_ref(block);
+                    anti_items = bytes_subslice(backing, block, input)?;
                     input = i;
                 }
                 _ => {
@@ -386,56 +449,123 @@ fn defined_property_layout<'a, 'b>(
     Ok((all_defined, &block[1..bitmap_end], data_start))
 }
 
-fn parse_defined_u64_property<'a>(
+fn external_property_data<'a>(
     error_input: &'a [u8],
-    block: &[u8],
+    index_bytes: &[u8],
+    external_data: &[Bytes],
+) -> Result<Bytes, ParseError<'a>> {
+    let (remaining, index) = sevenzip_varuint64_decode(index_bytes).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Verify,
+        ))
+    })?;
+    if !remaining.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    let index = usize::try_from(index).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+    external_data.get(index).cloned().ok_or_else(|| {
+        nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Eof,
+        ))
+    })
+}
+
+fn validate_name_data<'a>(
+    data: &[u8],
+    num_names: usize,
+    error_input: &'a [u8],
+) -> Result<(), ParseError<'a>> {
+    let mut code_units = data.chunks_exact(2);
+    let every_name_is_terminated =
+        (0..num_names).all(|_| code_units.position(|unit| unit == [0, 0]).is_some());
+    if !every_name_is_terminated
+        || code_units.next().is_some()
+        || !code_units.remainder().is_empty()
+    {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok(())
+}
+
+fn parse_defined_u64_values<'a>(
+    error_input: &'a [u8],
+    all_defined: u8,
+    bitmap: &[u8],
+    data: &[u8],
     num_values: usize,
 ) -> Result<Vec<Option<u64>>, ParseError<'a>> {
-    let (all_defined, bitmap, mut pos) = defined_property_layout(error_input, block, num_values)?;
+    let mut pos = 0;
     let mut values = Vec::with_capacity(num_values);
     for index in 0..num_values {
         let is_defined = all_defined != 0 || bitmap_is_set(bitmap, index);
         if is_defined {
-            if pos + 8 > block.len() {
+            if pos + 8 > data.len() {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     error_input,
                     nom::error::ErrorKind::Eof,
                 )));
             }
             values.push(Some(u64::from_le_bytes(
-                block[pos..pos + 8].try_into().unwrap(),
+                data[pos..pos + 8].try_into().unwrap(),
             )));
             pos += 8;
         } else {
             values.push(None);
         }
     }
+    if pos != data.len() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     Ok(values)
 }
 
-fn parse_defined_u32_property<'a>(
+fn parse_defined_u32_values<'a>(
     error_input: &'a [u8],
-    block: &[u8],
+    all_defined: u8,
+    bitmap: &[u8],
+    data: &[u8],
     num_values: usize,
 ) -> Result<Vec<Option<u32>>, ParseError<'a>> {
-    let (all_defined, bitmap, mut pos) = defined_property_layout(error_input, block, num_values)?;
+    let mut pos = 0;
     let mut values = Vec::with_capacity(num_values);
     for index in 0..num_values {
         let is_defined = all_defined != 0 || bitmap_is_set(bitmap, index);
         if is_defined {
-            if pos + 4 > block.len() {
+            if pos + 4 > data.len() {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     error_input,
                     nom::error::ErrorKind::Eof,
                 )));
             }
             values.push(Some(u32::from_le_bytes(
-                block[pos..pos + 4].try_into().unwrap(),
+                data[pos..pos + 4].try_into().unwrap(),
             )));
             pos += 4;
         } else {
             values.push(None);
         }
+    }
+    if pos != data.len() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            error_input,
+            nom::error::ErrorKind::Verify,
+        )));
     }
     Ok(values)
 }
@@ -449,7 +579,7 @@ fn parse_defined_u32_property<'a>(
 ///
 /// Returns a nom error if the input is truncated or does not start with
 /// the `FilesInfo` property tag.
-pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
+pub(crate) fn scan_files_info_with_external(input: &[u8]) -> IResult<&[u8], (u64, bool)> {
     let orig = input;
     let (input, tag) = Property::parse(input)?;
     if tag != Property::FilesInfo {
@@ -460,7 +590,14 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
     }
 
     let (input, num_files) = sevenzip_varuint64_decode(input)?;
+    let num_files_usize = usize::try_from(num_files).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
     let mut input = input;
+    let mut uses_external_data = false;
 
     loop {
         let (i, tag) = Property::parse(input)?;
@@ -476,16 +613,36 @@ pub(crate) fn scan_files_info(input: &[u8]) -> IResult<&[u8], u64> {
                 nom::error::ErrorKind::TooLarge,
             ))
         })?;
-        let (i, _) = take(sz)(i)?;
+        let (i, block) = take(sz)(i)?;
+        let external_flag = match tag {
+            Property::Name => block.first().copied(),
+            Property::CTime
+            | Property::ATime
+            | Property::MTime
+            | Property::StartPos
+            | Property::Attributes => {
+                let layout_start = match block.first().copied() {
+                    Some(0) => 2 + num_files_usize.div_ceil(8),
+                    Some(value) if value != 0 => 2,
+                    _ => usize::MAX,
+                };
+                layout_start
+                    .checked_sub(1)
+                    .and_then(|index| block.get(index))
+                    .copied()
+            }
+            _ => None,
+        };
+        uses_external_data |= external_flag.is_some_and(|flag| flag != 0);
         input = i;
     }
 
-    Ok((input, num_files))
+    Ok((input, (num_files, uses_external_data)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesInfo, scan_files_info};
+    use super::{FilesInfo, scan_files_info_with_external};
     use bytes::Bytes;
 
     /// Minimal: 3 files, no sub-properties.
@@ -493,43 +650,174 @@ mod tests {
     fn scan_files_info_no_props() {
         // FilesInfo (0x05), num_files=3, END (0x00)
         let input = [0x05u8, 0x03, 0x00];
-        let (rem, n) = scan_files_info(&input).unwrap();
+        let (rem, n) = scan_files_info_with_external(&input).unwrap();
         assert!(rem.is_empty());
-        assert_eq!(n, 3);
+        assert_eq!(n, (3, false));
     }
 
     /// `num_files=0` is valid.
     #[test]
     fn scan_files_info_zero_files() {
         let input = [0x05u8, 0x00, 0x00];
-        let (rem, n) = scan_files_info(&input).unwrap();
+        let (rem, n) = scan_files_info_with_external(&input).unwrap();
         assert!(rem.is_empty());
-        assert_eq!(n, 0);
+        assert_eq!(n, (0, false));
     }
 
     /// One size-prefixed sub-property is skipped correctly.
     #[test]
     fn scan_files_info_with_sub_property() {
         // FilesInfo, num_files=2, MTime (0x14), size=5, 5 dummy bytes, END
-        let input = [0x05u8, 0x02, 0x14, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05, 0x00];
-        let (rem, n) = scan_files_info(&input).unwrap();
+        let input = [0x05u8, 0x02, 0x14, 0x05, 0x01, 0x00, 0x03, 0x04, 0x05, 0x00];
+        let (rem, n) = scan_files_info_with_external(&input).unwrap();
         assert!(rem.is_empty());
-        assert_eq!(n, 2);
+        assert_eq!(n, (2, false));
+    }
+
+    #[test]
+    fn scan_files_info_detects_external_property_streams() {
+        let name = [0x05, 0x01, 0x11, 0x02, 0x01, 0x00, 0x00];
+        let time = [0x05, 0x01, 0x12, 0x03, 0x01, 0x01, 0x00, 0x00];
+
+        assert_eq!(scan_files_info_with_external(&name).unwrap().1, (1, true));
+        assert_eq!(scan_files_info_with_external(&time).unwrap().1, (1, true));
     }
 
     /// Trailing bytes after END are preserved in the remainder.
     #[test]
     fn scan_files_info_trailing_bytes() {
         let input = [0x05u8, 0x07, 0x00, 0xFF];
-        let (rem, n) = scan_files_info(&input).unwrap();
+        let (rem, n) = scan_files_info_with_external(&input).unwrap();
         assert_eq!(rem, &[0xFF]);
-        assert_eq!(n, 7);
+        assert_eq!(n, (7, false));
     }
 
     /// Wrong opening tag returns a hard Failure.
     #[test]
     fn scan_files_info_wrong_tag() {
-        assert!(scan_files_info(&[0x06u8]).is_err());
+        assert!(scan_files_info_with_external(&[0x06u8]).is_err());
+    }
+
+    #[test]
+    fn parse_files_info_rejects_name_data_outside_backing() {
+        let input = [0x05u8, 0x01, 0x11, 0x05, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00];
+        let backing = Bytes::from_static(b"unrelated");
+
+        assert!(FilesInfo::parse(&input, &backing).is_err());
+    }
+
+    #[test]
+    fn external_files_metadata_resolves_names_times_and_attributes() {
+        let input = [
+            0x05, 0x01, // one file
+            0x11, 0x02, 0x01, 0x00, // Name: external stream 0
+            0x12, 0x03, 0x01, 0x01, 0x01, // CTime: external stream 1
+            0x13, 0x03, 0x01, 0x01, 0x01, // ATime: external stream 1
+            0x14, 0x03, 0x01, 0x01, 0x01, // MTime: external stream 1
+            0x15, 0x03, 0x01, 0x01, 0x02, // Attributes: external stream 2
+            0x00,
+        ];
+        let backing = Bytes::copy_from_slice(&input);
+        let external = [
+            Bytes::from_static(&[b'A', 0, 0, 0]),
+            Bytes::from_static(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]),
+            Bytes::from_static(&[0x81, 0x00, 0x00, 0x00]),
+        ];
+
+        let (remaining, files) =
+            FilesInfo::parse_with_external(&input, &backing, &external).unwrap();
+
+        assert!(remaining.is_empty());
+        assert_eq!(files.name(0).as_deref(), Some("A"));
+        assert_eq!(files.ctimes, [Some(0x0102_0304_0506_0708)]);
+        assert_eq!(files.atimes, [Some(0x0102_0304_0506_0708)]);
+        assert_eq!(files.mtimes, [Some(0x0102_0304_0506_0708)]);
+        assert_eq!(files.attributes, [Some(0x81)]);
+    }
+
+    #[test]
+    fn external_sparse_time_properties_keep_undefined_entries() {
+        let input = [0x05, 0x02, 0x12, 0x04, 0x00, 0x80, 0x22, 0x00, 0x00];
+        let backing = Bytes::copy_from_slice(&input);
+        let external = [Bytes::from_static(&[
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        ])];
+
+        let files = FilesInfo::parse_with_external(&backing, &backing, &external)
+            .unwrap()
+            .1;
+
+        assert_eq!(files.ctimes, [Some(0x0102_0304_0506_0708), None]);
+    }
+
+    #[test]
+    fn external_files_metadata_rejects_invalid_indices_and_trailing_values() {
+        let invalid_index = [0x05, 0x01, 0x11, 0x02, 0x01, 0x01, 0x00];
+        let invalid_index_backing = Bytes::copy_from_slice(&invalid_index);
+        assert!(
+            FilesInfo::parse_with_external(&invalid_index, &invalid_index_backing, &[]).is_err()
+        );
+
+        let trailing_values = [0x05, 0x01, 0x12, 0x03, 0x01, 0x01, 0x00, 0x00];
+        let trailing_values_backing = Bytes::copy_from_slice(&trailing_values);
+        let external = [Bytes::from_static(&[0; 9])];
+        assert!(
+            FilesInfo::parse_with_external(&trailing_values, &trailing_values_backing, &external)
+                .is_err()
+        );
+
+        let truncated_values = [0x05, 0x01, 0x12, 0x03, 0x01, 0x01, 0x00, 0x00];
+        let truncated_backing = Bytes::copy_from_slice(&truncated_values);
+        let truncated_external = [Bytes::from_static(&[0; 7])];
+        assert!(
+            FilesInfo::parse_with_external(
+                &truncated_values,
+                &truncated_backing,
+                &truncated_external
+            )
+            .is_err()
+        );
+
+        let trailing_index = [0x05, 0x01, 0x11, 0x03, 0x01, 0x00, 0x00, 0x00];
+        let trailing_index_backing = Bytes::copy_from_slice(&trailing_index);
+        assert!(
+            FilesInfo::parse_with_external(
+                &trailing_index,
+                &trailing_index_backing,
+                &truncated_external
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn files_info_rejects_duplicate_properties_and_wrong_name_counts() {
+        let duplicate_names = [
+            0x05, 0x01, 0x11, 0x05, 0x00, b'A', 0x00, 0x00, 0x00, 0x11, 0x05, 0x00, b'B', 0x00,
+            0x00, 0x00, 0x00,
+        ];
+        let duplicate_backing = Bytes::copy_from_slice(&duplicate_names);
+        assert!(FilesInfo::parse(&duplicate_backing, &duplicate_backing).is_err());
+
+        let missing_name = [0x05, 0x02, 0x11, 0x05, 0x00, b'A', 0x00, 0x00, 0x00, 0x00];
+        let missing_backing = Bytes::copy_from_slice(&missing_name);
+        assert!(FilesInfo::parse(&missing_backing, &missing_backing).is_err());
+
+        let trailing_name_data = [
+            0x05, 0x01, 0x11, 0x06, 0x00, b'A', 0x00, 0x00, 0x00, b'B', 0x00, 0x00,
+        ];
+        let trailing_backing = Bytes::copy_from_slice(&trailing_name_data);
+        assert!(FilesInfo::parse(&trailing_backing, &trailing_backing).is_err());
+    }
+
+    #[test]
+    fn files_info_preserves_invalid_utf16_and_replaces_it_for_display() {
+        let input = [0x05, 0x01, 0x11, 0x05, 0x00, 0x00, 0xd8, 0x00, 0x00, 0x00];
+        let backing = Bytes::copy_from_slice(&input);
+        let files = FilesInfo::parse(&backing, &backing).unwrap().1;
+
+        assert_eq!(files.name(0).as_deref(), Some("\u{fffd}"));
+        assert_eq!(files.name_data.as_ref(), &[0x00, 0xd8, 0x00, 0x00]);
     }
 
     #[test]

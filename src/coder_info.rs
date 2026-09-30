@@ -22,6 +22,55 @@ pub struct CoderInfo {
     pub properties: Option<SmallVec<[u8; 16]>>,
 }
 
+/// Borrowed fields from a parsed coder block, used by scanners that retain no data.
+pub(crate) struct CoderInfoRef<'a> {
+    pub(crate) codec_id: &'a [u8],
+    pub(crate) num_in_streams: u64,
+    pub(crate) num_out_streams: u64,
+    pub(crate) properties: Option<&'a [u8]>,
+}
+
+impl<'a> CoderInfoRef<'a> {
+    pub(crate) fn parse(input: &'a [u8]) -> IResult<&'a [u8], Self> {
+        let (input, flags) = le_u8(input)?;
+        let codec_id_size = usize::from(flags & 0x0f);
+        let is_complex = (flags & 0x10) != 0;
+        let has_attributes = (flags & 0x20) != 0;
+
+        let (input, codec_id) = take(codec_id_size)(input)?;
+        let (input, num_in_streams, num_out_streams) = if is_complex {
+            let (input, num_in) = sevenzip_varuint64_decode(input)?;
+            let (input, num_out) = sevenzip_varuint64_decode(input)?;
+            (input, num_in, num_out)
+        } else {
+            (input, 1, 1)
+        };
+        let (input, properties) = if has_attributes {
+            let (input, prop_size) = sevenzip_varuint64_decode(input)?;
+            let size = usize::try_from(prop_size).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            let (input, properties) = take(size)(input)?;
+            (input, Some(properties))
+        } else {
+            (input, None)
+        };
+
+        Ok((
+            input,
+            Self {
+                codec_id,
+                num_in_streams,
+                num_out_streams,
+                properties,
+            },
+        ))
+    }
+}
+
 impl CoderInfo {
     /// Parse a single `CoderInfo` block from the input.
     ///
@@ -29,47 +78,21 @@ impl CoderInfo {
     ///
     /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], CoderInfo> {
-        let (input, flags) = le_u8(input)?;
-        let codec_id_size = (flags & 0x0f) as usize;
-        let is_complex = (flags & 0x10) != 0;
-        let has_attributes = (flags & 0x20) != 0;
-
-        let (input, codec_id_bytes) = take(codec_id_size)(input)?;
-        let codec_id: ArrayVec<u8, 15> = ArrayVec::try_from(codec_id_bytes).map_err(|_| {
+        let (input, parsed) = CoderInfoRef::parse(input)?;
+        let codec_id: ArrayVec<u8, 15> = ArrayVec::try_from(parsed.codec_id).map_err(|_| {
             nom::Err::Error(nom::error::Error::new(
                 input,
                 nom::error::ErrorKind::TooLarge,
             ))
         })?;
-
-        let (input, num_in_streams, num_out_streams) = if is_complex {
-            let (input, n_in) = sevenzip_varuint64_decode(input)?;
-            let (input, n_out) = sevenzip_varuint64_decode(input)?;
-            (input, n_in, n_out)
-        } else {
-            (input, 1u64, 1u64)
-        };
-
-        let (input, properties) = if has_attributes {
-            let (input, prop_size) = sevenzip_varuint64_decode(input)?;
-            let sz = usize::try_from(prop_size).map_err(|_| {
-                nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-            let (input, prop_bytes) = take(sz)(input)?;
-            (input, Some(SmallVec::from_slice(prop_bytes)))
-        } else {
-            (input, None)
-        };
+        let properties = parsed.properties.map(SmallVec::from_slice);
 
         Ok((
             input,
             CoderInfo {
                 codec_id,
-                num_in_streams,
-                num_out_streams,
+                num_in_streams: parsed.num_in_streams,
+                num_out_streams: parsed.num_out_streams,
                 properties,
             },
         ))

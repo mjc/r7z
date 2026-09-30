@@ -247,7 +247,10 @@ fn write_files_info(h: &mut Vec<u8>, entries: &[WriteEntry]) {
 }
 
 fn write_empty_properties(h: &mut Vec<u8>, entries: &[WriteEntry]) {
-    let empty: Vec<bool> = entries.iter().map(|entry| !entry.has_stream).collect();
+    let empty: Vec<bool> = entries
+        .iter()
+        .map(|entry| !entry.stream.has_stream())
+        .collect();
     if !empty.iter().any(|&v| v) {
         return;
     }
@@ -258,7 +261,7 @@ fn write_empty_properties(h: &mut Vec<u8>, entries: &[WriteEntry]) {
 
     let mut empty_files = Vec::new();
     let mut anti = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.has_stream) {
+    for entry in entries.iter().filter(|entry| !entry.stream.has_stream()) {
         empty_files.push(entry.kind == EntryKind::File);
         anti.push(entry.kind == EntryKind::Anti);
     }
@@ -280,8 +283,12 @@ fn write_names(h: &mut Vec<u8>, entries: &[WriteEntry]) {
     h.push(0x11);
     let mut name_data = Vec::new();
     for entry in entries {
-        for unit in entry.name.encode_utf16() {
-            name_data.extend_from_slice(&unit.to_le_bytes());
+        if let Some(raw_name) = &entry.raw_name {
+            name_data.extend_from_slice(raw_name.as_utf16le());
+        } else {
+            for unit in entry.name.encode_utf16() {
+                name_data.extend_from_slice(&unit.to_le_bytes());
+            }
         }
         name_data.extend_from_slice(&[0, 0]);
     }
@@ -382,18 +389,22 @@ fn system_time_to_filetime(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::build_header;
-    use crate::write::model::{EntryKind, EntryMeta, WriteEntry};
+    use crate::write::model::{EntryKind, EntryMeta, WriteEntry, WriteEntryStream, WriteFolderId};
     use bytes::Bytes;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn entry(name: &str, kind: EntryKind, has_stream: bool, meta: EntryMeta) -> WriteEntry {
         WriteEntry {
             name: name.to_string(),
+            raw_name: None,
             kind,
             meta,
-            has_stream,
-            data: has_stream.then(|| vec![0xAA]),
-            folder_id: 0,
+            stream: if has_stream {
+                WriteEntryStream::Buffered(vec![0xAA])
+            } else {
+                WriteEntryStream::Empty
+            },
+            folder_id: WriteFolderId::FIRST,
         }
     }
 
@@ -426,6 +437,24 @@ mod tests {
         assert!(fi.is_empty_file(1));
         assert!(fi.is_anti(2));
         assert!(!fi.is_empty_stream(3));
+    }
+
+    #[test]
+    fn files_info_writer_preserves_raw_utf16_name_units() {
+        let raw_name = crate::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+        let mut entry = entry("�", EntryKind::File, true, EntryMeta::default());
+        entry.raw_name = Some(raw_name.clone());
+
+        let header = parse_header(build_header(&[entry], &[]));
+        let stored_name = header
+            .files_info()
+            .unwrap()
+            .name_slices()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored_name.as_ref(), raw_name.as_utf16le());
     }
 
     #[test]

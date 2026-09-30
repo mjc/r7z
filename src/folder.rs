@@ -1,8 +1,89 @@
-use crate::{CoderInfo, R7zError, method_from_id, sevenzip_varuint64_decode, usize_cap};
+use crate::{
+    CoderInfo, R7zError, coder_info::CoderInfoRef, method_from_id, sevenzip_varuint64_decode,
+    usize_cap,
+};
 use nom::IResult;
 use smallvec::SmallVec;
 
 const MAX_FOLDER_STREAMS: usize = 16_384;
+
+fn checked_coder_count(
+    input: &[u8],
+    count: u64,
+) -> Result<usize, nom::Err<nom::error::Error<&[u8]>>> {
+    let count = usize::try_from(count).map_err(|_| {
+        nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
+    })?;
+    match count {
+        1..=MAX_FOLDER_STREAMS => Ok(count),
+        _ => Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))),
+    }
+}
+
+#[derive(Default)]
+struct FolderStreamCounts {
+    inputs: u64,
+    outputs: u64,
+}
+
+impl FolderStreamCounts {
+    fn add_coder<'a>(
+        &mut self,
+        input: &'a [u8],
+        num_inputs: u64,
+        num_outputs: u64,
+    ) -> Result<(), nom::Err<nom::error::Error<&'a [u8]>>> {
+        let too_large = || -> nom::Err<nom::error::Error<&'a [u8]>> {
+            nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        };
+        self.inputs = self.inputs.checked_add(num_inputs).ok_or_else(too_large)?;
+        self.outputs = self
+            .outputs
+            .checked_add(num_outputs)
+            .ok_or_else(too_large)?;
+        if self.inputs > MAX_FOLDER_STREAMS as u64 || self.outputs > MAX_FOLDER_STREAMS as u64 {
+            return Err(too_large());
+        }
+        Ok(())
+    }
+
+    fn layout<'a>(
+        &self,
+        input: &'a [u8],
+    ) -> Result<(u64, u64), nom::Err<nom::error::Error<&'a [u8]>>> {
+        let num_bind_pairs = self.outputs.checked_sub(1).ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+        })?;
+        let num_packed = self.inputs.checked_sub(num_bind_pairs).ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+        })?;
+        Ok((num_bind_pairs, num_packed))
+    }
+}
+
+fn checked_stream_index(
+    input: &[u8],
+    index: u64,
+    total: u64,
+) -> Result<(), nom::Err<nom::error::Error<&[u8]>>> {
+    if index < total {
+        Ok(())
+    } else {
+        Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct CoderIndex(usize);
@@ -11,7 +92,7 @@ pub(crate) struct InputStreamIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct OutputStreamIndex(usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-struct PackedStreamIndex(usize);
+pub(crate) struct PackedStreamIndex(usize);
 
 /// A validated view of a folder's global input/output stream graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +100,23 @@ pub(crate) struct FolderGraph {
     execution_order: SmallVec<[CoderIndex; 4]>,
     packed_inputs: SmallVec<[(PackedStreamIndex, InputStreamIndex); 4]>,
     final_output: OutputStreamIndex,
+    input_owners: Vec<CoderIndex>,
+    output_owners: Vec<CoderIndex>,
+    input_sources: Vec<Option<OutputStreamIndex>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Bcj2Channel {
+    pub(crate) coder: Option<CoderIndex>,
+    pub(crate) packed: PackedStreamIndex,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Bcj2Layout {
+    pub(crate) main: Bcj2Channel,
+    pub(crate) call: Bcj2Channel,
+    pub(crate) jump: Bcj2Channel,
+    pub(crate) control: Bcj2Channel,
 }
 
 impl CoderIndex {
@@ -49,6 +147,12 @@ impl OutputStreamIndex {
     }
 }
 
+impl PackedStreamIndex {
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 impl FolderGraph {
     pub(crate) fn execution_order(&self) -> impl DoubleEndedIterator<Item = CoderIndex> + '_ {
         self.execution_order.iter().copied()
@@ -60,6 +164,116 @@ impl FolderGraph {
 
     pub(crate) const fn final_output(&self) -> OutputStreamIndex {
         self.final_output
+    }
+
+    pub(crate) fn bcj2_layout(&self, folder: &Folder) -> Result<Option<Bcj2Layout>, R7zError> {
+        let mut coders = folder
+            .coders
+            .iter()
+            .enumerate()
+            .filter(|(_, coder)| coder.codec_id.as_slice() == crate::CODEC_BCJ2);
+        let Some((index, _)) = coders.next() else {
+            return Ok(None);
+        };
+        if coders.next().is_some()
+            || self.output_owners.get(self.final_output.0) != Some(&CoderIndex(index))
+        {
+            return Err(R7zError::InvalidFolderGraph);
+        }
+
+        let inputs = self
+            .input_owners
+            .iter()
+            .enumerate()
+            .filter_map(|(input, owner)| {
+                (*owner == CoderIndex(index)).then_some(InputStreamIndex(input))
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        let [main, call, jump, control] = inputs.as_slice() else {
+            return Err(R7zError::InvalidFolderGraph);
+        };
+        let [main, call, jump, control] = [*main, *call, *jump, *control]
+            .map(|input| self.bcj2_channel(folder, CoderIndex(index), input));
+        let layout = Bcj2Layout {
+            main: main?,
+            call: call?,
+            jump: jump?,
+            control: control?,
+        };
+        let channel_coders = [layout.main.coder, layout.call.coder, layout.jump.coder];
+        let channel_coders = channel_coders
+            .into_iter()
+            .flatten()
+            .collect::<SmallVec<[_; 3]>>();
+        let unique_coders = channel_coders
+            .iter()
+            .enumerate()
+            .all(|(index, coder)| !channel_coders[..index].contains(coder));
+        let all_coders_are_channels = folder
+            .coders
+            .iter()
+            .enumerate()
+            .map(|(index, _)| CoderIndex(index))
+            .all(|coder| coder == CoderIndex(index) || channel_coders.contains(&coder));
+        if layout.main.coder.is_none()
+            || layout.control.coder.is_some()
+            || !unique_coders
+            || !all_coders_are_channels
+        {
+            return Err(R7zError::InvalidFolderGraph);
+        }
+        Ok(Some(layout))
+    }
+
+    fn bcj2_channel(
+        &self,
+        folder: &Folder,
+        bcj2: CoderIndex,
+        input: InputStreamIndex,
+    ) -> Result<Bcj2Channel, R7zError> {
+        let packed_slot = |input| {
+            self.packed_inputs
+                .iter()
+                .find_map(|(slot, candidate)| (*candidate == input).then_some(*slot))
+                .ok_or(R7zError::InvalidFolderGraph)
+        };
+        let source = *self
+            .input_sources
+            .get(input.0)
+            .ok_or(R7zError::InvalidFolderGraph)?;
+        match source {
+            None => Ok(Bcj2Channel {
+                coder: None,
+                packed: packed_slot(input)?,
+            }),
+            Some(output) => {
+                let coder = *self
+                    .output_owners
+                    .get(output.0)
+                    .ok_or(R7zError::InvalidFolderGraph)?;
+                let info = folder
+                    .coders
+                    .get(coder.0)
+                    .ok_or(R7zError::InvalidFolderGraph)?;
+                let arity = StreamArity::try_from(info)?;
+                if coder == bcj2 || arity.inputs != 1 || arity.outputs != 1 {
+                    return Err(R7zError::InvalidFolderGraph);
+                }
+                let producer_input = self
+                    .input_owners
+                    .iter()
+                    .position(|owner| *owner == coder)
+                    .map(InputStreamIndex)
+                    .ok_or(R7zError::InvalidFolderGraph)?;
+                if self.input_sources.get(producer_input.0) != Some(&None) {
+                    return Err(R7zError::InvalidFolderGraph);
+                }
+                Ok(Bcj2Channel {
+                    coder: Some(coder),
+                    packed: packed_slot(producer_input)?,
+                })
+            }
+        }
     }
 }
 
@@ -129,6 +343,7 @@ impl StreamOwners {
 struct Bindings {
     bound_inputs: Vec<bool>,
     bound_outputs: Vec<bool>,
+    input_sources: Vec<Option<OutputStreamIndex>>,
     edges: Vec<SmallVec<[CoderIndex; 2]>>,
     indegree: Vec<usize>,
 }
@@ -151,6 +366,7 @@ impl Bindings {
         let mut bindings = Self {
             bound_inputs: vec![false; owners.inputs.len()],
             bound_outputs: vec![false; owners.outputs.len()],
+            input_sources: vec![None; owners.inputs.len()],
             edges: vec![SmallVec::new(); coder_count],
             indegree: vec![0; coder_count],
         };
@@ -188,6 +404,10 @@ impl Bindings {
         }
         *input_bound = true;
         *output_bound = true;
+        *self
+            .input_sources
+            .get_mut(input.0)
+            .ok_or(R7zError::InvalidFolderGraph)? = Some(output);
         self.edges
             .get_mut(source.0)
             .ok_or(R7zError::InvalidFolderGraph)?
@@ -248,7 +468,7 @@ impl Bindings {
         }
     }
 
-    fn execution_order(mut self) -> Result<SmallVec<[CoderIndex; 4]>, R7zError> {
+    fn execution_order(&mut self) -> Result<SmallVec<[CoderIndex; 4]>, R7zError> {
         let mut ready = self
             .indegree
             .iter()
@@ -281,91 +501,41 @@ impl Bindings {
 ///
 /// This walks the exact same byte layout as [`Folder::parse`] — varints,
 /// coder blocks, bind pairs, packed indices — and performs identical
-/// bounds / overflow checks, but builds no structs.
+/// bounds / overflow checks without allocating owned structs.
 ///
 /// # Errors
 ///
 /// Returns a nom error if the bytes are truncated or malformed.
 pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
     let (mut input, num_coders) = sevenzip_varuint64_decode(input)?;
+    let num_coders = checked_coder_count(input, num_coders)?;
 
-    if num_coders == 0 || num_coders > MAX_FOLDER_STREAMS as u64 {
-        return Err(nom::Err::Failure(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::TooLarge,
-        )));
-    }
-
-    let mut num_in_total: u64 = 0;
-    let mut num_out_total: u64 = 0;
+    let mut stream_counts = FolderStreamCounts::default();
 
     for _ in 0..num_coders {
-        let (i, flags) = nom::number::complete::le_u8(input)?;
-        let codec_id_size = usize::from(flags & 0x0f);
-        let is_complex = (flags & 0x10) != 0;
-        let has_attributes = (flags & 0x20) != 0;
-
-        let (i, _codec_id) = nom::bytes::complete::take(codec_id_size)(i)?;
-
-        let (i, n_in, n_out) = if is_complex {
-            let (i, n_in) = sevenzip_varuint64_decode(i)?;
-            let (i, n_out) = sevenzip_varuint64_decode(i)?;
-            (i, n_in, n_out)
-        } else {
-            (i, 1u64, 1u64)
-        };
-
-        num_in_total = num_in_total.checked_add(n_in).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
-        })?;
-        num_out_total = num_out_total.checked_add(n_out).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
-        })?;
-        if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                i,
-                nom::error::ErrorKind::TooLarge,
-            )));
-        }
-
-        input = if has_attributes {
-            let (i, prop_size) = sevenzip_varuint64_decode(i)?;
-            let sz = usize::try_from(prop_size).map_err(|_| {
-                nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::TooLarge))
-            })?;
-            let (i, _props) = nom::bytes::complete::take(sz)(i)?;
-            i
-        } else {
-            i
-        };
+        let (remaining, coder) = CoderInfoRef::parse(input)?;
+        stream_counts.add_coder(remaining, coder.num_in_streams, coder.num_out_streams)?;
+        input = remaining;
     }
 
-    let num_bind_pairs = num_out_total.checked_sub(1).ok_or_else(|| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-    })?;
-    if num_bind_pairs > num_in_total {
-        return Err(nom::Err::Failure(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Verify,
-        )));
-    }
+    let (num_bind_pairs, num_packed) = stream_counts.layout(input)?;
     for _ in 0..num_bind_pairs {
-        let (i, _in_idx) = sevenzip_varuint64_decode(input)?;
-        let (i, _out_idx) = sevenzip_varuint64_decode(i)?;
+        let (i, in_idx) = sevenzip_varuint64_decode(input)?;
+        checked_stream_index(i, in_idx, stream_counts.inputs)?;
+        let (i, out_idx) = sevenzip_varuint64_decode(i)?;
+        checked_stream_index(i, out_idx, stream_counts.outputs)?;
         input = i;
     }
 
-    let num_packed = num_in_total.checked_sub(num_bind_pairs).ok_or_else(|| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-    })?;
     if num_packed != 1 {
         for _ in 0..num_packed {
-            let (i, _idx) = sevenzip_varuint64_decode(input)?;
+            let (i, idx) = sevenzip_varuint64_decode(input)?;
+            checked_stream_index(i, idx, stream_counts.inputs)?;
             input = i;
         }
     }
 
-    let total_out = usize::try_from(num_out_total).map_err(|_| {
+    let total_out = usize::try_from(stream_counts.outputs).map_err(|_| {
         nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::TooLarge,
@@ -407,7 +577,7 @@ impl Folder {
     /// Resolve the coder graph into the information required by a decoder.
     pub(crate) fn graph(&self) -> Result<FolderGraph, R7zError> {
         let owners = StreamOwners::from_coders(&self.coders)?;
-        let bindings = Bindings::new(&self.bind_pairs, &owners, self.coders.len())?;
+        let mut bindings = Bindings::new(&self.bind_pairs, &owners, self.coders.len())?;
         let final_output = bindings.final_output()?;
         let packed_inputs = bindings.packed_inputs(&self.packed_indices)?;
         let execution_order = bindings.execution_order()?;
@@ -415,6 +585,9 @@ impl Folder {
             execution_order,
             packed_inputs,
             final_output,
+            input_owners: owners.inputs,
+            output_owners: owners.outputs,
+            input_sources: bindings.input_sources,
         })
     }
 
@@ -425,68 +598,39 @@ impl Folder {
     /// Returns a nom error if the input is truncated or malformed.
     pub fn parse(input: &[u8]) -> IResult<&[u8], Folder> {
         let (input, num_coders) = sevenzip_varuint64_decode(input)?;
+        let num_coders = checked_coder_count(input, num_coders)?;
         let mut coders: SmallVec<[CoderInfo; 4]> =
-            SmallVec::with_capacity(usize_cap(num_coders, input.len()));
+            SmallVec::with_capacity(num_coders.min(input.len()));
         let mut input = input;
+        let mut stream_counts = FolderStreamCounts::default();
         for _ in 0..num_coders {
             let (i, coder) = CoderInfo::parse(input)?;
+            stream_counts.add_coder(i, coder.num_in_streams, coder.num_out_streams)?;
             coders.push(coder);
             input = i;
         }
 
-        let num_in_total = coders
-            .iter()
-            .try_fold(0u64, |sum, c| sum.checked_add(c.num_in_streams))
-            .ok_or_else(|| {
-                nom::Err::Failure(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-        let num_out_total = coders
-            .iter()
-            .try_fold(0u64, |sum, c| sum.checked_add(c.num_out_streams))
-            .ok_or_else(|| {
-                nom::Err::Failure(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::TooLarge,
-                ))
-            })?;
-        if num_in_total > MAX_FOLDER_STREAMS as u64 || num_out_total > MAX_FOLDER_STREAMS as u64 {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::TooLarge,
-            )));
-        }
-        let num_bind_pairs = num_out_total.checked_sub(1).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-        })?;
-        if num_bind_pairs > num_in_total {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Verify,
-            )));
-        }
+        let (num_bind_pairs, num_packed) = stream_counts.layout(input)?;
 
         let mut bind_pairs: SmallVec<[(u64, u64); 1]> =
             SmallVec::with_capacity(usize_cap(num_bind_pairs, input.len()));
         for _ in 0..num_bind_pairs {
             let (i, in_idx) = sevenzip_varuint64_decode(input)?;
+            checked_stream_index(i, in_idx, stream_counts.inputs)?;
             let (i, out_idx) = sevenzip_varuint64_decode(i)?;
+            checked_stream_index(i, out_idx, stream_counts.outputs)?;
             bind_pairs.push((in_idx, out_idx));
             input = i;
         }
 
         // NumPackedStreams = NumInStreams_Total - NumBindPairs
         // Only written explicitly when NumPackedStreams != 1
-        let num_packed = num_in_total.checked_sub(num_bind_pairs).ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-        })?;
         let mut packed_indices: SmallVec<[u64; 1]> = SmallVec::new();
         if num_packed != 1 {
             packed_indices.reserve_exact(usize_cap(num_packed, input.len()));
             for _ in 0..num_packed {
                 let (i, idx) = sevenzip_varuint64_decode(input)?;
+                checked_stream_index(i, idx, stream_counts.inputs)?;
                 packed_indices.push(idx);
                 input = i;
             }
@@ -580,10 +724,126 @@ mod tests {
         assert!(scan_folder(&[0x01u8]).is_err());
     }
 
+    #[test]
+    fn folder_parser_and_scanner_agree_on_coder_layouts() {
+        let copy = [0x01u8, 0x01, 0x00];
+        let lzma = [
+            0x01u8, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5d, 0x00, 0x10, 0x00, 0x00,
+        ];
+        let multiple_packed = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x01, 0x00, 0x01];
+        let chained = [
+            0x02u8, 0x11, 0x00, 0x01, 0x01, 0x11, 0x00, 0x01, 0x01, 0x00, 0x00,
+        ];
+
+        for folder in [&copy[..], &lzma[..], &multiple_packed[..], &chained[..]] {
+            for end in 0..=folder.len() {
+                assert_folder_parser_and_scanner_agree(&folder[..end]);
+            }
+
+            let mut trailing = folder.to_vec();
+            trailing.extend_from_slice(&[0xde, 0xad]);
+            assert_folder_parser_and_scanner_agree(&trailing);
+        }
+    }
+
+    fn assert_folder_parser_and_scanner_agree(input: &[u8]) {
+        match (scan_folder(input), Folder::parse(input)) {
+            (Ok((scan_rest, out_streams)), Ok((parse_rest, folder))) => {
+                assert_eq!(scan_rest.len(), parse_rest.len());
+                assert_eq!(out_streams, folder.total_out_streams());
+            }
+            (Err(_), Err(_)) => {}
+            (scan, parse) => {
+                panic!("scanner/parser disagree for {input:02x?}: scan={scan:?}, parse={parse:?}")
+            }
+        }
+    }
+
     /// Empty input returns an error.
     #[test]
     fn scan_folder_empty() {
         assert!(scan_folder(&[]).is_err());
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_reject_invalid_coder_counts_consistently() {
+        let too_many =
+            crate::sevenzip_varuint64_encode(u64::try_from(super::MAX_FOLDER_STREAMS + 1).unwrap());
+
+        for input in [&[0][..], too_many.as_slice()] {
+            for result in [
+                Folder::parse(input).map(|_| ()),
+                scan_folder(input).map(|_| ()),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(nom::Err::Failure(nom::error::Error {
+                        code: nom::error::ErrorKind::TooLarge,
+                        ..
+                    }))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_reject_excessive_stream_counts_consistently() {
+        let mut input = vec![0x01u8, 0x11, 0x00];
+        input.extend(crate::sevenzip_varuint64_encode(
+            u64::try_from(super::MAX_FOLDER_STREAMS + 1).unwrap(),
+        ));
+        input.push(0x01);
+
+        for result in [
+            Folder::parse(&input).map(|_| ()),
+            scan_folder(&input).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(nom::Err::Failure(nom::error::Error {
+                    code: nom::error::ErrorKind::TooLarge,
+                    ..
+                }))
+            ));
+        }
+
+        let mut truncated_after_limit = vec![0x02u8, 0x11, 0x00];
+        truncated_after_limit.extend(crate::sevenzip_varuint64_encode(
+            u64::try_from(super::MAX_FOLDER_STREAMS + 1).unwrap(),
+        ));
+        truncated_after_limit.push(0x01);
+
+        for result in [
+            Folder::parse(&truncated_after_limit).map(|_| ()),
+            scan_folder(&truncated_after_limit).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(nom::Err::Failure(nom::error::Error {
+                    code: nom::error::ErrorKind::TooLarge,
+                    ..
+                }))
+            ));
+        }
+    }
+
+    #[test]
+    fn folder_parser_and_scanner_reject_out_of_range_stream_indices() {
+        let invalid_bind_input = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x02, 0x02, 0x00];
+        let invalid_bind_output = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x02, 0x00, 0x02];
+        let invalid_packed = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x01, 0x02, 0x00];
+
+        for input in [
+            &invalid_bind_input[..],
+            &invalid_bind_output[..],
+            &invalid_packed[..],
+        ] {
+            assert!(
+                Folder::parse(input).is_err(),
+                "parser accepted {input:02x?}"
+            );
+            assert!(scan_folder(input).is_err(), "scanner accepted {input:02x?}");
+        }
     }
 
     #[test]
@@ -632,5 +892,67 @@ mod tests {
             packed_indices: SmallVec::new(),
         };
         assert!(folder.graph().is_err());
+    }
+
+    #[test]
+    fn graph_maps_supported_bcj2_channels_from_connections() {
+        let bcj2_coder = || {
+            let mut coder = copy_coder();
+            coder.codec_id = ArrayVec::from_iter(SevenZMethod::Bcj2.id().iter().copied());
+            coder.num_in_streams = 4;
+            coder
+        };
+        let layouts = [
+            (
+                Folder {
+                    coders: smallvec![copy_coder(), bcj2_coder()],
+                    bind_pairs: smallvec![(1, 0)],
+                    packed_indices: smallvec![0, 2, 3, 4],
+                },
+                [
+                    (Some(CoderIndex(0)), PackedStreamIndex(0)),
+                    (None, PackedStreamIndex(1)),
+                    (None, PackedStreamIndex(2)),
+                    (None, PackedStreamIndex(3)),
+                ],
+            ),
+            (
+                Folder {
+                    coders: smallvec![copy_coder(), copy_coder(), copy_coder(), bcj2_coder()],
+                    bind_pairs: smallvec![(5, 0), (4, 1), (3, 2)],
+                    packed_indices: smallvec![2, 6, 1, 0],
+                },
+                [
+                    (Some(CoderIndex(2)), PackedStreamIndex(0)),
+                    (Some(CoderIndex(1)), PackedStreamIndex(2)),
+                    (Some(CoderIndex(0)), PackedStreamIndex(3)),
+                    (None, PackedStreamIndex(1)),
+                ],
+            ),
+        ];
+        for (folder, expected) in layouts {
+            let graph = folder.graph().unwrap();
+            let layout = graph.bcj2_layout(&folder).unwrap().unwrap();
+            let actual = [layout.main, layout.call, layout.jump, layout.control]
+                .map(|channel| (channel.coder, channel.packed));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn graph_rejects_unsupported_bcj2_connections() {
+        let bcj2_coder = || {
+            let mut coder = copy_coder();
+            coder.codec_id = ArrayVec::from_iter(SevenZMethod::Bcj2.id().iter().copied());
+            coder.num_in_streams = 4;
+            coder
+        };
+        let chained_main = Folder {
+            coders: smallvec![copy_coder(), copy_coder(), bcj2_coder()],
+            bind_pairs: smallvec![(1, 0), (2, 1)],
+            packed_indices: smallvec![0, 3, 4, 5],
+        };
+        let graph = chained_main.graph().unwrap();
+        assert!(graph.bcj2_layout(&chained_main).is_err());
     }
 }

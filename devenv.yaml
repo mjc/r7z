@@ -1,0 +1,13 @@
+require_version: true
+nixpkgs:
+  permitted_insecure_packages:
+    - minio-2025-10-15T17-29-55Z
+
+inputs:
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs

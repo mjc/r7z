@@ -1,6 +1,54 @@
 use crate::files_info::FilesInfoNameSlices;
 use crate::{EntryType, FilesInfo, R7zError};
+use bytes::Bytes;
 use std::borrow::Cow;
+
+/// A 7z entry name stored as UTF-16LE code units, without the null terminator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawEntryName(Bytes);
+
+impl RawEntryName {
+    /// Builds a raw name from UTF-16LE bytes without a null terminator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::InvalidOptions`] if `bytes` has an odd length or contains a null unit.
+    pub fn from_utf16le(bytes: impl Into<Bytes>) -> Result<Self, R7zError> {
+        let bytes = bytes.into();
+        if bytes.len() % 2 != 0 {
+            return Err(R7zError::InvalidOptions(
+                "UTF-16LE name has odd byte length",
+            ));
+        }
+        if bytes.chunks_exact(2).any(|unit| unit == [0, 0]) {
+            return Err(R7zError::InvalidOptions(
+                "UTF-16LE name contains a null terminator",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the original UTF-16LE code units.
+    #[must_use]
+    pub fn as_utf16le(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Decodes the name for display, replacing unpaired surrogates.
+    #[must_use]
+    pub fn display(&self) -> String {
+        crate::files_info::decode_name(&self.0)
+    }
+
+    /// Tests a Unicode string against the original UTF-16 code units.
+    #[must_use]
+    pub fn matches_text(&self, text: &str) -> bool {
+        self.0
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .eq(text.encode_utf16())
+    }
+}
 
 /// An index in the archive's file table, independent of folder/substream indexes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,17 +103,18 @@ impl<S> EntryKind<S> {
 }
 
 pub(crate) struct EntryMetadata<'a> {
+    _files: std::marker::PhantomData<&'a FilesInfo>,
     pub(crate) index: EntryIndex,
-    pub(crate) name: Option<&'a [u8]>,
+    pub(crate) name: Option<RawEntryName>,
     pub(crate) modified: Option<u64>,
     pub(crate) attributes: Option<u32>,
 }
 
 impl EntryMetadata<'_> {
     pub(crate) fn name(&self) -> String {
-        self.name.map_or_else(
+        self.name.as_ref().map_or_else(
             || format!("unknown-{}", self.index.get()),
-            crate::files_info::decode_name,
+            RawEntryName::display,
         )
     }
 }
@@ -91,7 +140,7 @@ impl<'a, S> Entry<'a, S> {
 pub(crate) struct Entries<'a> {
     files: Option<&'a FilesInfo>,
     indices: std::ops::Range<usize>,
-    names: Option<FilesInfoNameSlices<'a>>,
+    names: Option<FilesInfoNameSlices>,
 }
 
 impl<'a> Entries<'a> {
@@ -136,8 +185,9 @@ impl<'a> Iterator for Entries<'a> {
         let kind = self.kind(index);
         Some(Entry {
             metadata: EntryMetadata {
+                _files: std::marker::PhantomData,
                 index: EntryIndex(index),
-                name,
+                name: name.map(RawEntryName),
                 modified: self
                     .files
                     .and_then(|files| files.mtimes.get(index).copied().flatten()),
@@ -221,6 +271,20 @@ impl ExactSizeIterator for EntrySelection<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_entry_name_keeps_invalid_utf16_and_matches_exact_code_units() {
+        let raw = crate::RawEntryName::from_utf16le(vec![0x00, 0xD8]).unwrap();
+
+        assert_eq!(raw.as_utf16le(), &[0x00, 0xD8]);
+        assert_eq!(raw.display(), "�");
+        assert!(!raw.matches_text("�"));
+        assert!(!raw.matches_text("𐀀"));
+        let valid_pair = crate::RawEntryName::from_utf16le(vec![0x00, 0xD8, 0x00, 0xDC]).unwrap();
+        assert!(valid_pair.matches_text("𐀀"));
+        assert!(crate::RawEntryName::from_utf16le(vec![0x61]).is_err());
+        assert!(crate::RawEntryName::from_utf16le(vec![0x00, 0x00]).is_err());
+    }
 
     #[test]
     fn selection_borrows_sorted_inputs_and_owns_only_reordered_inputs() {

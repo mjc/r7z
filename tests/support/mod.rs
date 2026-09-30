@@ -7,7 +7,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Command,
+    sync::Once,
 };
+
+static LOG_7Z_IDENTITY: Once = Once::new();
 
 pub fn valid_7z_string() -> Vec<u8> {
     let path = env::current_dir().unwrap().join("tests/fixtures/test_1.7z");
@@ -19,20 +22,60 @@ pub fn valid_7z_string() -> Vec<u8> {
 
 /// Run the configured p7zip binary, or `7z` from PATH.
 pub fn run_7z(args: &[&str], dir: &std::path::Path) -> std::process::Output {
-    if let Ok(bin) = env::var("P7ZIP_BIN") {
-        if !bin.is_empty() {
-            return Command::new(&bin)
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .unwrap_or_else(|err| panic!("P7ZIP_BIN should run ({bin}): {err}"));
-        }
-    }
-    Command::new("7z")
+    let bin = selected_7z_binary();
+    log_7z_identity(&bin);
+    Command::new(&bin)
         .args(args)
         .current_dir(dir)
         .output()
-        .expect("7z not found; install p7zip, enter devenv, or set P7ZIP_BIN")
+        .unwrap_or_else(|err| panic!("7z executable should run ({}): {err}", bin.display()))
+}
+
+fn selected_7z_binary() -> PathBuf {
+    let selected = if let Ok(bin) = env::var("P7ZIP_BIN") {
+        if !bin.is_empty() {
+            PathBuf::from(bin)
+        } else {
+            which_7z().expect("7z not found; install p7zip, enter devenv, or set P7ZIP_BIN")
+        }
+    } else {
+        which_7z().expect("7z not found; install p7zip, enter devenv, or set P7ZIP_BIN")
+    };
+    fs::canonicalize(&selected).unwrap_or(selected)
+}
+
+fn which_7z() -> Option<PathBuf> {
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|dir| dir.join("7z"))
+        .find(|path| path.is_file())
+}
+
+fn log_7z_identity(bin: &Path) {
+    LOG_7Z_IDENTITY.call_once(|| {
+        let canonical = fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+        let bytes = fs::read(&canonical).unwrap_or_else(|err| {
+            panic!("cannot hash 7z executable {}: {err}", canonical.display())
+        });
+        use sha2::{Digest, Sha256};
+        let hash = hex::encode(Sha256::digest(bytes));
+        let info = Command::new(&canonical)
+            .arg("i")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "cannot inspect 7z executable {}: {err}",
+                    canonical.display()
+                )
+            });
+        let info = String::from_utf8_lossy(&info.stdout);
+        let version = info.lines().take(3).collect::<Vec<_>>().join(" | ");
+        eprintln!(
+            "interop 7z oracle: path={} sha256={} identity={}",
+            canonical.display(),
+            hash,
+            version
+        );
+    });
 }
 
 pub fn run_7z_checked(args: &[&str], dir: &Path) -> std::process::Output {

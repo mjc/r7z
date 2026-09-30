@@ -19,9 +19,9 @@ find_oracle_bin() {
 
 ensure_build_tools() {
   local tool
-  for tool in make gcc git cmake; do
+  for tool in make gcc g++ clang clang++ git cmake patchelf; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "$tool is required to build the p7zip oracle; enter devenv or install it" >&2
+      echo "$tool is required to build the p7zip oracle; run 'devenv shell' from the project root" >&2
       exit 127
     fi
   done
@@ -45,17 +45,20 @@ use_existing_bin() {
 }
 
 if [[ -d "$dir/.git" ]]; then
-  checkout_oracle_sha
-  use_existing_bin "$dir/CPP/7zip/Bundles/Alone2"
+  current_sha="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$current_sha" == "$sha" ]]; then
+    use_existing_bin "$dir/CPP/7zip/Bundles/Alone2"
+  fi
 fi
 
 ensure_build_tools
 
-if [[ ! -d "$dir/.git" ]]; then
+if [[ -d "$dir/.git" ]]; then
+  checkout_oracle_sha
+else
   git clone "$repo" "$dir" >&2
+  checkout_oracle_sha
 fi
-
-checkout_oracle_sha
 
 make_dir="$dir/CPP/7zip/Bundles/Alone2"
 use_existing_bin "$make_dir"

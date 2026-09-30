@@ -1,4 +1,4 @@
-use crate::files_info::scan_files_info;
+use crate::files_info::scan_files_info_with_external;
 use crate::folder_decode::{ExternalFolderData, FolderLayout, FolderLayouts};
 use crate::stream_info::scan_stream_info_with_external;
 use crate::{FilesInfo, PackInfo, Property, R7zError, StreamInfo, UnpackInfo};
@@ -51,7 +51,8 @@ impl EncodedHeader {
             self.unpack_info.num_folders_usize(),
         ) {
             (1, 1, 1, 1) => {
-                FolderLayouts::new(&self.pack_info, &self.unpack_info, None, metadata_limit)?
+                FolderLayouts::preflight(&self.pack_info, &self.unpack_info, None, metadata_limit)?
+                    .into_layouts()
                     .next()
                     .ok_or(R7zError::Parse)?
             }
@@ -236,7 +237,25 @@ impl HeaderScan {
                     input = remaining;
                 }
                 Property::FilesInfo => {
-                    let (remaining, count) = scan_files_info(input).map_err(|_| R7zError::Parse)?;
+                    let (remaining, (count, uses_external_data)) =
+                        scan_files_info_with_external(input).map_err(|_| R7zError::Parse)?;
+                    if external.is_none() && uses_external_data {
+                        let range = self
+                            .additional_streams_range
+                            .as_ref()
+                            .ok_or(R7zError::Parse)?;
+                        let bytes = backing
+                            .get(range.start as usize..range.end as usize)
+                            .ok_or(R7zError::Parse)?;
+                        let additional = match StreamInfo::parse(bytes, &backing) {
+                            Ok(([], streams)) => streams,
+                            _ => return Err(R7zError::Parse),
+                        };
+                        return Ok(HeaderProgress::Pending(Box::new(PendingHeader {
+                            scan: self,
+                            additional,
+                        })));
+                    }
                     let start =
                         u32::try_from(backing.len() - input.len()).map_err(|_| R7zError::Parse)?;
                     let end = u32::try_from(backing.len() - remaining.len())
@@ -370,11 +389,15 @@ impl Header {
             let start = range.start as usize;
             let end = range.end as usize;
             self.data.get(start..end).ok_or(()).and_then(|slice| {
-                FilesInfo::parse(slice, &self.data)
-                    .ok()
-                    .filter(|(rest, info)| rest.is_empty() && info.num_files == self.num_files)
-                    .map(|(_, value)| value)
-                    .ok_or(())
+                FilesInfo::parse_with_external(
+                    slice,
+                    &self.data,
+                    self.external_folder_data.as_slice(),
+                )
+                .ok()
+                .filter(|(rest, info)| rest.is_empty() && info.num_files == self.num_files)
+                .map(|(_, value)| value)
+                .ok_or(())
             })
         });
         parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
@@ -419,7 +442,15 @@ impl Header {
     /// Returns a nom error if the input is truncated, malformed, or does not start with
     /// the `Header` property tag.
     pub fn parse(backing: &Bytes) -> IResult<&[u8], Header> {
-        Self::parse_with_external_data(backing, ExternalFolderData::default())
+        match HeaderScan::new(backing).and_then(|scan| scan.advance(None)) {
+            Ok(HeaderProgress::Complete { header, consumed }) => {
+                Ok((&backing[consumed..], *header))
+            }
+            _ => Err(nom::Err::Failure(nom::error::Error::new(
+                backing.as_ref(),
+                nom::error::ErrorKind::Verify,
+            ))),
+        }
     }
 
     /// Parse a header with decoded external folder definition bytes.
@@ -507,7 +538,7 @@ mod tests {
     fn lazy_header_sections_are_bounded_to_scanned_ranges() {
         let bytes = Bytes::from_static(&[
             0x01, // Header
-            0x05, 0x01, 0x11, 0x03, 0x00, b'a', 0x00, // one file name
+            0x05, 0x01, 0x11, 0x05, 0x00, b'a', 0x00, 0x00, 0x00, // one file name
             0x00, // END FilesInfo
             0x19, 0x01, 0xAA, // Dummy property with one byte payload
             0x00, // END Header
@@ -515,6 +546,67 @@ mod tests {
         let (rem, header) = Header::parse(&bytes).unwrap();
         assert!(rem.is_empty());
         assert_eq!(header.try_files_info().unwrap().unwrap().num_files, 1);
+    }
+
+    #[test]
+    fn files_info_names_resolve_from_external_streams() {
+        let bytes = Bytes::from_static(&[
+            0x01, // Header
+            0x05, 0x01, // one file
+            0x11, 0x02, 0x01, 0x00, // Name: external stream 0
+            0x00, // END FilesInfo
+            0x00, // END Header
+        ]);
+
+        let (_, header) =
+            Header::parse_with_external(&bytes, vec![Bytes::from_static(&[b'A', 0, 0, 0])])
+                .unwrap();
+
+        assert_eq!(
+            header.try_files_info().unwrap().unwrap().name(0).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn external_files_metadata_suspends_header_until_additional_streams_decode() {
+        let bytes = Bytes::from_static(&[
+            0x01, // Header
+            0x03, // AdditionalStreamsInfo
+            0x06, 0x00, 0x01, 0x09, 0x04, 0x00, // one packed stream, four bytes
+            0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x04, 0x00, // one Copy folder
+            0x08, 0x00, 0x00, // SubStreamsInfo and end AdditionalStreamsInfo
+            0x05, 0x01, 0x11, 0x02, 0x01, 0x00, 0x00, // external Name index 0
+            0x00, // end Header
+        ]);
+        let HeaderResolution::RequiresExternalFolders(pending) =
+            Header::resolve_archive(&bytes).unwrap()
+        else {
+            panic!("external file metadata must suspend the header scan");
+        };
+
+        let header = pending
+            .resolve_with(|additional| {
+                crate::folder_decode::ExternalFolderPlan::new(
+                    additional,
+                    crate::folder_decode::MetadataBudget::new(1024),
+                )?
+                .decode(
+                    |_| {
+                        Ok(crate::codec::PackedInput {
+                            reader: std::io::Cursor::new([b'A', 0, 0, 0]),
+                            size: 4,
+                        })
+                    },
+                    None,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            header.try_files_info().unwrap().unwrap().name(0).as_deref(),
+            Some("A")
+        );
     }
 
     #[test]
@@ -534,11 +626,12 @@ mod tests {
         let external_folder = vec![Bytes::from_static(&[0x01, 0x01, 0x00])];
 
         assert!(Header::parse(&bytes).is_err());
+        assert!(Header::parse_with_external(&bytes, Vec::new()).is_err());
         assert!(matches!(
             Header::resolve_archive(&bytes),
             Ok(HeaderResolution::RequiresExternalFolders(_))
         ));
-        let (rest, header) = Header::parse_with_external(&bytes, external_folder).unwrap();
+        let (rest, header) = Header::parse_with_external(&bytes, external_folder.clone()).unwrap();
         assert_eq!(rest, b"");
         let streams = header.try_streams_info().unwrap().unwrap();
         let folder = streams
@@ -548,13 +641,25 @@ mod tests {
             .parse_folder(0)
             .unwrap();
         assert_eq!(folder.coders.len(), 1);
+
+        let mut invalid_reference = bytes.to_vec();
+        let reference = invalid_reference
+            .windows(5)
+            .position(|window| window == [0x07, 0x0b, 0x01, 0x01, 0x00])
+            .unwrap()
+            + 4;
+        invalid_reference[reference] = 1;
+        assert!(
+            Header::parse_with_external(&Bytes::from(invalid_reference), external_folder).is_err()
+        );
     }
 
     #[test]
     fn external_resolution_resumes_scanned_sections_and_requires_exact_end() {
         let bytes = Bytes::from_static(&[
             0x01, // Header
-            0x05, 0x01, 0x11, 0x03, 0x00, b'a', 0x00, 0x00, // FilesInfo before dependency
+            0x05, 0x01, 0x11, 0x05, 0x00, b'a', 0x00, 0x00, 0x00,
+            0x00, // FilesInfo before dependency
             0x03, // AdditionalStreamsInfo
             0x06, 0x00, 0x01, 0x09, 0x03, 0x00, 0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c,
             0x03, 0x00, 0x08, 0x00, 0x00,

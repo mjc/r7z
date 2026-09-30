@@ -1,33 +1,52 @@
+use crate::byte_range::{DecodedRange, PackedRange};
 use crate::stream_info::SubstreamInfo;
 use crate::{Folder, PackInfo, R7zError, UnpackInfo, codec};
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::io::Read;
-use std::ops::Range;
 
-/// Remaining capacity for retained header bytes and external metadata.
-pub(crate) struct MetadataBudget(u64);
+/// Operation-wide capacity for retained header bytes and external metadata.
+pub(crate) struct MetadataBudget {
+    limit: u64,
+    used: u64,
+}
 
 impl MetadataBudget {
     pub(crate) fn new(limit: u64) -> Self {
-        Self(limit)
+        Self { limit, used: 0 }
     }
 
     pub(crate) fn charge(self, bytes: u64) -> Result<Self, R7zError> {
-        self.0
-            .checked_sub(bytes)
-            .map(Self)
-            .ok_or(R7zError::LimitExceeded("metadata"))
+        let used = self.used.checked_add(bytes).ok_or(self.limit_error())?;
+        if used > self.limit {
+            return Err(self.limit_error());
+        }
+        Ok(Self { used, ..self })
     }
 
     pub(crate) fn remaining(&self) -> u64 {
-        self.0
+        self.limit - self.used
+    }
+
+    pub(crate) fn limit_error(&self) -> R7zError {
+        R7zError::ResourceLimitExceeded {
+            resource: "metadata",
+            limit: self.limit,
+        }
+    }
+
+    pub(crate) fn map_error(&self, error: R7zError) -> R7zError {
+        match error {
+            R7zError::LimitExceeded("metadata") => self.limit_error(),
+            error => error,
+        }
     }
 }
 
 /// External folders whose decoded bytes and stream slots fit the remaining budget.
 pub(crate) struct ExternalFolderPlan<'a> {
     folders: FolderLayouts<'a>,
+    output_limit: u64,
 }
 
 impl<'a> ExternalFolderPlan<'a> {
@@ -36,15 +55,19 @@ impl<'a> ExternalFolderPlan<'a> {
         budget: MetadataBudget,
     ) -> Result<Self, R7zError> {
         let (pack, unpack) = streams.packed_folders()?;
-        let folders = FolderLayouts::new(
+        let validated = FolderLayouts::preflight(
             pack,
             unpack,
             streams.substream_info.as_ref(),
             budget.remaining(),
-        )?;
-        let slot_bytes = external_slot_bytes(folders.stream_count())?;
-        let _remaining = budget.charge(slot_bytes)?.charge(folders.output_size)?;
-        Ok(Self { folders })
+        )
+        .map_err(|error| budget.map_error(error))?;
+        let slot_bytes = external_slot_bytes(validated.layouts.stream_count())?;
+        let _remaining = budget.charge(slot_bytes)?.charge(validated.output_size)?;
+        Ok(Self {
+            folders: validated.layouts,
+            output_limit: validated.output_size,
+        })
     }
 
     pub(crate) fn pack_pos(&self) -> u64 {
@@ -56,10 +79,12 @@ impl<'a> ExternalFolderPlan<'a> {
         mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
         password: Option<&str>,
     ) -> Result<VerifiedExternalData, R7zError> {
-        let output_limit = self.folders.output_size;
+        let output_limit = self.output_limit;
         let mut output = ExternalFolderData::reserve(self.folders.stream_count())?;
         for folder in self.folders {
-            let decoded = folder?.bind(&mut open)?.collect(password, output_limit)?;
+            let decoded = folder?
+                .bind(&mut open, None)?
+                .collect(password, output_limit)?;
             output = output.append(decoded)?;
         }
         output.finish()
@@ -67,7 +92,7 @@ impl<'a> ExternalFolderPlan<'a> {
 }
 
 pub(crate) struct PackedStream {
-    pub(crate) range: Range<u64>,
+    pub(crate) range: PackedRange,
     pub(crate) crc: Option<u32>,
 }
 
@@ -86,7 +111,7 @@ impl PackedStreams<'_> {
             .scan(self.start, |offset, (index, &size)| {
                 let end = *offset + size;
                 let stream = PackedStream {
-                    range: *offset..end,
+                    range: PackedRange::from_range(*offset..end),
                     crc: self.digests.get(index).copied().flatten(),
                 };
                 *offset = end;
@@ -212,7 +237,7 @@ impl<'a> FolderStreamLayout<'a> {
 }
 
 pub(crate) struct Substream {
-    pub(crate) range: Range<u64>,
+    pub(crate) range: DecodedRange,
     pub(crate) digest: Option<u32>,
 }
 
@@ -236,7 +261,7 @@ impl Iterator for Substreams<'_> {
             .or(self.layout.final_size)?;
         let end = self.offset + size;
         let stream = Substream {
-            range: self.offset..end,
+            range: DecodedRange::from_range(self.offset..end),
             digest: self.layout.digests.get(self.position).copied().flatten(),
         };
         self.offset = end;
@@ -295,13 +320,15 @@ impl<'a> FolderLayout<'a> {
     pub(crate) fn bind<R: Read>(
         &self,
         mut open: impl FnMut(PackedStream) -> Result<codec::PackedInput<R>, R7zError>,
+        max_working_set_bytes: Option<u64>,
     ) -> Result<ReadyFolder<'a, R>, R7zError> {
-        let plan = codec::DecoderPlan::compile(
+        let plan = codec::DecoderPlan::compile_with_working_set_limit(
             &self.state.folder,
             &self.state.graph,
             self.state.unpack_size,
             self.state.coder_sizes,
             self.state.streams.sizes,
+            max_working_set_bytes,
         )?;
         let inputs = self
             .state
@@ -352,16 +379,26 @@ impl<'a, R: Read> ReadyFolder<'a, R> {
         verify_folder_output(self.layout, self.unpack_size, self.crc, Bytes::from(bytes))
     }
 
-    pub(crate) fn start<'r>(self, password: Option<&str>) -> Result<ActiveFolder<'a, 'r>, R7zError>
+    pub(crate) fn start<'r>(
+        self,
+        password: Option<&str>,
+        budget: &mut DecodedByteBudget,
+    ) -> Result<ActiveFolder<'a, 'r>, R7zError>
     where
         R: 'r,
     {
+        let eager_output_size = self.decoder.eager_output_size();
+        let reader = match eager_output_size {
+            Some(size) => budget.with_eager_output(size, || self.decoder.start(password))?,
+            None => self.decoder.start(password)?,
+        };
         Ok(ActiveFolder {
-            reader: self.decoder.start(password)?,
+            reader,
             streams: self.layout.streams(),
             digest: DigestState::new(self.crc),
             decoded_len: 0,
             unpack_size: self.unpack_size,
+            budgeted_eagerly: eager_output_size.is_some(),
         })
     }
 }
@@ -393,8 +430,8 @@ impl<'a> DecodedFolder<'a> {
         self.layout.streams().map(move |substream| {
             // Materialization proved the whole folder fits usize before reading.
             let start =
-                usize::try_from(substream.range.start).expect("materialized substream start");
-            let end = usize::try_from(substream.range.end).expect("materialized substream end");
+                usize::try_from(substream.range.start()).expect("materialized substream start");
+            let end = usize::try_from(substream.range.end()).expect("materialized substream end");
             let stream = self.state.0.slice(start..end);
             if substream
                 .digest
@@ -418,27 +455,44 @@ struct FolderPlans<'a> {
     pack_offset: u64,
     stream_size_base: usize,
     stream_digest_base: usize,
+    finished: bool,
 }
 
 pub(crate) struct FolderLayouts<'a> {
     plans: FolderPlans<'a>,
     stream_count: usize,
+}
+
+pub(crate) struct PreflightedFolderLayouts<'a> {
+    layouts: FolderLayouts<'a>,
     output_size: u64,
 }
 
 impl<'a> FolderLayouts<'a> {
-    pub(crate) fn new(
+    pub(crate) fn preflight(
         pack: &'a PackInfo,
         unpack: &'a UnpackInfo,
         substream_info: Option<&'a SubstreamInfo>,
         metadata_limit: u64,
-    ) -> Result<Self, R7zError> {
+    ) -> Result<PreflightedFolderLayouts<'a>, R7zError> {
         Self::validate(pack, unpack, substream_info, Some(metadata_limit))
     }
 
     pub(crate) fn for_streams(streams: &'a crate::StreamInfo) -> Result<Self, R7zError> {
         let (pack, unpack) = streams.packed_folders()?;
-        Self::validate(pack, unpack, streams.substream_info.as_ref(), None)
+        let folder_count = unpack.num_folders_usize();
+        if pack.num_pack_streams != pack.pack_size.len() as u64
+            || (!pack.digests.is_empty() && pack.digests.len() != pack.pack_size.len())
+            || unpack.num_folders != folder_count as u64
+            || (!unpack.digests.is_empty() && unpack.digests.len() != folder_count)
+        {
+            return Err(R7zError::Parse);
+        }
+        let stream_count = substream_count(folder_count, streams.substream_info.as_ref())?;
+        Ok(Self {
+            plans: FolderPlans::new(pack, unpack, streams.substream_info.as_ref()),
+            stream_count,
+        })
     }
 
     fn validate(
@@ -446,32 +500,18 @@ impl<'a> FolderLayouts<'a> {
         unpack: &'a UnpackInfo,
         substream_info: Option<&'a SubstreamInfo>,
         limit: Option<u64>,
-    ) -> Result<Self, R7zError> {
+    ) -> Result<PreflightedFolderLayouts<'a>, R7zError> {
         let packed_bytes = pack.pack_size.iter().try_fold(0u64, |total, &size| {
             total.checked_add(size).ok_or(R7zError::Parse)
         })?;
         if limit.is_some_and(|limit| packed_bytes > limit) {
             return Err(R7zError::LimitExceeded("metadata"));
         }
-        let plans = FolderPlans {
-            pack_info: pack,
-            unpack_info: unpack,
-            substream_info,
-            folder_index: 0,
-            pack_index: 0,
-            output_base: 0,
-            pack_offset: 0,
-            stream_size_base: 0,
-            stream_digest_base: 0,
-        };
+        let plans = FolderPlans::new(pack, unpack, substream_info);
         let mut preflight = plans.clone();
         let mut output_size = 0u64;
-        let mut stream_count = 0usize;
         for folder in preflight.by_ref() {
             let folder = folder?;
-            stream_count = stream_count
-                .checked_add(folder.layout.len())
-                .ok_or(R7zError::Parse)?;
             output_size = output_size
                 .checked_add(folder.state.unpack_size)
                 .ok_or(R7zError::Parse)?;
@@ -479,24 +519,15 @@ impl<'a> FolderLayouts<'a> {
                 return Err(R7zError::LimitExceeded("metadata"));
             }
         }
-        let substreams_complete = substream_info.is_none_or(|info| {
-            info.num_unpack_streams_per_folder.len() == unpack.num_folders_usize()
-                && info.unpack_sizes.len() == preflight.stream_size_base
-                && (info.digests.is_empty() || info.digests.len() == stream_count)
-        });
-        if preflight.pack_index != pack.pack_size.len()
-            || pack.num_pack_streams != pack.pack_size.len() as u64
-            || unpack.num_folders != unpack.num_folders_usize() as u64
-            || preflight.output_base != unpack.unpack_sizes.len()
-            || (!pack.digests.is_empty() && pack.digests.len() != pack.pack_size.len())
-            || (!unpack.digests.is_empty() && unpack.digests.len() != unpack.num_folders_usize())
-            || !substreams_complete
-        {
+        let stream_count = substream_count(unpack.num_folders_usize(), substream_info)?;
+        if stream_count != preflight.stream_digest_base {
             return Err(R7zError::Parse);
         }
-        Ok(FolderLayouts {
-            plans,
-            stream_count,
+        Ok(PreflightedFolderLayouts {
+            layouts: FolderLayouts {
+                plans,
+                stream_count,
+            },
             output_size,
         })
     }
@@ -512,6 +543,32 @@ impl FolderLayouts<'_> {
     }
 }
 
+impl<'a> PreflightedFolderLayouts<'a> {
+    pub(crate) fn into_layouts(self) -> FolderLayouts<'a> {
+        self.layouts
+    }
+}
+
+fn substream_count(
+    folder_count: usize,
+    substream_info: Option<&SubstreamInfo>,
+) -> Result<usize, R7zError> {
+    substream_info.map_or_else(
+        || Ok(folder_count),
+        |info| {
+            (info.num_unpack_streams_per_folder.len() == folder_count)
+                .then_some(())
+                .ok_or(R7zError::Parse)?;
+            info.num_unpack_streams_per_folder
+                .iter()
+                .try_fold(0usize, |total, &count| {
+                    let count = usize::try_from(count).map_err(|_| R7zError::Parse)?;
+                    total.checked_add(count).ok_or(R7zError::Parse)
+                })
+        },
+    )
+}
+
 impl<'a> Iterator for FolderLayouts<'a> {
     type Item = Result<FolderLayout<'a>, R7zError>;
 
@@ -524,17 +581,63 @@ impl<'a> Iterator for FolderPlans<'a> {
     type Item = Result<FolderLayout<'a>, R7zError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        (self.folder_index < self.unpack_info.num_folders_usize()).then(|| {
-            let result = self.next_folder();
-            if result.is_err() {
-                self.folder_index = self.unpack_info.num_folders_usize();
-            }
-            result
-        })
+        if self.finished {
+            return None;
+        }
+        if self.folder_index == self.unpack_info.num_folders_usize() {
+            self.finished = true;
+            return self.validate_complete().err().map(Err);
+        }
+        let result = self.next_folder();
+        if result.is_err() {
+            self.finished = true;
+        }
+        Some(result)
     }
 }
 
 impl<'a> FolderPlans<'a> {
+    fn new(
+        pack_info: &'a PackInfo,
+        unpack_info: &'a UnpackInfo,
+        substream_info: Option<&'a SubstreamInfo>,
+    ) -> Self {
+        Self {
+            pack_info,
+            unpack_info,
+            substream_info,
+            folder_index: 0,
+            pack_index: 0,
+            output_base: 0,
+            pack_offset: 0,
+            stream_size_base: 0,
+            stream_digest_base: 0,
+            finished: false,
+        }
+    }
+
+    fn validate_complete(&self) -> Result<(), R7zError> {
+        let pack_count = self.pack_info.pack_size.len();
+        let folder_count = self.unpack_info.num_folders_usize();
+        let substreams_complete = self.substream_info.is_none_or(|info| {
+            info.num_unpack_streams_per_folder.len() == folder_count
+                && info.unpack_sizes.len() == self.stream_size_base
+                && (info.digests.is_empty() || info.digests.len() == self.stream_digest_base)
+        });
+        if self.pack_index != pack_count
+            || self.pack_info.num_pack_streams != pack_count as u64
+            || self.unpack_info.num_folders != folder_count as u64
+            || self.output_base != self.unpack_info.unpack_sizes.len()
+            || (!self.pack_info.digests.is_empty() && self.pack_info.digests.len() != pack_count)
+            || (!self.unpack_info.digests.is_empty()
+                && self.unpack_info.digests.len() != folder_count)
+            || !substreams_complete
+        {
+            return Err(R7zError::Parse);
+        }
+        Ok(())
+    }
+
     fn next_folder(&mut self) -> Result<FolderLayout<'a>, R7zError> {
         let (folder, graph) = self
             .unpack_info
@@ -659,12 +762,72 @@ pub(crate) enum FolderCompletion {
     VerifiedSelection,
 }
 
+pub(crate) struct DecodedByteBudget {
+    limit: Option<u64>,
+    decoded: u64,
+}
+
+impl DecodedByteBudget {
+    pub(crate) fn new(limit: Option<u64>) -> Self {
+        Self { limit, decoded: 0 }
+    }
+
+    fn remaining(&self) -> Option<u64> {
+        self.limit.map(|limit| limit - self.decoded)
+    }
+
+    fn exceed_error(&self) -> R7zError {
+        R7zError::ResourceLimitExceeded {
+            resource: "total decoded output",
+            limit: self.limit.unwrap_or(u64::MAX),
+        }
+    }
+
+    fn next_total(&self, bytes: u64) -> Result<u64, R7zError> {
+        let Some(decoded) = self.decoded.checked_add(bytes) else {
+            return self
+                .limit
+                .map_or(Ok(u64::MAX), |_| Err(self.exceed_error()));
+        };
+        if self.limit.is_some_and(|limit| decoded > limit) {
+            return Err(self.exceed_error());
+        }
+        Ok(decoded)
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<(), R7zError> {
+        self.decoded = self.next_total(bytes)?;
+        Ok(())
+    }
+
+    fn with_eager_output<T>(
+        &mut self,
+        bytes: u64,
+        start: impl FnOnce() -> Result<T, R7zError>,
+    ) -> Result<T, R7zError> {
+        let next_total = self.next_total(bytes)?;
+        match start() {
+            Ok(output) => {
+                self.decoded = next_total;
+                Ok(output)
+            }
+            Err(error) => {
+                if !matches!(error, R7zError::PasswordRequired) {
+                    self.decoded = next_total;
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
 pub(crate) struct ActiveFolder<'a, 'r> {
     reader: codec::FolderReader<'r>,
     streams: Substreams<'a>,
     digest: DigestState,
     decoded_len: u64,
     unpack_size: u64,
+    budgeted_eagerly: bool,
 }
 
 impl ActiveFolder<'_, '_> {
@@ -672,30 +835,44 @@ impl ActiveFolder<'_, '_> {
         self.streams.position
     }
 
-    pub(crate) fn skip_to(mut self, position: usize) -> Result<Self, R7zError> {
-        if position < self.position() || position > self.streams.layout.len() {
+    pub(crate) fn skip_to(
+        self,
+        position: usize,
+        budget: &mut DecodedByteBudget,
+    ) -> Result<Self, R7zError> {
+        let current = self.position();
+        if !(current..=self.streams.layout.len()).contains(&position) {
             return Err(R7zError::Parse);
         }
-        while self.position() < position {
-            self = self.read_stream(|_| Ok(()))?;
-        }
-        Ok(self)
+        (0..position - current).try_fold(self, |folder, _| folder.read_stream(budget, |_| Ok(())))
     }
 
     pub(crate) fn read_stream(
         mut self,
+        budget: &mut DecodedByteBudget,
         consume: impl FnOnce(&mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<Self, R7zError> {
         let stream = self.streams.next().ok_or(R7zError::Parse)?;
         let mut content = SubstreamReader {
             reader: &mut self.reader,
-            remaining: stream.range.end - stream.range.start,
+            remaining: stream.range.len(),
             folder_digest: &mut self.digest,
             stream_digest: DigestState::new(stream.digest),
             decoded_len: &mut self.decoded_len,
+            budget,
+            limit_exceeded: false,
+            charge_budget: !self.budgeted_eagerly,
         };
-        consume(&mut content)?;
-        std::io::copy(&mut content, &mut std::io::sink()).map_err(|_| R7zError::Decompression)?;
+        let consume_result = consume(&mut content);
+        if content.limit_exceeded {
+            return Err(content.budget.exceed_error());
+        }
+        consume_result?;
+        let drain_result = std::io::copy(&mut content, &mut std::io::sink());
+        if content.limit_exceeded {
+            return Err(content.budget.exceed_error());
+        }
+        drain_result.map_err(|_| R7zError::Decompression)?;
         if content.remaining != 0 {
             return Err(R7zError::Decompression);
         }
@@ -703,21 +880,25 @@ impl ActiveFolder<'_, '_> {
         Ok(self)
     }
 
-    pub(crate) fn finish(mut self, mode: CompletionMode) -> Result<FolderCompletion, R7zError> {
+    pub(crate) fn finish(
+        self,
+        mode: CompletionMode,
+        budget: &mut DecodedByteBudget,
+    ) -> Result<FolderCompletion, R7zError> {
         if matches!(mode, CompletionMode::SelectedStreams)
             && matches!(self.digest, DigestState::Absent)
             && self.streams.len() != 0
         {
             return Ok(FolderCompletion::VerifiedSelection);
         }
-        while self.streams.len() != 0 {
-            self = self.read_stream(|_| Ok(()))?;
-        }
-        if self.decoded_len != self.unpack_size {
+        let remaining = self.streams.len();
+        let mut folder =
+            (0..remaining).try_fold(self, |folder, _| folder.read_stream(budget, |_| Ok(())))?;
+        if folder.decoded_len != folder.unpack_size {
             return Err(R7zError::Decompression);
         }
         let mut extra = [0];
-        if self
+        if folder
             .reader
             .read(&mut extra)
             .map_err(|_| R7zError::Decompression)?
@@ -725,7 +906,7 @@ impl ActiveFolder<'_, '_> {
         {
             return Err(R7zError::Decompression);
         }
-        self.digest.finish()?;
+        folder.digest.finish()?;
         Ok(FolderCompletion::VerifiedFolder)
     }
 }
@@ -773,6 +954,9 @@ struct SubstreamReader<'a> {
     folder_digest: &'a mut DigestState,
     stream_digest: DigestState,
     decoded_len: &'a mut u64,
+    budget: &'a mut DecodedByteBudget,
+    limit_exceeded: bool,
+    charge_budget: bool,
 }
 
 impl Read for SubstreamReader<'_> {
@@ -783,11 +967,24 @@ impl Read for SubstreamReader<'_> {
         if limit == 0 {
             return Ok(0);
         }
-        let n = self.reader.read(&mut buf[..limit])?;
+        let allowed = match (self.charge_budget, self.budget.remaining()) {
+            (false, _) | (true, None) => usize::MAX,
+            (true, Some(0)) => {
+                self.limit_exceeded = true;
+                return Err(std::io::Error::other("decoded byte limit exceeded"));
+            }
+            (true, Some(remaining)) => usize::try_from(remaining).unwrap_or(usize::MAX),
+        };
+        let n = self.reader.read(&mut buf[..limit.min(allowed)])?;
         if n == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
         self.remaining -= n as u64;
+        if self.charge_budget {
+            self.budget
+                .charge(n as u64)
+                .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        }
         *self.decoded_len = self
             .decoded_len
             .checked_add(n as u64)
@@ -809,9 +1006,13 @@ mod tests {
             digest: DigestState::new(Some(crc32fast::hash(b"tail"))),
             decoded_len: 0,
             unpack_size: 4,
+            budgeted_eagerly: false,
         };
         assert!(matches!(
-            active.finish(CompletionMode::SelectedStreams),
+            active.finish(
+                CompletionMode::SelectedStreams,
+                &mut DecodedByteBudget::new(None),
+            ),
             Ok(FolderCompletion::VerifiedFolder)
         ));
     }
@@ -827,16 +1028,139 @@ mod tests {
             digest: DigestState::new(Some(crc32fast::hash(b"A"))),
             decoded_len: 0,
             unpack_size: 1,
+            budgeted_eagerly: false,
         };
+        let mut budget = DecodedByteBudget::new(None);
         let active = active
-            .read_stream(|reader| {
+            .read_stream(&mut budget, |reader| {
                 let mut byte = [0];
                 reader.read_exact(&mut byte).map_err(R7zError::Io)
             })
             .unwrap();
         assert!(matches!(
-            active.finish(CompletionMode::WholeFolder),
+            active.finish(CompletionMode::WholeFolder, &mut budget),
             Err(R7zError::Decompression)
+        ));
+    }
+
+    #[test]
+    fn decoded_byte_budget_spans_substreams() {
+        let active = ActiveFolder {
+            reader: codec::FolderReader::Stream(Box::new(std::io::Cursor::new(b"abcdef"))),
+            streams: FolderStreamLayout::new(6, 2, &[3], &[]).unwrap().streams(),
+            digest: DigestState::new(None),
+            decoded_len: 0,
+            unpack_size: 6,
+            budgeted_eagerly: false,
+        };
+        let mut budget = DecodedByteBudget::new(Some(5));
+        let active = active
+            .read_stream(&mut budget, |reader| {
+                std::io::copy(reader, &mut std::io::sink()).map_err(R7zError::Io)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            active.read_stream(&mut budget, |reader| {
+                std::io::copy(reader, &mut std::io::sink()).map_err(R7zError::Io)?;
+                Ok(())
+            }),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "total decoded output",
+                limit: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn decoded_byte_budget_rejects_overflow() {
+        let mut budget = DecodedByteBudget::new(Some(u64::MAX));
+        budget.charge(u64::MAX).unwrap();
+
+        assert!(matches!(
+            budget.charge(1),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "total decoded output",
+                limit: u64::MAX,
+            })
+        ));
+    }
+
+    #[test]
+    fn failed_eager_start_does_not_consume_decoded_budget() {
+        let mut budget = DecodedByteBudget::new(Some(8));
+
+        assert!(matches!(
+            budget.with_eager_output(5, || Err::<(), _>(R7zError::PasswordRequired)),
+            Err(R7zError::PasswordRequired)
+        ));
+        assert!(matches!(
+            budget.with_eager_output(5, || Err::<(), _>(R7zError::Decompression)),
+            Err(R7zError::Decompression)
+        ));
+        assert!(matches!(
+            budget.with_eager_output(4, || Ok(())),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "total decoded output",
+                limit: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn decoded_byte_budget_rejects_eager_bcj2_before_reading_inputs() {
+        struct Unreadable;
+
+        impl Read for Unreadable {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("decoder started before budget check"))
+            }
+        }
+
+        let coder = |bytes: &[u8]| crate::CoderInfo::parse(bytes).unwrap().1;
+        let folder = Folder {
+            coders: smallvec::smallvec![coder(&[1, 0]), coder(&[0x14, 3, 3, 1, 0x1b, 4, 1])],
+            packed_indices: smallvec::smallvec![0, 2, 3, 4],
+            bind_pairs: smallvec::smallvec![(1, 0)],
+        };
+        let graph = folder.graph().unwrap();
+        let pack_sizes = [1, 4, 0, 5];
+        let coder_sizes = [1, 5];
+        let layout = FolderLayout {
+            state: LaidOut {
+                folder,
+                graph,
+                streams: PackedStreams {
+                    sizes: &pack_sizes,
+                    digests: &[],
+                    start: 0,
+                },
+                coder_sizes: &coder_sizes,
+                unpack_size: 5,
+                crc: None,
+            },
+            layout: FolderStreamLayout::new(5, 1, &[], &[]).unwrap(),
+        };
+        let ready = layout
+            .bind(
+                |stream| {
+                    Ok(codec::PackedInput {
+                        reader: Unreadable,
+                        size: stream.range.len() as usize,
+                    })
+                },
+                None,
+            )
+            .unwrap();
+        let mut budget = DecodedByteBudget::new(Some(4));
+
+        assert!(matches!(
+            ready.start(None, &mut budget),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "total decoded output",
+                limit: 4,
+            })
         ));
     }
 
@@ -878,7 +1202,7 @@ mod tests {
             assert_eq!(
                 streams
                     .by_ref()
-                    .map(|stream| (stream.range.start, stream.range.end))
+                    .map(|stream| (stream.range.start(), stream.range.end()))
                     .collect::<Vec<_>>(),
                 expected
             );
@@ -912,6 +1236,28 @@ mod tests {
     }
 
     #[test]
+    fn main_folder_layouts_parse_only_the_folder_being_consumed() {
+        let bytes = Bytes::from_static(&[
+            0x06, 0x00, 0x02, 0x09, 0x03, 0x03, 0x00, // two packed streams
+            0x07, 0x0b, 0x02, 0x00, // two folders, inline definitions
+            0x01, 0x01, 0x00, // valid copy folder
+            0x03, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, // three copy coders
+            0x01, 0x00, 0x00, 0x01, // cyclic coder bindings
+            0x0c, 0x03, 0x03, 0x03, 0x03, 0x00, // coder output sizes
+            0x08, 0x00, 0x00, // one substream per folder
+        ]);
+        let streams = crate::StreamInfo::parse(&bytes, &bytes).unwrap().1;
+
+        let mut folders = FolderLayouts::for_streams(&streams).unwrap();
+        let first = folders.next().unwrap().unwrap();
+        assert_eq!(first.state.folder.total_out_streams(), 1);
+        assert!(matches!(
+            folders.next(),
+            Some(Err(R7zError::InvalidFolderGraph))
+        ));
+    }
+
+    #[test]
     fn implicit_substream_inherits_folder_crc_in_the_layout() {
         let mut streams = copy_streams();
         let digest = crc32fast::hash(b"abc");
@@ -923,7 +1269,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let stream = folder.substreams().next().unwrap();
-        assert_eq!(stream.range, 0..3);
+        assert_eq!(stream.range.into_range(), 0..3);
         assert_eq!(stream.digest, Some(digest));
     }
 
@@ -937,7 +1283,10 @@ mod tests {
         let required = 3 + 2 * std::mem::size_of::<Bytes>() as u64;
         assert!(matches!(
             ExternalFolderPlan::new(&streams, MetadataBudget::new(required - 1)),
-            Err(R7zError::LimitExceeded("metadata"))
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "metadata",
+                limit,
+            }) if limit == required - 1
         ));
         let plan = ExternalFolderPlan::new(&streams, MetadataBudget::new(required)).unwrap();
         let data = plan
@@ -963,24 +1312,72 @@ mod tests {
     }
 
     #[test]
+    fn external_folder_preflight_reports_the_operation_metadata_limit() {
+        assert!(matches!(
+            ExternalFolderPlan::new(&copy_streams(), MetadataBudget::new(2)),
+            Err(R7zError::ResourceLimitExceeded {
+                resource: "metadata",
+                limit: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn external_plan_decodes_multiple_folder_definitions_in_order() {
+        let bytes = Bytes::from_static(&[
+            0x06, 0x00, 0x02, 0x09, 0x03, 0x03, 0x00, // two packed streams
+            0x07, 0x0b, 0x02, 0x00, // two inline copy folders
+            0x01, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x03, 0x03, 0x00,
+            0x00, // end streams info
+        ]);
+        let streams = crate::StreamInfo::parse(&bytes, &bytes).unwrap().1;
+        let plan = ExternalFolderPlan::new(&streams, MetadataBudget::new(1024)).unwrap();
+        let mut folder_index = 0;
+        let data = plan
+            .decode(
+                |_| {
+                    let payload = match folder_index {
+                        0 => *b"abc",
+                        1 => *b"def",
+                        _ => panic!("unexpected external folder"),
+                    };
+                    folder_index += 1;
+                    Ok(codec::PackedInput {
+                        reader: std::io::Cursor::new(payload),
+                        size: 3,
+                    })
+                },
+                None,
+            )
+            .unwrap()
+            .into_data();
+
+        assert_eq!(folder_index, 2);
+        assert_eq!(
+            data.as_slice(),
+            [Bytes::from_static(b"abc"), Bytes::from_static(b"def")]
+        );
+    }
+
+    #[test]
     fn folder_layout_rejects_unmatched_tables_before_opening_sources() {
+        fn validate_layouts(streams: &crate::StreamInfo) -> Result<(), R7zError> {
+            FolderLayouts::for_streams(streams)?
+                .collect::<Result<Vec<_>, _>>()
+                .map(|_| ())
+        }
+
         let mut streams = copy_streams();
         streams
             .substream_info
             .as_mut()
             .unwrap()
             .num_unpack_streams_per_folder[0] = u64::MAX;
-        assert!(matches!(
-            FolderLayouts::for_streams(&streams),
-            Err(R7zError::Parse)
-        ));
+        assert!(matches!(validate_layouts(&streams), Err(R7zError::Parse)));
 
         let mut streams = copy_streams();
         streams.unpack_info.as_mut().unwrap().unpack_sizes.push(0);
-        assert!(matches!(
-            FolderLayouts::for_streams(&streams),
-            Err(R7zError::Parse)
-        ));
+        assert!(matches!(validate_layouts(&streams), Err(R7zError::Parse)));
 
         let mut streams = copy_streams();
         streams
@@ -989,17 +1386,11 @@ mod tests {
             .unwrap()
             .num_unpack_streams_per_folder
             .push(0);
-        assert!(matches!(
-            FolderLayouts::for_streams(&streams),
-            Err(R7zError::Parse)
-        ));
+        assert!(matches!(validate_layouts(&streams), Err(R7zError::Parse)));
 
         let mut streams = copy_streams();
         streams.pack_info.as_mut().unwrap().num_pack_streams = 2;
-        assert!(matches!(
-            FolderLayouts::for_streams(&streams),
-            Err(R7zError::Parse)
-        ));
+        assert!(matches!(validate_layouts(&streams), Err(R7zError::Parse)));
     }
 
     #[test]
@@ -1012,8 +1403,10 @@ mod tests {
             .unwrap();
         folder.state.folder.coders[0].codec_id = [0x21].into_iter().collect(); // LZMA2
         folder.state.folder.coders[0].properties = Some(smallvec::smallvec![41]);
-        let result = folder
-            .bind::<std::io::Empty>(|_| panic!("invalid properties must precede source reads"));
+        let result = folder.bind::<std::io::Empty>(
+            |_| panic!("invalid properties must precede source reads"),
+            None,
+        );
         assert!(matches!(result, Err(R7zError::Decompression)));
     }
 

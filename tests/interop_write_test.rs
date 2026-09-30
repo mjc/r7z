@@ -134,7 +134,7 @@ fn r7z_write_r7z_read_single_file() {
 
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), 1);
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(fi.name(0).unwrap(), "hello.txt");
 
     let extracted = archive.extract_to_memory(0).unwrap();
@@ -159,7 +159,7 @@ fn r7z_write_r7z_read_multi_file() {
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), files.len());
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     for (i, (name, original)) in files.iter().enumerate() {
         assert_eq!(fi.name(i).unwrap(), *name);
         let extracted = archive.extract_to_memory(i).unwrap();
@@ -317,7 +317,7 @@ fn archive_writer_single_folder_r7z_reads() {
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), files.len());
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     for (i, (name, original)) in files.iter().enumerate() {
         assert_eq!(fi.name(i).unwrap(), *name);
         let extracted = archive.extract_to_memory(i).unwrap();
@@ -352,7 +352,7 @@ fn archive_writer_multi_folder_r7z_reads() {
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).expect("from_bytes failed");
     assert_eq!(archive.num_files(), 4);
 
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let all = [folder0[0], folder0[1], folder1[0], folder1[1]];
     for (i, (name, original)) in all.iter().enumerate() {
         assert_eq!(fi.name(i).unwrap(), *name);
@@ -443,7 +443,7 @@ fn archive_writer_mtime_r7z_reads() {
     w.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     // The raw FILETIME: seconds since Windows epoch × 10_000_000
     // Windows epoch offset = 11_644_473_600 s
@@ -465,7 +465,7 @@ fn archive_writer_unix_mode_r7z_reads() {
     w.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     let attrs = fi.attributes.first().copied().flatten().unwrap();
     // High 16 bits = st_mode, low 16 bits = Windows attribs (0x20)
@@ -496,7 +496,7 @@ fn archive_builder_full_metadata_r7z_reads() {
         .expect("build failed");
 
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     assert_eq!(fi.ctimes[0], Some(filetime_from_unix_secs(ctime_secs)));
     assert_eq!(fi.ctimes[1], None);
@@ -568,7 +568,7 @@ fn r7z_write_bcj_lzma2_r7z_reads() {
     assert_eq!(archive.num_files(), 1);
 
     // Verify the archive uses BCJ + LZMA2
-    let si = archive.streams_info().unwrap();
+    let si = archive.raw_streams_info().unwrap();
     let ui = si.unpack_info.as_ref().unwrap();
     let folder = ui.parse_folder(0).unwrap();
     assert_eq!(folder.coders.len(), 2, "expected 2 coders for BCJ+LZMA2");
@@ -685,7 +685,7 @@ fn archive_builder_lzma_literal_position_options_p7zip_extracts() {
 
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let folder = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -957,9 +957,9 @@ fn archive_builder_default_is_lzma2_and_uses_encoded_header_for_multi_entry() {
         .expect("build failed");
 
     let archive = r7z::Archive::from_bytes(bytes.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_some());
+    assert!(archive.raw_encoded_header().is_some());
     let ui = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -996,7 +996,7 @@ fn archive_builder_lzma2_levels_write_p7zip_dictionary_properties() {
         std::fs::write(&archive_path, &bytes).unwrap();
         let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
         let folder = archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -1025,7 +1025,7 @@ fn archive_builder_header_modes_are_honored() {
         .build()
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(single_default.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_none());
+    assert!(archive.raw_encoded_header().is_none());
 
     let encoded = r7z::ArchiveBuilder::new()
         .options(r7z::ArchiveOptions {
@@ -1036,7 +1036,7 @@ fn archive_builder_header_modes_are_honored() {
         .build()
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(encoded.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_some());
+    assert!(archive.raw_encoded_header().is_some());
 
     let plain = r7z::ArchiveBuilder::new()
         .options(r7z::ArchiveOptions {
@@ -1048,7 +1048,7 @@ fn archive_builder_header_modes_are_honored() {
         .build()
         .expect("build failed");
     let archive = r7z::Archive::from_bytes(plain.into()).expect("from_bytes failed");
-    assert!(archive.encoded_header.is_none());
+    assert!(archive.raw_encoded_header().is_none());
 }
 
 #[test]
@@ -1200,6 +1200,39 @@ fn archive_writer_bcj_lzma2_streams_payload_before_finish() {
 }
 
 #[test]
+fn archive_writer_ppmd_streams_payload_before_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let archive_path = dir.join("writer_ppmd_streamed.7z");
+    let payload = (0u8..=255).cycle().take(1024 * 1024).collect::<Vec<_>>();
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
+        .expect("new failed")
+        .compression(r7z::Codec::Ppmd)
+        .expect("codec selection failed");
+
+    writer
+        .append_file(
+            "streamed.bin",
+            payload.as_slice(),
+            r7z::EntryMeta::archive_file(),
+        )
+        .expect("append failed");
+    assert!(
+        std::fs::metadata(&archive_path).unwrap().len() > 32,
+        "PPMd writer should emit compressed payload bytes during append"
+    );
+
+    writer.finish().expect("finish failed");
+    assert_p7zip_extracts_archive(
+        dir,
+        &archive_path,
+        &[(PathBuf::from("streamed.bin"), payload)],
+        &["PPMD"],
+    );
+}
+
+#[test]
 fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -1231,7 +1264,7 @@ fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     writer.finish().expect("finish failed");
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(archive.num_files(), 5);
     assert_eq!(fi.name(0).unwrap(), "a.txt");
     assert_eq!(fi.name(1).unwrap(), "nested");
@@ -1242,7 +1275,7 @@ fn archive_writer_mixed_empty_entries_preserve_order_and_folder_boundaries() {
     assert!(fi.is_empty_file(2));
     assert!(fi.is_anti(3));
     let unpack_info = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -1290,7 +1323,7 @@ fn archive_entry_helpers_round_trip_and_validate_stream_kind() {
         )
         .unwrap();
     let archive = r7z::Archive::from_bytes(builder.build().unwrap().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_directory(0));
     assert_eq!(archive.extract_to_memory(1).unwrap(), b"hello");
     assert!(fi.is_empty_file(2));
@@ -1332,7 +1365,7 @@ fn archive_entry_helpers_round_trip_and_validate_stream_kind() {
     writer.finish().unwrap();
 
     let archive = r7z::Archive::from_bytes(buf.into_inner().into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_directory(0));
     assert_eq!(archive.extract_to_memory(1).unwrap(), b"hello");
     assert!(fi.is_empty_file(2));
@@ -1354,7 +1387,7 @@ fn archive_builder_empty_directory_and_anti_items_round_trip_and_p7zip_lists() {
     std::fs::write(&archive_path, bytes).unwrap();
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_directory(0));
     assert!(fi.is_empty_file(1));
     assert!(fi.is_anti(3));
@@ -1392,8 +1425,8 @@ fn archive_builder_empty_only_p7zip_extracts_and_r7z_reads() {
     std::fs::write(&archive_path, bytes).unwrap();
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    assert!(archive.streams_info().is_none());
-    let fi = archive.files_info().unwrap();
+    assert!(archive.raw_streams_info().is_none());
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(archive.num_files(), 3);
     assert_eq!(fi.name(0).unwrap(), "emptydir");
     assert_eq!(fi.name(1).unwrap(), "emptydir/empty.txt");
@@ -1483,7 +1516,7 @@ fn archive_builder_default_aes_properties_match_p7zip_settings() {
         .expect("build failed");
 
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
-    let streams = archive.streams_info().unwrap();
+    let streams = archive.raw_streams_info().unwrap();
     let unpack_info = streams.unpack_info.as_ref().unwrap();
     let folder = unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
@@ -1502,7 +1535,7 @@ fn archive_builder_default_aes_properties_match_p7zip_settings() {
         .expect("build failed");
     let archive = r7z::Archive::from_bytes_with_password(bytes.into(), Some("HeaderSecret"))
         .expect("from_bytes_with_password failed");
-    let encoded_header = archive.encoded_header.as_ref().unwrap();
+    let encoded_header = archive.raw_encoded_header().unwrap();
     let folder = encoded_header.unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
     assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
@@ -1528,7 +1561,7 @@ fn archive_builder_salted_aes_content_p7zip_and_r7z_extract() {
     std::fs::write(&archive_path, bytes).unwrap();
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let streams = archive.streams_info().unwrap();
+    let streams = archive.raw_streams_info().unwrap();
     let unpack_info = streams.unpack_info.as_ref().unwrap();
     let folder = unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
@@ -1590,7 +1623,7 @@ fn archive_builder_salted_aes_encrypted_header_p7zip_and_r7z_extract() {
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
-    let encoded_header = archive.encoded_header.as_ref().unwrap();
+    let encoded_header = archive.raw_encoded_header().unwrap();
     let folder = encoded_header.unpack_info.parse_folder(0).unwrap();
     let aes_coder = &folder.coders[0];
     assert_eq!(aes_coder.codec_id.as_slice(), r7z::CODEC_AES_256_SHA_256);
@@ -1857,8 +1890,8 @@ fn archive_builder_empty_only_encrypted_header_p7zip_and_r7z_read() {
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
 
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
-    assert!(archive.streams_info().is_none());
-    let fi = archive.files_info().unwrap();
+    assert!(archive.raw_streams_info().is_none());
+    let fi = archive.raw_files_info().unwrap();
     assert_eq!(archive.num_files(), 3);
     assert!(fi.is_directory(0));
     assert!(fi.is_empty_file(1));
@@ -1930,7 +1963,7 @@ fn compression_options_control_lzma2_properties_and_solid_blocks() {
         .unwrap();
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
     let unpack_info = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -2017,6 +2050,120 @@ fn build_streaming_to_writer_matches_seek_backed_output() {
 }
 
 #[test]
+fn temporary_spool_limit_covers_temp_file_and_auto_spill() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let entries = || vec![("payload".to_string(), b"temporary spool limit".as_slice())];
+    let mut expected = std::io::Cursor::new(Vec::new());
+    r7z::build_streaming_with_options(entries(), &mut expected, r7z::ArchiveOptions::default())
+        .unwrap();
+    let spool_limit = expected.get_ref().len() as u64 - 1;
+    let tmp = tempfile::tempdir().unwrap();
+
+    for spool in [
+        r7z::SpoolMode::TempFile {
+            dir: Some(tmp.path().to_path_buf()),
+        },
+        r7z::SpoolMode::Auto {
+            memory_threshold: 1,
+            dir: Some(tmp.path().to_path_buf()),
+        },
+    ] {
+        let exact_limit_spool = spool.clone();
+        let mut output = WriteOnly(Vec::new());
+        let result = r7z::build_streaming_to_writer(
+            entries(),
+            &mut output,
+            r7z::ArchiveOptions {
+                streaming: r7z::StreamingOptions {
+                    spool,
+                    max_temporary_storage_bytes: Some(spool_limit),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(r7z::R7zError::ResourceLimitExceeded {
+                resource: "temporary storage",
+                limit,
+            }) if limit == spool_limit
+        ));
+        assert!(output.0.is_empty());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+        let mut exact_limit_output = WriteOnly(Vec::new());
+        r7z::build_streaming_to_writer(
+            entries(),
+            &mut exact_limit_output,
+            r7z::ArchiveOptions {
+                streaming: r7z::StreamingOptions {
+                    spool: exact_limit_spool,
+                    max_temporary_storage_bytes: Some(expected.get_ref().len() as u64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            exact_limit_output.0.as_slice(),
+            expected.get_ref().as_slice()
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn memory_spool_does_not_use_temporary_storage_allowance() {
+    struct WriteOnly(Vec<u8>);
+    impl std::io::Write for WriteOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = WriteOnly(Vec::new());
+    r7z::build_streaming_to_writer(
+        [("payload".to_string(), b"memory spool".as_slice())],
+        &mut output,
+        r7z::ArchiveOptions {
+            streaming: r7z::StreamingOptions {
+                spool: r7z::SpoolMode::Memory,
+                max_temporary_storage_bytes: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        r7z::Archive::from_bytes(output.0.into())
+            .unwrap()
+            .extract_to_memory(0)
+            .unwrap(),
+        b"memory spool"
+    );
+}
+
+#[test]
 fn build_streaming_volumes_splits_final_archive_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("split.7z");
@@ -2047,6 +2194,26 @@ fn build_streaming_volumes_splits_final_archive_bytes() {
 }
 
 #[test]
+fn build_streaming_volumes_rejects_empty_sizes_before_encoding_or_file_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("invalid.7z");
+    let entries = std::iter::from_fn(|| -> Option<(String, std::io::Empty)> {
+        panic!("invalid volume sizes must be rejected before reading entries")
+    });
+
+    let error = r7z::build_streaming_volumes(
+        entries,
+        &base,
+        r7z::ArchiveOptions::default(),
+        r7z::VolumeOptions { sizes: Vec::new() },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("at least one size"));
+    assert!(!tmp.path().join("invalid.7z.001").exists());
+}
+
+#[test]
 fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out");
@@ -2055,7 +2222,7 @@ fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
         .build()
         .unwrap();
     let archive = r7z::Archive::from_bytes(bytes.into()).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     assert!(fi.is_symlink(0));
     assert_eq!(fi.entry_type(0), r7z::EntryType::Symlink);
     assert_eq!(

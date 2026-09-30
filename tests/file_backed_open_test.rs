@@ -72,30 +72,40 @@ fn from_reader_accepts_cursor() {
 
 #[test]
 fn open_mmap_parses_fixture() {
-    let archive = r7z::Archive::open_with_options(
-        Path::new("tests/fixtures/test_1.7z"),
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Mmap,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    // SAFETY: The fixture is not modified while this archive is alive.
+    let archive =
+        unsafe { r7z::Archive::open_mmap(Path::new("tests/fixtures/test_1.7z")) }.unwrap();
 
     assert!(archive.num_files() > 0);
 }
 
 #[test]
-fn open_seek_mode_parses_fixture() {
-    let archive = r7z::Archive::open_with_options(
-        Path::new("tests/fixtures/test_1.7z"),
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Seek,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+fn open_positioned_reads_parse_fixture() {
+    let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
 
     assert!(archive.num_files() > 0);
+}
+
+#[test]
+fn seek_open_reports_file_truncated_after_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive_path = tmp.path().join("truncated-after-open.7z");
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("payload.txt", b"truncated source data")
+        .build()
+        .unwrap();
+    std::fs::write(&archive_path, bytes).unwrap();
+
+    let archive = r7z::Archive::open(&archive_path).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&archive_path)
+        .unwrap()
+        .set_len(32)
+        .unwrap();
+
+    assert!(archive.extract_to_memory(0).is_err());
 }
 
 #[test]
@@ -113,7 +123,11 @@ fn open_split_archive_first_volume_reads_siblings() {
     std::fs::write(tmp.path().join("split.7z.003"), &bytes[chunk * 2..]).unwrap();
 
     let archive = r7z::Archive::open(&first).unwrap();
-    let names = archive.files_info().unwrap().names().collect::<Vec<_>>();
+    let names = archive
+        .raw_files_info()
+        .unwrap()
+        .names()
+        .collect::<Vec<_>>();
     let alpha_idx = names.iter().position(|name| name == "alpha.txt").unwrap();
     let beta_idx = names
         .iter()
@@ -163,20 +177,13 @@ fn sparse_seek_open_does_not_read_whole_file() {
     drop(file);
 
     reset_allocated_bytes();
-    let archive = r7z::Archive::open_with_options(
-        &archive_path,
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Seek,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let archive = r7z::Archive::open(&archive_path).unwrap();
     let allocated = allocated_bytes();
 
     assert_eq!(archive.num_files(), 1);
     assert!(
         allocated < 8 * 1024 * 1024,
-        "seek-backed open allocated {allocated} bytes"
+        "positioned file open allocated {allocated} bytes"
     );
 }
 
@@ -194,14 +201,19 @@ fn metadata_limit_rejects_oversized_next_header() {
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: 1,
-            storage_mode: r7z::ArchiveStorageMode::Seek,
         },
     ) {
         Ok(_) => panic!("archive opened despite metadata limit"),
         Err(err) => err,
     };
 
-    assert!(matches!(err, r7z::R7zError::LimitExceeded("metadata")));
+    assert!(matches!(
+        err,
+        r7z::R7zError::ResourceLimitExceeded {
+            resource: "metadata",
+            limit: 1,
+        }
+    ));
 }
 
 #[test]
@@ -220,14 +232,19 @@ fn metadata_limit_rejects_oversized_decoded_header() {
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: next_header_size + 16,
-            storage_mode: r7z::ArchiveStorageMode::Seek,
         },
     ) {
         Ok(_) => panic!("archive opened despite decoded metadata limit"),
         Err(err) => err,
     };
 
-    assert!(matches!(err, r7z::R7zError::LimitExceeded("metadata")));
+    assert!(matches!(
+        err,
+        r7z::R7zError::ResourceLimitExceeded {
+            resource: "metadata",
+            limit,
+        } if limit == next_header_size + 16
+    ));
 }
 
 #[test]
@@ -246,6 +263,73 @@ fn extract_to_writer_from_seek_source_matches_from_bytes() {
     from_reader.extract_to_writer(0, &mut actual).unwrap();
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn source_adapters_decode_the_same_entries() {
+    let bytes = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("alpha.txt", b"first payload")
+        .add_file("beta.txt", b"second payload")
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let file_path = tmp.path().join("archive.7z");
+    std::fs::write(&file_path, &bytes).unwrap();
+
+    let split_path = tmp.path().join("split.7z.001");
+    let chunk_size = bytes.len().div_ceil(3);
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let volume = split_path.with_extension(format!("{:03}", index + 1));
+        std::fs::write(volume, chunk).unwrap();
+    }
+
+    let archives = [
+        r7z::Archive::from_bytes(bytes.clone().into()).unwrap(),
+        r7z::Archive::from_reader(Cursor::new(bytes.clone())).unwrap(),
+        r7z::Archive::open(&file_path).unwrap(),
+        r7z::Archive::open(&split_path).unwrap(),
+    ];
+
+    for archive in archives {
+        assert_eq!(archive.num_files(), 2);
+        assert_eq!(archive.extract_to_memory(0).unwrap(), b"first payload");
+        assert_eq!(archive.extract_to_memory(1).unwrap(), b"second payload");
+    }
+}
+
+#[test]
+fn copy_builder_avoids_copying_the_payload_during_build() {
+    let payload = vec![0x5A; 4 * 1024 * 1024];
+    let builder = r7z::ArchiveBuilder::new()
+        .compression(r7z::Codec::Copy)
+        .add_file("payload.bin", &payload);
+
+    reset_allocated_bytes();
+    let built = builder.build().unwrap();
+    let builder_allocated = allocated_bytes();
+
+    let options = r7z::ArchiveOptions {
+        codec: r7z::Codec::Copy,
+        ..Default::default()
+    };
+    let mut writer = r7z::ArchiveWriter::new(Cursor::new(Vec::new()), options).unwrap();
+    reset_allocated_bytes();
+    writer
+        .append_file(
+            "payload.bin",
+            Cursor::new(&payload),
+            r7z::EntryMeta::default(),
+        )
+        .unwrap();
+    let streamed = writer.finish().unwrap();
+    let streaming_allocated = allocated_bytes();
+
+    assert_eq!(built, streamed.into_inner());
+    assert!(
+        builder_allocated <= streaming_allocated + 64 * 1024,
+        "Copy builder allocated {builder_allocated} bytes; streaming writer allocated {streaming_allocated} bytes"
+    );
 }
 
 #[test]

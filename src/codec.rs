@@ -1,5 +1,11 @@
 mod plan;
 mod sizes;
+pub use crate::method::{
+    CODEC_AES_256_SHA_256, CODEC_BCJ_ARM, CODEC_BCJ_ARM_THUMB, CODEC_BCJ_ARM64, CODEC_BCJ_IA64,
+    CODEC_BCJ_PPC, CODEC_BCJ_RISCV, CODEC_BCJ_SPARC, CODEC_BCJ_X86, CODEC_BCJ2, CODEC_BZIP2,
+    CODEC_COPY, CODEC_DEFLATE, CODEC_DEFLATE64, CODEC_DELTA, CODEC_LZMA, CODEC_LZMA2, CODEC_PPMD,
+    CODEC_SWAP2, CODEC_SWAP4,
+};
 use crate::{Folder, R7zError};
 use bzip2_rs::DecoderReader as Bzip2Decoder;
 use deflate64::Deflate64Decoder;
@@ -16,13 +22,12 @@ use std::io::{Cursor, Read, Write};
 const MAX_LZMA_DICTIONARY_BYTES: u32 = 256 * 1024 * 1024;
 const MAX_LZMA2_PROBABILITY_BYTES: usize = 24 * 1024;
 const MAX_PPMD_MEMORY_BYTES: u32 = 256 * 1024 * 1024;
-// AES decryption holds both encrypted and decrypted copies, each capped here.
-const MAX_BUFFERED_AES_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BCJ2_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
 const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
 const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
+const AES_CBC_WORKING_SET_BYTES: usize = 1024;
 const MAX_FOLDER_CODERS: usize = 64;
 // Remaining buffered paths use this cap for packed folder bytes.
 pub(crate) const MAX_BUFFERED_PACKED_FOLDER_BYTES: usize = 512 * 1024 * 1024;
@@ -50,47 +55,6 @@ pub fn compress_lzma(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
     props.extend_from_slice(&dict_size.to_le_bytes());
     Ok((props, compressed))
 }
-
-/// Codec ID for LZMA (classic, used in older 7z archives and header streams).
-pub const CODEC_LZMA: &[u8] = &[0x03, 0x01, 0x01];
-/// Codec ID for LZMA2 (used in modern 7z archives).
-pub const CODEC_LZMA2: &[u8] = &[0x21];
-/// Codec ID for the x86 BCJ (Branch/Call/Jump) filter.
-pub const CODEC_BCJ_X86: &[u8] = &[0x03, 0x03, 0x01, 0x03];
-/// Codec ID for the BCJ2 multi-stream x86 branch filter.
-pub const CODEC_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
-/// Codec ID for the ARM branch filter.
-pub const CODEC_BCJ_ARM: &[u8] = &[0x03, 0x03, 0x05, 0x01];
-/// Codec ID for the ARM64 branch filter.
-pub const CODEC_BCJ_ARM64: &[u8] = &[0x0A];
-/// Codec ID for the ARM Thumb branch filter.
-pub const CODEC_BCJ_ARM_THUMB: &[u8] = &[0x03, 0x03, 0x07, 0x01];
-/// Codec ID for the IA-64 branch filter.
-pub const CODEC_BCJ_IA64: &[u8] = &[0x03, 0x03, 0x04, 0x01];
-/// Codec ID for the PowerPC branch filter.
-pub const CODEC_BCJ_PPC: &[u8] = &[0x03, 0x03, 0x02, 0x05];
-/// Codec ID for the SPARC branch filter.
-pub const CODEC_BCJ_SPARC: &[u8] = &[0x03, 0x03, 0x08, 0x05];
-/// Codec ID for the RISC-V branch filter.
-pub const CODEC_BCJ_RISCV: &[u8] = &[0x0B];
-/// Codec ID for the no-op copy codec (uncompressed).
-pub const CODEC_COPY: &[u8] = &[0x00];
-/// Codec ID for AES-256-SHA-256 encryption (7zAES).
-pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
-/// Codec ID for raw Deflate streams.
-pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
-/// Codec ID for `BZip2` streams.
-pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
-/// Codec ID for `PPMd7` streams.
-pub const CODEC_PPMD: &[u8] = &[0x03, 0x04, 0x01];
-/// Codec ID for Deflate64 streams.
-pub const CODEC_DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
-/// Codec ID for the Delta filter.
-pub const CODEC_DELTA: &[u8] = &[0x03];
-/// Codec ID for the 2-byte swap filter.
-pub const CODEC_SWAP2: &[u8] = &[0x02, 0x03, 0x02];
-/// Codec ID for the 4-byte swap filter.
-pub const CODEC_SWAP4: &[u8] = &[0x02, 0x03, 0x04];
 
 /// Compress `data` with LZMA2, returning `(properties_byte, compressed_stream)`.
 ///
@@ -286,32 +250,28 @@ fn prepare_folder_decoder<R: Read>(
         .iter()
         .map(|input| input.size as u64)
         .collect::<SmallVec<[_; 4]>>();
-    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes)?
+    DecoderPlan::with_output_sizes(folder, &graph, unpack_size, sizes, &packed_sizes, None)?
         .bind(packed_streams)
 }
 
 fn aes_coder_reader<'a>(
     props: crate::aes::AesProperties,
-    mut input: Box<dyn Read + 'a>,
+    input: Box<dyn Read + 'a>,
     input_size: OutputSize,
     unpack_size: OutputSize,
     password: Option<&str>,
-) -> Result<Cursor<Vec<u8>>, R7zError> {
+) -> Result<crate::aes::Aes256CbcDecryptReader<Box<dyn Read + 'a>>, R7zError> {
     let password = password.ok_or(R7zError::PasswordRequired)?;
     let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
-    let mut encrypted = Vec::new();
-    read_to_end_bounded(
-        &mut input,
-        &mut encrypted,
-        input_size.buffered_bytes(MAX_BUFFERED_AES_BYTES),
-        "AES encrypted input",
-    )?;
-    drop(input);
-    let mut decrypted = crate::aes::decrypt_aes256_cbc(&encrypted, &key, &props.iv)?;
-    if let OutputSize::Known(size) = unpack_size {
-        truncate_to(&mut decrypted, size)?;
-    }
-    Ok(Cursor::new(decrypted))
+    let ciphertext_size = match input_size {
+        OutputSize::Known(size) => Some(size),
+        OutputSize::Unknown => None,
+    };
+    let plaintext_size = match unpack_size {
+        OutputSize::Known(size) => Some(size),
+        OutputSize::Unknown => None,
+    };
+    crate::aes::Aes256CbcDecryptReader::new(input, &key, &props.iv, ciphertext_size, plaintext_size)
 }
 
 fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
@@ -331,7 +291,10 @@ fn ppmd_properties(props: &[u8]) -> Result<(u32, u32), R7zError> {
 }
 
 fn resource_limit(resource: &'static str, limit: usize) -> R7zError {
-    R7zError::ResourceLimitExceeded { resource, limit }
+    R7zError::ResourceLimitExceeded {
+        resource,
+        limit: limit as u64,
+    }
 }
 
 fn growth_safe_output_limit(available: usize) -> usize {
@@ -407,35 +370,6 @@ impl<R: Read> Read for ExactSizeReader<R> {
 
         self.remaining -= u64::try_from(n).expect("read length fits in u64");
         Ok(n)
-    }
-}
-
-enum DecoderTopology {
-    Chain,
-    Bcj2,
-}
-
-impl DecoderTopology {
-    fn from_folder(folder: &Folder) -> Result<Self, R7zError> {
-        match folder.coders.last() {
-            Some(coder) if coder.codec_id.as_slice() == CODEC_BCJ2 => Ok(Self::Bcj2),
-            _ if folder
-                .coders
-                .iter()
-                .all(|coder| coder.num_in_streams == 1 && coder.num_out_streams == 1) =>
-            {
-                Ok(Self::Chain)
-            }
-            _ => {
-                let unsupported = folder
-                    .coders
-                    .iter()
-                    .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
-                Err(unsupported.map_or(R7zError::InvalidFolderGraph, |coder| {
-                    R7zError::UnsupportedCodec(coder.codec_id.to_vec())
-                }))
-            }
-        }
     }
 }
 
@@ -572,15 +506,6 @@ fn ensure_bcj2_working_budget(output_size: usize, decoder_memory: usize) -> Resu
             MAX_BCJ2_WORKING_BYTES,
         ));
     }
-    Ok(())
-}
-
-fn truncate_to(data: &mut Vec<u8>, size: u64) -> Result<(), R7zError> {
-    let size = usize::try_from(size).map_err(|_| R7zError::Parse)?;
-    if data.len() < size {
-        return Err(R7zError::Decompression);
-    }
-    data.truncate(size);
     Ok(())
 }
 
@@ -797,20 +722,29 @@ mod tests {
     }
 
     #[test]
-    fn aes_buffering_obeys_the_admitted_input_size() {
+    fn aes_coder_reader_streams_inputs_over_256_mib() {
+        use super::{OutputSize, aes_coder_reader};
+
+        let size = 256 * 1024 * 1024 + 16;
         let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
-        assert!(matches!(
-            super::aes_coder_reader(
-                props,
-                Box::new(Cursor::new([0; 16])),
-                super::OutputSize::Known(8),
-                super::OutputSize::Known(0),
-                Some("password")
-            ),
-            Err(R7zError::ResourceLimitExceeded {
-                resource: "AES encrypted input",
-                limit: 8
-            })
-        ));
+        let mut reader = aes_coder_reader(
+            props,
+            Box::new(std::io::repeat(0).take(size)),
+            OutputSize::Known(size),
+            OutputSize::Known(size),
+            Some("password"),
+        )
+        .unwrap();
+        let mut output = [0; 8192];
+        let mut read = 0;
+        loop {
+            let n = reader.read(&mut output).unwrap();
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+        }
+
+        assert_eq!(read, size);
     }
 }

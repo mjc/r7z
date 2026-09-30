@@ -114,7 +114,7 @@ fn streaming_extract_stops_after_target_when_folder_crc_is_absent() {
         .unwrap();
     let archive = r7z::Archive::from_bytes(bytes.clone().into()).unwrap();
     let folder_digest = archive
-        .streams_info()
+        .raw_streams_info()
         .unwrap()
         .unpack_info
         .as_ref()
@@ -138,7 +138,7 @@ fn streaming_extract_stops_after_target_when_folder_crc_is_absent() {
 
 fn assert_archive_file_apis_match_source(archive_path: &Path, source_root: &Path, prefix: &str) {
     let archive = r7z::Archive::open(archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
 
     for i in 0..archive.num_files() {
         if fi.is_directory(i) || fi.is_anti(i) {

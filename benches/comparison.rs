@@ -406,7 +406,7 @@ fn r7z_extract_n64(c: &mut Criterion) {
     };
     // find first file that has actual data (not dir / empty-stream entry)
     let idx = archive
-        .files_info()
+        .raw_files_info()
         .and_then(|fi| (0..archive.num_files()).find(|&i| !fi.is_empty_stream(i)))
         .unwrap_or(0);
     c.bench_function("r7z_extract_n64", |b| {

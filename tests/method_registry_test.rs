@@ -1,4 +1,6 @@
-use r7z::{P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name};
+use r7z::{
+    MethodSupport, P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name, method_info,
+};
 
 #[test]
 fn p7zip_oracle_sha_is_pinned() {
@@ -29,4 +31,40 @@ fn method_registry_tracks_current_p7zip_extension_ids() {
         assert_eq!(method_from_name(name), Some(method));
         assert_eq!(method_from_id(id), Some(method));
     }
+}
+
+#[test]
+fn method_registry_separates_decode_encode_and_raw_copy_support() {
+    let lzma = method_info(r7z::CODEC_LZMA).unwrap();
+    assert_eq!(lzma.support, MethodSupport::DecodeAndEncode);
+    assert!(lzma.can_decode());
+    assert!(lzma.can_encode());
+
+    let deflate = method_info(r7z::CODEC_DEFLATE).unwrap();
+    assert_eq!(deflate.support, MethodSupport::DecodeOnly);
+    assert!(deflate.can_decode());
+    assert!(!deflate.can_encode());
+
+    let zstd = method_info(&[0x04, 0xF7, 0x11, 0x01]).unwrap();
+    assert_eq!(zstd.method, SevenZMethod::Zstd);
+    assert_eq!(zstd.support, MethodSupport::RawCopyOnly);
+    assert!(!zstd.can_decode());
+    assert!(!zstd.can_encode());
+    assert!(method_info(&[0xFF]).is_none());
+}
+
+#[test]
+fn method_enum_and_registry_metadata_stay_in_sync() {
+    assert_eq!(r7z::ALL_METHODS.len(), r7z::METHOD_REGISTRY.len());
+    for method in r7z::ALL_METHODS {
+        let info = r7z::METHOD_REGISTRY
+            .iter()
+            .find(|info| info.method == *method)
+            .unwrap_or_else(|| panic!("missing metadata for {method:?}"));
+        assert_eq!(method.id(), info.id);
+        assert_eq!(method.name(), info.name);
+        assert_eq!(method.kind(), info.kind);
+        assert_eq!(method.supported_by_r7z(), info.can_decode());
+    }
+    assert_eq!(method_from_id(r7z::CODEC_LZMA2), Some(SevenZMethod::Lzma2));
 }

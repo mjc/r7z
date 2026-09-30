@@ -68,7 +68,7 @@ fn create_parity_audit_p7zip_compression_switches_open_with_r7z() {
             .unwrap_or_else(|err| panic!("r7z failed to open {label}: {err}"));
         assert_eq!(archive.num_files(), 2, "{label}");
         let unpack_info = archive
-            .streams_info()
+            .raw_streams_info()
             .unwrap()
             .unpack_info
             .as_ref()
@@ -86,7 +86,11 @@ fn create_parity_audit_p7zip_compression_switches_open_with_r7z() {
             "{label}"
         );
 
-        let names = archive.files_info().unwrap().names().collect::<Vec<_>>();
+        let names = archive
+            .raw_files_info()
+            .unwrap()
+            .names()
+            .collect::<Vec<_>>();
         let payload_idx = names
             .iter()
             .position(|name| name == "payload.bin")
@@ -168,7 +172,7 @@ fn create_parity_audit_p7zip_link_payloads_and_metadata() {
     );
 
     let archive = r7z::Archive::open(&archive_path).unwrap();
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let names = fi.names().collect::<Vec<_>>();
     let link_idx = names.iter().position(|name| name == "link.txt").unwrap();
     let hard_idx = names.iter().position(|name| name == "hard.txt").unwrap();

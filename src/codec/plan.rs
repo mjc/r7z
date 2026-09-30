@@ -1,5 +1,5 @@
 use super::*;
-use crate::folder::FolderGraph;
+use crate::folder::{Bcj2Layout, CoderIndex, FolderGraph, PackedStreamIndex};
 
 /// An executable topology with parsed codec properties and admitted memory usage.
 pub(crate) struct DecoderPlan<'a> {
@@ -19,12 +19,12 @@ impl WorkingSet {
             .ok_or(R7zError::Decompression)
     }
 
-    fn admit(self) -> Result<Self, R7zError> {
-        if self.0 > MAX_DECODER_WORKING_SET_BYTES {
-            return Err(resource_limit(
-                "decoder working set",
-                MAX_DECODER_WORKING_SET_BYTES,
-            ));
+    fn admit(self, configured_limit: Option<u64>) -> Result<Self, R7zError> {
+        let limit = configured_limit.map_or(MAX_DECODER_WORKING_SET_BYTES as u64, |limit| {
+            limit.min(MAX_DECODER_WORKING_SET_BYTES as u64)
+        }) as usize;
+        if self.0 > limit {
+            return Err(resource_limit("decoder working set", limit));
         }
         Ok(self)
     }
@@ -46,6 +46,11 @@ enum Topology {
         slots: Bcj2Slots,
         output_size: usize,
     },
+}
+
+enum DecoderTopology {
+    Chain,
+    Bcj2(Bcj2Layout),
 }
 
 pub(crate) struct ReadyDecoder<R> {
@@ -85,6 +90,44 @@ struct Bcj2Slots {
 
 struct PackedLayout<'a> {
     sizes: &'a [u64],
+}
+
+fn decoder_topology(folder: &Folder, graph: &FolderGraph) -> Result<DecoderTopology, R7zError> {
+    match graph.bcj2_layout(folder)? {
+        Some(layout) => {
+            let bcj2 = folder
+                .coders
+                .iter()
+                .find(|coder| coder.codec_id.as_slice() == crate::CODEC_BCJ2)
+                .ok_or(R7zError::InvalidFolderGraph)?;
+            no_properties(bcj2)?;
+            Ok(DecoderTopology::Bcj2(layout))
+        }
+        None => {
+            let unknown_method = folder
+                .coders
+                .iter()
+                .find(|coder| crate::method_from_id(&coder.codec_id).is_none());
+            match unknown_method {
+                Some(coder) => Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec())),
+                None if folder
+                    .coders
+                    .iter()
+                    .all(|coder| coder.num_in_streams == 1 && coder.num_out_streams == 1) =>
+                {
+                    Ok(DecoderTopology::Chain)
+                }
+                None => Err(R7zError::InvalidFolderGraph),
+            }
+        }
+    }
+}
+
+fn no_properties(coder: &crate::CoderInfo) -> Result<(), R7zError> {
+    match coder.properties.as_deref() {
+        None | Some([]) => Ok(()),
+        Some(_) => Err(R7zError::Decompression),
+    }
 }
 
 /// Readers checked against the planned list and bounded to its byte lengths.
@@ -130,6 +173,7 @@ impl<R> BoundInputs<R> {
 }
 
 impl<'a> DecoderPlan<'a> {
+    #[cfg(test)]
     pub(crate) fn compile(
         folder: &Folder,
         graph: &FolderGraph,
@@ -137,8 +181,26 @@ impl<'a> DecoderPlan<'a> {
         sizes: &[u64],
         packed_sizes: &'a [u64],
     ) -> Result<Self, R7zError> {
+        Self::compile_with_working_set_limit(folder, graph, unpack_size, sizes, packed_sizes, None)
+    }
+
+    pub(crate) fn compile_with_working_set_limit(
+        folder: &Folder,
+        graph: &FolderGraph,
+        unpack_size: u64,
+        sizes: &[u64],
+        packed_sizes: &'a [u64],
+        max_working_set_bytes: Option<u64>,
+    ) -> Result<Self, R7zError> {
         let sizes = CoderOutputSizes::complete(folder, graph, unpack_size, sizes)?;
-        Self::with_output_sizes(folder, graph, unpack_size, sizes, packed_sizes)
+        Self::with_output_sizes(
+            folder,
+            graph,
+            unpack_size,
+            sizes,
+            packed_sizes,
+            max_working_set_bytes,
+        )
     }
 
     pub(super) fn with_output_sizes(
@@ -147,6 +209,7 @@ impl<'a> DecoderPlan<'a> {
         unpack_size: u64,
         sizes: CoderOutputSizes<'_>,
         packed_sizes: &'a [u64],
+        max_working_set_bytes: Option<u64>,
     ) -> Result<Self, R7zError> {
         validate_folder_coder_count(folder)?;
         if graph.packed_stream_count() != packed_sizes.len() {
@@ -155,7 +218,7 @@ impl<'a> DecoderPlan<'a> {
         let inputs = PackedLayout {
             sizes: packed_sizes,
         };
-        match DecoderTopology::from_folder(folder)? {
+        match decoder_topology(folder, graph)? {
             DecoderTopology::Chain => {
                 let [packed_size] = packed_sizes else {
                     return Err(R7zError::InvalidFolderGraph);
@@ -197,57 +260,46 @@ impl<'a> DecoderPlan<'a> {
                     .try_fold(WorkingSet::default(), |total, step| {
                         total.add(step.working_set()?)
                     })?
-                    .admit()?;
+                    .admit(max_working_set_bytes)?;
                 Ok(Self {
                     topology: Topology::Chain(steps),
                     memory,
                     inputs,
                 })
             }
-            DecoderTopology::Bcj2 => {
+            DecoderTopology::Bcj2(layout) => {
                 let output_size = bcj2_output_size(unpack_size)?;
-                let (main, call, jump, slots) = match (
-                    folder.coders.as_slice(),
-                    folder.packed_indices.as_slice(),
-                    folder.bind_pairs.as_slice(),
-                    packed_sizes,
-                ) {
-                    ([main, _], [0, 2, 3, 4], [(1, 0)], [_, _, _, _]) => (
-                        (main, sizes.get(0)),
-                        None,
-                        None,
-                        Bcj2Slots {
-                            main: PackedInputSlot(0),
-                            call: PackedInputSlot(1),
-                            jump: PackedInputSlot(2),
-                            control: PackedInputSlot(3),
-                        },
-                    ),
-                    (
-                        [jump, call, main, _],
-                        [2, 6, 1, 0],
-                        [(5, 0), (4, 1), (3, 2)],
-                        [_, _, _, _],
-                    ) => (
-                        (main, sizes.get(2)),
-                        Some((call, sizes.get(1))),
-                        Some((jump, sizes.get(0))),
-                        Bcj2Slots {
-                            main: PackedInputSlot(0),
-                            call: PackedInputSlot(2),
-                            jump: PackedInputSlot(3),
-                            control: PackedInputSlot(1),
-                        },
-                    ),
-                    _ => return Err(R7zError::Parse),
-                };
-                let channel = |(coder, size), slot| {
+                let slot = |packed: PackedStreamIndex| PackedInputSlot(packed.get());
+                let compile_channel = |coder: CoderIndex, packed: PackedInputSlot| {
+                    let index = coder.get();
+                    let coder = folder
+                        .coders
+                        .get(index)
+                        .ok_or(R7zError::InvalidFolderGraph)?;
+                    let size = sizes.get(index);
                     SizedCoder::compile(coder, size)?
-                        .bind_size(OutputSize::Known(inputs.size(slot)? as u64))
+                        .bind_size(OutputSize::Known(inputs.size(packed)? as u64))
                 };
-                let main = channel(main, slots.main)?;
-                let call = call.map(|coder| channel(coder, slots.call)).transpose()?;
-                let jump = jump.map(|coder| channel(coder, slots.jump)).transpose()?;
+                let slots = Bcj2Slots {
+                    main: slot(layout.main.packed),
+                    call: slot(layout.call.packed),
+                    jump: slot(layout.jump.packed),
+                    control: slot(layout.control.packed),
+                };
+                let main = compile_channel(
+                    layout.main.coder.ok_or(R7zError::InvalidFolderGraph)?,
+                    slots.main,
+                )?;
+                let call = layout
+                    .call
+                    .coder
+                    .map(|coder| compile_channel(coder, slots.call))
+                    .transpose()?;
+                let jump = layout
+                    .jump
+                    .coder
+                    .map(|coder| compile_channel(coder, slots.jump))
+                    .transpose()?;
                 let channels = [
                     (Some(&main), slots.main),
                     (call.as_ref(), slots.call),
@@ -272,6 +324,9 @@ impl<'a> DecoderPlan<'a> {
                     return Err(R7zError::Decompression);
                 }
                 ensure_bcj2_working_budget(output_size, memory.0)?;
+                let memory = memory
+                    .add(WorkingSet(output_size))?
+                    .admit(max_working_set_bytes)?;
                 Ok(Self {
                     topology: Topology::Bcj2 {
                         main,
@@ -341,6 +396,26 @@ impl<R: Read> BoundInput<R> {
 }
 
 impl<R: Read> ReadyDecoder<R> {
+    pub(crate) fn eager_output_size(&self) -> Option<u64> {
+        match &self.topology {
+            BoundTopology::Bcj2 { output_size, .. } => Some(*output_size as u64),
+            BoundTopology::Chain { steps, .. } => {
+                steps.iter().enumerate().rev().find_map(|(index, step)| {
+                    let eager_final_output = matches!(&step.coder, CoderPlan::Aes(_))
+                        && steps[index + 1..]
+                            .iter()
+                            .all(|following| following.coder.preserves_size());
+                    eager_final_output
+                        .then_some(step.output)
+                        .and_then(|output| match output {
+                            OutputSize::Known(size) => Some(size),
+                            OutputSize::Unknown => None,
+                        })
+                })
+            }
+        }
+    }
+
     pub(super) fn materialize(self, password: Option<&str>) -> Result<Vec<u8>, R7zError> {
         let limit = self.memory.output_limit()?;
         let mut reader = self.start(password)?;
@@ -416,7 +491,7 @@ struct DecodeStep {
 
 impl DecodeStep {
     fn working_set(&self) -> Result<WorkingSet, R7zError> {
-        self.coder.working_set(self.input)
+        self.coder.working_set()
     }
 
     fn open<'r>(
@@ -449,21 +524,51 @@ impl CoderPlan {
     pub(super) fn compile(coder: &crate::CoderInfo, size: OutputSize) -> Result<Self, R7zError> {
         use crate::SevenZMethod as Method;
         let properties = || coder.properties.as_deref().ok_or(R7zError::Decompression);
-        Ok(match crate::method_from_id(&coder.codec_id) {
-            Some(Method::Copy) => Self::Copy,
-            Some(Method::Lzma) => Self::Lzma(LzmaProperties::parse(properties()?)?),
-            Some(Method::Lzma2) => Self::Lzma2(lzma2_dict_size(coder.properties.as_deref())?),
-            Some(Method::Bcj) => Self::X86,
-            Some(Method::Arm) => Self::Branch(crate::bcj::BranchFilter::Arm),
-            Some(Method::ArmThumb) => Self::Branch(crate::bcj::BranchFilter::ArmThumb),
-            Some(Method::Ia64) => Self::Branch(crate::bcj::BranchFilter::Ia64),
-            Some(Method::Ppc) => Self::Branch(crate::bcj::BranchFilter::Ppc),
-            Some(Method::Sparc) => Self::Branch(crate::bcj::BranchFilter::Sparc),
-            Some(Method::Arm64) => Self::Arm64(branch_start_pos(coder.properties.as_deref(), 4)?),
-            Some(Method::Riscv) => Self::Riscv(branch_start_pos(coder.properties.as_deref(), 2)?),
-            Some(Method::Deflate) => Self::Deflate,
-            Some(Method::BZip2) => Self::Bzip2,
-            Some(Method::Ppmd) => {
+        let info = crate::method_info(&coder.codec_id)
+            .filter(|info| info.can_decode())
+            .ok_or_else(|| R7zError::UnsupportedCodec(coder.codec_id.to_vec()))?;
+        Ok(match info.method {
+            Method::Copy => {
+                no_properties(coder)?;
+                Self::Copy
+            }
+            Method::Lzma => Self::Lzma(LzmaProperties::parse(properties()?)?),
+            Method::Lzma2 => Self::Lzma2(lzma2_dict_size(coder.properties.as_deref())?),
+            Method::Bcj => {
+                no_properties(coder)?;
+                Self::X86
+            }
+            Method::Arm => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Arm)
+            }
+            Method::ArmThumb => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::ArmThumb)
+            }
+            Method::Ia64 => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Ia64)
+            }
+            Method::Ppc => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Ppc)
+            }
+            Method::Sparc => {
+                no_properties(coder)?;
+                Self::Branch(crate::bcj::BranchFilter::Sparc)
+            }
+            Method::Arm64 => Self::Arm64(branch_start_pos(coder.properties.as_deref(), 4)?),
+            Method::Riscv => Self::Riscv(branch_start_pos(coder.properties.as_deref(), 2)?),
+            Method::Deflate => {
+                no_properties(coder)?;
+                Self::Deflate
+            }
+            Method::BZip2 => {
+                no_properties(coder)?;
+                Self::Bzip2
+            }
+            Method::Ppmd => {
                 let (order, memory) = ppmd_properties(properties()?)?;
                 Self::Ppmd {
                     order,
@@ -471,21 +576,30 @@ impl CoderPlan {
                     size: size.require()?,
                 }
             }
-            Some(Method::Deflate64) => Self::Deflate64,
-            Some(Method::Delta) => {
+            Method::Deflate64 => {
+                no_properties(coder)?;
+                Self::Deflate64
+            }
+            Method::Delta => {
                 let &[distance] = properties()? else {
                     return Err(R7zError::Decompression);
                 };
                 Self::Delta(distance)
             }
-            Some(Method::Swap2) => Self::Swap(2),
-            Some(Method::Swap4) => Self::Swap(4),
-            Some(Method::SevenZAes) => Self::Aes(crate::aes::AesProperties::parse(properties()?)?),
+            Method::Swap2 => {
+                no_properties(coder)?;
+                Self::Swap(2)
+            }
+            Method::Swap4 => {
+                no_properties(coder)?;
+                Self::Swap(4)
+            }
+            Method::SevenZAes => Self::Aes(crate::aes::AesProperties::parse(properties()?)?),
             _ => return Err(R7zError::UnsupportedCodec(coder.codec_id.to_vec())),
         })
     }
 
-    fn working_set(&self, input_size: OutputSize) -> Result<WorkingSet, R7zError> {
+    fn working_set(&self) -> Result<WorkingSet, R7zError> {
         let bytes = match self {
             Self::Lzma(properties) => properties.memory,
             Self::Lzma2(dictionary) => (*dictionary as usize)
@@ -495,10 +609,8 @@ impl CoderPlan {
             Self::Ppmd { memory, .. } => (*memory as usize)
                 .checked_add(DECODER_OVERHEAD_BYTES)
                 .ok_or(R7zError::Decompression)?,
-            Self::Aes(_) => input_size
-                .buffered_bytes(MAX_BUFFERED_AES_BYTES)
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(DECODER_OVERHEAD_BYTES))
+            Self::Aes(_) => AES_CBC_WORKING_SET_BYTES
+                .checked_add(DECODER_OVERHEAD_BYTES)
                 .ok_or(R7zError::Decompression)?,
             Self::Copy | Self::X86 | Self::Branch(_) | Self::Delta(_) | Self::Swap(_) => 0,
             Self::Arm64(_) | Self::Riscv(_) | Self::Deflate | Self::Bzip2 | Self::Deflate64 => {
@@ -722,9 +834,43 @@ mod tests {
                 [1, 5, 4, 0],
                 [0, 2, 3, 1],
             ),
+            (
+                Folder {
+                    coders: smallvec::smallvec![copy(), copy(), copy(), bcj2()],
+                    packed_indices: smallvec::smallvec![0, 6, 2, 1],
+                    bind_pairs: smallvec::smallvec![(3, 0), (5, 1), (4, 2)],
+                },
+                vec![1, 0, 4, 5],
+                [1, 5, 4, 0],
+                [0, 2, 3, 1],
+            ),
+            (
+                Folder {
+                    coders: smallvec::smallvec![bcj2(), copy(), copy(), copy()],
+                    packed_indices: smallvec::smallvec![6, 5, 4, 3],
+                    bind_pairs: smallvec::smallvec![(0, 3), (2, 1), (1, 2)],
+                },
+                vec![5, 0, 4, 1],
+                [1, 4, 0, 5],
+                [0, 1, 2, 3],
+            ),
         ];
         for (folder, outputs, packed, expected) in layouts {
             let graph = folder.graph().unwrap();
+            assert!(matches!(
+                DecoderPlan::compile_with_working_set_limit(
+                    &folder,
+                    &graph,
+                    5,
+                    &outputs,
+                    &packed,
+                    Some(0),
+                ),
+                Err(R7zError::ResourceLimitExceeded {
+                    resource: "decoder working set",
+                    limit: 0,
+                })
+            ));
             let inputs = |bad_slot| {
                 packed
                     .iter()
@@ -771,10 +917,61 @@ mod tests {
     }
 
     #[test]
+    fn decoders_reject_properties_they_do_not_apply() {
+        let methods = [
+            crate::SevenZMethod::Copy,
+            crate::SevenZMethod::Bcj,
+            crate::SevenZMethod::Arm,
+            crate::SevenZMethod::ArmThumb,
+            crate::SevenZMethod::Ia64,
+            crate::SevenZMethod::Ppc,
+            crate::SevenZMethod::Sparc,
+            crate::SevenZMethod::Deflate,
+            crate::SevenZMethod::BZip2,
+            crate::SevenZMethod::Deflate64,
+            crate::SevenZMethod::Swap2,
+            crate::SevenZMethod::Swap4,
+        ];
+        for method in methods {
+            let mut coder = coder(&[1, 0]);
+            coder.codec_id = arrayvec::ArrayVec::from_iter(method.id().iter().copied());
+            coder.properties = Some(smallvec::smallvec![0]);
+            assert!(
+                matches!(
+                    CoderPlan::compile(&coder, OutputSize::Known(0)),
+                    Err(R7zError::Decompression)
+                ),
+                "{} accepted ignored properties",
+                method.name()
+            );
+
+            coder.properties = Some(smallvec::SmallVec::new());
+            assert!(CoderPlan::compile(&coder, OutputSize::Known(0)).is_ok());
+        }
+    }
+
+    #[test]
+    fn bcj2_rejects_properties_before_binding_inputs() {
+        let copy = || coder(&[1, 0]);
+        let bcj2 = || coder(&[0x14, 3, 3, 1, 0x1b, 4, 1]);
+        let mut folder = Folder {
+            coders: smallvec::smallvec![copy(), bcj2()],
+            packed_indices: smallvec::smallvec![0, 2, 3, 4],
+            bind_pairs: smallvec::smallvec![(1, 0)],
+        };
+        folder.coders[1].properties = Some(smallvec::smallvec![0]);
+        let graph = folder.graph().unwrap();
+        assert!(matches!(
+            DecoderPlan::compile(&folder, &graph, 5, &[1, 5], &[1, 4, 0, 5]),
+            Err(R7zError::Decompression)
+        ));
+    }
+
+    #[test]
     fn typed_codec_plans_preserve_memory_estimates() {
         let lzma2 = CoderPlan::compile(&coder(&[0x21, 0x21, 1, 0]), OutputSize::Known(0)).unwrap();
         assert_eq!(
-            lzma2.working_set(OutputSize::Known(0)).unwrap().0,
+            lzma2.working_set().unwrap().0,
             4096 + MAX_LZMA2_PROBABILITY_BYTES + DECODER_OVERHEAD_BYTES
         );
         let ppmd = CoderPlan::compile(
@@ -783,31 +980,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ppmd.working_set(OutputSize::Known(0)).unwrap().0,
+            ppmd.working_set().unwrap().0,
             1024 * 1024 + DECODER_OVERHEAD_BYTES
         );
         let copy = CoderPlan::compile(&coder(&[1, 0]), OutputSize::Known(0)).unwrap();
-        assert_eq!(
-            copy.working_set(OutputSize::Known(usize::MAX as u64))
-                .unwrap()
-                .0,
-            0
-        );
+        assert_eq!(copy.working_set().unwrap().0, 0);
     }
 
     #[test]
-    fn aes_working_set_uses_packed_size_and_caps_buffer_estimate() {
+    fn aes_working_set_covers_streaming_state() {
         let aes = CoderPlan::compile(
             &coder(&[0x24, 6, 0xf1, 7, 1, 2, 0, 0]),
             OutputSize::Known(0),
         )
         .unwrap();
-        for packed in [0, 129 * 1024 * 1024, MAX_BUFFERED_AES_BYTES, usize::MAX] {
-            assert_eq!(
-                aes.working_set(OutputSize::Known(packed as u64)).unwrap().0,
-                packed.min(MAX_BUFFERED_AES_BYTES) * 2 + DECODER_OVERHEAD_BYTES
-            );
-        }
+        assert_eq!(
+            aes.working_set().unwrap().0,
+            AES_CBC_WORKING_SET_BYTES + DECODER_OVERHEAD_BYTES
+        );
     }
 
     #[test]
@@ -999,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn aes_admission_uses_the_preceding_coders_output() {
+    fn aes_admission_does_not_scale_with_the_preceding_coders_output() {
         let folder = pair(
             coder(&[0x21, 0x21, 1, 0]),
             coder(&[0x24, 6, 0xf1, 7, 1, 2, 0, 0]),
@@ -1010,11 +1200,11 @@ mod tests {
             plan.memory.0,
             4096 + MAX_LZMA2_PROBABILITY_BYTES
                 + DECODER_OVERHEAD_BYTES
-                + 2 * 4096
+                + AES_CBC_WORKING_SET_BYTES
                 + DECODER_OVERHEAD_BYTES
         );
-        for sizes in [&[][..], &[MAX_BUFFERED_AES_BYTES as u64, 0][..]] {
-            assert!(matches!(
+        for sizes in [&[][..], &[256 * 1024 * 1024, 0][..]] {
+            assert!(
                 prepare_folder_decoder(
                     &folder,
                     smallvec::smallvec![PackedInput {
@@ -1023,12 +1213,9 @@ mod tests {
                     }],
                     0,
                     sizes
-                ),
-                Err(R7zError::ResourceLimitExceeded {
-                    resource: "decoder working set",
-                    ..
-                })
-            ));
+                )
+                .is_ok()
+            );
         }
     }
 

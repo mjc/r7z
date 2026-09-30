@@ -112,6 +112,8 @@ pub enum SolidMode {
 pub struct StreamingOptions {
     pub buffer_size: usize,
     pub spool: SpoolMode,
+    /// Maximum size of a temporary archive spool. Memory-only spools do not use this limit.
+    pub max_temporary_storage_bytes: Option<u64>,
 }
 
 impl Default for StreamingOptions {
@@ -122,6 +124,7 @@ impl Default for StreamingOptions {
                 memory_threshold: 16 * 1024 * 1024,
                 dir: None,
             },
+            max_temporary_storage_bytes: None,
         }
     }
 }
@@ -258,19 +261,67 @@ impl ArchiveEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct WriteFolderId(usize);
+
+impl WriteFolderId {
+    pub(crate) const FIRST: Self = Self(0);
+
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub(crate) fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct WriteEntry {
     pub name: String,
+    pub raw_name: Option<crate::RawEntryName>,
     pub kind: EntryKind,
     pub meta: EntryMeta,
-    pub has_stream: bool,
-    pub data: Option<Vec<u8>>,
-    pub folder_id: usize,
+    pub stream: WriteEntryStream,
+    pub folder_id: WriteFolderId,
+}
+
+#[derive(Clone)]
+pub(crate) enum WriteEntryStream {
+    Empty,
+    Buffered(Vec<u8>),
+    Streaming,
+}
+
+impl WriteEntryStream {
+    pub(crate) fn has_stream(&self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+
+    pub(crate) fn buffered_data(&self) -> Option<&[u8]> {
+        match self {
+            Self::Buffered(data) => Some(data),
+            Self::Empty | Self::Streaming => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct WriteEntryIndex(usize);
+
+impl WriteEntryIndex {
+    pub(super) const fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub(super) const fn index(self) -> usize {
+        self.0
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct CompletedFolder {
-    pub file_indices: Vec<usize>,
+    pub file_indices: Vec<WriteEntryIndex>,
     pub pack_sizes: Vec<u64>,
     pub coder_info: Vec<u8>,
     pub coder_unpack_sizes: Vec<u64>,

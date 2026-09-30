@@ -1,4 +1,4 @@
-use r7z::sevenzip_varuint64_decode;
+use r7z::raw::sevenzip_varuint64_decode;
 
 mod support;
 

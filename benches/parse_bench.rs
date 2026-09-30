@@ -13,29 +13,25 @@ fn fixture_bytes() -> Vec<u8> {
 fn bench_signature_parse(c: &mut Criterion) {
     let data = fixture_bytes();
     c.bench_function("SignatureHeader::parse", |b| {
-        b.iter(|| r7z::SignatureHeader::parse(black_box(&data)).unwrap())
+        b.iter(|| r7z::raw::SignatureHeader::parse(black_box(&data)).unwrap())
     });
 }
 
 fn bench_archive_open_mmap(c: &mut Criterion) {
     let path = Path::new("tests/fixtures/test_1.7z");
     c.bench_function("Archive::open mmap fixture", |b| {
-        b.iter(|| r7z::Archive::open(black_box(path)).unwrap())
+        b.iter(|| {
+            // SAFETY: The fixture is not modified during this benchmark.
+            unsafe { r7z::Archive::open_mmap(black_box(path)) }.unwrap()
+        })
     });
 }
 
-fn bench_archive_open_seek(c: &mut Criterion) {
+fn bench_archive_open_positioned(c: &mut Criterion) {
     let path = Path::new("tests/fixtures/test_1.7z");
-    c.bench_function("Archive::open seek fixture", |b| {
+    c.bench_function("Archive::open positioned fixture", |b| {
         b.iter(|| {
-            r7z::Archive::open_with_options(
-                black_box(path),
-                r7z::ArchiveOpenOptions {
-                    storage_mode: r7z::ArchiveStorageMode::Seek,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            r7z::Archive::open(black_box(path)).unwrap();
         })
     });
 }
@@ -57,18 +53,11 @@ fn sparse_archive_path() -> PathBuf {
     path
 }
 
-fn bench_archive_open_seek_sparse(c: &mut Criterion) {
+fn bench_archive_open_positioned_sparse(c: &mut Criterion) {
     let path = sparse_archive_path();
-    c.bench_function("Archive::open seek sparse_256mb", |b| {
+    c.bench_function("Archive::open positioned sparse_256mb", |b| {
         b.iter(|| {
-            r7z::Archive::open_with_options(
-                black_box(path.as_path()),
-                r7z::ArchiveOpenOptions {
-                    storage_mode: r7z::ArchiveStorageMode::Seek,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            r7z::Archive::open(black_box(path.as_path())).unwrap();
         })
     });
 }
@@ -83,7 +72,7 @@ fn bench_archive_from_bytes(c: &mut Criterion) {
 fn bench_extract_to_memory(c: &mut Criterion) {
     let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
     // Find the first non-empty file index
-    let fi = archive.files_info().unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let num_files = usize::try_from(fi.num_files).expect("num_files fits in usize");
     let idx = (0..num_files)
         .find(|&i| !fi.is_empty_stream(i))
@@ -94,15 +83,8 @@ fn bench_extract_to_memory(c: &mut Criterion) {
 }
 
 fn bench_extract_to_writer_seek_backed(c: &mut Criterion) {
-    let archive = r7z::Archive::open_with_options(
-        Path::new("tests/fixtures/test_1.7z"),
-        r7z::ArchiveOpenOptions {
-            storage_mode: r7z::ArchiveStorageMode::Seek,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let fi = archive.files_info().unwrap();
+    let archive = r7z::Archive::open(Path::new("tests/fixtures/test_1.7z")).unwrap();
+    let fi = archive.raw_files_info().unwrap();
     let num_files = usize::try_from(fi.num_files).expect("num_files fits in usize");
     let idx = (0..num_files)
         .find(|&i| !fi.is_empty_stream(i))
@@ -133,8 +115,8 @@ criterion_group!(
     benches,
     bench_signature_parse,
     bench_archive_open_mmap,
-    bench_archive_open_seek,
-    bench_archive_open_seek_sparse,
+    bench_archive_open_positioned,
+    bench_archive_open_positioned_sparse,
     bench_archive_from_bytes,
     bench_extract_to_memory,
     bench_extract_to_writer_seek_backed,
