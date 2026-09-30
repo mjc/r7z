@@ -765,6 +765,29 @@ mod tests {
             FilesInfo::parse_with_external(&trailing_values, &trailing_values_backing, &external)
                 .is_err()
         );
+
+        let truncated_values = [0x05, 0x01, 0x12, 0x03, 0x01, 0x01, 0x00, 0x00];
+        let truncated_backing = Bytes::copy_from_slice(&truncated_values);
+        let truncated_external = [Bytes::from_static(&[0; 7])];
+        assert!(
+            FilesInfo::parse_with_external(
+                &truncated_values,
+                &truncated_backing,
+                &truncated_external
+            )
+            .is_err()
+        );
+
+        let trailing_index = [0x05, 0x01, 0x11, 0x03, 0x01, 0x00, 0x00, 0x00];
+        let trailing_index_backing = Bytes::copy_from_slice(&trailing_index);
+        assert!(
+            FilesInfo::parse_with_external(
+                &trailing_index,
+                &trailing_index_backing,
+                &truncated_external
+            )
+            .is_err()
+        );
     }
 
     #[test]

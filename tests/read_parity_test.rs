@@ -248,6 +248,25 @@ fn build_copy_archive_with_external_name(name: &str, data: &[u8]) -> Vec<u8> {
         crc32fast::hash(&external_name),
     );
     let header_start = 32 + data.len() + external_name.len();
+    let additional_start = archive[header_start..]
+        .windows(2)
+        .position(|window| window == [0x03, 0x06])
+        .map(|offset| header_start + offset)
+        .unwrap();
+    let files_info_start = archive[additional_start..]
+        .windows(2)
+        .position(|window| window == [0x05, 0x01])
+        .map(|offset| additional_start + offset)
+        .unwrap();
+    let additional_info = archive[additional_start..files_info_start].to_vec();
+    archive.drain(additional_start..files_info_start);
+    let main_streams_start = archive[header_start..]
+        .iter()
+        .position(|&tag| tag == 0x04)
+        .map(|offset| header_start + offset)
+        .unwrap();
+    archive.splice(main_streams_start..main_streams_start, additional_info);
+
     let mut inline_name_property = vec![0x11];
     inline_name_property.extend_from_slice(&r7z::raw::sevenzip_varuint64_encode(
         1 + external_name.len() as u64,
@@ -460,6 +479,20 @@ fn external_file_names_are_loaded_from_additional_streams() {
         Some("external-name.txt")
     );
     assert_eq!(archive.extract_to_memory(0).unwrap(), b"external data");
+}
+
+#[test]
+fn external_metadata_matches_official_7zip_fixture() {
+    let archive = r7z::Archive::open(std::path::Path::new(
+        "tests/corpus/7z/generated/external_metadata.7z",
+    ))
+    .unwrap();
+    let files = archive.try_raw_files_info().unwrap().unwrap();
+
+    assert_eq!(files.name(0).as_deref(), Some("external-metadata.txt"));
+    assert_eq!(files.ctimes, [Some(132_223_104_000_000_000)]);
+    assert_eq!(files.attributes, [Some(0x20)]);
+    assert_eq!(archive.extract_to_memory(0).unwrap(), b"");
 }
 
 #[test]

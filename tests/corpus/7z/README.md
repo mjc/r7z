@@ -67,3 +67,13 @@ The checked-in archives have SHA-256 values:
 | `arm64_offset4.7z` | `cc30388a53c537d61ff4017c9be1eea4068436b69f66390182e6bb1dd112cf9a` |
 | `riscv.7z` | `0bf1512b2f6756118987baf1c747cf4ca0137531b0a451db47073cce0ef3e66e` |
 | `riscv_offset2.7z` | `9a7101b59363e384daf64ab0012ed0d831325d633d556cdb194b33b646a65118` |
+
+## External FilesInfo fixture
+
+`external_metadata.7z` is a small synthetic archive with its name, creation
+time, and Windows attributes stored in separate additional streams. Official
+7-Zip 26.03 (`7z2603-linux-x64.tar.xz`, SHA-256
+`dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695`) lists it
+as `external-metadata.txt`, created at FILETIME `132223104000000000`, with
+attribute `A`. Its SHA-256 is
+`0bd05f1fb0007d3cc8ca77573908ee7b9db747c5065397608fd2e09f9abcf957`.
