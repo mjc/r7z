@@ -528,6 +528,14 @@ re-encoded; exact original folder graph preservation is not guaranteed for those
 rewritten folders. Updating split-volume input writes a normal unsplit
 replacement archive.
 
+Replacements are written to a unique temporary file beside the destination.
+Read, write, flush and rename failures leave the destination unchanged and remove
+the temporary file. A successful rename commits the replacement; no fallible work
+follows it. This protects against operation failures, not power loss. Retained
+entries keep their names (including raw UTF-16 names), contents, timestamps,
+attributes and start positions. Entry and folder indexes belong to one archive
+and may change when the replacement is opened.
+
 Compression method parsing accepts p7zip-style LZMA property options such as
 `-m0=LZMA:lc=2:lp=1:pb=1` or standalone `-mlc=2 -mlp=1 -mpb=1`,
 plus match-finder options such as `-m0=LZMA:mf=bt4` or `-mmf=hc4`, alongside

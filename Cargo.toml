@@ -43,6 +43,7 @@ sha2 = "0.10"
 getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cap-std = { version = "4.0.3", default-features = false }
+tempfile = "3.26.0"
 
 [patch.crates-io]
 lzma-rust2 = { path = "vendor/lzma-rust2" }
@@ -50,7 +51,6 @@ lzma-rust2 = { path = "vendor/lzma-rust2" }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 hex = "0.4"
-tempfile = "3.26.0"
 pprof = { version = "0.15", features = ["flamegraph"] }
 xz2 = "0.1.7"
 walkdir = "2.5.0"

@@ -1750,20 +1750,41 @@ fn write_preserved_archive_entries_atomic(
     raw_folders: Vec<RawFolderBlock>,
     options: &ArchiveOptions,
 ) -> Result<(), CliError> {
-    let tmp_path = temp_archive_path(archive_path);
-    let file = fs::File::create(&tmp_path)?;
-    let result = match source {
-        Some(source) => write_archive_update(source, file, entries, raw_folders, options),
-        None if raw_folders.is_empty() => {
-            write_archive_with_preserved_folders(file, entries, raw_folders, options)
-        }
-        None => Err(R7zError::ArchiveMismatch),
-    };
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
+    replace_archive(archive_path, |file| {
+        match source {
+            Some(source) => write_archive_update(source, file, entries, raw_folders, options),
+            None if raw_folders.is_empty() => {
+                write_archive_with_preserved_folders(file, entries, raw_folders, options)
+            }
+            None => Err(R7zError::ArchiveMismatch),
+        }?;
+        Ok(())
+    })
+}
+
+/// The temporary file owns cleanup until the rename commits the replacement.
+/// All fallible work precedes that commit; this does not promise crash durability.
+fn replace_archive(
+    destination: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let directory = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".r7z-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
     }
-    fs::rename(&tmp_path, archive_path)?;
+    let mut temporary = builder.tempfile_in(directory)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file_mut().flush()?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -2089,6 +2110,214 @@ mod tests {
         decide_overwrite, parse_overwrite_answer, wildcard_match_raw,
     };
     use std::{collections::VecDeque, path::Path};
+
+    #[test]
+    fn failed_archive_replacement_removes_temporary_output() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("archive.7z");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("original"), b"original").unwrap();
+        let result = super::write_preserved_archive_entries_atomic(
+            None,
+            &destination,
+            Vec::new(),
+            Vec::new(),
+            &r7z::ArchiveOptions::default(),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(destination.join("original")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn archive_input_failure_preserves_source_and_cleans_output() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("archive.7z");
+        std::fs::write(&destination, b"original").unwrap();
+        let entry = r7z::update::v1::PreservedArchiveEntry {
+            name: "missing".into(),
+            raw_name: None,
+            kind: r7z::EntryKind::File,
+            meta: r7z::EntryMeta::default(),
+            stream: r7z::update::v1::PreservedEntryStream::Path {
+                path: root.path().join("missing"),
+                size: 1,
+            },
+        };
+        let result = super::write_preserved_archive_entries_atomic(
+            None,
+            &destination,
+            vec![entry],
+            Vec::new(),
+            &r7z::ArchiveOptions::default(),
+        );
+        assert!(
+            matches!(result, Err(CliError::Fatal(r7z::R7zError::Io(error)))
+            if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum OutputFailure {
+        Write,
+        Flush,
+    }
+
+    struct FailingOutput<'a> {
+        file: &'a mut std::fs::File,
+        failure: OutputFailure,
+    }
+
+    impl std::io::Write for FailingOutput<'_> {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            match self.failure {
+                OutputFailure::Write => Err(std::io::Error::other("injected write failure")),
+                OutputFailure::Flush => self.file.write(data),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected flush failure"))
+        }
+    }
+
+    impl std::io::Seek for FailingOutput<'_> {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(position)
+        }
+    }
+
+    #[test]
+    fn archive_output_failures_preserve_source_and_clean_output() {
+        for failure in [OutputFailure::Write, OutputFailure::Flush] {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("archive.7z");
+            std::fs::write(&destination, b"original").unwrap();
+            let result = super::replace_archive(&destination, |file| {
+                r7z::update::v1::write_archive_with_preserved_folders(
+                    FailingOutput { file, failure },
+                    Vec::new(),
+                    Vec::new(),
+                    &r7z::ArchiveOptions::default(),
+                )?;
+                Ok(())
+            });
+            let expected = match failure {
+                OutputFailure::Write => "injected write failure",
+                OutputFailure::Flush => "injected flush failure",
+            };
+            assert!(
+                matches!(result, Err(CliError::Fatal(r7z::R7zError::Io(error)))
+                if error.to_string() == expected)
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn archive_transactions_use_distinct_temporary_files() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("archive.7z");
+        super::replace_archive(&destination, |outer| {
+            outer.write_all(b"outer")?;
+            super::replace_archive(&destination, |inner| {
+                inner.write_all(b"inner")?;
+                Ok(())
+            })?;
+            assert_eq!(std::fs::read(&destination).unwrap(), b"inner");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"outer");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_uses_normal_archive_creation_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let normal = root.path().join("normal");
+        let destination = root.path().join("archive.7z");
+        std::fs::write(&normal, b"normal").unwrap();
+        super::replace_archive(&destination, |_| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::metadata(&normal).unwrap().permissions().mode(),
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode(),
+        );
+    }
+
+    #[test]
+    fn partial_solid_update_preserves_retained_entry_metadata() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("archive.7z");
+        let meta = r7z::EntryMeta {
+            ctime: Some(UNIX_EPOCH + Duration::from_secs(1)),
+            atime: Some(UNIX_EPOCH + Duration::from_secs(2)),
+            mtime: Some(UNIX_EPOCH + Duration::from_secs(3)),
+            attributes: Some(0x81A4_0020),
+            start_pos: Some(17),
+        };
+        let bytes = r7z::ArchiveBuilder::new()
+            .add_file("drop", b"discard")
+            .add_file_entry("keep", b"retained", meta.clone())
+            .add_empty_file("empty", meta.clone())
+            .build()
+            .unwrap();
+        std::fs::write(&destination, bytes).unwrap();
+        let source = r7z::Archive::open(&destination).unwrap();
+        let original = source.entries().skip(1).collect::<Vec<_>>();
+        let (entries, folders) = super::preserved_rewrite_entries(
+            &source,
+            None,
+            |entry| entry.name == "drop",
+            Vec::new(),
+        )
+        .unwrap();
+        super::write_preserved_archive_entries_atomic(
+            Some(&source),
+            &destination,
+            entries,
+            folders,
+            &r7z::ArchiveOptions::default(),
+        )
+        .unwrap();
+        let updated = r7z::Archive::open(&destination).unwrap();
+        let current = updated.entries().collect::<Vec<_>>();
+        assert_eq!(current.len(), original.len());
+        for (index, (before, after)) in original.iter().zip(&current).enumerate() {
+            assert_eq!(before.name, after.name);
+            assert_eq!(before.raw_name, after.raw_name);
+            assert_eq!(
+                super::entry_meta_from_archive(updated.raw_files_info().unwrap(), index),
+                meta
+            );
+        }
+        assert_eq!(
+            updated
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+                .unwrap(),
+            b"retained"
+        );
+        assert!(
+            updated
+                .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn parser_rejects_commands_without_required_operands() {
