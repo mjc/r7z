@@ -386,7 +386,7 @@ fn source_adapters_decode_the_same_entries() {
 
     let archives = [
         r7z::Archive::from_bytes(bytes.clone().into()).unwrap(),
-        r7z::Archive::from_reader(Cursor::new(bytes.clone())).unwrap(),
+        r7z::Archive::from_reader(Cursor::new(bytes)).unwrap(),
         r7z::Archive::open(&file_path).unwrap(),
         r7z::Archive::open(&split_path).unwrap(),
     ];
