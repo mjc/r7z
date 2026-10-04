@@ -11,6 +11,7 @@ pedantic = { level = "warn", priority = -1 }
 redundant_clone = "warn"
 needless_pass_by_ref_mut = "warn"
 search_is_some = "warn"
+derive_partial_eq_without_eq = "warn"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

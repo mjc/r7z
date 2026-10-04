@@ -18,7 +18,7 @@ pub(crate) fn decode_name(data: &[u8]) -> String {
 }
 
 /// File listing metadata from the 7z `FilesInfo` block.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FilesInfo {
     /// Total number of entries (files + directories).
     pub num_files: u64,

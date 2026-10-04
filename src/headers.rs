@@ -758,7 +758,7 @@ mod tests {
 ///
 /// Contains the magic bytes, format version, and the location and CRC of the
 /// next header (either an [`EncodedHeader`] or a plain `Header`).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SignatureHeader {
     /// Magic bytes: `37 7a bc af 27 1c`.
     pub signature: [u8; 6],

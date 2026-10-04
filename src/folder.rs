@@ -550,7 +550,7 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
 ///
 /// In the common case a folder contains a single [`CoderInfo`] with no bind pairs.
 /// Complex archives may chain multiple coders (e.g. BCJ + LZMA).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Folder {
     /// Ordered list of coders in this folder.
     /// Typically 1 (simple archive) or 2 (e.g. BCJ + LZMA); stays on the stack.
