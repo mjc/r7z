@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 mod support;
 
 use std::{fs, io::Cursor, path::PathBuf, process::Command};

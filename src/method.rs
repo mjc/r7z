@@ -114,9 +114,9 @@ pub const CODEC_COPY: &[u8] = &[0x00];
 pub const CODEC_AES_256_SHA_256: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 /// Codec ID for Deflate.
 pub const CODEC_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
-/// Codec ID for BZip2.
+/// Codec ID for `BZip2`.
 pub const CODEC_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
-/// Codec ID for PPMd.
+/// Codec ID for `PPMd`.
 pub const CODEC_PPMD: &[u8] = &[0x03, 0x04, 0x01];
 /// Codec ID for Deflate64.
 pub const CODEC_DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];

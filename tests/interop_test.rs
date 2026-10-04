@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 //! Interop tests: create archives with p7zip, extract with r7z, byte-compare.
 //!
 //! These tests require `7z` (p7zip) in PATH or `P7ZIP_BIN` set to its executable.
@@ -102,7 +100,7 @@ fn assert_every_folder_includes_bcj_lzma2(archive: &r7z::Archive) {
 fn executable_payload(size: usize) -> Vec<u8> {
     let mut data = vec![0x90u8; size];
     for pos in (16..size.saturating_sub(5)).step_by(97) {
-        let target = (pos as u32).wrapping_mul(13);
+        let target = u32::try_from(pos).unwrap().wrapping_mul(13);
         data[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
         data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
     }
@@ -114,8 +112,8 @@ fn branch_filter_payload(method: &str) -> Vec<u8> {
     match method {
         "ARM" => {
             for pos in (0..data.len()).step_by(16) {
-                data[pos] = pos as u8;
-                data[pos + 1] = (pos >> 8) as u8;
+                data[pos] = pos.to_le_bytes()[0];
+                data[pos + 1] = pos.to_le_bytes()[1];
                 data[pos + 2] = 0;
                 data[pos + 3] = 0xEB;
             }
@@ -446,8 +444,8 @@ fn p7zip_read_interop_bcj_lzma2() {
     for &pos in &[16u32, 64, 128, 256, 512, 1024, 1536] {
         let p = pos as usize;
         data[p] = 0xE8; // CALL
-        data[p + 1] = (pos * 7) as u8;
-        data[p + 2] = ((pos * 7) >> 8) as u8;
+        data[p + 1] = (pos * 7).to_le_bytes()[0];
+        data[p + 2] = (pos * 7).to_le_bytes()[1];
         data[p + 3] = 0x00;
         data[p + 4] = 0x00;
     }
@@ -823,7 +821,7 @@ fn aes_decrypt_fixture_correct_password() {
     );
 }
 
-/// Attempting to extract an AES-encrypted file without a password gives PasswordRequired.
+/// Attempting to extract an AES-encrypted file without a password gives `PasswordRequired`.
 #[test]
 fn aes_decrypt_no_password_returns_error() {
     let archive = r7z::Archive::open(std::path::Path::new("tests/fixtures/aes256.7z")).unwrap();
@@ -837,7 +835,7 @@ fn aes_decrypt_no_password_returns_error() {
     );
 }
 
-/// extract_all_with_password round-trips the AES fixture to disk.
+/// `extract_all_with_password` round-trips the AES fixture to disk.
 #[test]
 fn aes_extract_all_with_password() {
     let tmp = tempfile::tempdir().unwrap();
@@ -941,9 +939,8 @@ fn p7zip_aes_encrypted_headers_round_trip() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let err = match r7z::Archive::open(&archive_path) {
-        Ok(_) => panic!("encrypted headers opened without a password"),
-        Err(err) => err,
+    let Err(err) = r7z::Archive::open(&archive_path) else {
+        panic!("encrypted headers opened without a password")
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
 
@@ -1229,7 +1226,7 @@ fn p7zip_bcj2_encrypted_branches_extract_with_r7z() {
 /// Decrypt a file from a large real-world AES-encrypted archive.
 /// Requires /mnt/emulation/Nintendo64Archive.7z to be present.
 #[test]
-#[ignore]
+#[ignore = "requires the external encrypted Nintendo 64 archive"]
 fn aes_decrypt_n64_archive() {
     let path = std::path::Path::new("/mnt/emulation/Nintendo64Archive.7z");
     if !path.exists() {
@@ -1271,16 +1268,16 @@ fn aes_decrypt_n64_archive() {
     let mut total_bytes = 0u64;
     for entry in walkdir::WalkDir::new(tmp.path())
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         if entry.file_type().is_file() {
-            total_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            total_bytes += entry.metadata().map_or(0, |m| m.len());
             count += 1;
         }
     }
     eprintln!(
         "Extracted {count} files, {:.2} GB total in {elapsed:.2?}",
-        total_bytes as f64 / 1_073_741_824.0
+        num::ToPrimitive::to_f64(&total_bytes).unwrap() / 1_073_741_824.0
     );
 
     // Spot-check: verify Tower&Shaft.eep
@@ -1290,7 +1287,7 @@ fn aes_decrypt_n64_archive() {
     )
     .unwrap();
     assert_eq!(eep.len(), 512);
-    assert_eq!(crc32fast::hash(&eep), 0xEDDBB2AD);
+    assert_eq!(crc32fast::hash(&eep), 0xEDDB_B2AD);
 
     // Spot-check: verify GoldenEye
     let ge = std::fs::read(
@@ -1299,5 +1296,5 @@ fn aes_decrypt_n64_archive() {
     )
     .unwrap();
     assert_eq!(ge.len(), 12_582_912, "GoldenEye should be 12MB");
-    assert_eq!(crc32fast::hash(&ge), 0x8B70CB5B, "GoldenEye CRC mismatch");
+    assert_eq!(crc32fast::hash(&ge), 0x8B70_CB5B, "GoldenEye CRC mismatch");
 }

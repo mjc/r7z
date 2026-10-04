@@ -175,6 +175,11 @@ pub fn decompress_folder_with_password(
 /// Supplied zeroes mean empty outputs. Omitted entries are inferred through
 /// length-preserving filters where possible; codecs requiring a size reject
 /// unresolved entries. A supplied final size must agree with `unpack_size`.
+///
+/// # Errors
+///
+/// Returns errors for invalid folder layouts or sizes, unsupported codecs,
+/// missing passwords, decoder failures, or resource limits.
 pub fn decompress_folder_with_password_and_sizes(
     folder: &Folder,
     packed_data: &[u8],
@@ -259,7 +264,7 @@ fn prepare_folder_decoder<R: Read>(
 }
 
 fn aes_coder_reader<'a>(
-    props: crate::aes::AesProperties,
+    props: &crate::aes::AesProperties,
     input: Box<dyn Read + 'a>,
     input_size: OutputSize,
     unpack_size: OutputSize,
@@ -327,7 +332,7 @@ struct ExactSizeReader<R> {
 }
 
 enum OutputEnd {
-    /// The declared size ends the stream (PPMd may decode entropy padding).
+    /// The declared size ends the stream (`PPMd` may decode entropy padding).
     Sized,
     /// The underlying codec must also report EOF at the declared size.
     Terminated,
@@ -722,7 +727,7 @@ mod tests {
         for (output_size, expected) in [(OutputSize::Known(0), 0), (OutputSize::Unknown, 16)] {
             let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
             let mut reader = aes_coder_reader(
-                props,
+                &props,
                 Box::new(Cursor::new(&encrypted)),
                 OutputSize::Known(encrypted.len() as u64),
                 output_size,
@@ -746,7 +751,7 @@ mod tests {
         });
         let open = |budget: &mut OperationBudget| {
             aes_coder_reader(
-                crate::aes::AesProperties::parse(&[0, 0]).unwrap(),
+                &crate::aes::AesProperties::parse(&[0, 0]).unwrap(),
                 Box::new(Cursor::new([0; 16])),
                 OutputSize::Known(16),
                 OutputSize::Known(16),
@@ -773,7 +778,7 @@ mod tests {
         let props = crate::aes::AesProperties::parse(&[0, 0]).unwrap();
         let mut budget = OperationBudget::new(ResourceLimits::default());
         let mut reader = aes_coder_reader(
-            props,
+            &props,
             Box::new(std::io::repeat(0).take(size)),
             OutputSize::Known(size),
             OutputSize::Known(size),

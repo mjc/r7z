@@ -293,15 +293,14 @@ fn metadata_limit_rejects_oversized_next_header() {
         .unwrap();
     std::fs::write(&archive_path, bytes).unwrap();
 
-    let err = match r7z::Archive::open_with_options(
+    let Err(err) = r7z::Archive::open_with_options(
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: 1,
             ..r7z::ArchiveOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("archive opened despite metadata limit"),
-        Err(err) => err,
+    ) else {
+        panic!("archive opened despite metadata limit")
     };
 
     assert!(matches!(
@@ -325,15 +324,14 @@ fn metadata_limit_rejects_oversized_decoded_header() {
     let next_header_size = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
     std::fs::write(&archive_path, bytes).unwrap();
 
-    let err = match r7z::Archive::open_with_options(
+    let Err(err) = r7z::Archive::open_with_options(
         &archive_path,
         r7z::ArchiveOpenOptions {
             max_metadata_bytes: next_header_size + 16,
             ..r7z::ArchiveOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("archive opened despite decoded metadata limit"),
-        Err(err) => err,
+    ) else {
+        panic!("archive opened despite decoded metadata limit")
     };
 
     assert!(matches!(

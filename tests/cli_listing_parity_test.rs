@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 mod support;
 
 use std::collections::BTreeSet;
@@ -271,7 +269,12 @@ fn parse_technical_listing(text: &str) -> NormalizedArchiveListing {
             continue;
         }
         if let Some(value) = line.strip_prefix("Path = ") {
-            if saw_separator || !value.ends_with(".7z") {
+            if saw_separator
+                || !std::path::Path::new(value)
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("7z"))
+            {
                 if let Some(entry) = current.take() {
                     listing.entries.push(entry);
                 }

@@ -826,7 +826,7 @@ fn cli_encoder_thread_switches_create_readable_archives() {
     let tmp = tempdir().unwrap();
     let payload = tmp.path().join("payload.bin");
     let data = (0..(3 * 1024 * 1024 + 17))
-        .map(|index| (index % 251) as u8)
+        .map(|index| u8::try_from(index % 251).unwrap())
         .collect::<Vec<_>>();
     fs::write(&payload, &data).unwrap();
 
@@ -1265,7 +1265,7 @@ fn cli_extract_applies_overwrite_policy_to_destination_symlinks() {
             let destination = out.join("entry");
             std::os::unix::fs::symlink(&outside, &destination).unwrap();
 
-            ["-aos", "-y"].into_iter().for_each(|mode| {
+            for mode in ["-aos", "-y"] {
                 run_r7z(&[
                     command.into(),
                     mode.into(),
@@ -1273,19 +1273,18 @@ fn cli_extract_applies_overwrite_policy_to_destination_symlinks() {
                     format!("-o{}", out.display()),
                 ]);
                 let metadata = fs::symlink_metadata(&destination).unwrap();
-                match mode {
-                    "-aos" => assert!(metadata.is_symlink()),
-                    _ => {
-                        assert!(metadata.is_file());
-                        assert_eq!(fs::read(&destination).unwrap(), b"archive");
-                    }
+                if mode == "-aos" {
+                    assert!(metadata.is_symlink());
+                } else {
+                    assert!(metadata.is_file());
+                    assert_eq!(fs::read(&destination).unwrap(), b"archive");
                 }
                 match kind {
                     "file" => assert_eq!(fs::read(&outside).unwrap(), b"keep"),
                     "directory" => assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep"),
                     _ => assert!(!outside.exists()),
                 }
-            });
+            }
         });
 }
 
@@ -1404,29 +1403,27 @@ fn cli_metadata_only_selection_does_not_open_encrypted_data() {
         .unwrap();
     fs::write(&path, bytes).unwrap();
 
-    ["directory", "empty", "empty-link", "removed"]
-        .into_iter()
-        .for_each(|name| {
-            let output = run_r7z(&["t".into(), path.display().to_string(), name.into()]);
-            assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
-            ["x", "e"].into_iter().for_each(|command| {
-                let destination = tmp.path().join(format!("{command}-{name}"));
-                run_r7z(&[
-                    command.into(),
-                    path.display().to_string(),
-                    name.into(),
-                    format!("-o{}", destination.display()),
-                ]);
-                match (command, name) {
-                    ("x", "directory") => assert!(destination.join(name).is_dir()),
-                    (_, "empty" | "empty-link") => {
-                        assert_eq!(fs::read(destination.join(name)).unwrap(), b"");
-                    }
-                    _ => assert!(!destination.join(name).exists()),
+    for name in ["directory", "empty", "empty-link", "removed"] {
+        let output = run_r7z(&["t".into(), path.display().to_string(), name.into()]);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Everything is Ok"));
+        for command in ["x", "e"] {
+            let destination = tmp.path().join(format!("{command}-{name}"));
+            run_r7z(&[
+                command.into(),
+                path.display().to_string(),
+                name.into(),
+                format!("-o{}", destination.display()),
+            ]);
+            match (command, name) {
+                ("x", "directory") => assert!(destination.join(name).is_dir()),
+                (_, "empty" | "empty-link") => {
+                    assert_eq!(fs::read(destination.join(name)).unwrap(), b"");
                 }
-                assert!(!destination.join("payload").exists());
-            });
-        });
+                _ => assert!(!destination.join(name).exists()),
+            }
+            assert!(!destination.join("payload").exists());
+        }
+    }
 
     let output = Command::new(env!("CARGO_BIN_EXE_r7z"))
         .args(["x", path.to_str().unwrap(), "missing"])

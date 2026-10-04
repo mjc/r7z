@@ -559,7 +559,7 @@ fn short_output_writes_preserve_file_checksums() {
     for codec in CODECS {
         let out = ControlledOutput {
             bytes: Cursor::new(Vec::new()),
-            fail: Default::default(),
+            fail: std::rc::Rc::default(),
             max_write: 3,
         };
         let mut writer = ArchiveWriter::new(out, options(codec, false))

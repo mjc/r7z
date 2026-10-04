@@ -482,13 +482,13 @@ impl OperationBudget {
             .max_decoder_working_set_bytes
             .map_or(hard_limit, |configured| configured.min(hard_limit));
         if bytes.get() > limit {
-            return Err(self.decoder_working_set_error(limit));
+            return Err(Self::decoder_working_set_error(limit));
         }
         self.peak_decoder_working_set = self.peak_decoder_working_set.max(bytes);
         Ok(())
     }
 
-    fn decoder_working_set_error(&self, limit: u64) -> R7zError {
+    fn decoder_working_set_error(limit: u64) -> R7zError {
         R7zError::ResourceLimitExceeded {
             resource: "decoder working set",
             limit,

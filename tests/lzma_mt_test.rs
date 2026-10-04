@@ -19,7 +19,7 @@ const BLOCK_SIZE: usize = 4096;
 
 fn options() -> Lzma2Options {
     let mut options = Lzma2Options::with_preset(1);
-    options.lzma_options.dict_size = BLOCK_SIZE as u32;
+    options.lzma_options.dict_size = u32::try_from(BLOCK_SIZE).unwrap();
     options.set_chunk_size(NonZeroU64::new(BLOCK_SIZE as u64));
     options
 }
@@ -31,7 +31,7 @@ fn payload(size: usize) -> Vec<u8> {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            state as u8
+            state.to_le_bytes()[0]
         })
         .collect()
 }
@@ -62,7 +62,7 @@ fn bounded_lzma2_writer_round_trips_empty_partial_and_many_blocks() {
             assert_eq!(
                 decode(Lzma2Reader::new(
                     compressed.as_slice(),
-                    BLOCK_SIZE as u32,
+                    u32::try_from(BLOCK_SIZE).unwrap(),
                     None
                 )),
                 input
@@ -70,7 +70,7 @@ fn bounded_lzma2_writer_round_trips_empty_partial_and_many_blocks() {
             assert_eq!(
                 decode(Lzma2ReaderMt::new(
                     Cursor::new(compressed),
-                    BLOCK_SIZE as u32,
+                    u32::try_from(BLOCK_SIZE).unwrap(),
                     None,
                     workers
                 )),
@@ -93,7 +93,7 @@ fn lzma2_flush_publishes_pending_data_without_finishing_the_stream() {
     assert_eq!(
         decode(Lzma2Reader::new(
             compressed.as_slice(),
-            BLOCK_SIZE as u32,
+            u32::try_from(BLOCK_SIZE).unwrap(),
             None
         )),
         input
@@ -107,7 +107,7 @@ fn lzma2_flush_publishes_pending_data_without_finishing_the_stream() {
     assert_eq!(
         decode(Lzma2Reader::new(
             compressed.as_slice(),
-            BLOCK_SIZE as u32,
+            u32::try_from(BLOCK_SIZE).unwrap(),
             None
         )),
         input.repeat(2)
@@ -118,7 +118,7 @@ fn lzma2_flush_publishes_pending_data_without_finishing_the_stream() {
 fn shared_pool_lzip_writer_and_reader_round_trip_many_members() {
     let input = payload(32 * BLOCK_SIZE + 73);
     let mut options = LzipOptions::with_preset(1);
-    options.lzma_options.dict_size = BLOCK_SIZE as u32;
+    options.lzma_options.dict_size = u32::try_from(BLOCK_SIZE).unwrap();
     options.set_member_size(NonZeroU64::new(BLOCK_SIZE as u64));
     let mut writer = LzipWriterMt::new(Vec::new(), options, 2).unwrap();
     writer.write_all(&input).unwrap();
@@ -131,7 +131,7 @@ fn shared_pool_lzip_writer_and_reader_round_trip_many_members() {
 #[test]
 fn shared_pool_lzip_reader_propagates_corrupt_member_error() {
     let mut options = LzipOptions::with_preset(1);
-    options.lzma_options.dict_size = BLOCK_SIZE as u32;
+    options.lzma_options.dict_size = u32::try_from(BLOCK_SIZE).unwrap();
     options.set_member_size(NonZeroU64::new(BLOCK_SIZE as u64));
     let mut writer = LzipWriterMt::new(Vec::new(), options, 2).unwrap();
     writer.write_all(&payload(8 * BLOCK_SIZE)).unwrap();
@@ -147,7 +147,7 @@ fn shared_pool_lzip_reader_propagates_corrupt_member_error() {
 fn shared_pool_xz_writer_round_trips_many_blocks() {
     let input = payload(32 * BLOCK_SIZE + 73);
     let mut options = XzOptions::with_preset(1);
-    options.lzma_options.dict_size = BLOCK_SIZE as u32;
+    options.lzma_options.dict_size = u32::try_from(BLOCK_SIZE).unwrap();
     options.set_block_size(NonZeroU64::new(BLOCK_SIZE as u64));
     let mut writer = XzWriterMt::new(Vec::new(), options, 2).unwrap();
     writer.write_all(&input).unwrap();
@@ -261,7 +261,7 @@ fn stalled_output_bounds_input_consumption_and_resumes_in_order() {
     assert_eq!(
         decode(Lzma2Reader::new(
             compressed.as_slice(),
-            BLOCK_SIZE as u32,
+            u32::try_from(BLOCK_SIZE).unwrap(),
             None
         )),
         expected

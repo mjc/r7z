@@ -47,6 +47,7 @@ impl Default for ArchiveReadConfig<'_> {
 
 impl<'a> ArchiveReadConfig<'a> {
     /// Create a read configuration with no password.
+    #[must_use]
     pub fn new(options: ArchiveReadOptions) -> Self {
         Self {
             options,
@@ -55,6 +56,7 @@ impl<'a> ArchiveReadConfig<'a> {
     }
 
     /// Supply a password for encrypted archive data.
+    #[must_use]
     pub fn with_password(mut self, password: &'a str) -> Self {
         self.password = Some(password);
         self
@@ -364,9 +366,7 @@ impl LimitedOutput {
 impl Write for LimitedOutput {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let remaining = self.limit.map_or(buffer.len(), |limit| {
-            limit
-                .saturating_sub(self.bytes.len() as u64)
-                .min(usize::MAX as u64) as usize
+            usize::try_from(limit.saturating_sub(self.bytes.len() as u64)).unwrap_or(usize::MAX)
         });
         let length = buffer.len().min(remaining);
         self.bytes.extend_from_slice(&buffer[..length]);
@@ -562,6 +562,11 @@ impl Archive {
         Self::open_with_password_and_options(path, password, ArchiveOpenOptions::default())
     }
 
+    /// Open an archive from disk with resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, malformed-header, password, CRC, or resource-limit errors.
     pub fn open_with_options(
         path: &Path,
         options: ArchiveOpenOptions,
@@ -569,6 +574,11 @@ impl Archive {
         Self::open_with_password_and_options(path, None, options)
     }
 
+    /// Open an archive from disk with a password and resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, malformed-header, password, CRC, or resource-limit errors.
     pub fn open_with_password_and_options(
         path: &Path,
         password: Option<&str>,
@@ -587,6 +597,10 @@ impl Archive {
     /// The archive file must not be modified or truncated during this call or
     /// while the returned archive is alive. Concurrent mutation can cause
     /// undefined behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns file I/O or mapping errors, header validation errors, or resource-limit errors.
     pub unsafe fn open_mmap(path: &Path) -> Result<Archive, R7zError> {
         // SAFETY: The caller guarantees the mapped file remains unchanged.
         unsafe {
@@ -603,6 +617,11 @@ impl Archive {
     /// The archive file must not be modified or truncated during this call or
     /// while the returned archive is alive. Concurrent mutation can cause
     /// undefined behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns file I/O or mapping errors, header validation or password errors,
+    /// or resource-limit errors.
     pub unsafe fn open_mmap_with_password_and_options(
         path: &Path,
         password: Option<&str>,
@@ -655,6 +674,11 @@ impl Archive {
         Self::from_reader_with_password_and_options(reader, password, ArchiveOpenOptions::default())
     }
 
+    /// Open an archive from a seekable reader with resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns input I/O, malformed-header, password, CRC, or resource-limit errors.
     pub fn from_reader_with_options<R>(
         reader: R,
         options: ArchiveOpenOptions,
@@ -665,6 +689,11 @@ impl Archive {
         Self::from_reader_with_password_and_options(reader, None, options)
     }
 
+    /// Open an archive from a seekable reader with a password and resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns input I/O, malformed-header, password, CRC, or resource-limit errors.
     pub fn from_reader_with_password_and_options<R>(
         reader: R,
         password: Option<&str>,
@@ -812,6 +841,10 @@ impl Archive {
     }
 
     /// Fallible file metadata access for low-level format inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the metadata fails validation.
     pub fn try_raw_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
         self.try_files_info()
     }
@@ -868,6 +901,10 @@ impl Archive {
     }
 
     /// Fallible stream metadata access for low-level format inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the metadata fails validation.
     pub fn try_raw_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
         self.try_streams_info()
     }
@@ -896,8 +933,7 @@ impl Archive {
         let methods = archive_method_names(streams)?;
         let blocks = streams
             .and_then(|streams| streams.unpack_info.as_ref())
-            .map(crate::UnpackInfo::num_folders_usize)
-            .unwrap_or(0);
+            .map_or(0, crate::UnpackInfo::num_folders_usize);
         let solid = archive_is_solid(streams);
 
         let files_info = self.try_files_info()?;
@@ -927,6 +963,11 @@ impl Archive {
     /// The returned handle is tied to this archive and is required when adding
     /// the folder to an update. The packed streams are copied into bounded
     /// buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error for an invalid folder or stream layout, an I/O error
+    /// if packed bytes cannot be read, or a resource-limit error if the buffers exceed a limit.
     pub fn raw_folder(&self, folder_index: FolderIndex) -> Result<RawFolderBlock, R7zError> {
         self.read_raw_folder_block(folder_index.get())
     }
@@ -1252,6 +1293,10 @@ impl Archive {
     /// Stream every file-like entry with the supplied read configuration.
     ///
     /// Returns [`R7zError::ResourceLimitExceeded`] when a limit is exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns archive, decoder, password, CRC, resource-limit, or callback errors.
     pub fn stream_files_with_options<F>(
         &self,
         config: ArchiveReadConfig<'_>,
@@ -1319,6 +1364,11 @@ impl Archive {
     /// Stream selected entries with the supplied read configuration.
     ///
     /// Returns [`R7zError::ResourceLimitExceeded`] when a limit is exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-option error for duplicate or out-of-range indices,
+    /// or archive, decoder, password, CRC, resource-limit, or callback errors.
     pub fn stream_selected_files_with_options<F>(
         &self,
         indices: &[ArchiveEntryIndex],
@@ -1425,6 +1475,11 @@ impl Archive {
         decoder.finish()
     }
 
+    /// Decode the target of a symlink entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns extraction errors, or [`R7zError::Parse`] if the target is not valid UTF-8.
     pub fn symlink_target(
         &self,
         file_index: ArchiveEntryIndex,
@@ -1608,7 +1663,7 @@ fn verify_source_crc(
 ) -> Result<(), R7zError> {
     let mut reader = source.range_reader(range)?;
     let mut hasher = crc32fast::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buffer).map_err(R7zError::Io)?;
         if n == 0 {
@@ -1636,7 +1691,7 @@ fn decode_encoded_header(
     let packs = PackedSource::new(source, base_offset, encoded.pack_info.pack_pos)?;
     let decoded = decode_metadata_folder(
         &packs,
-        folder,
+        &folder,
         password,
         budget.metadata_remaining().get(),
         budget,
@@ -1751,14 +1806,14 @@ impl<'a> EntryDecoder<'a> {
         match entry.content {
             EntryContent::Empty => callback(&entry.info, &mut std::io::empty()),
             EntryContent::Stream(location) => {
-                self.read_stream(location, |reader| callback(&entry.info, reader))
+                self.read_stream(&location, |reader| callback(&entry.info, reader))
             }
         }
     }
 
     fn read_stream(
         &mut self,
-        location: StreamLocation<'_, 'a>,
+        location: &StreamLocation<'_, 'a>,
         callback: impl FnOnce(&mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<(), R7zError> {
         let active = match self.current.take() {
@@ -1797,7 +1852,7 @@ impl<'a> EntryDecoder<'a> {
 
 fn decode_metadata_folder<'a>(
     packs: &PackedSource<'_>,
-    folder: FolderLayout<'a>,
+    folder: &FolderLayout<'a>,
     password: Option<&str>,
     metadata_limit: u64,
     budget: &mut OperationBudget,
@@ -1970,7 +2025,7 @@ fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     if secs < WINDOWS_TO_UNIX_SECS {
         return None;
     }
-    Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, nanos as u32))
+    Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, u32::try_from(nanos).ok()?))
 }
 
 fn checked_add_usize(lhs: usize, rhs: usize) -> Result<usize, R7zError> {
@@ -2109,12 +2164,11 @@ mod selected_stream_tests {
 
     impl Read for ErrorsThenData {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            match self.errors.next() {
-                Some(error) => Err(error),
-                None => {
-                    let read_size = buffer.len().min(self.max_read);
-                    self.data.read(&mut buffer[..read_size])
-                }
+            if let Some(error) = self.errors.next() {
+                Err(error)
+            } else {
+                let read_size = buffer.len().min(self.max_read);
+                self.data.read(&mut buffer[..read_size])
             }
         }
     }
@@ -2151,13 +2205,11 @@ mod selected_stream_tests {
 
     #[test]
     fn entry_copy_preserves_wrapped_source_errors() {
-        [
+        for expected in [
             R7zError::Parse,
             R7zError::LimitExceeded("packed source"),
             R7zError::Io(std::io::ErrorKind::PermissionDenied.into()),
-        ]
-        .into_iter()
-        .for_each(|expected| {
+        ] {
             let message = expected.to_string();
             let variant = std::mem::discriminant(&expected);
             let mut reader = ErrorsThenData {
@@ -2170,7 +2222,7 @@ mod selected_stream_tests {
             assert_eq!(std::mem::discriminant(&error), variant);
             assert_eq!(error.to_string(), message);
             assert!(output.is_empty());
-        });
+        }
     }
 
     #[test]
@@ -2925,7 +2977,7 @@ mod selected_stream_tests {
 
     #[test]
     fn borrowed_entry_cursor_keeps_names_and_metadata_attached() {
-        let modified = UNIX_EPOCH + Duration::from_secs(123456);
+        let modified = UNIX_EPOCH + Duration::from_secs(123_456);
         let bytes = ArchiveBuilder::new()
             .compression(Codec::Copy)
             .add_file_entry(

@@ -6,6 +6,9 @@ rust-version = "1.85"
 license = "LGPL-2.1-or-later"
 description = "Pure-Rust library for reading and writing .7z archives"
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

@@ -18,7 +18,7 @@ fn options(codec: Codec) -> ArchiveOptions {
         codec,
         ..ArchiveOptions::default()
     };
-    options.compression.dictionary_size = Some(MIB as u32);
+    options.compression.dictionary_size = Some(u32::try_from(MIB).unwrap());
     options.compression.lzma2_chunk_size = NonZeroU64::new(MIB as u64);
     options.compression.threads = EncoderThreads::Fixed(2);
     options.compression.encoder_memory_limit = Some(512 * MIB as u64);
@@ -27,7 +27,7 @@ fn options(codec: Codec) -> ArchiveOptions {
 
 fn payload() -> Vec<u8> {
     (0..(3 * MIB + 17))
-        .map(|index| (index % 251) as u8)
+        .map(|index| u8::try_from(index % 251).unwrap())
         .collect()
 }
 

@@ -140,6 +140,7 @@ impl PreparedArchiveOptions {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct PreparedEncryption<'a> {
     options: &'a EncryptionOptions,
     settings: AesSettings,
@@ -431,25 +432,7 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<CodecSetting
     }
     validate_lzma_property_bits(&options.compression)?;
     validate_match_cycles(&options.compression)?;
-    if matches!(options.codec, Codec::Lzma2 | Codec::Lzma2Bcj) {
-        let dict = lzma_options(&options.compression).dict_size;
-        if u64::from(dict) > MAX_LZMA2_CHUNK_SIZE {
-            return Err(R7zError::InvalidOptions(
-                "dictionary_size must be <= 1g for LZMA2",
-            ));
-        }
-    }
-    if let Some(chunk_size) = options.compression.lzma2_chunk_size {
-        if chunk_size.get() > MAX_LZMA2_CHUNK_SIZE {
-            return Err(R7zError::InvalidOptions("lzma2_chunk_size must be <= 1g"));
-        }
-        let dict = lzma_options(&options.compression).dict_size;
-        if chunk_size.get() < u64::from(dict) {
-            return Err(R7zError::InvalidOptions(
-                "lzma2_chunk_size must be at least dictionary_size",
-            ));
-        }
-    }
+    validate_lzma2_chunk_size(options)?;
     if let SolidMode::Limit {
         max_files: None,
         max_bytes: None,
@@ -469,6 +452,29 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<CodecSetting
         (Codec::Ppmd, None) => Err(R7zError::Parse),
         (Codec::Lzma2Bcj, _) => Ok(CodecSettings::Lzma2Bcj),
     }
+}
+
+fn validate_lzma2_chunk_size(options: &ArchiveOptions) -> Result<(), R7zError> {
+    if matches!(options.codec, Codec::Lzma2 | Codec::Lzma2Bcj) {
+        let dict = lzma_options(&options.compression).dict_size;
+        if u64::from(dict) > MAX_LZMA2_CHUNK_SIZE {
+            return Err(R7zError::InvalidOptions(
+                "dictionary_size must be <= 1g for LZMA2",
+            ));
+        }
+    }
+    if let Some(chunk_size) = options.compression.lzma2_chunk_size {
+        if chunk_size.get() > MAX_LZMA2_CHUNK_SIZE {
+            return Err(R7zError::InvalidOptions("lzma2_chunk_size must be <= 1g"));
+        }
+        let dict = lzma_options(&options.compression).dict_size;
+        if chunk_size.get() < u64::from(dict) {
+            return Err(R7zError::InvalidOptions(
+                "lzma2_chunk_size must be at least dictionary_size",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_match_cycles(compression: &CompressionOptions) -> Result<(), R7zError> {
@@ -763,10 +769,10 @@ pub(crate) fn lzma2_options(compression: &CompressionOptions) -> Lzma2Options {
 
 fn effective_lzma2_chunk_size(compression: &CompressionOptions) -> NonZeroU64 {
     let dict = u64::from(lzma_options(compression).dict_size);
-    let size = compression
-        .lzma2_chunk_size
-        .map(NonZeroU64::get)
-        .unwrap_or_else(|| DEFAULT_LZMA2_CHUNK_SIZE.max(dict).min(MAX_LZMA2_CHUNK_SIZE));
+    let size = compression.lzma2_chunk_size.map_or_else(
+        || DEFAULT_LZMA2_CHUNK_SIZE.max(dict).min(MAX_LZMA2_CHUNK_SIZE),
+        NonZeroU64::get,
+    );
     NonZeroU64::new(size).expect("LZMA2 chunk size constants are non-zero")
 }
 

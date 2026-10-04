@@ -201,11 +201,12 @@ impl Cli {
             state.options.encryption = None;
         }
 
-        if !state.method_was_explicit && state.options.compression.level == CompressionLevel::Store
+        if state.method_origin == SettingOrigin::Default
+            && state.options.compression.level == CompressionLevel::Store
         {
             state.options.codec = Codec::Copy;
         }
-        if state.threading_was_explicit
+        if state.threading_origin == SettingOrigin::Explicit
             && !matches!(state.options.codec, Codec::Lzma2 | Codec::Lzma2Bcj)
             && !matches!(state.options.compression.threads, EncoderThreads::Single)
         {
@@ -229,13 +230,19 @@ impl Cli {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingOrigin {
+    Default,
+    Explicit,
+}
+
 struct CliParseState {
     output_dir: PathBuf,
     password: Option<String>,
     options: ArchiveOptions,
     technical: bool,
-    method_was_explicit: bool,
-    threading_was_explicit: bool,
+    method_origin: SettingOrigin,
+    threading_origin: SettingOrigin,
     volume_sizes: Vec<u64>,
     overwrite_mode: OverwriteMode,
     assume_yes: bool,
@@ -248,8 +255,8 @@ impl Default for CliParseState {
             password: None,
             options: ArchiveOptions::default(),
             technical: false,
-            method_was_explicit: false,
-            threading_was_explicit: false,
+            method_origin: SettingOrigin::Default,
+            threading_origin: SettingOrigin::Default,
             volume_sizes: Vec::new(),
             overwrite_mode: OverwriteMode::Ask,
             assume_yes: false,
@@ -294,9 +301,26 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
         state.password = Some(pass.to_string());
         return Ok(());
     }
+    if lower.starts_with('m') {
+        return parse_compression_switch(switch, &lower, state);
+    }
+    if let Some(size) = switch.strip_prefix('v') {
+        state.volume_sizes.push(parse_size(size)?);
+        return Ok(());
+    }
+    Err(CliError::Usage(format!("unsupported switch: -{switch}")))
+}
+
+fn parse_compression_switch(
+    switch: &str,
+    lower: &str,
+    state: &mut CliParseState,
+) -> Result<(), CliError> {
     if lower.starts_with("m0=") {
-        state.threading_was_explicit |= apply_method_spec(&switch[3..], &mut state.options)?;
-        state.method_was_explicit = true;
+        if apply_method_spec(&switch[3..], &mut state.options)? {
+            state.threading_origin = SettingOrigin::Explicit;
+        }
+        state.method_origin = SettingOrigin::Explicit;
         return Ok(());
     }
     if lower.starts_with("mc") {
@@ -341,7 +365,7 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
     if let Some(thread_value) = lower.strip_prefix("mmt") {
         let value = thread_value.strip_prefix('=').unwrap_or(thread_value);
         state.options.compression.threads = parse_threading_value(value, "-mmt")?;
-        state.threading_was_explicit = true;
+        state.threading_origin = SettingOrigin::Explicit;
         return Ok(());
     }
     if lower.starts_with("mx") {
@@ -388,10 +412,6 @@ fn parse_switch(switch: &str, state: &mut CliParseState) -> Result<(), CliError>
             state.options.header_mode
         };
         state.options.encryption = Some(encryption);
-        return Ok(());
-    }
-    if let Some(size) = switch.strip_prefix('v') {
-        state.volume_sizes.push(parse_size(size)?);
         return Ok(());
     }
     Err(CliError::Usage(format!("unsupported switch: -{switch}")))
@@ -710,12 +730,12 @@ fn print_listing(listing: &ArchiveListing, archive_path: &Path, selected: &Entry
     {
         if matches!(entry.kind, ListingEntryKind::Anti) {
             continue;
-        };
+        }
         if matches!(entry.kind, ListingEntryKind::Directory) {
             folder_count += 1;
         } else {
             file_count += 1;
-        };
+        }
         total_size += entry.size.unwrap_or(0);
         total_packed += entry_packed_for_summary(entry);
         summary_time = newest_time(summary_time, entry.modified);
@@ -913,12 +933,11 @@ fn test_archive(cli: &Cli, operands: &[PathBuf]) -> Result<u8, CliError> {
     let archive = open_archive(cli)?;
     let selected = EntryPatterns::from_paths(operands);
     let listing = archive.listing(None)?;
-    match selected.resolve_listing(&listing.entries) {
-        Some(selected) => test_selected_folders(&archive, cli.password.as_deref(), selected),
-        None => {
-            eprintln!("No files to process");
-            Ok(EXIT_WARNING)
-        }
+    if let Some(selected) = selected.resolve_listing(&listing.entries) {
+        test_selected_folders(&archive, cli.password.as_deref(), selected)
+    } else {
+        eprintln!("No files to process");
+        Ok(EXIT_WARNING)
     }
 }
 
@@ -991,36 +1010,33 @@ fn extract_archive_with_ui(
     let archive = open_archive(cli)?;
     let destination = open_destination(&cli.output_dir)?;
     let selected = EntryPatterns::from_paths(operands);
-    match selected.resolve_entries(&archive) {
-        Some(entries) => {
-            let mut extraction = Extraction {
-                archive: &archive,
-                destination: &destination,
-                password: cli.password.as_deref(),
-                session: None,
-                overwrite_mode: cli.overwrite_mode,
-                assume_yes: cli.assume_yes,
-                ui,
-            };
-            let result = entries
-                .filter_map(|entry| ExtractionTarget::from_entry(entry, &cli.output_dir, flat))
-                .map(|target| target.and_then(|target| extraction.write(target)))
-                .try_fold(EXIT_OK, |warnings, result| match result {
-                    Ok(ControlFlow::Continue(warning)) => ControlFlow::Continue(warnings | warning),
-                    Ok(ControlFlow::Break(())) => ControlFlow::Break(Ok(EXIT_WARNING)),
-                    Err(error) => ControlFlow::Break(Err(error)),
-                });
-            let warnings = match result {
-                ControlFlow::Continue(warnings) => warnings,
-                ControlFlow::Break(result) => result?,
-            };
-            extraction.finish()?;
-            Ok(warnings)
-        }
-        None => {
-            eprintln!("No files to process");
-            Ok(EXIT_WARNING)
-        }
+    if let Some(entries) = selected.resolve_entries(&archive) {
+        let mut extraction = Extraction {
+            archive: &archive,
+            destination: &destination,
+            password: cli.password.as_deref(),
+            session: None,
+            overwrite_mode: cli.overwrite_mode,
+            assume_yes: cli.assume_yes,
+            ui,
+        };
+        let result = entries
+            .filter_map(|entry| ExtractionTarget::from_entry(&entry, &cli.output_dir, flat))
+            .map(|target| target.and_then(|target| extraction.write(&target)))
+            .try_fold(EXIT_OK, |warnings, result| match result {
+                Ok(ControlFlow::Continue(warning)) => ControlFlow::Continue(warnings | warning),
+                Ok(ControlFlow::Break(())) => ControlFlow::Break(Ok(EXIT_WARNING)),
+                Err(error) => ControlFlow::Break(Err(error)),
+            });
+        let warnings = match result {
+            ControlFlow::Continue(warnings) => warnings,
+            ControlFlow::Break(result) => result?,
+        };
+        extraction.finish()?;
+        Ok(warnings)
+    } else {
+        eprintln!("No files to process");
+        Ok(EXIT_WARNING)
     }
 }
 
@@ -1045,7 +1061,7 @@ struct ExtractionTarget {
 
 impl ExtractionTarget {
     fn from_entry(
-        entry: r7z::ArchiveEntryInfo,
+        entry: &r7z::ArchiveEntryInfo,
         output_dir: &Path,
         flat: bool,
     ) -> Option<Result<Self, CliError>> {
@@ -1119,10 +1135,13 @@ enum Destination {
 impl Destination {
     fn at(destination: &Dir, path: &Path) -> Self {
         match destination.symlink_metadata(path) {
-            Ok(metadata) => match metadata.is_dir() {
-                true => Self::Directory,
-                false => Self::Other,
-            },
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    Self::Directory
+                } else {
+                    Self::Other
+                }
+            }
             Err(_) => Self::Missing,
         }
     }
@@ -1140,7 +1159,7 @@ struct Extraction<'a, U> {
 }
 
 impl<U: OverwriteUi> Extraction<'_, U> {
-    fn write(&mut self, target: ExtractionTarget) -> Result<ControlFlow<(), u8>, CliError> {
+    fn write(&mut self, target: &ExtractionTarget) -> Result<ControlFlow<(), u8>, CliError> {
         match target.prepare(
             self.destination,
             &mut self.overwrite_mode,
@@ -1511,7 +1530,7 @@ fn collect_path(
             meta,
         });
         let mut children = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-        children.sort_by_key(|entry| entry.file_name());
+        children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             collect_path(
                 &child.path(),
@@ -1583,19 +1602,7 @@ fn preserved_rewrite_entries(
         }
     }
 
-    let raw_folder_ids = actions
-        .iter()
-        .filter_map(|action| match action {
-            RetainedEntryAction::CopyRaw(folder) => Some(*folder),
-            RetainedEntryAction::Drop
-            | RetainedEntryAction::NoStream
-            | RetainedEntryAction::Decode => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let raw_folders = raw_folder_ids
-        .iter()
-        .map(|folder| archive.raw_folder(*folder))
-        .collect::<Result<Vec<_>, _>>()?;
+    let raw_folders = preserved_raw_folders(archive, &actions)?;
     let raw_folder_handles = raw_folders
         .iter()
         .map(|folder| (folder.folder_index(), folder.handle()))
@@ -1649,6 +1656,25 @@ fn preserved_rewrite_entries(
     }
     entries.extend(append_entries.into_iter().map(pending_to_preserved_entry));
     Ok((entries, raw_folders))
+}
+
+fn preserved_raw_folders(
+    archive: &Archive,
+    actions: &[RetainedEntryAction],
+) -> Result<Vec<RawFolderBlock>, CliError> {
+    let raw_folder_ids = actions
+        .iter()
+        .filter_map(|action| match action {
+            RetainedEntryAction::CopyRaw(folder) => Some(*folder),
+            RetainedEntryAction::Drop
+            | RetainedEntryAction::NoStream
+            | RetainedEntryAction::Decode => None,
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(raw_folder_ids
+        .iter()
+        .map(|folder| archive.raw_folder(*folder))
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 #[derive(Clone, Copy)]
@@ -1841,7 +1867,7 @@ fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     if secs < WINDOWS_TO_UNIX_SECS {
         return None;
     }
-    Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, nanos as u32))
+    Some(UNIX_EPOCH + Duration::new(secs - WINDOWS_TO_UNIX_SECS, u32::try_from(nanos).ok()?))
 }
 
 enum EntryPatterns {
@@ -1919,6 +1945,7 @@ impl EntryPatterns {
 }
 
 /// A listing whose selection is either unrestricted or has at least one match.
+#[derive(Clone, Copy)]
 struct SelectedListing<'a> {
     entries: &'a [ArchiveListingEntry],
     patterns: &'a EntryPatterns,

@@ -150,7 +150,7 @@ impl HeaderProgress {
     fn into_resolution(self) -> Result<HeaderResolution, R7zError> {
         match self {
             Self::Pending(pending) => Ok(HeaderResolution::RequiresExternalFolders(pending)),
-            complete => complete
+            complete @ Self::Complete { .. } => complete
                 .complete_exact()
                 .map(Box::new)
                 .map(HeaderResolution::Complete),
@@ -215,9 +215,8 @@ impl HeaderScan {
                         let bytes = backing
                             .get(range.start as usize..range.end as usize)
                             .ok_or(R7zError::Parse)?;
-                        let additional = match StreamInfo::parse(bytes, &backing) {
-                            Ok(([], streams)) => streams,
-                            _ => return Err(R7zError::Parse),
+                        let Ok(([], additional)) = StreamInfo::parse(bytes, &backing) else {
+                            return Err(R7zError::Parse);
                         };
                         return Ok(HeaderProgress::Pending(Box::new(PendingHeader {
                             scan: self,
@@ -247,9 +246,8 @@ impl HeaderScan {
                         let bytes = backing
                             .get(range.start as usize..range.end as usize)
                             .ok_or(R7zError::Parse)?;
-                        let additional = match StreamInfo::parse(bytes, &backing) {
-                            Ok(([], streams)) => streams,
-                            _ => return Err(R7zError::Parse),
+                        let Ok(([], additional)) = StreamInfo::parse(bytes, &backing) else {
+                            return Err(R7zError::Parse);
                         };
                         return Ok(HeaderProgress::Pending(Box::new(PendingHeader {
                             scan: self,
@@ -267,7 +265,7 @@ impl HeaderScan {
                 Property::ArchiveProperties => {
                     input = scan_archive_properties(after_tag)
                         .map_err(|_| R7zError::Parse)?
-                        .0
+                        .0;
                 }
                 _ => {
                     let (remaining, size) =
@@ -319,7 +317,12 @@ impl std::fmt::Debug for Header {
             .field("num_files", &self.num_files)
             .field("streams_cache", &self.streams_cache)
             .field("files_cache", &self.files_cache)
-            .finish()
+            .field("additional_streams_cache", &self.additional_streams_cache)
+            .field(
+                "external_folder_streams",
+                &self.external_folder_data.as_slice().len(),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -348,6 +351,10 @@ impl Header {
     }
 
     /// Access the stream descriptor and return any full-parser validation error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the metadata fails validation.
     pub fn try_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
         let Some(range) = &self.streams_info_range else {
             return Ok(None);
@@ -367,7 +374,7 @@ impl Header {
                 .ok_or(())
             })
         });
-        parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
+        parsed.as_ref().map(Some).map_err(|()| R7zError::Parse)
     }
 
     /// Access the file listing, parsing it on first call.
@@ -381,6 +388,10 @@ impl Header {
     }
 
     /// Access the file listing and return any full-parser validation error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the metadata fails validation.
     pub fn try_files_info(&self) -> Result<Option<&FilesInfo>, R7zError> {
         let Some(range) = &self.files_info_range else {
             return Ok(None);
@@ -400,10 +411,14 @@ impl Header {
                 .ok_or(())
             })
         });
-        parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
+        parsed.as_ref().map(Some).map_err(|()| R7zError::Parse)
     }
 
     /// Access the additional metadata streams, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::Parse`] if the metadata fails validation.
     pub fn try_additional_streams_info(&self) -> Result<Option<&StreamInfo>, R7zError> {
         let Some(range) = &self.additional_streams_range else {
             return Ok(None);
@@ -419,7 +434,7 @@ impl Header {
                     .ok_or(())
             })
         });
-        parsed.as_ref().map(Some).map_err(|_| R7zError::Parse)
+        parsed.as_ref().map(Some).map_err(|()| R7zError::Parse)
     }
 
     pub(crate) fn additional_pack_info(&self) -> Result<Option<&PackInfo>, R7zError> {

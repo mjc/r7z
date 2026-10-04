@@ -109,16 +109,13 @@ impl<'a> RangeDecoder<'a> {
             .ok_or(R7zError::Decompression)?;
         let bound = (self.range >> NUM_MODEL_BITS) * u32::from(*probability);
         let encoded = self.code >= bound;
-        match encoded {
-            false => {
-                self.range = bound;
-                *probability += (BIT_MODEL_TOTAL - *probability) >> NUM_MOVE_BITS;
-            }
-            true => {
-                self.range -= bound;
-                self.code -= bound;
-                *probability -= *probability >> NUM_MOVE_BITS;
-            }
+        if encoded {
+            self.range -= bound;
+            self.code -= bound;
+            *probability -= *probability >> NUM_MOVE_BITS;
+        } else {
+            self.range = bound;
+            *probability += (BIT_MODEL_TOTAL - *probability) >> NUM_MOVE_BITS;
         }
         Ok(encoded)
     }
@@ -180,7 +177,7 @@ impl<'a> StreamCursor<'a> {
         if self.pos == self.len {
             self.len = loop {
                 match self.reader.read(&mut self.buffer) {
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                     result => break result.map_err(R7zError::Io)?,
                 }
             };

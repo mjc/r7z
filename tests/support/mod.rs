@@ -1,5 +1,5 @@
-#![allow(clippy::pedantic)]
 #![allow(dead_code)]
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     env,
@@ -33,10 +33,10 @@ pub fn run_7z(args: &[&str], dir: &std::path::Path) -> std::process::Output {
 
 fn selected_7z_binary() -> PathBuf {
     let selected = if let Ok(bin) = env::var("P7ZIP_BIN") {
-        if !bin.is_empty() {
-            PathBuf::from(bin)
-        } else {
+        if bin.is_empty() {
             which_7z().expect("7z not found; install p7zip, enter devenv, or set P7ZIP_BIN")
+        } else {
+            PathBuf::from(bin)
         }
     } else {
         which_7z().expect("7z not found; install p7zip, enter devenv, or set P7ZIP_BIN")
@@ -56,7 +56,6 @@ fn log_7z_identity(bin: &Path) {
         let bytes = fs::read(&canonical).unwrap_or_else(|err| {
             panic!("cannot hash 7z executable {}: {err}", canonical.display())
         });
-        use sha2::{Digest, Sha256};
         let hash = hex::encode(Sha256::digest(bytes));
         let info = Command::new(&canonical)
             .arg("i")
@@ -153,10 +152,10 @@ pub fn try_create_p7zip_archive(
     files: &[&str],
     args: &[&str],
 ) -> std::process::Output {
-    let mut argv: Vec<&str> = vec!["a", archive_path.to_str().unwrap()];
-    argv.extend_from_slice(files);
-    argv.extend_from_slice(args);
-    run_7z(&argv, dir)
+    let mut command_args: Vec<&str> = vec!["a", archive_path.to_str().unwrap()];
+    command_args.extend_from_slice(files);
+    command_args.extend_from_slice(args);
+    run_7z(&command_args, dir)
 }
 
 pub fn extract_with_p7zip(dir: &Path, archive_path: &Path, out_dir: &Path) {
@@ -248,14 +247,14 @@ pub fn assert_trees_equal(expected: &Path, actual: &Path) {
 fn fixture_files() -> Vec<(PathBuf, Vec<u8>)> {
     let mut binary = Vec::with_capacity(1024 * 1024);
     for i in 0..1024 * 1024 {
-        binary.push(((i * 31 + i / 7) & 0xff) as u8);
+        binary.push(u8::try_from((i * 31 + i / 7) & 0xff).unwrap());
     }
 
     let mut code = vec![0x90u8; 16 * 1024];
     for &pos in &[8usize, 64, 255, 1024, 4096, 8191, 12000, 15000] {
         code[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
-        code[pos + 1] = (pos * 3) as u8;
-        code[pos + 2] = ((pos * 3) >> 8) as u8;
+        code[pos + 1] = (pos * 3).to_le_bytes()[0];
+        code[pos + 2] = (pos * 3).to_le_bytes()[1];
         code[pos + 3] = 0;
         code[pos + 4] = 0;
     }
