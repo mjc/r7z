@@ -2177,7 +2177,7 @@ mod tests {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
             match self.failure {
                 OutputFailure::Write => Err(std::io::Error::other("injected write failure")),
-                OutputFailure::Flush => self.file.write(data),
+                OutputFailure::Flush => std::io::Write::write(self.file, data),
             }
         }
 
@@ -2188,7 +2188,7 @@ mod tests {
 
     impl std::io::Seek for FailingOutput<'_> {
         fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
-            self.file.seek(position)
+            std::io::Seek::seek(self.file, position)
         }
     }
 
