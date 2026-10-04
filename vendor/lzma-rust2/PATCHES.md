@@ -17,6 +17,9 @@ R7Z-1 / R7Z-PLAN-2 step 2:
   receivers before joining workers so a blocked result send cannot deadlock.
 - Join workers on completion and abort. Abort stops new work; already running
   block compression may finish before the join returns.
+- Keep queue contents and closure under one mutex. This prevents a missed
+  shutdown notification between an idle worker's predicate check and wait, and
+  prevents submissions from racing past closure.
 
 The bound is on pending jobs, not total process memory. Dictionary allocations,
 caller-owned input/output, and format metadata remain separate; selecting a
