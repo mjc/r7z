@@ -2135,7 +2135,7 @@ impl AutoSpool {
         let migration_bytes = cursor.get_ref().len() as u64;
         let write_bytes = write_len;
         check_temporary_storage_write(
-            &mut self.budget.temporary_storage,
+            &self.budget.temporary_storage,
             &mut self.temporary_storage_limit_exceeded,
             migration_bytes.saturating_add(write_bytes),
         )?;
@@ -2171,7 +2171,7 @@ impl AutoSpool {
         };
         let write_len = u64::try_from(write_len).unwrap_or(u64::MAX);
         check_temporary_storage_write(
-            &mut self.budget.temporary_storage,
+            &self.budget.temporary_storage,
             &mut self.temporary_storage_limit_exceeded,
             write_len,
         )
@@ -2255,7 +2255,7 @@ impl AutoSpool {
 }
 
 fn check_temporary_storage_write(
-    budget: &mut TemporaryStorageBudget,
+    budget: &TemporaryStorageBudget,
     limit_exceeded: &mut bool,
     bytes: u64,
 ) -> io::Result<()> {
