@@ -542,7 +542,13 @@ so keep BT4 when matching p7zip's default or when compression ratio matters.
 LZMA2 creation selects encoder threads automatically. `-mmt=off|1` selects one
 thread; `-mmt=on` and `-mmt=N` select automatic or fixed parallel encoding.
 Method-scoped `mt` has the same values. Parallel LZMA2 uses independent 64 MiB
-blocks at level five. Inputs no larger than one block use the serial writer.
+blocks at level five. For known inputs from 1 MiB through one block, normal BT4
+match finding can overlap with encoding on a second thread without changing
+compression settings or block boundaries. This requires room in the memory
+allowance for a mirrored input window and bounded match queues. A strongly
+repetitive initial prefix, a short first write, or insufficient memory keeps
+match finding on the encoding thread. Explicit single-thread mode disables
+this overlap.
 The public compression options also expose an encoder memory allowance. Automatic
 selection reserves at most half of available memory, capped at 8 GiB; if memory
 availability cannot be read, it reserves 512 MiB. An explicit thread count that

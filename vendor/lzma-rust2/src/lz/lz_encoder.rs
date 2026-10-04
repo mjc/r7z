@@ -54,12 +54,21 @@ impl MfType {
     }
 }
 
+enum FinderState {
+    Local(MatchFinders),
+    #[cfg(feature = "std")]
+    Pipelined(super::match_pipeline::MatchPipeline),
+    #[cfg(feature = "std")]
+    Stopped,
+}
+
 pub(crate) struct LzEncoder {
     pub(crate) data: LzEncoderData,
     pub(crate) matches: Matches,
-    pub(crate) match_finder: MatchFinders,
+    match_finder: FinderState,
 }
 
+#[derive(Clone)]
 pub(crate) struct LzEncoderData {
     pub(crate) keep_size_before: u32,
     pub(crate) keep_size_after: u32,
@@ -182,7 +191,7 @@ impl LzEncoder {
                 pending_size: 0,
             },
             matches: Matches::new(nice_len as usize - 1),
-            match_finder,
+            match_finder: FinderState::Local(match_finder),
         }
     }
 
@@ -210,34 +219,120 @@ impl LzEncoder {
         normalize_scalar(positions, norm_offset);
     }
 
-    pub(crate) fn find_matches(&mut self) {
-        self.match_finder
-            .find_matches(&mut self.data, &mut self.matches)
+    #[cfg(feature = "std")]
+    pub(crate) fn into_parallel(self) -> std::io::Result<Self> {
+        let Self {
+            data,
+            matches,
+            match_finder,
+        } = self;
+        let match_finder = match match_finder {
+            FinderState::Local(finder) => FinderState::Pipelined(
+                super::match_pipeline::MatchPipeline::new(data.clone(), finder)?,
+            ),
+            FinderState::Pipelined(pipeline) => FinderState::Pipelined(pipeline),
+            FinderState::Stopped => return Err(std::io::Error::other("encoder has failed")),
+        };
+        Ok(Self {
+            data,
+            matches,
+            match_finder,
+        })
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn abort_pipeline(&mut self) {
+        self.match_finder = FinderState::Stopped;
+        self.data.buf = Vec::new();
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn parallel_overhead(dict_size: u32, nice_len: u32) -> u64 {
+        super::match_pipeline::MatchPipeline::overhead(
+            get_buf_size(dict_size, 4096, 4096, crate::MATCH_LEN_MAX as u32) as usize,
+            nice_len as usize,
+        ) as u64
+    }
+
+    pub(crate) fn find_matches(&mut self) -> crate::Result<()> {
+        match &mut self.match_finder {
+            FinderState::Local(finder) => {
+                finder.find_matches(&mut self.data, &mut self.matches);
+                Ok(())
+            }
+            #[cfg(feature = "std")]
+            FinderState::Pipelined(pipeline) => {
+                pipeline.find_matches(&mut self.data, &mut self.matches)
+            }
+            #[cfg(feature = "std")]
+            FinderState::Stopped => Err(std::io::Error::other("encoder has failed")),
+        }
     }
 
     pub(crate) fn matches(&mut self) -> &mut Matches {
         &mut self.matches
     }
 
-    pub(crate) fn skip(&mut self, len: usize) {
-        self.match_finder.skip(&mut self.data, len)
+    pub(crate) fn skip(&mut self, len: usize) -> crate::Result<()> {
+        match &mut self.match_finder {
+            FinderState::Local(finder) => {
+                finder.skip(&mut self.data, len);
+                Ok(())
+            }
+            #[cfg(feature = "std")]
+            FinderState::Pipelined(pipeline) => pipeline.skip(&mut self.data, len),
+            #[cfg(feature = "std")]
+            FinderState::Stopped => Err(std::io::Error::other("encoder has failed")),
+        }
     }
 
     pub(crate) fn set_preset_dict(&mut self, dict_size: u32, preset_dict: &[u8]) {
-        self.data
-            .set_preset_dict(dict_size, preset_dict, &mut self.match_finder)
+        match &mut self.match_finder {
+            FinderState::Local(finder) => self.data.set_preset_dict(dict_size, preset_dict, finder),
+            #[cfg(feature = "std")]
+            FinderState::Pipelined(_) | FinderState::Stopped => {
+                unreachable!("preset dictionaries are initialized before pipelining")
+            }
+        }
     }
 
-    pub(crate) fn set_finishing(&mut self) {
-        self.data.set_finishing(&mut self.match_finder)
+    pub(crate) fn set_finishing(&mut self) -> crate::Result<()> {
+        #[cfg(feature = "std")]
+        if let FinderState::Pipelined(pipeline) = &mut self.match_finder {
+            pipeline.finish()?;
+        }
+        self.data.set_finishing();
+        self.process_pending_bytes()
     }
 
-    pub(crate) fn fill_window(&mut self, input: &[u8]) -> usize {
-        self.data.fill_window(input, &mut self.match_finder)
+    pub(crate) fn fill_window(&mut self, input: &[u8]) -> crate::Result<usize> {
+        let count = self.data.fill_window(input);
+        #[cfg(feature = "std")]
+        if let FinderState::Pipelined(pipeline) = &mut self.match_finder {
+            pipeline.input(&input[..count])?;
+        }
+        self.process_pending_bytes()?;
+        Ok(count)
     }
 
-    pub(crate) fn set_flushing(&mut self) {
-        self.data.set_flushing(&mut self.match_finder)
+    pub(crate) fn set_flushing(&mut self) -> crate::Result<()> {
+        #[cfg(feature = "std")]
+        if let FinderState::Pipelined(pipeline) = &mut self.match_finder {
+            pipeline.flush()?;
+        }
+        self.data.set_flushing();
+        self.process_pending_bytes()
+    }
+
+    fn process_pending_bytes(&mut self) -> crate::Result<()> {
+        if self.data.pending_size > 0 && self.data.read_pos < self.data.read_limit {
+            self.data.read_pos -= self.data.pending_size as i32;
+            let old_pending = self.data.pending_size;
+            self.data.pending_size = 0;
+            self.skip(old_pending as usize)?;
+            debug_assert!(self.data.pending_size <= old_pending);
+        }
+        Ok(())
     }
 
     pub(crate) fn verify_matches(&self) -> bool {
@@ -287,7 +382,7 @@ impl LzEncoderData {
         self.write_pos -= move_offset;
     }
 
-    fn fill_window(&mut self, input: &[u8], match_finder: &mut dyn MatchFind) -> usize {
+    pub(super) fn fill_window(&mut self, input: &[u8]) -> usize {
         debug_assert!(!self.finishing);
         if self.read_pos >= (self.buf_size as i32 - self.keep_size_after as i32) {
             self.move_window();
@@ -304,29 +399,16 @@ impl LzEncoderData {
         if self.write_pos >= self.keep_size_after as i32 {
             self.read_limit = self.write_pos - self.keep_size_after as i32;
         }
-        self.process_pending_bytes(match_finder);
         len
     }
 
-    fn process_pending_bytes(&mut self, match_finder: &mut dyn MatchFind) {
-        if self.pending_size > 0 && self.read_pos < self.read_limit {
-            self.read_pos -= self.pending_size as i32;
-            let old_pending = self.pending_size;
-            self.pending_size = 0;
-            match_finder.skip(self, old_pending as _);
-            debug_assert!(self.pending_size <= old_pending);
-        }
-    }
-
-    fn set_flushing(&mut self, match_finder: &mut dyn MatchFind) {
+    pub(super) fn set_flushing(&mut self) {
         self.read_limit = self.write_pos - 1;
-        self.process_pending_bytes(match_finder);
     }
 
-    fn set_finishing(&mut self, match_finder: &mut dyn MatchFind) {
+    pub(super) fn set_finishing(&mut self) {
         self.read_limit = self.write_pos - 1;
         self.finishing = true;
-        self.process_pending_bytes(match_finder);
     }
 
     pub fn has_enough_data(&self, already_read_len: i32) -> bool {

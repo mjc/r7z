@@ -45,3 +45,17 @@ them with and without the `optimization` feature.
 
 The encoder memory estimate converts the LZ buffer from bytes to KiB and counts
 all three hash tables. R7Z uses this corrected estimate for worker admission.
+
+
+Single-block match finding can run concurrently with the normal encoder. The
+existing BT4 tree moves to one worker; a mirrored input window and queues are
+bounded by bytes and positions. The encoder retains its original lookahead,
+write cadence, and independent-block boundaries. Short matches transfer as
+length/distance pairs; the main encoder extends nice-length matches using its
+own window. Output errors stop and join the worker, and resets release the old
+worker before creating its replacement. Differential tests require identical
+compressed output through fragmented writes, flushes, window moves and resets.
+R7Z selects this scheduling path only for sufficiently large single blocks,
+when the thread and memory allowances permit it and the initial input prefix
+contains more than 1024 distinct adjacent byte pairs. Repetitive or short
+prefixes retain the local finder without changing compression settings.

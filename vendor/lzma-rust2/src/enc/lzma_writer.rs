@@ -126,7 +126,7 @@ impl<W: Write> LzmaWriter<W> {
                 ));
             }
         }
-        self.lzma.lz.set_finishing();
+        self.lzma.lz.set_finishing()?;
         self.lzma.encode_for_lzma1(&mut self.rc, &mut self.mode)?;
         if self.use_end_marker {
             self.lzma.encode_lzma1_end_marker(&mut self.rc)?;
@@ -152,7 +152,7 @@ impl<W: Write> Write for LzmaWriter<W> {
         let mut len = buf.len();
         let mut off = 0;
         while len > 0 {
-            let used = self.lzma.lz.fill_window(&buf[off..]);
+            let used = self.lzma.lz.fill_window(&buf[off..])?;
             off += used;
             len -= used;
             self.lzma.encode_for_lzma1(&mut self.rc, &mut self.mode)?;

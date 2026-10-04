@@ -423,7 +423,7 @@ impl NormalEncoderMode {
 }
 
 impl LzmaEncoderTrait for NormalEncoderMode {
-    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> u32 {
+    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> crate::Result<u32> {
         // If there are pending symbols from an earlier call to this
         // function, return those symbols first.
         let pos = encoder.lz.get_pos();
@@ -433,7 +433,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
             self.opt_cur = self.opts[self.opt_cur].opt_prev;
             encoder.data.back = self.opts[self.opt_cur].back_prev;
             debug_assert!(len >= 0);
-            return len as u32;
+            return Ok(len as u32);
         }
 
         debug_assert_eq!(self.opt_cur, self.opt_end);
@@ -441,7 +441,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
         self.opt_end = 0;
         encoder.data.back = -1;
         if encoder.data.read_ahead == -1 {
-            encoder.find_matches();
+            encoder.find_matches()?;
         }
 
         // Get the number of bytes available in the dictionary, but
@@ -450,7 +450,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
         // immediately to encode this byte as a literal.
         let mut avail = i32::min(encoder.lz.get_avail(), MATCH_LEN_MAX as i32);
         if avail < MATCH_LEN_MIN as i32 {
-            return 1;
+            return Ok(1);
         }
         // Get the lengths of repeated matches.
         let mut rep_best = 0;
@@ -471,8 +471,8 @@ impl LzmaEncoderTrait for NormalEncoderMode {
         // Return if the best repeated match is at least niceLen bytes long.
         if rep_lens[rep_best] >= encoder.data.nice_len as i32 {
             encoder.data.back = rep_best as _;
-            encoder.skip((rep_lens[rep_best] - 1) as usize);
-            return rep_lens[rep_best] as _;
+            encoder.skip((rep_lens[rep_best] - 1) as usize)?;
+            return Ok(rep_lens[rep_best] as _);
         }
 
         // Initialize mainLen and mainDist to the longest match found
@@ -487,8 +487,8 @@ impl LzmaEncoderTrait for NormalEncoderMode {
             // Return if it is at least niceLen bytes long.
             if main_len >= encoder.data.nice_len {
                 encoder.data.back = main_dist + REPS as i32;
-                encoder.skip(main_len - 1);
-                return main_len as u32;
+                encoder.skip(main_len - 1)?;
+                return Ok(main_len as u32);
             }
         }
 
@@ -502,7 +502,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
             && cur_byte != match_byte
             && rep_lens[rep_best] < MATCH_LEN_MIN as i32
         {
-            return 1;
+            return Ok(1);
         }
 
         let mut pos = encoder.lz.get_pos() as u32;
@@ -537,7 +537,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
         if self.opt_end < MATCH_LEN_MIN {
             debug_assert_eq!(self.opt_end, 0);
             encoder.data.back = self.opts[1].back_prev;
-            return 1;
+            return Ok(1);
         }
 
         // Update the lookup tables for distances and lengths before using
@@ -628,7 +628,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
             self.opt_cur += 1;
             self.opt_cur < self.opt_end
         } {
-            encoder.find_matches();
+            encoder.find_matches()?;
             let matches = encoder.lz.matches();
             if matches.count > 0
                 && matches.len[matches.count as usize - 1] >= encoder.data.nice_len as u32
@@ -664,7 +664,7 @@ impl LzmaEncoderTrait for NormalEncoderMode {
             }
         }
 
-        self.convert_opts(encoder) as _
+        Ok(self.convert_opts(encoder) as _)
     }
 
     fn reset(&mut self) {
