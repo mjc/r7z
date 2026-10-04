@@ -429,8 +429,7 @@ fn validate_name_data<'a>(
     error_input: &'a [u8],
 ) -> Result<(), ParseError<'a>> {
     let mut code_units = data.chunks_exact(2);
-    let every_name_is_terminated =
-        (0..num_names).all(|_| code_units.position(|unit| unit == [0, 0]).is_some());
+    let every_name_is_terminated = (0..num_names).all(|_| code_units.any(|unit| unit == [0, 0]));
     if !every_name_is_terminated
         || code_units.next().is_some()
         || !code_units.remainder().is_empty()
