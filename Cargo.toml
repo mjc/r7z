@@ -12,6 +12,12 @@ redundant_clone = "warn"
 needless_pass_by_ref_mut = "warn"
 search_is_some = "warn"
 derive_partial_eq_without_eq = "warn"
+needless_collect = "warn"
+collection_is_never_read = "warn"
+read_zero_byte_vec = "warn"
+debug_assert_with_mut_call = "warn"
+significant_drop_in_scrutinee = "warn"
+path_buf_push_overwrite = "warn"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
