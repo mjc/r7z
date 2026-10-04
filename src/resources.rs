@@ -254,8 +254,13 @@ pub(crate) struct SpoolBudget {
     pub(crate) retained_output: RetainedOutputBudget,
 }
 
-pub(crate) struct WriterBudgets {
+pub(crate) struct WriterOperation {
     pub(crate) kdf: KdfBudget,
+    pub(crate) monitor: crate::operation::OperationMonitor,
+}
+
+pub(crate) struct WriterBudgets {
+    pub(crate) operation: WriterOperation,
     pub(crate) spool: SpoolBudget,
     pub(crate) open_volumes: OpenVolumeBudget,
     pub(crate) volume_count: VolumeCountBudget,
@@ -325,6 +330,7 @@ impl DecoderWorkingSetBytes {
 
 /// Mutable counters shared by every nested step in one archive operation.
 pub(crate) struct OperationBudget {
+    pub(crate) monitor: crate::operation::OperationMonitor,
     limits: ResourceLimits,
     metadata: MetadataBytes,
     decoded: DecodedBytes,
@@ -339,6 +345,7 @@ pub(crate) struct OperationBudget {
 impl OperationBudget {
     pub(crate) fn new(limits: ResourceLimits) -> Self {
         Self {
+            monitor: crate::operation::OperationMonitor::default(),
             limits,
             metadata: MetadataBytes::new(0),
             decoded: DecodedBytes::new(0),
@@ -351,9 +358,17 @@ impl OperationBudget {
         }
     }
 
+    pub(crate) fn with_control(mut self, control: Option<crate::OperationControl>) -> Self {
+        self.monitor = crate::operation::OperationMonitor::new(control);
+        self
+    }
+
     pub(crate) fn into_writer_budgets(self) -> WriterBudgets {
         WriterBudgets {
-            kdf: self.kdf,
+            operation: WriterOperation {
+                kdf: self.kdf,
+                monitor: self.monitor.for_phase(crate::OperationPhase::Write),
+            },
             spool: SpoolBudget {
                 temporary_storage: self.temporary_storage,
                 retained_output: self.retained_output,
@@ -656,9 +671,9 @@ mod tests {
         });
         let mut budgets = budget.into_writer_budgets();
 
-        budgets.kdf.charge(KdfCycles::new(6)).unwrap();
+        budgets.operation.kdf.charge(KdfCycles::new(6)).unwrap();
         assert!(matches!(
-            budgets.kdf.charge(KdfCycles::new(3)),
+            budgets.operation.kdf.charge(KdfCycles::new(3)),
             Err(R7zError::ResourceLimitExceeded {
                 resource: "AES KDF cycles",
                 limit: 8,

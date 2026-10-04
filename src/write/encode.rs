@@ -9,7 +9,7 @@ use super::model::{
     EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, PreparedFolder, SolidMode,
     WriteEntry, WriteEntryIndex,
 };
-use crate::resources::{KdfBudget, KdfCycles, OperationBudget};
+use crate::resources::{KdfCycles, OperationBudget, WriterOperation};
 use crate::{R7zError, aes, bcj, codec};
 use lzma_rust2::{EncodeMode, Lzma2Options, LzmaOptions, LzmaWriter, MfType};
 use ppmd_rust::{
@@ -83,8 +83,26 @@ pub(super) struct PreparedSettings {
 }
 
 pub(super) struct PreparedArchiveOptions {
-    archive: ArchiveOptions,
+    archive: SensitiveArchiveOptions,
     settings: PreparedSettings,
+}
+
+struct SensitiveArchiveOptions(ArchiveOptions);
+
+impl std::ops::Deref for SensitiveArchiveOptions {
+    type Target = ArchiveOptions;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for SensitiveArchiveOptions {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(encryption) = &mut self.0.encryption {
+            encryption.password.zeroize();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,15 +213,19 @@ pub(crate) fn build_archive(
     options: &ArchiveOptions,
 ) -> Result<Vec<u8>, R7zError> {
     let prepared = prepare_archive_options(options.clone())?;
-    let budget = OperationBudget::new(options.streaming.resource_limits);
-    let mut kdf_budget = budget.into_writer_budgets().kdf;
-    build_archive_with_settings(entries, &prepared, &mut kdf_budget)
+    if let Some(control) = &options.streaming.control {
+        control.check()?;
+    }
+    let budget = OperationBudget::new(options.streaming.resource_limits)
+        .with_control(options.streaming.control.clone());
+    let mut operation = budget.into_writer_budgets().operation;
+    build_archive_with_settings(entries, &prepared, &mut operation)
 }
 
 pub(super) fn build_archive_with_settings(
     entries: &[WriteEntry],
     prepared: &PreparedArchiveOptions,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<Vec<u8>, R7zError> {
     let mut folders = Vec::new();
     let mut by_folder: BTreeMap<super::model::WriteFolderId, Vec<WriteEntryIndex>> =
@@ -229,7 +251,7 @@ pub(crate) fn build_archive_from_prepared(
     entries: &[WriteEntry],
     folders: &[PreparedFolder],
     prepared: &PreparedArchiveOptions,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<Vec<u8>, R7zError> {
     let options = &prepared.archive;
     let mut packed_data = Vec::new();
@@ -351,6 +373,7 @@ pub(crate) fn validate_archive_options(
 pub(super) fn prepare_archive_options(
     archive: ArchiveOptions,
 ) -> Result<PreparedArchiveOptions, R7zError> {
+    let archive = SensitiveArchiveOptions(archive);
     let settings = validate_archive_options(&archive)?;
     Ok(PreparedArchiveOptions { archive, settings })
 }
@@ -516,8 +539,9 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     entries: &[WriteEntry],
     folders: &[CompletedFolder],
     prepared: &PreparedArchiveOptions,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<W, R7zError> {
+    budget.monitor.check()?;
     let options = &prepared.archive;
     let packed_size = folders.iter().try_fold(0u64, |acc, folder| {
         let folder_size = folder.pack_sizes.iter().try_fold(0u64, |acc, &size| {
@@ -553,6 +577,7 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     out.seek(SeekFrom::Start(0))?;
     out.write_all(&signature)?;
     out.flush()?;
+    budget.monitor.check()?;
     Ok(out)
 }
 
@@ -560,7 +585,7 @@ pub(crate) fn encode_folder(
     entries: &[WriteEntry],
     file_indices: Vec<WriteEntryIndex>,
     prepared: &PreparedArchiveOptions,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<PreparedFolder, R7zError> {
     let mut data = Vec::new();
     let mut file_sizes = Vec::new();
@@ -664,7 +689,7 @@ fn encode_payload_with_options(
 fn encode_header_stream(
     raw_header: &[u8],
     prepared: &PreparedArchiveOptions,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<EncodedHeader, R7zError> {
     let (props, compressed) = codec::compress_lzma(raw_header)?;
     let coder_info = encode_coder_info_lzma(&props);
@@ -897,14 +922,14 @@ fn encode_lzma2_dict_size(dict_size: u32) -> Result<u8, R7zError> {
 }
 
 pub(super) struct AesMaterial {
-    pub(super) key: [u8; 32],
+    pub(super) key: zeroize::Zeroizing<[u8; 32]>,
     pub(super) iv: [u8; 16],
     pub(super) props: Vec<u8>,
 }
 
 pub(super) fn make_aes_material(
     encryption: PreparedEncryption<'_>,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<AesMaterial, R7zError> {
     let PreparedEncryption { options, settings } = encryption;
     let mut salt = vec![0u8; usize::from(settings.salt_len)];
@@ -921,10 +946,20 @@ pub(super) fn make_aes_material(
     let cycles = 1u64
         .checked_shl(u32::from(settings.cycles_power))
         .ok_or(R7zError::Decompression)?;
-    budget.charge(KdfCycles::new(cycles))?;
-    let key = aes::derive_key(&options.password, &salt, settings.cycles_power)?;
+    budget.monitor.check()?;
+    budget.kdf.charge(KdfCycles::new(cycles))?;
+    let key = aes::derive_key_with_control(
+        &options.password,
+        &salt,
+        settings.cycles_power,
+        budget.monitor.control(),
+    )?;
     let props = aes::encode_aes_properties(settings.cycles_power, &salt, &iv_bytes);
-    Ok(AesMaterial { key, iv, props })
+    Ok(AesMaterial {
+        key: zeroize::Zeroizing::new(key),
+        iv,
+        props,
+    })
 }
 
 fn write_signature(archive: &mut [u8], next_header_offset: u64, next_header: &[u8]) {

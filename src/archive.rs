@@ -37,6 +37,7 @@ pub struct ArchiveReadConfig<'a> {
     /// Resource limits for this operation.
     pub options: ArchiveReadOptions,
     password: Option<&'a str>,
+    control: Option<&'a crate::OperationControl>,
 }
 
 impl Default for ArchiveReadConfig<'_> {
@@ -52,6 +53,7 @@ impl<'a> ArchiveReadConfig<'a> {
         Self {
             options,
             password: None,
+            control: None,
         }
     }
 
@@ -59,6 +61,13 @@ impl<'a> ArchiveReadConfig<'a> {
     #[must_use]
     pub fn with_password(mut self, password: &'a str) -> Self {
         self.password = Some(password);
+        self
+    }
+
+    /// Apply cooperative cancellation and decoded-byte progress to this read.
+    #[must_use]
+    pub fn with_control(mut self, control: &'a crate::OperationControl) -> Self {
+        self.control = Some(control);
         self
     }
 
@@ -74,6 +83,7 @@ impl fmt::Debug for ArchiveReadConfig<'_> {
             .debug_struct("ArchiveReadConfig")
             .field("options", &self.options)
             .field("password", &self.password.map(|_| "<redacted>"))
+            .field("control", &self.control)
             .finish()
     }
 }
@@ -313,20 +323,23 @@ impl ArchiveReadSession<'_> {
     /// Complete the current folder and release its decoder. With a folder CRC,
     /// this reads and verifies the remaining data, including unselected entries.
     /// Without a folder CRC, an unselected tail may remain unread.
+    /// Returns the cumulative verification scope for visited folders. Earlier read
+    /// failures keep that scope [`crate::ReadVerification::Incomplete`].
     ///
     /// # Errors
     /// Returns decoding, checksum, or resource-limit errors. The decoder is released on both
     /// success and failure, so independent folders can still be processed.
-    pub fn finish_folder(&mut self) -> Result<(), R7zError> {
+    pub fn finish_folder(&mut self) -> Result<crate::ReadVerification, R7zError> {
         self.decoder.finish()
     }
 
     /// Complete the last folder and close this session.
+    /// The result distinguishes checked folders from checked entries with unread tails.
     ///
     /// # Errors
     /// Returns errors from [`finish_folder`](Self::finish_folder), including
     /// [`R7zError::ResourceLimitExceeded`].
-    pub fn finish(mut self) -> Result<(), R7zError> {
+    pub fn finish(mut self) -> Result<crate::ReadVerification, R7zError> {
         self.finish_folder()
     }
 }
@@ -401,9 +414,12 @@ impl Read for EntryReader<'_> {
         self.0.read(&mut buffer[..capacity]).map_err(|error| {
             let error = match error.kind() {
                 std::io::ErrorKind::Interrupted => R7zError::Io(error),
-                _ => error
-                    .downcast::<R7zError>()
-                    .unwrap_or(R7zError::Decompression),
+                _ => match error.downcast::<crate::operation::CancelledRead>() {
+                    Ok(_) => R7zError::Cancelled,
+                    Err(error) => error
+                        .downcast::<R7zError>()
+                        .unwrap_or(R7zError::Decompression),
+                },
             };
             let kind = match &error {
                 R7zError::Io(error) => error.kind(),
@@ -1143,7 +1159,7 @@ impl Archive {
 
         let mut session = self.read_session_with_options(config)?;
         let written = session.extract_to_writer(file_index, writer)?;
-        session.finish()?;
+        session.finish().map(|_| ())?;
         Ok(written)
     }
 
@@ -1257,11 +1273,12 @@ impl Archive {
             self.try_streams_info()?,
         )?;
         let decoder = EntryDecoder {
+            verification: crate::ReadVerification::CompleteFolders,
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
             password: config.password,
             mode: CompletionMode::SelectedStreams,
-            budget: OperationBudget::new(config.options),
+            budget: OperationBudget::new(config.options).with_control(config.control.cloned()),
         };
         Ok(ArchiveReadSession {
             files,
@@ -1447,11 +1464,12 @@ impl Archive {
             self.try_streams_info()?,
         )?;
         let mut decoder = EntryDecoder {
+            verification: crate::ReadVerification::CompleteFolders,
             source: PackedSource::new(&self.source, self.base_offset, files.pack_pos())?,
             current: None,
             password: config.password,
             mode,
-            budget: OperationBudget::new(config.options),
+            budget: OperationBudget::new(config.options).with_control(config.control.cloned()),
         };
         let result = match selected {
             EntrySelection::All(_) => files
@@ -1472,7 +1490,7 @@ impl Archive {
                 .collect::<Result<(), _>>(),
         };
         result?;
-        decoder.finish()
+        decoder.finish().map(|_| ())
     }
 
     /// Decode the target of a symlink entry.
@@ -1790,6 +1808,7 @@ impl<'c, 'a> ReadableEntry<'c, 'a> {
 
 /// Shares file-content dispatch and folder decoder state across read APIs.
 struct EntryDecoder<'a> {
+    verification: crate::ReadVerification,
     source: PackedSource<'a>,
     current: Option<(ReadFolderIndex, ActiveFolder<'a, 'a>)>,
     password: Option<&'a str>,
@@ -1803,12 +1822,20 @@ impl<'a> EntryDecoder<'a> {
         entry: ReadableEntry<'_, 'a>,
         callback: impl FnOnce(&ArchiveEntryInfo, &mut dyn Read) -> Result<(), R7zError>,
     ) -> Result<(), R7zError> {
-        match entry.content {
-            EntryContent::Empty => callback(&entry.info, &mut std::io::empty()),
-            EntryContent::Stream(location) => {
-                self.read_stream(&location, |reader| callback(&entry.info, reader))
-            }
+        let result = self
+            .budget
+            .monitor
+            .check()
+            .and_then(|()| match entry.content {
+                EntryContent::Empty => callback(&entry.info, &mut std::io::empty()),
+                EntryContent::Stream(location) => {
+                    self.read_stream(&location, |reader| callback(&entry.info, reader))
+                }
+            });
+        if result.is_err() {
+            self.verification = crate::ReadVerification::Incomplete;
         }
+        result
     }
 
     fn read_stream(
@@ -1833,9 +1860,11 @@ impl<'a> EntryDecoder<'a> {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), R7zError> {
+    fn finish(&mut self) -> Result<crate::ReadVerification, R7zError> {
         let active = self.current.take();
-        self.complete(active)
+        self.complete(active)?;
+        self.budget.monitor.check()?;
+        Ok(self.verification)
     }
 
     /// Consumes the detached folder on success or failure, including during a switch.
@@ -1843,10 +1872,20 @@ impl<'a> EntryDecoder<'a> {
         &mut self,
         active: Option<(ReadFolderIndex, ActiveFolder<'a, 'a>)>,
     ) -> Result<(), R7zError> {
-        active
+        let result = active
             .map(|(_, folder)| folder.finish(self.mode, &mut self.budget))
-            .transpose()
-            .map(|_| ())
+            .transpose();
+        match result {
+            Ok(Some(verification)) => {
+                self.verification = self.verification.combine(verification);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => {
+                self.verification = crate::ReadVerification::Incomplete;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -3091,7 +3130,10 @@ mod selected_stream_tests {
         session
             .read_entry(ArchiveEntryIndex::new(1), |_| Ok(()))
             .unwrap();
-        session.finish().unwrap();
+        assert_eq!(
+            session.finish().unwrap(),
+            crate::ReadVerification::CompleteFolders
+        );
         let reused = count.swap(0, Ordering::Relaxed);
         assert!(reused > 0);
         assert_eq!(reused, batched);
@@ -3155,7 +3197,10 @@ mod selected_stream_tests {
         session
             .extract_to_writer(ArchiveEntryIndex::new(6), &mut std::io::sink())
             .unwrap();
-        session.finish().unwrap();
+        assert_eq!(
+            session.finish().unwrap(),
+            crate::ReadVerification::CompleteFolders
+        );
     }
 
     #[test]
@@ -3174,7 +3219,10 @@ mod selected_stream_tests {
         session
             .extract_to_writer(ArchiveEntryIndex::new(6), &mut std::io::sink())
             .unwrap();
-        session.finish().unwrap();
+        assert_eq!(
+            session.finish().unwrap(),
+            crate::ReadVerification::CompleteFolders
+        );
     }
 
     #[test]
@@ -3194,7 +3242,10 @@ mod selected_stream_tests {
                 Ok(())
             });
             assert!(result.is_err());
-            session.finish_folder().unwrap();
+            assert_eq!(
+                session.finish_folder().unwrap(),
+                crate::ReadVerification::Incomplete
+            );
             let mut data = Vec::new();
             session
                 .extract_to_writer(ArchiveEntryIndex::new(2), &mut data)
@@ -3205,7 +3256,10 @@ mod selected_stream_tests {
                     .extract_to_memory(ArchiveEntryIndex::new(2))
                     .unwrap()
             );
-            session.finish().unwrap();
+            assert_eq!(
+                session.finish().unwrap(),
+                crate::ReadVerification::Incomplete
+            );
         }
     }
 
@@ -3218,7 +3272,10 @@ mod selected_stream_tests {
         session
             .extract_to_writer(ArchiveEntryIndex::new(0), &mut std::io::sink())
             .unwrap();
-        session.finish().unwrap();
+        assert_eq!(
+            session.finish().unwrap(),
+            crate::ReadVerification::SelectedEntries
+        );
     }
 
     fn archive_with_folder_crc_failure_bytes() -> Vec<u8> {
@@ -3289,7 +3346,10 @@ mod selected_stream_tests {
             .unwrap();
         assert_eq!(output, b"ab");
         assert!(matches!(session.finish_folder(), Err(R7zError::Crc)));
-        session.finish().unwrap();
+        assert_eq!(
+            session.finish().unwrap(),
+            crate::ReadVerification::Incomplete
+        );
 
         let mut output = Vec::new();
         let result = archive.stream_selected_files(&[ArchiveEntryIndex::new(0)], |_, reader| {
@@ -3382,7 +3442,10 @@ mod selected_stream_tests {
             )),
             Err(R7zError::Crc)
         ));
-        session.finish().unwrap();
+        assert_eq!(
+            session.finish().unwrap(),
+            crate::ReadVerification::Incomplete
+        );
 
         let mut visited = Vec::new();
         let result = archive.stream_selected_files(

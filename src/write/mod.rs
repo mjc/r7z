@@ -5,8 +5,8 @@ mod model;
 
 use crate::aes::Aes256CbcEncryptWriter;
 use crate::resources::{
-    KdfBudget, OpenVolumeBudget, OperationBudget, RetainedOutputBytes, SpoolBudget,
-    TemporaryStorageBudget, TemporaryStorageBytes, VolumeCountBudget, WriterBudgets,
+    OpenVolumeBudget, OperationBudget, RetainedOutputBytes, SpoolBudget, TemporaryStorageBudget,
+    TemporaryStorageBytes, VolumeCountBudget, WriterBudgets, WriterOperation,
 };
 use crate::{
     Archive, ArchiveEntryIndex, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle,
@@ -120,7 +120,7 @@ impl<W: Write> PayloadWriter<W> {
     fn new(
         out: W,
         prepared: &encode::PreparedArchiveOptions,
-        budget: &mut KdfBudget,
+        budget: &mut WriterOperation,
     ) -> Result<Self, R7zError> {
         match prepared.encryption() {
             Some(encryption) => {
@@ -242,7 +242,7 @@ impl<W: Write> StreamingFolder<W> {
         out: W,
         known_size: Option<u64>,
         prepared: &encode::PreparedArchiveOptions,
-        budget: &mut KdfBudget,
+        budget: &mut WriterOperation,
     ) -> Result<Self, R7zError> {
         prepared.validate_encoder_working_set()?;
         let options = prepared.archive();
@@ -250,12 +250,10 @@ impl<W: Write> StreamingFolder<W> {
         let payload = PayloadWriter::new(out, prepared, budget)?;
         let encoder = match settings.codec {
             encode::PreparedCodec::Copy => StreamingEncoder::Copy(payload),
-            encode::PreparedCodec::Lzma2(threads) => StreamingEncoder::Lzma2(lzma2::Encoder::new(
-                payload,
-                &options.compression,
-                known_size,
-                threads,
-            )?),
+            encode::PreparedCodec::Lzma2(threads) => StreamingEncoder::Lzma2(
+                lzma2::Encoder::new(payload, &options.compression, known_size, threads)?
+                    .with_control(budget.monitor.control().cloned()),
+            ),
             encode::PreparedCodec::Lzma => {
                 let lzma_options = encode::lzma_options(&options.compression);
                 let dict_size = lzma_options.dict_size;
@@ -283,12 +281,10 @@ impl<W: Write> StreamingFolder<W> {
                 StreamingEncoder::Ppmd { writer, props }
             }
             encode::PreparedCodec::Lzma2Bcj(threads) => {
-                StreamingEncoder::BcjLzma2(BcjX86Writer::new(lzma2::Encoder::new(
-                    payload,
-                    &options.compression,
-                    known_size,
-                    threads,
-                )?))
+                StreamingEncoder::BcjLzma2(BcjX86Writer::new(
+                    lzma2::Encoder::new(payload, &options.compression, known_size, threads)?
+                        .with_control(budget.monitor.control().cloned()),
+                ))
             }
         };
         Ok(Self {
@@ -303,7 +299,9 @@ impl<W: Write> StreamingFolder<W> {
         raw: RawFolderBlock,
         streams: &[StagedEntry],
         file_indices: Vec<WriteEntryIndex>,
+        monitor: &mut crate::operation::OperationMonitor,
     ) -> Result<Self, R7zError> {
+        monitor.check()?;
         if raw.packed_streams.len() != raw.pack_sizes.len() {
             return Err(R7zError::Parse);
         }
@@ -311,7 +309,11 @@ impl<W: Write> StreamingFolder<W> {
             if packed.len() as u64 != size {
                 return Err(R7zError::Parse);
             }
-            writer.write_all(packed)?;
+            for chunk in packed.chunks(monitor.buffer_size(packed.len().max(1))) {
+                monitor.check()?;
+                writer.write_all(chunk)?;
+                monitor.advance(chunk.len())?;
+            }
         }
         let files = file_indices
             .into_iter()
@@ -835,9 +837,11 @@ fn write_preserved_archive<W: Write + Seek>(
     let mut options = options.clone();
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
-    let budget = OperationBudget::new(prepared.archive().streaming.resource_limits);
+    let budget = OperationBudget::new(prepared.archive().streaming.resource_limits)
+        .with_control(prepared.archive().streaming.control.clone());
     let writer_budgets = budget.into_writer_budgets();
-    let mut kdf_budget = writer_budgets.kdf;
+    let mut operation = writer_budgets.operation;
+    operation.monitor.check()?;
     let mut retained_output_budget = writer_budgets.spool.retained_output;
     for entry in &entries {
         if let PreservedEntryStream::Data(data) = &entry.stream {
@@ -870,7 +874,7 @@ fn write_preserved_archive<W: Write + Seek>(
                     inner: &mut out,
                     count: 0,
                 };
-                StreamingFolder::raw(writer, raw, &entries, file_indices)?
+                StreamingFolder::raw(writer, raw, &entries, file_indices, &mut operation.monitor)?
             };
             let (_writer, folder) = folder.complete(&prepared)?;
             completed.push(folder);
@@ -880,7 +884,7 @@ fn write_preserved_archive<W: Write + Seek>(
                 &entries,
                 file_indices,
                 &prepared,
-                &mut kdf_budget,
+                &mut operation,
             )?);
         }
     }
@@ -889,7 +893,7 @@ fn write_preserved_archive<W: Write + Seek>(
         .into_iter()
         .map(StagedEntry::into_write_entry)
         .collect::<Vec<_>>();
-    encode::finish_streamed_archive(out, &write_entries, &completed, &prepared, &mut kdf_budget)
+    encode::finish_streamed_archive(out, &write_entries, &completed, &prepared, &mut operation)
 }
 
 enum StagedStream {
@@ -1079,7 +1083,7 @@ fn write_encoded_folder_streaming<W: Write>(
     streams: &[StagedEntry],
     file_indices: Vec<WriteEntryIndex>,
     prepared: &encode::PreparedArchiveOptions,
-    budget: &mut KdfBudget,
+    budget: &mut WriterOperation,
 ) -> Result<model::CompletedFolder, R7zError> {
     let data_entries = file_indices
         .into_iter()
@@ -1105,7 +1109,8 @@ fn write_encoded_folder_streaming<W: Write>(
     let known_size = staged_folder_size(&data_entries)?;
     let mut folder = StreamingFolder::encoded(out, Some(known_size), prepared, budget)?;
     for entry in data_entries {
-        let (size, checksum) = write_staged_stream_to(&entry.source, &mut folder)?;
+        let (size, checksum) =
+            write_staged_stream_to(&entry.source, &mut folder, &mut budget.monitor)?;
         folder.record_stream(entry.index, size, checksum)?;
     }
     let (_out, folder) = folder.complete(prepared)?;
@@ -1115,29 +1120,36 @@ fn write_encoded_folder_streaming<W: Write>(
 fn write_staged_stream_to<W: Write>(
     source: &StagedDataSource<'_>,
     out: &mut W,
+    monitor: &mut crate::operation::OperationMonitor,
+) -> Result<(u64, u32), R7zError> {
+    match source {
+        StagedDataSource::Bytes(data) => write_staged_reader(*data, out, monitor),
+        StagedDataSource::Path { path, .. } => write_staged_reader(File::open(path)?, out, monitor),
+    }
+}
+
+fn write_staged_reader(
+    mut reader: impl Read,
+    out: &mut impl Write,
+    monitor: &mut crate::operation::OperationMonitor,
 ) -> Result<(u64, u32), R7zError> {
     let mut hasher = crc32fast::Hasher::new();
-    let mut size = 0u64;
-    let mut buf = vec![0u8; 1024 * 1024];
-    match source {
-        StagedDataSource::Bytes(data) => {
-            out.write_all(data)?;
-            hasher.update(data);
-            size = data.len() as u64;
-        }
-        StagedDataSource::Path { path, .. } => {
-            let mut file = File::open(path)?;
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                out.write_all(&buf[..n])?;
-                hasher.update(&buf[..n]);
-                size = size.checked_add(n as u64).ok_or(R7zError::Parse)?;
-            }
-        }
-    }
+    let mut buf = vec![0u8; monitor.buffer_size(1024 * 1024)];
+    let size = std::iter::from_fn(|| match monitor.read(&mut reader, &mut buf) {
+        Ok(0) => None,
+        Ok(count) => Some(
+            out.write_all(&buf[..count])
+                .map(|()| {
+                    hasher.update(&buf[..count]);
+                    count as u64
+                })
+                .map_err(R7zError::from),
+        ),
+        Err(error) => Some(Err(error)),
+    })
+    .try_fold(0u64, |total, count| {
+        total.checked_add(count?).ok_or(R7zError::Parse)
+    })?;
     Ok((size, hasher.finalize()))
 }
 
@@ -1222,7 +1234,7 @@ pub struct ArchiveWriter<W: Write + Seek, const STARTED: bool = false> {
     state: WriterState<W>,
     entries: Vec<WriteEntry>,
     prepared: encode::PreparedArchiveOptions,
-    budget: KdfBudget,
+    budget: WriterOperation,
 }
 
 impl<W: Write + Seek> ArchiveWriter<W, false> {
@@ -1235,15 +1247,16 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
         let mut options = options;
         lzma2::set_default_budget(&mut options);
         let prepared = encode::prepare_archive_options(options)?;
-        let budget = OperationBudget::new(prepared.archive().streaming.resource_limits);
-        let kdf_budget = budget.into_writer_budgets().kdf;
-        Ok(Self::new_prepared(out, prepared, kdf_budget))
+        let budget = OperationBudget::new(prepared.archive().streaming.resource_limits)
+            .with_control(prepared.archive().streaming.control.clone());
+        let operation = budget.into_writer_budgets().operation;
+        Ok(Self::new_prepared(out, prepared, operation))
     }
 
     fn new_prepared(
         out: W,
         prepared: encode::PreparedArchiveOptions,
-        kdf_budget: KdfBudget,
+        operation: WriterOperation,
     ) -> Self {
         Self {
             state: WriterState::Ready {
@@ -1252,7 +1265,7 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
             },
             entries: Vec::new(),
             prepared,
-            budget: kdf_budget,
+            budget: operation,
         }
     }
 
@@ -1307,6 +1320,7 @@ impl<W: Write + Seek, const STARTED: bool> ArchiveWriter<W, STARTED> {
     ///
     /// Returns an error if the writer has already failed.
     pub fn append_empty_entry(&mut self, entry: ArchiveEntry) -> Result<(), R7zError> {
+        self.budget.monitor.check()?;
         let folder_id = self.next_folder_id()?;
         self.entries.push(WriteEntry {
             raw_name: None,
@@ -1487,6 +1501,7 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
     /// Returns a prior writer failure, or an encoding, output, or resource-limit
     /// error while finishing folders and writing the header.
     pub fn finish(mut self) -> Result<W, R7zError> {
+        self.budget.monitor.check()?;
         if matches!(self.state, WriterState::Failed) {
             return Err(writer_failed());
         }
@@ -1522,6 +1537,7 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         out.seek(SeekFrom::Start(0))?;
         out.write_all(&bytes)?;
         out.flush()?;
+        self.budget.monitor.check()?;
         Ok(out)
     }
 
@@ -1533,7 +1549,7 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         folder_plan: FolderPlan,
     ) -> Result<(), R7zError> {
         let mut buffer = vec![0u8; self.prepared.archive().streaming.buffer_size];
-        let first = reader.read(&mut buffer)?;
+        let first = self.budget.monitor.read(&mut reader, &mut buffer)?;
         if first == 0 {
             if matches!(folder_plan, FolderPlan::Preplanned { .. }) {
                 self.ensure_streaming_folder(folder_plan)?;
@@ -1577,7 +1593,7 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
             size = size
                 .checked_add(chunk.len() as u64)
                 .ok_or(R7zError::Parse)?;
-            let read = reader.read(&mut buffer)?;
+            let read = self.budget.monitor.read(&mut reader, &mut buffer)?;
             if read == 0 {
                 break;
             }
@@ -1776,23 +1792,24 @@ where
     let mut options = options;
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
-    let budget = OperationBudget::new(prepared.archive().streaming.resource_limits);
-    let kdf_budget = budget.into_writer_budgets().kdf;
-    build_streaming_with_prepared_options(entries, out, prepared, kdf_budget)
+    let budget = OperationBudget::new(prepared.archive().streaming.resource_limits)
+        .with_control(prepared.archive().streaming.control.clone());
+    let operation = budget.into_writer_budgets().operation;
+    build_streaming_with_prepared_options(entries, out, prepared, operation)
 }
 
 fn build_streaming_with_prepared_options<W, I, R>(
     entries: I,
     out: W,
     prepared: encode::PreparedArchiveOptions,
-    kdf_budget: KdfBudget,
+    operation: WriterOperation,
 ) -> Result<(), R7zError>
 where
     W: Write + Seek,
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    let mut writer = ArchiveWriter::new_prepared(out, prepared, kdf_budget).start();
+    let mut writer = ArchiveWriter::new_prepared(out, prepared, operation).start();
     for (name, reader) in entries {
         writer.append(&name, reader)?;
     }
@@ -1820,10 +1837,11 @@ where
     lzma2::set_default_budget(&mut options);
     let prepared = encode::prepare_archive_options(options)?;
     let resource_limits = prepared.archive().streaming.resource_limits;
-    let budget = OperationBudget::new(resource_limits);
+    let budget = OperationBudget::new(resource_limits)
+        .with_control(prepared.archive().streaming.control.clone());
     let all_budgets = budget.into_writer_budgets();
     let streaming_budgets = StreamingWriteBudgets {
-        kdf: all_budgets.kdf,
+        operation: all_budgets.operation,
         spool: all_budgets.spool,
     };
     match prepared.archive().streaming.spool.clone() {
@@ -1848,7 +1866,7 @@ where
 }
 
 struct StreamingWriteBudgets {
-    kdf: KdfBudget,
+    operation: WriterOperation,
     spool: SpoolBudget,
 }
 
@@ -1865,13 +1883,17 @@ where
     I: IntoIterator<Item = (String, R)>,
     R: Read,
 {
-    let StreamingWriteBudgets { kdf, spool } = budgets;
+    let StreamingWriteBudgets { operation, spool } = budgets;
+    let mut output_monitor =
+        crate::operation::OperationMonitor::new(prepared.archive().streaming.control.clone())
+            .for_phase(crate::OperationPhase::CopyOutput);
     let mut spool = AutoSpool::new(memory_threshold, dir, spool)?;
     let result = (|| {
-        build_streaming_with_prepared_options(entries, &mut spool, prepared, kdf)?;
+        build_streaming_with_prepared_options(entries, &mut spool, prepared, operation)?;
         spool.seek(SeekFrom::Start(0))?;
-        io::copy(&mut spool, out)?;
+        output_monitor.copy_to(&mut spool, out)?;
         out.flush()?;
+        output_monitor.check()?;
         Ok(())
     })();
     let limit_error = spool.limit_error();
@@ -1915,9 +1937,10 @@ where
     lzma2::set_default_budget(&mut archive_options);
     let prepared = encode::prepare_archive_options(archive_options)?;
     let resource_limits = prepared.archive().streaming.resource_limits;
-    let budget = OperationBudget::new(resource_limits);
+    let budget = OperationBudget::new(resource_limits)
+        .with_control(prepared.archive().streaming.control.clone());
     let WriterBudgets {
-        kdf: kdf_budget,
+        operation,
         spool,
         open_volumes: mut open_volume_budget,
         volume_count: mut volume_count_budget,
@@ -1930,15 +1953,19 @@ where
         } => (Some(memory_threshold), dir),
         SpoolMode::TempFile { dir } => (Some(0), dir),
     };
+    let mut output_monitor =
+        crate::operation::OperationMonitor::new(prepared.archive().streaming.control.clone())
+            .for_phase(crate::OperationPhase::CopyOutput);
     let mut archive = AutoSpool::new(memory_threshold, dir, spool)?;
     let result = (|| {
-        build_streaming_with_prepared_options(entries, &mut archive, prepared, kdf_budget)?;
+        build_streaming_with_prepared_options(entries, &mut archive, prepared, operation)?;
         write_volume_files(
             &mut archive,
             base_path.as_ref(),
             &sizes,
             &mut open_volume_budget,
             &mut volume_count_budget,
+            &mut output_monitor,
         )
     })();
     let limit_error = archive.limit_error();
@@ -1960,14 +1987,16 @@ fn write_volume_files<R: Read + Seek>(
     volume_sizes: &[NonZeroU64],
     open_volume_budget: &mut OpenVolumeBudget,
     volume_count_budget: &mut VolumeCountBudget,
+    monitor: &mut crate::operation::OperationMonitor,
 ) -> Result<Vec<PathBuf>, R7zError> {
+    monitor.check()?;
     let total_size = archive.seek(SeekFrom::End(0))?;
     let volume_count = required_volume_count(total_size, volume_sizes)?;
     volume_count_budget.charge(volume_count)?;
 
     archive.seek(SeekFrom::Start(0))?;
     let mut next = [0u8; 1];
-    let mut has_next = archive.read(&mut next)? != 0;
+    let mut has_next = monitor.read(archive, &mut next)? != 0;
     let mut volume_index = 0usize;
     let mut paths = Vec::new();
 
@@ -1984,15 +2013,16 @@ fn write_volume_files<R: Read + Seek>(
         let remaining = size - 1;
         let copied = write_volume_file(&path, open_volume_budget, |file| {
             file.write_all(&next)?;
-            let copied = io::copy(&mut archive.take(remaining), file)?;
+            let copied = monitor.copy_to(&mut archive.take(remaining), file)?;
             file.flush()?;
+            monitor.check()?;
             Ok(copied)
         })?;
         paths.push(path);
         if copied < remaining {
             break;
         }
-        has_next = archive.read(&mut next)? != 0;
+        has_next = monitor.read(archive, &mut next)? != 0;
         volume_index += 1;
     }
 

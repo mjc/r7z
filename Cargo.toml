@@ -37,12 +37,13 @@ num-derive = "0.4"
 num-traits = "0.2"
 ppmd-rust = "1.4.0"
 thiserror = "2"
-aes = "0.8"
+aes = { version = "0.8", features = ["zeroize"] }
 cbc = "0.1"
 sha2 = "0.10"
 getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cap-std = { version = "4.0.3", default-features = false }
+zeroize = "1.8"
 
 [patch.crates-io]
 lzma-rust2 = { path = "vendor/lzma-rust2" }

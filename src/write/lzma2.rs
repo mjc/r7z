@@ -160,6 +160,7 @@ enum State<W: Write> {
 
 pub(super) struct Encoder<W: Write> {
     state: Option<State<W>>,
+    control: Option<crate::OperationControl>,
 }
 
 impl<W: Write> Encoder<W> {
@@ -181,10 +182,22 @@ impl<W: Write> Encoder<W> {
                 data: Vec::new(),
             }
         };
-        Ok(Self { state: Some(state) })
+        Ok(Self {
+            state: Some(state),
+            control: None,
+        })
     }
 
-    fn start(state: State<W>, parallel: bool) -> io::Result<State<W>> {
+    pub(super) fn with_control(mut self, control: Option<crate::OperationControl>) -> Self {
+        self.control = control;
+        self
+    }
+
+    fn start(
+        state: State<W>,
+        parallel: bool,
+        control: Option<&crate::OperationControl>,
+    ) -> io::Result<State<W>> {
         let State::Buffered {
             out,
             options,
@@ -196,7 +209,10 @@ impl<W: Write> Encoder<W> {
         };
         if parallel {
             let mut writer = Lzma2WriterMt::new(out, options, workers)?;
-            writer.write_all(&data)?;
+            if let Some(control) = control {
+                writer.set_cancellation(control.cancellation_flag());
+            }
+            writer.write_all(&data).map_err(encoder_io_error)?;
             Ok(State::Parallel(Box::new(writer)))
         } else {
             let mut writer = Lzma2Writer::new(out, options);
@@ -210,9 +226,9 @@ impl<W: Write> Encoder<W> {
             .state
             .take()
             .ok_or_else(|| io::Error::other("encoder is unavailable after an error"))?;
-        match Self::start(state, false)? {
+        match Self::start(state, false, self.control.as_ref())? {
             State::Single(writer) => writer.finish(),
-            State::Parallel(writer) => writer.finish(),
+            State::Parallel(writer) => writer.finish().map_err(encoder_io_error),
             State::Buffered { .. } => unreachable!(),
         }
     }
@@ -236,11 +252,11 @@ impl<W: Write> Write for Encoder<W> {
                 return Ok(buf.len());
             }
             let state = self.state.take().expect("encoder state exists");
-            self.state = Some(Self::start(state, true)?);
+            self.state = Some(Self::start(state, true, self.control.as_ref())?);
         }
         match self.state.as_mut().expect("encoder state exists") {
             State::Single(writer) => writer.write(buf),
-            State::Parallel(writer) => writer.write(buf),
+            State::Parallel(writer) => writer.write(buf).map_err(encoder_io_error),
             State::Buffered { .. } => unreachable!(),
         }
     }
@@ -251,13 +267,20 @@ impl<W: Write> Write for Encoder<W> {
         }
         if matches!(self.state, Some(State::Buffered { .. })) {
             let state = self.state.take().expect("encoder state exists");
-            self.state = Some(Self::start(state, false)?);
+            self.state = Some(Self::start(state, false, self.control.as_ref())?);
         }
         match self.state.as_mut().expect("encoder state exists") {
             State::Single(writer) => writer.flush(),
-            State::Parallel(writer) => writer.flush(),
+            State::Parallel(writer) => writer.flush().map_err(encoder_io_error),
             State::Buffered { .. } => unreachable!(),
         }
+    }
+}
+
+fn encoder_io_error(error: io::Error) -> io::Error {
+    match error.downcast::<lzma_rust2::EncoderCancelled>() {
+        Ok(_) => crate::operation::read_io_error(R7zError::Cancelled),
+        Err(error) => error,
     }
 }
 

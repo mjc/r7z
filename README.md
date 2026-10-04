@@ -283,6 +283,26 @@ and releases the current decoder without closing the session. Dropping a session
 verify its remaining data. Failed data reads release the decoder, allowing a later request
 to continue at an independent folder.
 
+`finish()` and `finish_folder()` return `ReadVerification`: `CompleteFolders`
+means every visited folder was drained and checked, `SelectedEntries` means an
+unselected tail remains unchecked, and `Incomplete` records an earlier failed
+read. These results describe visited folders, not the entire archive.
+
+Pass an `OperationControl` through `ArchiveReadConfig::with_control` for reads or
+`StreamingOptions::control` for writing and updates. `cancel()` can be called from
+another thread. `with_progress` installs a callback that can also cancel by
+returning `ControlFlow::Break(())`. Progress counts decoded bytes, encoder input
+or copied packed bytes; final spool transfers use a separate `CopyOutput` phase.
+Counts restart at each phase and callbacks run at most once per 64 KiB.
+
+Cancellation checks run at data boundaries, every 1024 AES KDF rounds, and while
+waiting for encoder workers. Blocking I/O and individual codec calls must return
+before a check can run. Workers are joined before the operation returns.
+Cancellation returns `R7zError::Cancelled`; failed reads keep verification
+incomplete. Caller-owned writers and volume files can contain partial output.
+Passwords are redacted from option debug output. Prepared writer password copies, KDF
+buffers and AES keys are cleared on drop; caller-owned passwords remain theirs.
+
 `EntryType::EmptySymlink` identifies a symlink with no target data stream.
 It remains file-like for extraction, and `ArchiveEntryInfo::has_data_stream()` returns `false`.
 

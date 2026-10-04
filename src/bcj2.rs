@@ -6,6 +6,23 @@ const NUM_MODEL_BITS: u32 = 11;
 const BIT_MODEL_TOTAL: u16 = 1 << NUM_MODEL_BITS;
 const NUM_MOVE_BITS: u32 = 5;
 
+#[cfg(test)]
+#[test]
+fn cancellation_stops_bcj2_materialization_before_the_folder_end() {
+    let control = crate::OperationControl::with_progress(|_| std::ops::ControlFlow::Break(()));
+    let mut monitor = crate::operation::OperationMonitor::new(Some(control));
+    let result = decode_with_control(
+        Box::new(std::io::Cursor::new(vec![0; 128 * 1024])),
+        Box::new(std::io::empty()),
+        Box::new(std::io::empty()),
+        Box::new(std::io::Cursor::new([0; 5])),
+        128 * 1024,
+        &mut monitor,
+    );
+    assert!(matches!(result, Err(R7zError::Cancelled)));
+}
+
+#[cfg(test)]
 pub(crate) fn decode<'a>(
     main: Box<dyn Read + 'a>,
     call: Box<dyn Read + 'a>,
@@ -13,6 +30,25 @@ pub(crate) fn decode<'a>(
     rc: Box<dyn Read + 'a>,
     output_size: usize,
 ) -> Result<Vec<u8>, R7zError> {
+    decode_with_control(
+        main,
+        call,
+        jump,
+        rc,
+        output_size,
+        &mut crate::operation::OperationMonitor::default(),
+    )
+}
+
+pub(crate) fn decode_with_control<'a>(
+    main: Box<dyn Read + 'a>,
+    call: Box<dyn Read + 'a>,
+    jump: Box<dyn Read + 'a>,
+    rc: Box<dyn Read + 'a>,
+    output_size: usize,
+    monitor: &mut crate::operation::OperationMonitor,
+) -> Result<Vec<u8>, R7zError> {
+    monitor.check()?;
     let mut main = StreamCursor::new(main);
     let mut call = StreamCursor::new(call);
     let mut jump = StreamCursor::new(jump);
@@ -22,16 +58,27 @@ pub(crate) fn decode<'a>(
     let mut prev = 0u8;
 
     while output.len() < output_size {
+        let before = output.len();
+        let limit = before + monitor.buffer_size(output_size - before);
         control.normalize()?;
 
-        let Some((opcode, prev_before_opcode)) =
-            copy_until_branch_opcode(&mut main, &mut output, output_size, &mut ip, prev)?
-        else {
-            break;
-        };
+        let (opcode, prev_before_opcode) =
+            match copy_until_branch_opcode(&mut main, &mut output, limit, &mut ip, prev)? {
+                OpcodeScan::Branch { opcode, previous } => (opcode, previous),
+                OpcodeScan::Boundary { previous } => {
+                    prev = previous;
+                    monitor.advance(output.len() - before)?;
+                    continue;
+                }
+                OpcodeScan::End => {
+                    monitor.advance(output.len() - before)?;
+                    break;
+                }
+            };
         prev = opcode;
 
         if !control.branch_is_encoded(opcode, prev_before_opcode)? {
+            monitor.advance(output.len() - before)?;
             continue;
         }
         let absolute = match opcode {
@@ -47,6 +94,7 @@ pub(crate) fn decode<'a>(
         prev = relative[3];
 
         control.normalize_if_available()?;
+        monitor.advance(output.len() - before)?;
     }
 
     if output.len() != output_size || main.has_more()? || call.has_more()? || jump.has_more()? {
@@ -54,6 +102,7 @@ pub(crate) fn decode<'a>(
     }
 
     control.finish()?;
+    monitor.check()?;
     Ok(output)
 }
 
@@ -128,32 +177,44 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
+enum OpcodeScan {
+    Branch { opcode: u8, previous: u8 },
+    Boundary { previous: u8 },
+    End,
+}
+
 fn copy_until_branch_opcode(
     main: &mut StreamCursor<'_>,
     output: &mut Vec<u8>,
     output_size: usize,
     ip: &mut u32,
     mut prev: u8,
-) -> Result<Option<(u8, u8)>, R7zError> {
+) -> Result<OpcodeScan, R7zError> {
     while output.len() < output_size {
         let Some(opcode) = main.read_byte_optional()? else {
-            return Ok(None);
+            return Ok(OpcodeScan::End);
         };
         output.push(opcode);
         *ip = ip.wrapping_add(1);
 
         if prev == 0x0F && (opcode & 0xF0) == 0x80 {
-            return Ok(Some((opcode, prev)));
+            return Ok(OpcodeScan::Branch {
+                opcode,
+                previous: prev,
+            });
         }
 
         let prev_before_opcode = prev;
         prev = opcode;
         if (opcode & 0xFE) == 0xE8 {
-            return Ok(Some((opcode, prev_before_opcode)));
+            return Ok(OpcodeScan::Branch {
+                opcode,
+                previous: prev_before_opcode,
+            });
         }
     }
 
-    Ok(None)
+    Ok(OpcodeScan::Boundary { previous: prev })
 }
 
 struct StreamCursor<'a> {
@@ -178,7 +239,7 @@ impl<'a> StreamCursor<'a> {
             self.len = loop {
                 match self.reader.read(&mut self.buffer) {
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                    result => break result.map_err(R7zError::Io)?,
+                    result => break result.map_err(crate::operation::restore_read_error)?,
                 }
             };
             self.pos = 0;
@@ -211,7 +272,7 @@ impl<'a> StreamCursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::{decode, decode_with_control};
     use crate::R7zError;
     use std::io::{self, Cursor, Read};
 
@@ -280,6 +341,30 @@ mod tests {
                 [opcode, 4, 0, 0, 0],
             );
         }
+    }
+
+    #[test]
+    fn conditional_branch_survives_a_progress_boundary() {
+        let mut main = vec![0x90; crate::operation::CHECK_INTERVAL - 1];
+        main.extend_from_slice(&[0x0f, 0x85]);
+        let absolute = u32::try_from(main.len() + 8).unwrap().to_be_bytes();
+        let control = [0, 0x7f, 0xff, 0xfc, 0];
+        let mut expected = main.clone();
+        expected.extend_from_slice(&[4, 0, 0, 0]);
+        let progress = crate::OperationControl::new();
+        let mut monitor = crate::operation::OperationMonitor::new(Some(progress));
+        assert_eq!(
+            decode_with_control(
+                reader(&main),
+                reader(&[]),
+                reader(&absolute),
+                reader(&control),
+                expected.len(),
+                &mut monitor,
+            )
+            .unwrap(),
+            expected
+        );
     }
 
     #[test]

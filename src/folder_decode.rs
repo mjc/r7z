@@ -728,12 +728,6 @@ pub(crate) enum CompletionMode {
     SelectedStreams,
 }
 
-#[must_use]
-pub(crate) enum FolderCompletion {
-    VerifiedFolder,
-    VerifiedSelection,
-}
-
 pub(crate) struct ActiveFolder<'a, 'r> {
     reader: codec::FolderReader<'r>,
     streams: Substreams<'a>,
@@ -780,12 +774,12 @@ impl ActiveFolder<'_, '_> {
         if content.limit_exceeded {
             return Err(content.budget.decoded_limit_error());
         }
-        consume_result?;
+        consume_result.map_err(crate::operation::restore_callback_error)?;
         let drain_result = std::io::copy(&mut content, &mut std::io::sink());
         if content.limit_exceeded {
             return Err(content.budget.decoded_limit_error());
         }
-        drain_result.map_err(|_| R7zError::Decompression)?;
+        drain_result.map_err(crate::operation::restore_read_error)?;
         if content.remaining != 0 {
             return Err(R7zError::Decompression);
         }
@@ -797,12 +791,12 @@ impl ActiveFolder<'_, '_> {
         self,
         mode: CompletionMode,
         budget: &mut OperationBudget,
-    ) -> Result<FolderCompletion, R7zError> {
+    ) -> Result<crate::ReadVerification, R7zError> {
         if matches!(mode, CompletionMode::SelectedStreams)
             && matches!(self.digest, DigestState::Absent)
             && self.streams.len() != 0
         {
-            return Ok(FolderCompletion::VerifiedSelection);
+            return Ok(crate::ReadVerification::SelectedEntries);
         }
         let remaining = self.streams.len();
         let mut folder =
@@ -814,13 +808,13 @@ impl ActiveFolder<'_, '_> {
         if folder
             .reader
             .read(&mut extra)
-            .map_err(|_| R7zError::Decompression)?
+            .map_err(crate::operation::restore_read_error)?
             != 0
         {
             return Err(R7zError::Decompression);
         }
         folder.digest.finish()?;
-        Ok(FolderCompletion::VerifiedFolder)
+        Ok(crate::ReadVerification::CompleteFolders)
     }
 }
 
@@ -874,6 +868,10 @@ struct SubstreamReader<'a> {
 
 impl Read for SubstreamReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.budget
+            .monitor
+            .check()
+            .map_err(crate::operation::read_io_error)?;
         let limit = usize::try_from(self.remaining)
             .unwrap_or(usize::MAX)
             .min(buf.len());
@@ -888,7 +886,8 @@ impl Read for SubstreamReader<'_> {
             }
             (true, Some(remaining)) => usize::try_from(remaining.get()).unwrap_or(usize::MAX),
         };
-        let n = self.reader.read(&mut buf[..limit.min(allowed)])?;
+        let limit = self.budget.monitor.buffer_size(limit.min(allowed));
+        let n = self.reader.read(&mut buf[..limit])?;
         if n == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -904,6 +903,12 @@ impl Read for SubstreamReader<'_> {
             .ok_or(std::io::ErrorKind::InvalidData)?;
         self.folder_digest.update(&buf[..n]);
         self.stream_digest.update(&buf[..n]);
+        if self.charge_budget {
+            self.budget
+                .monitor
+                .advance(n)
+                .map_err(crate::operation::read_io_error)?;
+        }
         Ok(n)
     }
 }
@@ -926,7 +931,7 @@ mod tests {
                 CompletionMode::SelectedStreams,
                 &mut OperationBudget::for_decoded_limit(None),
             ),
-            Ok(FolderCompletion::VerifiedFolder)
+            Ok(crate::ReadVerification::CompleteFolders)
         ));
     }
 

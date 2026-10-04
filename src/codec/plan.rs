@@ -495,12 +495,13 @@ impl<R: Read> ReadyDecoder<R> {
                 }
                 Ok(FolderReader::Stream(reader))
             }
-            BoundTopology::Bcj2(bcj2) => crate::bcj2::decode(
+            BoundTopology::Bcj2(bcj2) => crate::bcj2::decode_with_control(
                 bcj2.main.open(password, budget)?,
                 bcj2.call.open(password, budget)?,
                 bcj2.jump.open(password, budget)?,
                 bcj2.control.open(password, budget)?,
                 bcj2.output_size,
+                &mut budget.monitor,
             )
             .map(|bytes| FolderReader::Buffered(Cursor::new(bytes))),
         }
