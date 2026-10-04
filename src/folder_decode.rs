@@ -607,6 +607,19 @@ impl<'a> FolderPlans<'a> {
         Ok(())
     }
 
+    fn folder_stream_count(&self) -> Result<usize, R7zError> {
+        self.substream_info
+            .map(|info| {
+                info.num_unpack_streams_per_folder
+                    .get(self.folder_index)
+                    .copied()
+                    .ok_or(R7zError::Parse)
+                    .and_then(|count| usize::try_from(count).map_err(|_| R7zError::Parse))
+            })
+            .transpose()
+            .map(|count| count.unwrap_or(1))
+    }
+
     fn next_folder(&mut self) -> Result<FolderLayout<'a>, R7zError> {
         let (folder, graph) = self
             .unpack_info
@@ -632,17 +645,7 @@ impl<'a> FolderPlans<'a> {
         let unpack_size = *coder_sizes
             .get(graph.final_output().get())
             .ok_or(R7zError::Parse)?;
-        let stream_count = self
-            .substream_info
-            .map(|info| {
-                info.num_unpack_streams_per_folder
-                    .get(self.folder_index)
-                    .copied()
-                    .ok_or(R7zError::Parse)
-                    .and_then(|count| usize::try_from(count).map_err(|_| R7zError::Parse))
-            })
-            .transpose()?
-            .unwrap_or(1);
+        let stream_count = self.folder_stream_count()?;
         let explicit_count = stream_count.saturating_sub(1);
         let stream_size_end = self
             .stream_size_base
@@ -1075,7 +1078,7 @@ mod tests {
                 |stream| {
                     Ok(codec::PackedInput {
                         reader: Unreadable,
-                        size: stream.range.len() as usize,
+                        size: usize::try_from(stream.range.len()).unwrap(),
                     })
                 },
                 &mut budget,
@@ -1091,11 +1094,11 @@ mod tests {
         ));
     }
 
-    fn packed_folder<'a>(
+    fn packed_folder(
         decoded_len: usize,
         crc: Option<u32>,
-        layout: FolderStreamLayout<'a>,
-    ) -> FolderLayout<'a> {
+        layout: FolderStreamLayout<'_>,
+    ) -> FolderLayout<'_> {
         let folder = Folder::parse(&[1, 1, 0]).unwrap().1;
         let graph = folder.graph().unwrap();
         FolderLayout {

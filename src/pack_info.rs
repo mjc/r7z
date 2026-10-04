@@ -131,7 +131,7 @@ fn scan_folder_blocks(
 }
 
 /// Describes where the packed (compressed) data streams live in the archive file.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PackInfo {
     /// Byte offset of the first packed stream, measured from the end of the
     /// 32-byte [`SignatureHeader`](crate::SignatureHeader).

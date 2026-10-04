@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 use std::{fs, path::Path};
 
 #[derive(Debug)]

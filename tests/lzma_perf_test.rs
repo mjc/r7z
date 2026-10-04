@@ -1,12 +1,10 @@
-#![allow(clippy::pedantic)]
-
 use sha2::{Digest, Sha256};
-/// Head-to-head comparison: lzma_rust2 (pure Rust) vs C liblzma (via xz2).
+/// Head-to-head comparison: `lzma_rust2` (pure Rust) vs C liblzma (via xz2).
 ///
 /// Uses LZMA-alone format for both so the underlying algorithm is identical
 /// and framing differences are negligible.
 ///
-/// Run with:  cargo test --release lzma_perf -- --nocapture --ignored
+/// Run with:  cargo test --release `lzma_perf` -- --nocapture --ignored
 use std::io::{Cursor, Read, Write};
 use std::num::NonZeroU64;
 use std::time::Instant;
@@ -15,7 +13,7 @@ const ITERS: u32 = 5;
 
 /// 1 MB payload — repeating counter cycle, same as the benchmark fixtures.
 fn payload() -> Vec<u8> {
-    (0..1_048_576u32).map(|i| (i % 256) as u8).collect()
+    (0..1_048_576u32).map(|i| i.to_le_bytes()[0]).collect()
 }
 
 /// Pseudo-random 1 MB — poor compressibility (xorshift32).
@@ -76,7 +74,7 @@ fn rust_decompress(alone: &[u8]) -> Vec<u8> {
         None,
     )
     .unwrap();
-    let mut out = Vec::with_capacity(unpack_size as usize);
+    let mut out = Vec::with_capacity(usize::try_from(unpack_size).unwrap());
     r.read_to_end(&mut out).unwrap();
     out
 }
@@ -118,7 +116,7 @@ fn bench<F: Fn() -> R, R>(label: &str, iters: u32, f: F) -> std::time::Duration 
 }
 
 #[test]
-#[ignore] // run explicitly with --ignored
+#[ignore = "manual Rust and liblzma performance comparison"]
 fn lzma_rust_vs_c_performance() {
     let data = payload();
     println!(
@@ -130,7 +128,7 @@ fn lzma_rust_vs_c_performance() {
     println!("Compression (preset 6):");
     let rust_comp_time = bench("lzma_rust2", ITERS, || rust_compress(&data));
     let c_comp_time = bench("C liblzma ", ITERS, || c_compress(&data));
-    let comp_ratio = rust_comp_time.as_nanos() as f64 / c_comp_time.as_nanos() as f64;
+    let comp_ratio = rust_comp_time.as_secs_f64() / c_comp_time.as_secs_f64();
     println!("  → Rust/C ratio: {comp_ratio:.2}x\n");
 
     // Pre-compress for decompression benchmarks
@@ -146,7 +144,7 @@ fn lzma_rust_vs_c_performance() {
     println!("Decompression:");
     let rust_dec_time = bench("lzma_rust2", ITERS, || rust_decompress(&rust_compressed));
     let c_dec_time = bench("C liblzma ", ITERS, || c_decompress(&c_compressed));
-    let dec_ratio = rust_dec_time.as_nanos() as f64 / c_dec_time.as_nanos() as f64;
+    let dec_ratio = rust_dec_time.as_secs_f64() / c_dec_time.as_secs_f64();
     println!("  → Rust/C ratio: {dec_ratio:.2}x\n");
 
     // Verify correctness
@@ -161,7 +159,7 @@ fn lzma_rust_vs_c_performance() {
     println!("Compression (preset 6):");
     let rust_comp_time2 = bench("lzma_rust2", ITERS, || rust_compress(&random_data));
     let c_comp_time2 = bench("C liblzma ", ITERS, || c_compress(&random_data));
-    let comp_ratio2 = rust_comp_time2.as_nanos() as f64 / c_comp_time2.as_nanos() as f64;
+    let comp_ratio2 = rust_comp_time2.as_secs_f64() / c_comp_time2.as_secs_f64();
     println!("  → Rust/C ratio: {comp_ratio2:.2}x\n");
 
     let rust_rand_compressed = rust_compress(&random_data);
@@ -177,7 +175,7 @@ fn lzma_rust_vs_c_performance() {
         rust_decompress(&rust_rand_compressed)
     });
     let c_dec_time2 = bench("C liblzma ", ITERS, || c_decompress(&c_rand_compressed));
-    let dec_ratio2 = rust_dec_time2.as_nanos() as f64 / c_dec_time2.as_nanos() as f64;
+    let dec_ratio2 = rust_dec_time2.as_secs_f64() / c_dec_time2.as_secs_f64();
     println!("  → Rust/C ratio: {dec_ratio2:.2}x\n");
 
     assert_eq!(rust_decompress(&rust_rand_compressed), random_data);
@@ -191,7 +189,7 @@ fn lzma_rust_vs_c_performance() {
     println!("Compression (preset 6):");
     let rust_comp_time3 = bench("lzma_rust2", ITERS, || rust_compress(&text_data));
     let c_comp_time3 = bench("C liblzma ", ITERS, || c_compress(&text_data));
-    let comp_ratio3 = rust_comp_time3.as_nanos() as f64 / c_comp_time3.as_nanos() as f64;
+    let comp_ratio3 = rust_comp_time3.as_secs_f64() / c_comp_time3.as_secs_f64();
     println!("  → Rust/C ratio: {comp_ratio3:.2}x\n");
 
     let rust_text_compressed = rust_compress(&text_data);
@@ -207,7 +205,7 @@ fn lzma_rust_vs_c_performance() {
         rust_decompress(&rust_text_compressed)
     });
     let c_dec_time3 = bench("C liblzma ", ITERS, || c_decompress(&c_text_compressed));
-    let dec_ratio3 = rust_dec_time3.as_nanos() as f64 / c_dec_time3.as_nanos() as f64;
+    let dec_ratio3 = rust_dec_time3.as_secs_f64() / c_dec_time3.as_secs_f64();
     println!("  → Rust/C ratio: {dec_ratio3:.2}x\n");
 
     assert_eq!(rust_decompress(&rust_text_compressed), text_data);
@@ -244,7 +242,7 @@ fn large_lzma2_mt_candidate() {
     let input_size = std::fs::metadata(input_path).unwrap().len();
     let mut input_hash = Sha256::new();
     let mut input = std::fs::File::open(input_path).unwrap();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = input.read(&mut buffer).unwrap();
         if read == 0 {
@@ -281,10 +279,10 @@ fn large_lzma2_mt_candidate() {
 
     let mut decoder =
         lzma_rust2::Lzma2Reader::new(output.as_slice(), options.lzma_options.dict_size, None);
-    let mut decoded = Sha256Sink::default();
-    std::io::copy(&mut decoder, &mut decoded).unwrap();
-    assert_eq!(decoded.len, input_size);
-    assert_eq!(decoded.hasher.finalize(), expected_hash);
+    let mut decoded_output = Sha256Sink::default();
+    std::io::copy(&mut decoder, &mut decoded_output).unwrap();
+    assert_eq!(decoded_output.len, input_size);
+    assert_eq!(decoded_output.hasher.finalize(), expected_hash);
 }
 
 #[derive(Default)]

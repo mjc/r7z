@@ -457,8 +457,7 @@ impl Bindings {
                         let is_unbound = self.bound_inputs.get(input.0) == Some(&false);
                         let is_new = seen
                             .get_mut(input.0)
-                            .map(|seen| !std::mem::replace(seen, true))
-                            .unwrap_or(false);
+                            .is_some_and(|seen| !std::mem::replace(seen, true));
                         (is_unbound && is_new)
                             .then_some((PackedStreamIndex(packed), input))
                             .ok_or(R7zError::InvalidFolderGraph)
@@ -490,9 +489,10 @@ impl Bindings {
                 }
             }
         }
-        match order.len() == self.indegree.len() {
-            true => Ok(order),
-            false => Err(R7zError::InvalidFolderGraph),
+        if order.len() == self.indegree.len() {
+            Ok(order)
+        } else {
+            Err(R7zError::InvalidFolderGraph)
         }
     }
 }
@@ -550,7 +550,7 @@ pub fn scan_folder(input: &[u8]) -> IResult<&[u8], usize> {
 ///
 /// In the common case a folder contains a single [`CoderInfo`] with no bind pairs.
 /// Complex archives may chain multiple coders (e.g. BCJ + LZMA).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Folder {
     /// Ordered list of coders in this folder.
     /// Typically 1 (simple archive) or 2 (e.g. BCJ + LZMA); stays on the stack.

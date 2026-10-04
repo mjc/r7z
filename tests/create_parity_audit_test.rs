@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 mod support;
 
 use support::{extract_with_p7zip, run_7z_checked};

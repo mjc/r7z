@@ -1,5 +1,3 @@
-#![allow(clippy::missing_errors_doc)]
-
 mod encode;
 mod header;
 mod lzma2;
@@ -403,48 +401,32 @@ impl<W: Write> StreamingFolder<W> {
                     },
                 ));
             }
-            StreamingEncoder::Copy(writer) => {
-                let PayloadCompletion { writer, encrypted } = writer.finish()?;
-                let packed_size = writer.count;
-                let mut coder_info = encode_coder_info_copy();
-                let mut coder_unpack_sizes = vec![unpack_size];
-                if let Some(encrypted) = encrypted {
-                    coder_info = encode_coder_info_aes_then(&[CoderSpec::Copy], &encrypted.props);
-                    coder_unpack_sizes.insert(0, encrypted.plaintext_size);
-                }
-                return Ok((
-                    writer,
-                    model::CompletedFolder {
-                        file_indices,
-                        pack_sizes: vec![packed_size],
-                        coder_info,
-                        coder_unpack_sizes,
-                        folder_crc: None,
-                        file_sizes,
-                        file_crcs,
-                    },
-                ));
-            }
+            StreamingEncoder::Copy(writer) => (
+                writer,
+                encode_coder_info_copy(),
+                vec![unpack_size],
+                smallvec::smallvec![CoderSpec::Copy],
+            ),
             StreamingEncoder::Lzma2(writer) => {
                 let property = encode::lzma2_property_byte(&prepared.archive().compression)?;
                 (
                     writer.finish()?,
                     encode_coder_info_lzma2(property),
                     vec![unpack_size],
-                    vec![CoderSpec::Lzma2(property)],
+                    smallvec::smallvec![CoderSpec::Lzma2(property)],
                 )
             }
             StreamingEncoder::Lzma { writer, props } => (
                 writer.finish()?,
                 encode_coder_info_lzma(&props),
                 vec![unpack_size],
-                vec![CoderSpec::Lzma(props)],
+                smallvec::smallvec![CoderSpec::Lzma(props)],
             ),
             StreamingEncoder::Ppmd { writer, props } => (
                 (*writer).finish(false)?,
                 encode_coder_info_ppmd(&props),
                 vec![unpack_size],
-                vec![CoderSpec::Ppmd(props)],
+                smallvec::smallvec![CoderSpec::Ppmd(props)],
             ),
             StreamingEncoder::BcjLzma2(writer) => {
                 let writer = writer.finish()?.finish()?;
@@ -453,10 +435,11 @@ impl<W: Write> StreamingFolder<W> {
                     writer,
                     encode_coder_info_bcj_lzma2(property),
                     vec![unpack_size, unpack_size],
-                    vec![CoderSpec::Lzma2(property), CoderSpec::Bcj],
+                    smallvec::smallvec![CoderSpec::Lzma2(property), CoderSpec::Bcj],
                 )
             }
         };
+        let specs: smallvec::SmallVec<[CoderSpec; 2]> = specs;
         let PayloadCompletion { writer, encrypted } = writer.finish()?;
         let pack_size = writer.count;
         if let Some(encrypted) = encrypted {
@@ -636,6 +619,11 @@ impl ArchiveBuilder {
         self
     }
 
+    /// Add entry metadata and optional buffered contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::InvalidOptions`] if a non-file entry has stream data.
     pub fn add_entry(mut self, entry: ArchiveEntry, data: Option<&[u8]>) -> Result<Self, R7zError> {
         self.entries.push(write_entry_from_archive_entry(
             entry,
@@ -684,6 +672,11 @@ impl ArchiveBuilder {
         self
     }
 
+    /// Encode the buffered entries into an archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid-option, encoding, encryption, or resource-limit errors.
     pub fn build(self) -> Result<Vec<u8>, R7zError> {
         let mut options = self.options;
         lzma2::set_default_budget(&mut options);
@@ -1233,6 +1226,11 @@ pub struct ArchiveWriter<W: Write + Seek, const STARTED: bool = false> {
 }
 
 impl<W: Write + Seek> ArchiveWriter<W, false> {
+    /// Prepare a streaming archive writer with the supplied options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compression, encryption, or resource-limit settings are invalid.
     pub fn new(out: W, options: ArchiveOptions) -> Result<Self, R7zError> {
         let mut options = options;
         lzma2::set_default_budget(&mut options);
@@ -1258,6 +1256,11 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
         }
     }
 
+    /// Prepare a streaming archive writer with default options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the default encoder settings cannot be prepared.
     pub fn new_default(out: W) -> Result<Self, R7zError> {
         Self::new(out, ArchiveOptions::default())
     }
@@ -1273,11 +1276,21 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
         }
     }
 
+    /// Select the codec before starting the archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::InvalidOptions`] if the codec conflicts with the current settings.
     pub fn compression(mut self, codec: Codec) -> Result<Self, R7zError> {
         self.set_compression(codec)?;
         Ok(self)
     }
 
+    /// Update the codec before starting the archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::InvalidOptions`] if the codec conflicts with the current settings.
     pub fn set_compression(&mut self, codec: Codec) -> Result<(), R7zError> {
         let mut options = self.prepared.archive().clone();
         options.codec = codec;
@@ -1288,6 +1301,11 @@ impl<W: Write + Seek> ArchiveWriter<W, false> {
 }
 
 impl<W: Write + Seek, const STARTED: bool> ArchiveWriter<W, STARTED> {
+    /// Append entry metadata without a data stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer has already failed.
     pub fn append_empty_entry(&mut self, entry: ArchiveEntry) -> Result<(), R7zError> {
         let folder_id = self.next_folder_id()?;
         self.entries.push(WriteEntry {
@@ -1312,6 +1330,12 @@ impl<W: Write + Seek, const STARTED: bool> ArchiveWriter<W, STARTED> {
 }
 
 impl<W: Write + Seek> ArchiveWriter<W, true> {
+    /// Read and encode a file into the current archive folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns prior writer failures, input/output I/O errors, encoding errors,
+    /// or errors from enforcing resource limits.
     pub fn append_file(
         &mut self,
         name: &str,
@@ -1330,6 +1354,11 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         result
     }
 
+    /// Append a symlink whose data stream contains its target.
+    ///
+    /// # Errors
+    ///
+    /// Returns prior writer failures, output or encoding errors, or resource-limit errors.
     pub fn append_symlink(
         &mut self,
         name: &str,
@@ -1339,6 +1368,11 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         self.append_file(name, target.as_bytes(), meta.with_symlink_default())
     }
 
+    /// Append a zero-length file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer has already failed.
     pub fn append_empty_file(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
         self.append_empty_entry(ArchiveEntry {
             name: name.to_owned(),
@@ -1347,6 +1381,11 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         })
     }
 
+    /// Append a directory entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer has already failed.
     pub fn append_directory(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
         self.append_empty_entry(ArchiveEntry {
             name: name.to_owned(),
@@ -1355,6 +1394,11 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         })
     }
 
+    /// Append an anti-item entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer has already failed.
     pub fn append_anti_item(&mut self, name: &str, meta: EntryMeta) -> Result<(), R7zError> {
         self.append_empty_entry(ArchiveEntry {
             name: name.to_owned(),
@@ -1365,10 +1409,22 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
 }
 
 impl<W: Write + Seek> ArchiveWriter<W, true> {
+    /// Append a file with default metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns prior writer failures, input/output I/O errors, encoding errors,
+    /// or errors from enforcing resource limits.
     pub fn append(&mut self, name: &str, reader: impl Read) -> Result<(), R7zError> {
         self.append_file(name, reader, EntryMeta::default())
     }
 
+    /// Append a file with the supplied metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns prior writer failures, input/output I/O errors, encoding errors,
+    /// or errors from enforcing resource limits.
     pub fn append_entry(
         &mut self,
         name: &str,
@@ -1378,6 +1434,12 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         self.append_file(name, reader, meta)
     }
 
+    /// Append entry metadata and encode its contents when it has a stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`R7zError::InvalidOptions`] if the entry is not a file, or
+    /// writer, input/output, encoding, or resource-limit errors.
     pub fn append_archive_entry(
         &mut self,
         entry: ArchiveEntry,
@@ -1392,6 +1454,12 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         self.append_file(&name, reader, meta)
     }
 
+    /// Finish the current folder and begin a new one on the next file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a prior writer failure, or an encoding/output error while finishing
+    /// the current folder.
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
         self.seal_streaming_folder()
     }
@@ -1412,6 +1480,12 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         }
     }
 
+    /// Finish the current folder, write the headers, and return the output writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a prior writer failure, or an encoding, output, or resource-limit
+    /// error while finishing folders and writing the header.
     pub fn finish(mut self) -> Result<W, R7zError> {
         if matches!(self.state, WriterState::Failed) {
             return Err(writer_failed());
@@ -1670,6 +1744,11 @@ fn write_entry_from_archive_entry(
     })
 }
 
+/// Write an archive from file readers using default options.
+///
+/// # Errors
+///
+/// Returns input/output I/O, encoding, encryption, or resource-limit errors.
 pub fn build_streaming<W, I, R>(entries: I, out: W) -> Result<(), R7zError>
 where
     W: Write + Seek,
@@ -1679,6 +1758,11 @@ where
     build_streaming_with_options(entries, out, ArchiveOptions::default())
 }
 
+/// Write an archive from file readers with the supplied options.
+///
+/// # Errors
+///
+/// Returns invalid-option, input/output I/O, encoding, encryption, or resource-limit errors.
 pub fn build_streaming_with_options<W, I, R>(
     entries: I,
     out: W,
@@ -1716,6 +1800,12 @@ where
     Ok(())
 }
 
+/// Stage an archive, then copy it to a writer that need not support seeking.
+///
+/// # Errors
+///
+/// Returns invalid-option, input/output I/O, spool creation or cleanup,
+/// encoding, encryption, or resource-limit errors.
 pub fn build_streaming_to_writer<W, I, R>(
     entries: I,
     mut out: W,
@@ -1798,6 +1888,12 @@ where
     }
 }
 
+/// Write an archive split across volumes.
+///
+/// # Errors
+///
+/// Returns invalid-option, input/output I/O, spool creation or cleanup,
+/// encoding, encryption, or resource-limit errors.
 pub fn build_streaming_volumes<P, I, R>(
     entries: I,
     base_path: P,
@@ -2039,7 +2135,7 @@ impl AutoSpool {
         let migration_bytes = cursor.get_ref().len() as u64;
         let write_bytes = write_len;
         check_temporary_storage_write(
-            &mut self.budget.temporary_storage,
+            &self.budget.temporary_storage,
             &mut self.temporary_storage_limit_exceeded,
             migration_bytes.saturating_add(write_bytes),
         )?;
@@ -2075,7 +2171,7 @@ impl AutoSpool {
         };
         let write_len = u64::try_from(write_len).unwrap_or(u64::MAX);
         check_temporary_storage_write(
-            &mut self.budget.temporary_storage,
+            &self.budget.temporary_storage,
             &mut self.temporary_storage_limit_exceeded,
             write_len,
         )
@@ -2159,7 +2255,7 @@ impl AutoSpool {
 }
 
 fn check_temporary_storage_write(
-    budget: &mut TemporaryStorageBudget,
+    budget: &TemporaryStorageBudget,
     limit_exceeded: &mut bool,
     bytes: u64,
 ) -> io::Result<()> {

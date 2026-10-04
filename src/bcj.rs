@@ -115,7 +115,7 @@ pub fn bcj_x86_convert(data: &mut [u8], ip: u32, state: &mut u32, encoding: bool
                 | u32::from(data[p + 3]) << 16
                 | u32::from(data[p + 2]) << 8
                 | u32::from(data[p + 1]);
-            let current = ip.wrapping_add(pos as u32);
+            let current = ip.wrapping_add(wrapping_offset(pos));
             pos += 5;
 
             if encoding {
@@ -370,6 +370,10 @@ pub fn bcj_x86_encode(data: &mut [u8]) {
     bcj_x86_convert(data, 0, &mut state, true);
 }
 
+fn wrapping_offset(position: usize) -> u32 {
+    u32::try_from(position & 0xFFFF_FFFF).expect("offset is masked to 32 bits")
+}
+
 fn arm_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
     let size = data.len() & !3;
     let ip = ip.wrapping_add(4);
@@ -380,7 +384,7 @@ fn arm_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
         if data[pos - 1] == 0xEB {
             let start = pos - 4;
             let mut value = get_u32_le(data, start) << 2;
-            let current = ip.wrapping_add(pos as u32);
+            let current = ip.wrapping_add(wrapping_offset(pos));
             if encoding {
                 value = value.wrapping_add(current);
             } else {
@@ -426,17 +430,17 @@ fn arm_thumb_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
             + u32::from(data[pos]);
 
         pos += 2;
-        let current = ip.wrapping_add(pos as u32) >> 1;
+        let current = ip.wrapping_add(wrapping_offset(pos)) >> 1;
         if encoding {
             value = value.wrapping_add(current);
         } else {
             value = value.wrapping_sub(current);
         }
 
-        data[pos - 4] = (value >> 11) as u8;
-        data[pos - 3] = (0xF0 | ((value >> 19) & 0x7)) as u8;
-        data[pos - 2] = value as u8;
-        data[pos - 1] = (0xF8 | (value >> 8)) as u8;
+        data[pos - 4] = (value >> 11).to_le_bytes()[0];
+        data[pos - 3] = 0xF0 | ((value >> 19).to_le_bytes()[0] & 0x7);
+        data[pos - 2] = value.to_le_bytes()[0];
+        data[pos - 1] = 0xF8 | value.to_le_bytes()[1];
     }
 }
 
@@ -450,7 +454,7 @@ fn ppc_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
         if (data[pos - 4] & 0xFC) == 0x48 && (data[pos - 1] & 3) == 1 {
             let start = pos - 4;
             let mut value = get_u32_be(data, start);
-            let current = ip.wrapping_add(pos as u32);
+            let current = ip.wrapping_add(wrapping_offset(pos));
             if encoding {
                 value = value.wrapping_add(current);
             } else {
@@ -477,7 +481,7 @@ fn sparc_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
         {
             let start = pos - 4;
             let mut value = get_u32_be(data, start) << 2;
-            let current = ip.wrapping_add(pos as u32);
+            let current = ip.wrapping_add(wrapping_offset(pos));
             if encoding {
                 value = value.wrapping_add(current);
             } else {
@@ -516,7 +520,7 @@ fn ia64_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
                     let mut value = raw >> mask;
                     value = (value & 0xFFFFF) | ((value & (1 << 23)) >> 3);
                     value <<= 4;
-                    let current = ip.wrapping_add(pos as u32);
+                    let current = ip.wrapping_add(wrapping_offset(pos));
                     if encoding {
                         value = value.wrapping_add(current);
                     } else {
@@ -543,7 +547,6 @@ fn ia64_convert(data: &mut [u8], ip: u32, encoding: bool) -> usize {
 }
 
 #[cfg(test)]
-#[allow(clippy::pedantic)]
 mod tests {
     use super::*;
 
@@ -552,7 +555,7 @@ mod tests {
         match filter {
             BranchFilter::Arm => {
                 for pos in (0..data.len()).step_by(16) {
-                    data[pos] = pos as u8;
+                    data[pos] = pos.to_le_bytes()[0];
                     data[pos + 3] = 0xEB;
                 }
             }
@@ -666,8 +669,8 @@ mod tests {
             let p = pos as usize;
             if p + 5 <= data.len() {
                 data[p] = 0xE8;
-                data[p + 1] = (pos * 7) as u8;
-                data[p + 2] = ((pos * 7) >> 8) as u8;
+                data[p + 1] = (pos * 7).to_le_bytes()[0];
+                data[p + 2] = (pos * 7).to_le_bytes()[1];
                 data[p + 3] = 0x00;
                 data[p + 4] = 0x00;
             }
@@ -704,8 +707,8 @@ mod tests {
         let mut original = vec![0x90u8; 4096];
         for &pos in &[3usize, 10, 63, 127, 512, 1021, 2048, 3070] {
             original[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
-            original[pos + 1] = (pos * 5) as u8;
-            original[pos + 2] = ((pos * 5) >> 8) as u8;
+            original[pos + 1] = (pos * 5).to_le_bytes()[0];
+            original[pos + 2] = (pos * 5).to_le_bytes()[1];
             original[pos + 3] = 0;
             original[pos + 4] = 0;
         }
@@ -764,7 +767,7 @@ mod tests {
         let mut data = vec![0x90u8; 4096];
         for pos in (3..data.len().saturating_sub(5)).step_by(37) {
             data[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
-            let target = (pos as u32).wrapping_mul(11);
+            let target = u32::try_from(pos).unwrap().wrapping_mul(11);
             data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
         }
 

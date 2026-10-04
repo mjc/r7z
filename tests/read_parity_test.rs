@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 use std::path::PathBuf;
 
 fn build_copy_archive(name: &str, data: &[u8]) -> Vec<u8> {
@@ -609,9 +607,8 @@ fn truncated_archive_returns_parse_or_crc() {
         .unwrap();
 
     for len in [0, 4, 31, bytes.len() - 1] {
-        let err = match r7z::Archive::from_bytes(bytes[..len].to_vec().into()) {
-            Ok(_) => panic!("truncated archive unexpectedly parsed"),
-            Err(err) => err,
+        let Err(err) = r7z::Archive::from_bytes(bytes[..len].to_vec().into()) else {
+            panic!("truncated archive unexpectedly parsed")
         };
         assert!(matches!(err, r7z::R7zError::Parse | r7z::R7zError::Crc));
     }

@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 ///
 /// Each `CoderInfo` identifies a codec by its ID bytes and carries optional
 /// codec-specific properties (e.g. LZMA dictionary/mode settings).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CoderInfo {
     /// Codec identifier bytes (e.g. `[0x03, 0x01, 0x01]` = LZMA, `[0x21]` = LZMA2).
     /// The 7z format encodes the length in a 4-bit field, so this is at most 15 bytes,

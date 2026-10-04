@@ -279,7 +279,7 @@ fn encrypted_size_for_plaintext(size: u64) -> Result<u64, R7zError> {
 fn read_one(reader: &mut impl io::Read, output: &mut [u8]) -> io::Result<usize> {
     loop {
         match reader.read(output) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             result => return result,
         }
     }

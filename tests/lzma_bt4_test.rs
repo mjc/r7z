@@ -18,7 +18,7 @@ fn boundary_payload() -> Vec<u8> {
         random ^= random << 13;
         random ^= random >> 17;
         random ^= random << 5;
-        input.push(random as u8);
+        input.push(random.to_le_bytes()[0]);
     }
     input.extend_from_slice(b"aaaaaaa");
     input

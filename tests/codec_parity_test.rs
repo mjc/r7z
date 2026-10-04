@@ -50,7 +50,7 @@ fn branch_method_ids_and_names_are_registered() {
 #[test]
 fn official_7zip_2603_branch_archives_extract() {
     for (name, method, arm64, offset) in [
-        ("arm64.7z", r7z::CODEC_BCJ_ARM64, true, 0),
+        ("arm64.7z", r7z::CODEC_BCJ_ARM64, true, 0_u32),
         ("arm64_offset4.7z", r7z::CODEC_BCJ_ARM64, true, 4),
         ("riscv.7z", r7z::CODEC_BCJ_RISCV, false, 0),
         ("riscv_offset2.7z", r7z::CODEC_BCJ_RISCV, false, 2),
@@ -75,7 +75,7 @@ fn official_7zip_2603_branch_archives_extract() {
         let expected_properties = if offset == 0 {
             None
         } else {
-            Some((offset as u32).to_le_bytes().to_vec())
+            Some(offset.to_le_bytes().to_vec())
         };
         assert_eq!(
             coder.properties.as_deref(),

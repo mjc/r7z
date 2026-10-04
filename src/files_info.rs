@@ -18,7 +18,7 @@ pub(crate) fn decode_name(data: &[u8]) -> String {
 }
 
 /// File listing metadata from the 7z `FilesInfo` block.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FilesInfo {
     /// Total number of entries (files + directories).
     pub num_files: u64,
@@ -179,7 +179,6 @@ impl FilesInfo {
     /// with the `FilesInfo` property tag, or if retained property bytes are not
     /// contained in `backing`. Repeated supported properties, mismatched name
     /// counts, and external references with invalid indices or payload sizes fail.
-    #[allow(clippy::too_many_lines)]
     pub fn parse<'a>(input: &'a [u8], backing: &Bytes) -> IResult<&'a [u8], FilesInfo> {
         Self::parse_with_external(input, backing, &[])
     }
@@ -207,191 +206,85 @@ impl FilesInfo {
         })?;
 
         // Lazy init: no allocations until the relevant property is seen.
-        let mut name_data = Bytes::new();
-        let mut ctimes: Vec<Option<u64>> = Vec::new();
-        let mut atimes: Vec<Option<u64>> = Vec::new();
-        let mut mtimes: Vec<Option<u64>> = Vec::new();
-        let mut start_positions: Vec<Option<u64>> = Vec::new();
-        let mut attributes: Vec<Option<u32>> = Vec::new();
-        let mut empty_streams = Bytes::new();
-        let mut empty_files = Bytes::new();
-        let mut anti_items = Bytes::new();
-        let mut seen_properties = 0u32;
+        let mut files = Self {
+            num_files,
+            name_data: Bytes::new(),
+            ctimes: Vec::new(),
+            atimes: Vec::new(),
+            mtimes: Vec::new(),
+            start_positions: Vec::new(),
+            attributes: Vec::new(),
+            empty_streams: Bytes::new(),
+            empty_files: Bytes::new(),
+            anti_items: Bytes::new(),
+            empty_stream_ordinals: Vec::new(),
+        };
+        let mut seen_properties = SeenFileProperties::default();
         let mut input = input;
 
         loop {
             let (i, tag) = Property::parse(input)?;
             input = i;
-            if tag != Property::END {
-                let property_mask = match tag {
-                    Property::Name
-                    | Property::CTime
-                    | Property::ATime
-                    | Property::MTime
-                    | Property::StartPos
-                    | Property::Attributes
-                    | Property::EmptyStream
-                    | Property::EmptyFile
-                    | Property::Anti => Some(1u32 << tag as u8),
-                    _ => None,
-                };
-                if let Some(property_mask) = property_mask {
-                    if seen_properties & property_mask != 0 {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::Verify,
-                        )));
-                    }
-                    seen_properties |= property_mask;
-                }
+            if tag == Property::END {
+                break;
             }
+            seen_properties.register(tag, input)?;
+            let (remaining, size) = sevenzip_varuint64_decode(input)?;
+            let size = usize::try_from(size).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            let (remaining, block) = take(size)(remaining)?;
             match tag {
-                Property::END => break,
                 Property::Name => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, block) = take(sz)(i)?;
-                    if block.is_empty() {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::Eof,
-                        )));
-                    }
-                    name_data = match block[0] {
-                        0 => bytes_subslice(backing, &block[1..], input)?,
-                        _ => external_property_data(input, &block[1..], external_data)?,
-                    };
-                    validate_name_data(&name_data, n, input)?;
-                    input = i;
+                    files.name_data = property_data(input, block, backing, external_data)?;
+                    validate_name_data(&files.name_data, n, input)?;
                 }
                 Property::CTime | Property::ATime | Property::MTime | Property::StartPos => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, block) = take(sz)(i)?;
-                    let (all_defined, bitmap, data_start) =
-                        defined_property_layout(input, block, n)?;
-                    let value_data = match block[data_start - 1] {
-                        0 => bytes_subslice(backing, &block[data_start..], input)?,
-                        _ => external_property_data(input, &block[data_start..], external_data)?,
-                    };
+                    let property = DefinedProperty::parse(input, block, n, backing, external_data)?;
                     let values = parse_defined_u64_values(
                         input,
-                        all_defined,
-                        bitmap,
-                        value_data.as_ref(),
+                        property.all_defined,
+                        property.bitmap,
+                        &property.values,
                         n,
                     )?;
                     match tag {
-                        Property::CTime => ctimes = values,
-                        Property::ATime => atimes = values,
-                        Property::MTime => mtimes = values,
-                        Property::StartPos => start_positions = values,
+                        Property::CTime => files.ctimes = values,
+                        Property::ATime => files.atimes = values,
+                        Property::MTime => files.mtimes = values,
+                        Property::StartPos => files.start_positions = values,
                         _ => unreachable!(),
                     }
-                    input = i;
                 }
                 Property::Attributes => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, block) = take(sz)(i)?;
-                    let (all_defined, bitmap, data_start) =
-                        defined_property_layout(input, block, n)?;
-                    let value_data = match block[data_start - 1] {
-                        0 => bytes_subslice(backing, &block[data_start..], input)?,
-                        _ => external_property_data(input, &block[data_start..], external_data)?,
-                    };
-                    attributes = parse_defined_u32_values(
+                    let property = DefinedProperty::parse(input, block, n, backing, external_data)?;
+                    files.attributes = parse_defined_u32_values(
                         input,
-                        all_defined,
-                        bitmap,
-                        value_data.as_ref(),
+                        property.all_defined,
+                        property.bitmap,
+                        &property.values,
                         n,
                     )?;
-                    input = i;
                 }
                 Property::EmptyStream => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, block) = take(sz)(i)?;
-                    empty_streams = bytes_subslice(backing, block, input)?;
-                    input = i;
+                    files.empty_streams = bytes_subslice(backing, block, input)?;
                 }
                 Property::EmptyFile => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, block) = take(sz)(i)?;
-                    empty_files = bytes_subslice(backing, block, input)?;
-                    input = i;
+                    files.empty_files = bytes_subslice(backing, block, input)?;
                 }
                 Property::Anti => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, block) = take(sz)(i)?;
-                    anti_items = bytes_subslice(backing, block, input)?;
-                    input = i;
+                    files.anti_items = bytes_subslice(backing, block, input)?;
                 }
-                _ => {
-                    let (i, size) = sevenzip_varuint64_decode(input)?;
-                    let sz = usize::try_from(size).map_err(|_| {
-                        nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::TooLarge,
-                        ))
-                    })?;
-                    let (i, _) = take(sz)(i)?;
-                    input = i;
-                }
+                _ => {}
             }
+            input = remaining;
         }
 
-        let empty_stream_ordinals = empty_stream_ordinals(&empty_streams, n);
-
-        Ok((
-            input,
-            FilesInfo {
-                num_files,
-                name_data,
-                ctimes,
-                atimes,
-                mtimes,
-                start_positions,
-                attributes,
-                empty_streams,
-                empty_files,
-                anti_items,
-                empty_stream_ordinals,
-            },
-        ))
+        files.empty_stream_ordinals = empty_stream_ordinals(&files.empty_streams, n);
+        Ok((input, files))
     }
 }
 
@@ -410,43 +303,93 @@ fn empty_stream_ordinals(empty_streams: &[u8], num_files: usize) -> Vec<Option<u
         .collect()
 }
 
-type ParseError<'a> = nom::Err<nom::error::Error<&'a [u8]>>;
-type DefinedPropertyLayout<'b> = (u8, &'b [u8], usize);
+#[derive(Default)]
+struct SeenFileProperties(u32);
 
-fn defined_property_layout<'a, 'b>(
-    error_input: &'a [u8],
-    block: &'b [u8],
-    num_values: usize,
-) -> Result<DefinedPropertyLayout<'b>, ParseError<'a>> {
-    if block.is_empty() {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            error_input,
-            nom::error::ErrorKind::Eof,
-        )));
+impl SeenFileProperties {
+    fn register<'a>(&mut self, tag: Property, input: &'a [u8]) -> Result<(), ParseError<'a>> {
+        let property_mask = match tag {
+            Property::Name
+            | Property::CTime
+            | Property::ATime
+            | Property::MTime
+            | Property::StartPos
+            | Property::Attributes
+            | Property::EmptyStream
+            | Property::EmptyFile
+            | Property::Anti => Some(1u32 << tag as u8),
+            _ => None,
+        };
+        if let Some(property_mask) = property_mask {
+            if self.0 & property_mask != 0 {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+            self.0 |= property_mask;
+        }
+        Ok(())
     }
+}
 
-    let all_defined = block[0];
-    if all_defined != 0 {
-        if block.len() < 2 {
-            return Err(nom::Err::Error(nom::error::Error::new(
+type ParseError<'a> = nom::Err<nom::error::Error<&'a [u8]>>;
+struct DefinedProperty<'a> {
+    all_defined: u8,
+    bitmap: &'a [u8],
+    values: Bytes,
+}
+
+impl<'b> DefinedProperty<'b> {
+    fn parse<'a>(
+        error_input: &'a [u8],
+        block: &'b [u8],
+        num_values: usize,
+        backing: &Bytes,
+        external_data: &[Bytes],
+    ) -> Result<Self, ParseError<'a>> {
+        let (&all_defined, payload) = block.split_first().ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
                 error_input,
                 nom::error::ErrorKind::Eof,
-            )));
-        }
-        return Ok((all_defined, &[], 2));
+            ))
+        })?;
+        let bitmap_len = if all_defined == 0 {
+            num_values.div_ceil(8)
+        } else {
+            0
+        };
+        let (bitmap, payload) = payload.split_at_checked(bitmap_len).ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
+                error_input,
+                nom::error::ErrorKind::Eof,
+            ))
+        })?;
+        let values = property_data(error_input, payload, backing, external_data)?;
+        Ok(Self {
+            all_defined,
+            bitmap,
+            values,
+        })
     }
+}
 
-    let bitmap_len = num_values.div_ceil(8);
-    let data_start = 2 + bitmap_len;
-    if block.len() < data_start {
-        return Err(nom::Err::Error(nom::error::Error::new(
+fn property_data<'a>(
+    error_input: &'a [u8],
+    payload: &[u8],
+    backing: &Bytes,
+    external_data: &[Bytes],
+) -> Result<Bytes, ParseError<'a>> {
+    let (&external, data) = payload.split_first().ok_or_else(|| {
+        nom::Err::Error(nom::error::Error::new(
             error_input,
             nom::error::ErrorKind::Eof,
-        )));
+        ))
+    })?;
+    match external {
+        0 => bytes_subslice(backing, data, error_input),
+        _ => external_property_data(error_input, data, external_data),
     }
-
-    let bitmap_end = 1 + bitmap_len;
-    Ok((all_defined, &block[1..bitmap_end], data_start))
 }
 
 fn external_property_data<'a>(
@@ -486,8 +429,7 @@ fn validate_name_data<'a>(
     error_input: &'a [u8],
 ) -> Result<(), ParseError<'a>> {
     let mut code_units = data.chunks_exact(2);
-    let every_name_is_terminated =
-        (0..num_names).all(|_| code_units.position(|unit| unit == [0, 0]).is_some());
+    let every_name_is_terminated = (0..num_names).all(|_| code_units.any(|unit| unit == [0, 0]));
     if !every_name_is_terminated
         || code_units.next().is_some()
         || !code_units.remainder().is_empty()

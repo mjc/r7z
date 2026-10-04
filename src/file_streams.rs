@@ -141,12 +141,11 @@ impl<'a> FileStreams<'a> {
 
     /// The returned layout borrows the current folder until the next advance.
     pub(crate) fn next(&mut self) -> Result<Option<FileStream<'_, 'a>>, R7zError> {
-        match self.entries.next() {
-            Some(entry) => entry.bind(|()| self.streams.nth(0)).map(Some),
-            None => {
-                self.streams.finish()?;
-                Ok(None)
-            }
+        if let Some(entry) = self.entries.next() {
+            entry.bind(|()| self.streams.nth(0)).map(Some)
+        } else {
+            self.streams.finish()?;
+            Ok(None)
         }
     }
 }

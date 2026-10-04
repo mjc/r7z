@@ -108,9 +108,9 @@ impl ArchiveSource {
             ArchiveSourceKind::Bytes(bytes) => {
                 u64::try_from(bytes.len()).map_err(|_| R7zError::Parse)
             }
-            ArchiveSourceKind::File { len, .. } => Ok(*len),
-            ArchiveSourceKind::Seekable { len, .. } => Ok(*len),
-            ArchiveSourceKind::Volumes { len, .. } => Ok(*len),
+            ArchiveSourceKind::File { len, .. }
+            | ArchiveSourceKind::Seekable { len, .. }
+            | ArchiveSourceKind::Volumes { len, .. } => Ok(*len),
         }
     }
 
@@ -341,7 +341,7 @@ impl PositionedFile {
                     let result = self.0.seek_read(dst, offset);
 
                     match result {
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         result => break result?,
                     }
                 };

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Folder, R7zError};
 use crate::folder::FolderGraph;
 
 /// Unknown is an omitted size, never an empty output.
@@ -12,8 +12,7 @@ impl OutputSize {
     pub(super) fn reconcile(self, other: Self) -> Result<Self, R7zError> {
         match (self, other) {
             (Self::Known(a), Self::Known(b)) if a != b => Err(R7zError::Parse),
-            (Self::Unknown, size) | (size, Self::Unknown) => Ok(size),
-            (size, _) => Ok(size),
+            (Self::Unknown, size) | (size, _) => Ok(size),
         }
     }
 
@@ -26,6 +25,7 @@ impl OutputSize {
 }
 
 /// Borrows the caller's table and supplies the independently declared final size.
+#[derive(Clone, Copy)]
 pub(super) struct CoderOutputSizes<'a> {
     declared: &'a [u64],
     final_index: usize,

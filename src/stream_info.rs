@@ -10,7 +10,7 @@ use nom::{IResult, number::complete::le_u8};
 const MAX_SUBSTREAM_DIGESTS: usize = (64 * 1024 * 1024) / std::mem::size_of::<Option<u32>>();
 
 /// Per-file stream metadata within a solid (multi-file) folder.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubstreamInfo {
     /// Number of files (data streams) stored in each folder.
     pub num_unpack_streams_per_folder: Vec<u64>,

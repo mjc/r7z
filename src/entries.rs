@@ -332,7 +332,7 @@ mod tests {
             ArchiveEntryIndex::new(0),
             ArchiveEntryIndex::new(1),
         ];
-        [None, Some(&indices[..])].into_iter().for_each(|indices| {
+        for indices in [None, Some(&indices[..])] {
             let mut selection = EntrySelection::new(indices, 3).unwrap();
             assert_eq!(selection.size_hint(), (3, Some(3)));
             assert_eq!(selection.next().map(EntryIndex::get), Some(0));
@@ -341,7 +341,7 @@ mod tests {
             assert_eq!(selection.size_hint(), (0, Some(0)));
             assert!(selection.next().is_none());
             assert!(selection.next().is_none());
-        });
+        }
     }
 
     #[test]

@@ -1,5 +1,3 @@
-#![allow(clippy::pedantic)]
-
 //! Write-interop tests: create archives with r7z, extract with p7zip, byte-compare.
 
 mod support;
@@ -35,7 +33,7 @@ fn executable_files() -> Vec<(PathBuf, Vec<u8>)> {
 fn executable_payload(size: usize) -> Vec<u8> {
     let mut data = vec![0xCCu8; size];
     for pos in (16..size.saturating_sub(5)).step_by(89) {
-        let target = (pos as u32).wrapping_mul(17);
+        let target = u32::try_from(pos).unwrap().wrapping_mul(17);
         data[pos] = if pos % 2 == 0 { 0xE8 } else { 0xE9 };
         data[pos + 1..pos + 5].copy_from_slice(&target.to_le_bytes());
     }
@@ -575,8 +573,8 @@ fn r7z_write_bcj_lzma2_r7z_reads() {
     for &pos in &[10u32, 50, 100, 200, 300, 400] {
         let p = pos as usize;
         original[p] = 0xE8;
-        original[p + 1] = (pos * 3) as u8;
-        original[p + 2] = ((pos * 3) >> 8) as u8;
+        original[p + 1] = (pos * 3).to_le_bytes()[0];
+        original[p + 2] = (pos * 3).to_le_bytes()[1];
         original[p + 3] = 0x00;
         original[p + 4] = 0x00;
     }
@@ -612,8 +610,8 @@ fn r7z_write_bcj_lzma2_p7zip_reads() {
     for &pos in &[10u32, 50, 100, 200, 400, 600, 800] {
         let p = pos as usize;
         original[p] = 0xE8;
-        original[p + 1] = (pos * 5) as u8;
-        original[p + 2] = ((pos * 5) >> 8) as u8;
+        original[p + 1] = (pos * 5).to_le_bytes()[0];
+        original[p + 2] = (pos * 5).to_le_bytes()[1];
         original[p + 3] = 0x00;
         original[p + 4] = 0x00;
     }
@@ -638,7 +636,7 @@ fn r7z_write_bcj_lzma2_p7zip_reads() {
     assert_eq!(extracted, original, "p7zip extracted data != original");
 }
 
-/// p7zip reads BCJ+LZMA2 archive created by r7z via ArchiveWriter.
+/// p7zip reads BCJ+LZMA2 archive created by r7z via `ArchiveWriter`.
 #[test]
 fn archive_writer_bcj_lzma2_p7zip_reads() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1687,9 +1685,8 @@ fn archive_builder_salted_aes_encrypted_header_p7zip_and_r7z_extract() {
         .expect("build failed");
     std::fs::write(&archive_path, bytes).unwrap();
 
-    let err = match r7z::Archive::open(&archive_path) {
-        Ok(_) => panic!("encrypted salted header opened without password"),
-        Err(err) => err,
+    let Err(err) = r7z::Archive::open(&archive_path) else {
+        panic!("encrypted salted header opened without password")
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
@@ -1841,15 +1838,14 @@ fn archive_builder_rejects_invalid_aes_options() {
     let mut enc = r7z::EncryptionOptions::default_for_password("Secret123");
     enc.num_cycles_power = 25;
     let mut buf = std::io::Cursor::new(Vec::new());
-    let err = match r7z::ArchiveWriter::new(
+    let Err(err) = r7z::ArchiveWriter::new(
         &mut buf,
         r7z::ArchiveOptions {
             encryption: Some(enc),
             ..Default::default()
         },
-    ) {
-        Ok(_) => panic!("ArchiveWriter accepted unsupported AES cycle power"),
-        Err(err) => err,
+    ) else {
+        panic!("ArchiveWriter accepted unsupported AES cycle power")
     };
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 
@@ -1868,9 +1864,8 @@ fn archive_builder_rejects_invalid_aes_options() {
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    let err = match r7z::ArchiveWriter::new(&mut buf, invalid_options) {
-        Ok(_) => panic!("ArchiveWriter accepted invalid encrypted header options"),
-        Err(err) => err,
+    let Err(err) = r7z::ArchiveWriter::new(&mut buf, invalid_options) else {
+        panic!("ArchiveWriter accepted invalid encrypted header options")
     };
     assert!(matches!(err, r7z::R7zError::InvalidOptions(_)));
 }
@@ -1893,9 +1888,8 @@ fn archive_builder_aes_encrypted_header_p7zip_and_r7z_require_password() {
         .expect("build failed");
     std::fs::write(&archive_path, bytes).unwrap();
 
-    let err = match r7z::Archive::open(&archive_path) {
-        Ok(_) => panic!("encrypted header opened without password"),
-        Err(err) => err,
+    let Err(err) = r7z::Archive::open(&archive_path) else {
+        panic!("encrypted header opened without password")
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
     let archive = r7z::Archive::open_with_password(&archive_path, Some("HeaderSecret")).unwrap();
@@ -1953,9 +1947,8 @@ fn archive_builder_empty_only_encrypted_header_p7zip_and_r7z_read() {
         .expect("build failed");
     std::fs::write(&archive_path, bytes).unwrap();
 
-    let err = match r7z::Archive::open(&archive_path) {
-        Ok(_) => panic!("encrypted empty header opened without password"),
-        Err(err) => err,
+    let Err(err) = r7z::Archive::open(&archive_path) else {
+        panic!("encrypted empty header opened without password")
     };
     assert!(matches!(err, r7z::R7zError::PasswordRequired));
 
@@ -2045,18 +2038,6 @@ fn compression_options_control_lzma2_properties_and_solid_blocks() {
 
 #[test]
 fn build_streaming_to_writer_matches_seek_backed_output() {
-    let files = vec![
-        ("a.txt".to_string(), b"alpha".as_slice()),
-        ("b.txt".to_string(), b"bravo".as_slice()),
-    ];
-    let mut seek_backed = std::io::Cursor::new(Vec::new());
-    r7z::build_streaming_with_options(
-        files.clone(),
-        &mut seek_backed,
-        r7z::ArchiveOptions::default(),
-    )
-    .unwrap();
-
     struct WriteOnly(Vec<u8>);
     impl std::io::Write for WriteOnly {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -2068,6 +2049,18 @@ fn build_streaming_to_writer_matches_seek_backed_output() {
             Ok(())
         }
     }
+
+    let files = vec![
+        ("a.txt".to_string(), b"alpha".as_slice()),
+        ("b.txt".to_string(), b"bravo".as_slice()),
+    ];
+    let mut seek_backed = std::io::Cursor::new(Vec::new());
+    r7z::build_streaming_with_options(
+        files.clone(),
+        &mut seek_backed,
+        r7z::ArchiveOptions::default(),
+    )
+    .unwrap();
 
     let mut write_only = WriteOnly(Vec::new());
     r7z::build_streaming_to_writer(files, &mut write_only, r7z::ArchiveOptions::default()).unwrap();
