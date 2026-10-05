@@ -637,6 +637,7 @@ fn deleting_part_of_solid_zstd_folder_fails_without_rewriting_archive() {
         "partial unsupported delete unexpectedly succeeded"
     );
     assert_eq!(fs::read(&archive).unwrap(), before);
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("would require decoding retained entry"));
     assert!(stderr.contains("unsupported codec"));
@@ -676,6 +677,7 @@ fn replacing_part_of_solid_zstd_folder_fails_without_rewriting_archive() {
         "partial unsupported replace unexpectedly succeeded"
     );
     assert_eq!(fs::read(&archive).unwrap(), before);
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("would require decoding retained entry"));
     assert!(stderr.contains("unsupported codec"));
