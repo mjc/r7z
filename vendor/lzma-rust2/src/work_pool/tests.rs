@@ -195,6 +195,17 @@ fn finishing_empty_pool_joins_idle_worker() {
 }
 
 #[test]
+fn cancellation_rejects_work_before_calling_the_producer() {
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut pool = WorkPool::new(WorkPoolConfig::new(2, 10), worker);
+    pool.set_cancellation(flag);
+    let error = pool.dispatch_next_work(&mut |_| panic!("cancelled producer called")).unwrap_err();
+    assert!(error.get_ref().unwrap().is::<crate::EncoderCancelled>());
+    assert!(pool.worker_handles.is_empty());
+    assert!(pool.work_queue.is_empty());
+}
+
+#[test]
 fn reader_prefetch_returns_every_result_in_order() {
     let mut pool = WorkPool::new(WorkPoolConfig::new(2, 32), worker);
     let mut output = Vec::new();

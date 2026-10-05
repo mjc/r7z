@@ -3,6 +3,9 @@ use thiserror::Error;
 /// Errors returned by r7z operations.
 #[derive(Debug, Error)]
 pub enum R7zError {
+    /// The caller cancelled an archive operation.
+    #[error("operation cancelled")]
+    Cancelled,
     /// Binary structure could not be parsed (malformed archive).
     #[error("parse error")]
     Parse,
@@ -33,7 +36,7 @@ pub enum R7zError {
 
     /// An underlying I/O error occurred.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
 
     /// Decompression failed (corrupt or truncated stream).
     #[error("decompression error")]
@@ -70,4 +73,13 @@ pub enum R7zError {
     /// A decoder resource limit was exceeded.
     #[error("{resource} resource limit exceeded ({limit} bytes)")]
     ResourceLimitExceeded { resource: &'static str, limit: u64 },
+}
+
+impl From<std::io::Error> for R7zError {
+    fn from(error: std::io::Error) -> Self {
+        match error.downcast::<crate::operation::CancelledRead>() {
+            Ok(_) => Self::Cancelled,
+            Err(error) => Self::Io(error),
+        }
+    }
 }

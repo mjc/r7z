@@ -12,6 +12,17 @@ use std::{
     time::Duration,
 };
 
+/// Cooperative encoder cancellation, carried through the writer's I/O result.
+#[derive(Debug)]
+pub struct EncoderCancelled;
+
+impl std::fmt::Display for EncoderCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("encoder cancelled")
+    }
+}
+impl std::error::Error for EncoderCancelled {}
+
 /// Interval for checking worker errors while waiting for results.
 const ERROR_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -66,6 +77,7 @@ pub(crate) struct WorkPool<W, R> {
     next_index_to_return: u64,
     out_of_order_results: BTreeMap<u64, R>,
     shutdown_flag: Arc<AtomicBool>,
+    cancellation: Option<Arc<AtomicBool>>,
     error_store: Arc<Mutex<Option<io::Error>>>,
     state: WorkPoolState,
     active_workers: Arc<AtomicU32>,
@@ -92,6 +104,7 @@ where
             next_index_to_return: 0,
             out_of_order_results: BTreeMap::new(),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            cancellation: None,
             error_store: Arc::new(Mutex::new(None)),
             state: WorkPoolState::Dispatching,
             active_workers: Arc::new(AtomicU32::new(0)),
@@ -121,10 +134,18 @@ where
             self.abort();
             return Err(error);
         }
+        if self.cancellation.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            self.abort();
+            return Err(io::Error::other(crate::EncoderCancelled));
+        }
         if self.state == WorkPoolState::Error {
             return Err(io::Error::other("work pool has failed"));
         }
         Ok(())
+    }
+
+    pub(crate) fn set_cancellation(&mut self, flag: Arc<AtomicBool>) {
+        self.cancellation = Some(flag);
     }
 
     /// Submit work to the pool. Returns `false` if there is no more work to work on.

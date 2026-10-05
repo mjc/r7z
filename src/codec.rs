@@ -278,7 +278,12 @@ fn aes_coder_reader<'a>(
         _ => return Err(R7zError::Decompression),
     };
     budget.charge_kdf_cycles(KdfCycles::new(cycles))?;
-    let key = crate::aes::derive_key(password, &props.salt, props.num_cycles_power)?;
+    let key = zeroize::Zeroizing::new(crate::aes::derive_key_with_control(
+        password,
+        &props.salt,
+        props.num_cycles_power,
+        budget.monitor.control(),
+    )?);
     let ciphertext_size = match input_size {
         OutputSize::Known(size) => Some(size),
         OutputSize::Unknown => None,

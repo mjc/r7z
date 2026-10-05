@@ -88,16 +88,40 @@ impl AesProperties {
 ///
 /// The password is first encoded as UTF-16LE. Then for `2^num_cycles_power`
 /// iterations, we feed `salt || password_utf16le || counter_le_8bytes` into SHA-256.
+#[cfg(test)]
 pub(crate) fn derive_key(
     password: &str,
     salt: &[u8],
     num_cycles_power: u8,
 ) -> Result<[u8; 32], R7zError> {
+    derive_key_with_control(password, salt, num_cycles_power, None)
+}
+
+pub(crate) fn derive_key_with_control(
+    password: &str,
+    salt: &[u8],
+    num_cycles_power: u8,
+    control: Option<&crate::OperationControl>,
+) -> Result<[u8; 32], R7zError> {
+    use zeroize::Zeroizing;
+    if let Some(control) = control {
+        control.check()?;
+    }
     // Special case: 0x3F means raw key = salt || password, zero-padded
     if num_cycles_power == 0x3F {
-        let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let pwd_utf16 = Zeroizing::new(
+            password
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        );
         let mut key = [0u8; 32];
-        let total: Vec<u8> = salt.iter().chain(pwd_utf16.iter()).copied().collect();
+        let total = Zeroizing::new(
+            salt.iter()
+                .chain(pwd_utf16.iter())
+                .copied()
+                .collect::<Vec<u8>>(),
+        );
         let len = total.len().min(32);
         key[..len].copy_from_slice(&total[..len]);
         return Ok(key);
@@ -107,25 +131,38 @@ pub(crate) fn derive_key(
         return Err(R7zError::Decompression);
     }
 
-    let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let pwd_utf16 = Zeroizing::new(
+        password
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>(),
+    );
 
     let num_rounds: u64 = 1u64 << num_cycles_power;
 
     // Pre-build the append buffer: salt || password_utf16le || counter[8]
     let prefix_len = salt.len() + pwd_utf16.len();
     let buf_len = prefix_len + 8;
-    let mut buf = vec![0u8; buf_len];
+    let mut buf = Zeroizing::new(vec![0u8; buf_len]);
     buf[..salt.len()].copy_from_slice(salt);
     buf[salt.len()..prefix_len].copy_from_slice(&pwd_utf16);
 
     let mut hasher = Sha256::new();
     for i in 0..num_rounds {
+        if i % 1024 == 0 {
+            if let Some(control) = control {
+                control.check()?;
+            }
+        }
         // Write counter as 8-byte LE into the last 8 bytes
         buf[prefix_len..].copy_from_slice(&i.to_le_bytes());
-        hasher.update(&buf);
+        hasher.update(buf.as_slice());
     }
 
     let result = hasher.finalize();
+    if let Some(control) = control {
+        control.check()?;
+    }
     let mut key = [0u8; 32];
     key.copy_from_slice(&result);
     Ok(key)

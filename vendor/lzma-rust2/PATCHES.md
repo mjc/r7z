@@ -45,3 +45,9 @@ them with and without the `optimization` feature.
 
 The encoder memory estimate converts the LZ buffer from bytes to KiB and counts
 all three hash tables. R7Z uses this corrected estimate for worker admission.
+
+The LZMA2 writer accepts a shared cancellation flag. Result waits check it at the
+existing 100 ms error-check interval. Workers check cancellation and shutdown
+between 64 KiB input writes, so abort joins no longer require compressing the
+remainder of an independent block. Cancellation has a distinct I/O error payload;
+output errors retain their original cause.

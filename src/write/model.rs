@@ -111,6 +111,8 @@ pub enum SolidMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamingOptions {
+    /// Optional cancellation and progress shared by this write operation.
+    pub control: Option<crate::OperationControl>,
     pub buffer_size: usize,
     pub spool: SpoolMode,
     /// Resource limits applied while building this archive.
@@ -120,6 +122,7 @@ pub struct StreamingOptions {
 impl Default for StreamingOptions {
     fn default() -> Self {
         Self {
+            control: None,
             buffer_size: 8192,
             spool: SpoolMode::Auto {
                 memory_threshold: 16 * 1024 * 1024,
@@ -147,13 +150,25 @@ pub struct VolumeOptions {
     pub sizes: Vec<NonZeroU64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionOptions {
     pub password: String,
     pub encrypt_header: bool,
     pub num_cycles_power: u8,
     pub salt_len: u8,
     pub iv_len: u8,
+}
+
+impl std::fmt::Debug for EncryptionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionOptions")
+            .field("password", &"<redacted>")
+            .field("encrypt_header", &self.encrypt_header)
+            .field("num_cycles_power", &self.num_cycles_power)
+            .field("salt_len", &self.salt_len)
+            .field("iv_len", &self.iv_len)
+            .finish()
+    }
 }
 
 impl EncryptionOptions {

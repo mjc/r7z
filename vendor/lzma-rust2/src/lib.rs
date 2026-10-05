@@ -126,6 +126,9 @@ pub use xz::{CheckType, XzReader, XzStream};
 #[cfg(all(feature = "xz", feature = "encoder"))]
 pub use xz::{XzOptions, XzWriter};
 
+#[cfg(feature = "std")]
+pub use work_pool::EncoderCancelled;
+
 /// Result type of the crate.
 #[cfg(feature = "std")]
 pub type Result<T> = core::result::Result<T, Error>;

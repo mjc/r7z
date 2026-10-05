@@ -119,6 +119,7 @@ mod folder;
 mod folder_decode;
 mod headers;
 mod method;
+mod operation;
 mod pack_info;
 mod parsers;
 mod property;
@@ -145,6 +146,7 @@ pub use method::{
     ALL_METHODS, METHOD_REGISTRY, MethodInfo, MethodKind, MethodSupport, P7ZIP_ORACLE_SHA,
     SevenZMethod, method_from_id, method_from_name, method_info,
 };
+pub use operation::{OperationControl, OperationPhase, OperationProgress, ReadVerification};
 pub use resources::ResourceLimits;
 pub use write::{
     ArchiveBuilder, ArchiveEntry, ArchiveOptions, ArchiveWriter, Codec, CompressionLevel,

@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -16,6 +16,30 @@ use lzma_rust2::{
 };
 
 const BLOCK_SIZE: usize = 4096;
+
+#[test]
+fn cancellation_rejects_encoder_input_and_finishing_pending_work() {
+    for dispatched in [false, true] {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut writer = Lzma2WriterMt::new(Vec::new(), options(), 2).unwrap();
+        writer.set_cancellation(Arc::clone(&flag));
+        if dispatched {
+            writer.write_all(&payload(BLOCK_SIZE * 4)).unwrap();
+        }
+        flag.store(true, Ordering::Relaxed);
+        let error = if dispatched {
+            writer.finish().unwrap_err()
+        } else {
+            writer.write(b"input").unwrap_err()
+        };
+        assert!(
+            error
+                .get_ref()
+                .unwrap()
+                .is::<lzma_rust2::EncoderCancelled>()
+        );
+    }
+}
 
 fn options() -> Lzma2Options {
     let mut options = Lzma2Options::with_preset(1);

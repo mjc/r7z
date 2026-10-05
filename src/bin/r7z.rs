@@ -136,7 +136,6 @@ enum OverwriteMode {
     SkipExisting,
 }
 
-#[derive(Debug)]
 struct Cli {
     command: Command,
     archive: PathBuf,
@@ -956,7 +955,7 @@ fn test_selected_folders(
                         .extract_to_writer(index, &mut io::sink())
                         .map(|_| ())
                 })
-                .and_then(|()| session.finish_folder());
+                .and_then(|()| session.finish_folder().map(|_| ()));
             match result {
                 Ok(()) => warnings,
                 Err(error) => {
@@ -965,7 +964,7 @@ fn test_selected_folders(
                 }
             }
         });
-        session.finish()?;
+        session.finish().map(|_| ())?;
         warnings
     } else {
         EXIT_OK
