@@ -195,6 +195,10 @@ impl LzEncoder {
         }
     }
 
+    // Position normalization is rare. Keep its CPU dispatch out of the
+    // per-byte position-advance path so that path can stay inlined.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn normalize(positions: &mut [i32], norm_offset: i32) {
         #[cfg(all(feature = "std", feature = "optimization", target_arch = "x86_64"))]
         {
