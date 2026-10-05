@@ -1472,8 +1472,8 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
     ///
     /// # Errors
     ///
-    /// Returns a prior writer failure, or an encoding/output error while finishing
-    /// the current folder.
+    /// Returns cancellation, a prior writer failure, or an encoding/output error
+    /// while finishing the current folder.
     pub fn new_folder(&mut self) -> Result<(), R7zError> {
         self.seal_streaming_folder()
     }
@@ -1683,7 +1683,9 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
     }
 
     fn seal_streaming_folder(&mut self) -> Result<(), R7zError> {
-        let (output, completed) = match std::mem::replace(&mut self.state, WriterState::Failed) {
+        let state = std::mem::replace(&mut self.state, WriterState::Failed);
+        self.budget.monitor.check()?;
+        let (output, completed) = match state {
             WriterState::Ready { output, completed } => (output, completed),
             WriterState::Active {
                 folder,
@@ -1696,6 +1698,7 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
             }
             WriterState::Failed => return Err(writer_failed()),
         };
+        self.budget.monitor.check()?;
         self.state = WriterState::Ready { output, completed };
         Ok(())
     }

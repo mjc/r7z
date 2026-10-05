@@ -379,3 +379,65 @@ fn metadata_only_finish_observes_cancellation_during_flush() {
         .start();
     assert!(matches!(writer.finish(), Err(R7zError::Cancelled)));
 }
+
+#[test]
+fn precancelled_new_folder_leaves_output_untouched() {
+    let control = OperationControl::new();
+    control.cancel();
+    let mut output = Cursor::new(b"original".to_vec());
+    let mut writer = ArchiveWriter::new(&mut output, controlled_options(control))
+        .unwrap()
+        .start();
+    assert!(matches!(writer.new_folder(), Err(R7zError::Cancelled)));
+    assert!(writer.new_folder().is_err());
+    assert!(writer.finish().is_err());
+    assert_eq!(output.into_inner(), b"original");
+}
+
+#[test]
+fn new_folder_observes_cancellation_for_each_serial_codec() {
+    for codec in [
+        Codec::Copy,
+        Codec::Lzma,
+        Codec::Lzma2,
+        Codec::Ppmd,
+        Codec::Lzma2Bcj,
+    ] {
+        let control = OperationControl::new();
+        let mut options = controlled_options(control.clone());
+        options.codec = codec;
+        options.compression.threads = r7z::EncoderThreads::Single;
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)
+            .unwrap()
+            .start();
+        writer.append("file", Cursor::new(b"small input")).unwrap();
+        control.cancel();
+        assert!(
+            matches!(writer.new_folder(), Err(R7zError::Cancelled)),
+            "{codec:?}"
+        );
+        let mut next = Cursor::new(b"next input");
+        assert!(writer.append("next", &mut next).is_err());
+        assert_eq!(next.position(), 0);
+        assert!(writer.finish().is_err());
+    }
+}
+
+#[test]
+fn new_folder_observes_cancellation_during_encoder_completion() {
+    let control = OperationControl::new();
+    let mut options = controlled_options(control.clone());
+    options.codec = Codec::Lzma2;
+    options.compression.threads = r7z::EncoderThreads::Single;
+    let output = CancelOnPackedWrite {
+        bytes: Cursor::new(Vec::new()),
+        control: control.clone(),
+    };
+    let mut writer = ArchiveWriter::new(output, options).unwrap().start();
+    writer.append("file", Cursor::new(b"small input")).unwrap();
+    assert!(!control.is_cancelled());
+    assert!(matches!(writer.new_folder(), Err(R7zError::Cancelled)));
+    assert!(control.is_cancelled());
+    assert!(writer.new_folder().is_err());
+    assert!(writer.finish().is_err());
+}
