@@ -283,6 +283,7 @@ impl MatchPipeline {
         Ok(())
     }
 
+    #[inline(never)]
     pub(super) fn find_matches(
         &mut self,
         data: &mut LzEncoderData,
@@ -304,6 +305,7 @@ impl MatchPipeline {
         Ok(())
     }
 
+    #[inline(never)]
     pub(super) fn skip(&mut self, data: &mut LzEncoderData, count: usize) -> io::Result<()> {
         (0..count).try_for_each(|_| match data.move_pos(data.nice_len as i32, 4) {
             0 => Ok(()),

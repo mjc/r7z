@@ -254,6 +254,7 @@ impl LzEncoder {
         ) as u64
     }
 
+    #[inline]
     pub(crate) fn find_matches(&mut self) -> crate::Result<()> {
         match &mut self.match_finder {
             FinderState::Local(finder) => {
@@ -273,6 +274,7 @@ impl LzEncoder {
         &mut self.matches
     }
 
+    #[inline]
     pub(crate) fn skip(&mut self, len: usize) -> crate::Result<()> {
         match &mut self.match_finder {
             FinderState::Local(finder) => {

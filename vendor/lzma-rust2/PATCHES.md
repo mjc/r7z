@@ -59,3 +59,10 @@ R7Z selects this scheduling path only for sufficiently large single blocks,
 when the thread and memory allowances permit it and the initial input prefix
 contains more than 1024 distinct adjacent byte pairs. Repetitive or short
 prefixes retain the local finder without changing compression settings.
+
+Local matcher dispatch stays inlined; the pipeline implementations remain
+separate so their size does not force local matching through extra calls.
+Known multiblock inputs start the admitted MT writer directly, avoiding the
+first-block staging copy. Dispatch replaces the producer buffer with one
+reserved to the block size, avoiding repeated growth and copying on later
+blocks. Unknown input lengths still defer MT activation until a second block.

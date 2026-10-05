@@ -233,6 +233,9 @@ impl<W: Write> Encoder<W> {
             } else {
                 State::Single(Box::new(Lzma2Writer::new(out, options)))
             }
+        } else if known_size.is_some() {
+            // Admission has already capped workers to the number of blocks.
+            State::Parallel(Box::new(Lzma2WriterMt::new(out, options, workers)?))
         } else {
             State::Buffered {
                 out,
@@ -485,5 +488,52 @@ mod tests {
             })
             .collect();
         assert!(benefits_from_parallel_matching(&random));
+    }
+
+    #[test]
+    fn known_multiblock_input_starts_without_staging_a_copy() {
+        let compression = CompressionOptions {
+            dictionary_size: Some(64 * 1024),
+            lzma2_chunk_size: std::num::NonZeroU64::new(64 * 1024),
+            encoder_memory_limit: Some(256 * MIB),
+            ..CompressionOptions::default()
+        };
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        let known = Encoder::new(Vec::new(), &compression, Some(128 * 1024), two).unwrap();
+        assert!(matches!(known.state, Some(State::Parallel(_))));
+        let unknown = Encoder::new(Vec::new(), &compression, None, two).unwrap();
+        assert!(matches!(unknown.state, Some(State::Buffered { .. })));
+    }
+
+    #[test]
+    fn direct_and_deferred_multiblock_writers_emit_identical_output() {
+        use std::io::Read;
+
+        let compression = CompressionOptions {
+            dictionary_size: Some(64 * 1024),
+            lzma2_chunk_size: std::num::NonZeroU64::new(64 * 1024),
+            encoder_memory_limit: Some(256 * MIB),
+            ..CompressionOptions::default()
+        };
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        let data: Vec<_> = (0..128 * 1024 + 31)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        for fragment in [1, 8193, data.len()] {
+            let encode = |known_size| {
+                let mut writer = Encoder::new(Vec::new(), &compression, known_size, two).unwrap();
+                for chunk in data.chunks(fragment) {
+                    writer.write_all(chunk).unwrap();
+                }
+                writer.finish().unwrap()
+            };
+            let direct = encode(Some(data.len() as u64));
+            assert_eq!(direct, encode(None));
+            let mut decoded = Vec::new();
+            lzma_rust2::Lzma2Reader::new(direct.as_slice(), 64 * 1024, None)
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, data);
+        }
     }
 }

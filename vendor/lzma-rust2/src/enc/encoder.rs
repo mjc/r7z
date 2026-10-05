@@ -401,6 +401,7 @@ impl LzmaEncoder {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn find_matches(&mut self) -> crate::Result<()> {
         self.data.read_ahead += 1;
         self.lz.find_matches()?;
@@ -408,6 +409,7 @@ impl LzmaEncoder {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn skip(&mut self, len: usize) -> crate::Result<()> {
         self.data.read_ahead += len as i32;
         self.lz.skip(len)
