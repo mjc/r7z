@@ -167,6 +167,17 @@ pub struct Lzma2Options {
 }
 
 impl Lzma2Options {
+    /// Additional bytes used by parallel match finding: a mirrored input
+    /// window, bounded input packets and bounded match-result slabs.
+    /// Thread stack and allocator overhead are separate.
+    #[cfg(feature = "std")]
+    pub fn parallel_match_finder_overhead(&self) -> u64 {
+        super::lz::LzEncoder::parallel_overhead(
+            self.lzma_options.dict_size,
+            self.lzma_options.nice_len,
+        )
+    }
+
     /// Create options with specific preset.
     pub fn with_preset(preset: u32) -> Self {
         Self {
@@ -189,7 +200,7 @@ pub fn get_extra_size_before(dict_size: u32) -> u32 {
     COMPRESSED_SIZE_MAX.saturating_sub(dict_size)
 }
 
-/// A single-threaded LZMA2 compressor.
+/// An LZMA2 compressor with optional concurrent match finding.
 pub struct Lzma2Writer<W: Write> {
     inner: W,
     rc: RangeEncoder<RangeEncoderBuffer>,
@@ -203,6 +214,10 @@ pub struct Lzma2Writer<W: Write> {
     uncompressed_size: u64,
     force_independent_chunk: bool,
     options: Lzma2Options,
+    #[cfg(feature = "std")]
+    parallel_match_finder: bool,
+    #[cfg(feature = "std")]
+    failed: bool,
 }
 
 impl<W: Write> Lzma2Writer<W> {
@@ -245,7 +260,33 @@ impl<W: Write> Lzma2Writer<W> {
             uncompressed_size: 0,
             force_independent_chunk: false,
             options,
+            #[cfg(feature = "std")]
+            parallel_match_finder: false,
+            #[cfg(feature = "std")]
+            failed: false,
         }
+    }
+
+    /// Overlap normal BT4 match finding with encoding, without changing
+    /// dictionary size, match limits or independent block boundaries.
+    /// Preset dictionaries and other match finders are not supported here.
+    #[cfg(feature = "std")]
+    pub fn new_parallel_match_finder(inner: W, options: Lzma2Options) -> std::io::Result<Self> {
+        let lzma = &options.lzma_options;
+        if lzma.preset_dict.is_some()
+            || lzma.mode != EncodeMode::Normal
+            || lzma.mf != MfType::Bt4
+            || !(LzmaOptions::NICE_LEN_MIN..=LzmaOptions::NICE_LEN_MAX).contains(&lzma.nice_len)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "parallel match finding requires normal BT4 without a preset dictionary",
+            ));
+        }
+        let mut writer = Self::new(inner, options);
+        writer.lzma.lz = writer.lzma.lz.into_parallel()?;
+        writer.parallel_match_finder = true;
+        Ok(writer)
     }
 
     fn should_start_independent_chunk(&self) -> bool {
@@ -257,7 +298,7 @@ impl<W: Write> Lzma2Writer<W> {
     }
 
     fn start_independent_chunk(&mut self) -> crate::Result<()> {
-        self.lzma.lz.set_flushing();
+        self.lzma.lz.set_flushing()?;
 
         while self.pending_size > 0 {
             self.lzma.encode_for_lzma2(&mut self.rc, &mut self.mode)?;
@@ -272,6 +313,12 @@ impl<W: Write> Lzma2Writer<W> {
 
         let lzma_options = &self.options.lzma_options;
 
+        #[cfg(feature = "std")]
+        if self.parallel_match_finder {
+            // Join and release the old dictionary before allocating its replacement.
+            self.lzma.lz.abort_pipeline();
+        }
+
         let (new_lzma, new_mode) = LzmaEncoder::new(
             lzma_options.mode,
             lzma_options.lc,
@@ -283,6 +330,14 @@ impl<W: Write> Lzma2Writer<W> {
             lzma_options.nice_len as usize,
         );
 
+        #[cfg(feature = "std")]
+        let new_lzma = if self.parallel_match_finder {
+            let mut encoder = new_lzma;
+            encoder.lz = encoder.lz.into_parallel()?;
+            encoder
+        } else {
+            new_lzma
+        };
         self.lzma = new_lzma;
         self.mode = new_mode;
         self.rc = RangeEncoder::new_buffer(COMPRESSED_SIZE_MAX as usize);
@@ -392,7 +447,9 @@ impl<W: Write> Lzma2Writer<W> {
 
     /// Finishes the compression and returns the underlying writer.
     pub fn finish(mut self) -> crate::Result<W> {
-        self.lzma.lz.set_finishing();
+        #[cfg(feature = "std")]
+        self.ensure_active()?;
+        self.lzma.lz.set_finishing()?;
 
         while self.pending_size > 0 {
             self.lzma.encode_for_lzma2(&mut self.rc, &mut self.mode)?;
@@ -405,8 +462,8 @@ impl<W: Write> Lzma2Writer<W> {
     }
 }
 
-impl<W: Write> Write for Lzma2Writer<W> {
-    fn write(&mut self, buf: &[u8]) -> crate::Result<usize> {
+impl<W: Write> Lzma2Writer<W> {
+    fn write_input(&mut self, buf: &[u8]) -> crate::Result<usize> {
         let mut len = buf.len();
 
         let mut off = 0;
@@ -415,7 +472,7 @@ impl<W: Write> Write for Lzma2Writer<W> {
                 self.start_independent_chunk()?;
             }
 
-            let used = self.lzma.lz.fill_window(&buf[off..(off + len)]);
+            let used = self.lzma.lz.fill_window(&buf[off..(off + len)])?;
             off += used;
             len -= used;
             self.pending_size += used as u32;
@@ -426,8 +483,8 @@ impl<W: Write> Write for Lzma2Writer<W> {
         Ok(off)
     }
 
-    fn flush(&mut self) -> crate::Result<()> {
-        self.lzma.lz.set_flushing();
+    fn flush_pending(&mut self) -> crate::Result<()> {
+        self.lzma.lz.set_flushing()?;
 
         while self.pending_size > 0 {
             self.lzma.encode_for_lzma2(&mut self.rc, &mut self.mode)?;
@@ -435,6 +492,45 @@ impl<W: Write> Write for Lzma2Writer<W> {
         }
 
         self.inner.flush()
+    }
+}
+
+impl<W: Write> Lzma2Writer<W> {
+    #[cfg(feature = "std")]
+    fn ensure_active(&self) -> std::io::Result<()> {
+        if self.failed {
+            Err(std::io::Error::other("encoder has failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn abort_on_error<T>(&mut self, result: &crate::Result<T>) {
+        if self.parallel_match_finder && result.is_err() {
+            self.failed = true;
+            self.lzma.lz.abort_pipeline();
+        }
+    }
+}
+
+impl<W: Write> Write for Lzma2Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> crate::Result<usize> {
+        #[cfg(feature = "std")]
+        self.ensure_active()?;
+        let result = self.write_input(buf);
+        #[cfg(feature = "std")]
+        self.abort_on_error(&result);
+        result
+    }
+
+    fn flush(&mut self) -> crate::Result<()> {
+        #[cfg(feature = "std")]
+        self.ensure_active()?;
+        let result = self.flush_pending();
+        #[cfg(feature = "std")]
+        self.abort_on_error(&result);
+        result
     }
 }
 

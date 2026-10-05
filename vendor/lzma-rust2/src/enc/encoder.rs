@@ -29,7 +29,7 @@ pub enum EncodeMode {
 }
 
 pub(crate) trait LzmaEncoderTrait {
-    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> u32;
+    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> crate::Result<u32>;
     fn reset(&mut self) {}
 }
 
@@ -39,7 +39,7 @@ pub(crate) enum LzmaEncoderModes {
 }
 
 impl LzmaEncoderTrait for LzmaEncoderModes {
-    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> u32 {
+    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> crate::Result<u32> {
         match self {
             LzmaEncoderModes::Fast(a) => a.get_next_symbol(encoder),
             LzmaEncoderModes::Normal(a) => a.get_next_symbol(encoder),
@@ -257,7 +257,7 @@ impl LzmaEncoder {
         if !self.lz.has_enough_data(0) {
             return Ok(false);
         }
-        self.skip(1);
+        self.skip(1)?;
         let state = self.coder.state.get() as usize;
         rc.encode_bit(&mut self.coder.is_match[state], 0, 0)?;
         self.literal_encoder
@@ -277,7 +277,7 @@ impl LzmaEncoder {
         if !self.lz.has_enough_data(self.data.read_ahead + 1) {
             return Ok(false);
         }
-        let len = mode.get_next_symbol(self);
+        let len = mode.get_next_symbol(self)?;
 
         debug_assert!(self.data.read_ahead >= 0);
         let pos_state = (self.lz.get_pos() - self.data.read_ahead) as u32 & self.coder.pos_mask;
@@ -401,13 +401,16 @@ impl LzmaEncoder {
         Ok(())
     }
 
-    pub(crate) fn find_matches(&mut self) {
+    #[inline]
+    pub(crate) fn find_matches(&mut self) -> crate::Result<()> {
         self.data.read_ahead += 1;
-        self.lz.find_matches();
+        self.lz.find_matches()?;
         debug_assert!(self.lz.verify_matches());
+        Ok(())
     }
 
-    pub(crate) fn skip(&mut self, len: usize) {
+    #[inline]
+    pub(crate) fn skip(&mut self, len: usize) -> crate::Result<()> {
         self.data.read_ahead += len as i32;
         self.lz.skip(len)
     }

@@ -27,15 +27,15 @@ fn change_pair(small_dist: u32, big_dist: u32) -> bool {
 }
 
 impl LzmaEncoderTrait for FastEncoderMode {
-    fn get_next_symbol(&mut self, encoder: &mut super::encoder::LzmaEncoder) -> u32 {
+    fn get_next_symbol(&mut self, encoder: &mut super::encoder::LzmaEncoder) -> crate::Result<u32> {
         if encoder.data.read_ahead == -1 {
-            encoder.find_matches();
+            encoder.find_matches()?;
         }
 
         encoder.data.back = -1;
         let avail = encoder.lz.data.get_avail().min(MATCH_LEN_MAX as i32);
         if avail < MATCH_LEN_MIN as i32 {
-            return 1;
+            return Ok(1);
         }
         let mut best_rep_len = 0;
         let mut best_rep_index = 0;
@@ -49,8 +49,8 @@ impl LzmaEncoderTrait for FastEncoderMode {
             }
             if len >= encoder.data.nice_len {
                 encoder.data.back = rep as i32;
-                encoder.skip(len - 1);
-                return len as u32;
+                encoder.skip(len - 1)?;
+                return Ok(len as u32);
             }
             if len > best_rep_len {
                 best_rep_index = rep;
@@ -67,8 +67,8 @@ impl LzmaEncoderTrait for FastEncoderMode {
 
             if main_len >= encoder.data.nice_len as u32 {
                 encoder.data.back = (main_dist + REPS as i32) as _;
-                encoder.skip((main_len - 1) as _);
-                return main_len;
+                encoder.skip((main_len - 1) as _)?;
+                return Ok(main_len);
             }
 
             while matches.count > 1 && main_len == matches.len[matches.count as usize - 2] + 1 {
@@ -94,16 +94,16 @@ impl LzmaEncoderTrait for FastEncoderMode {
                 || (best_rep_len + 3 >= main_len as usize && main_dist >= (1 << 15)))
         {
             encoder.data.back = best_rep_index as _;
-            encoder.skip(best_rep_len - 1);
-            return best_rep_len as _;
+            encoder.skip(best_rep_len - 1)?;
+            return Ok(best_rep_len as _);
         }
 
         if main_len < MATCH_LEN_MIN as _ || avail <= MATCH_LEN_MIN as _ {
-            return 1;
+            return Ok(1);
         }
         // Get the next match. Test if it is better than the current match.
         // If so, encode the current byte as a literal.
-        encoder.find_matches();
+        encoder.find_matches()?;
         let matches = encoder.lz.matches();
         if matches.count > 0 {
             let new_len = matches.len[matches.count as usize - 1];
@@ -116,7 +116,7 @@ impl LzmaEncoderTrait for FastEncoderMode {
                     && main_len > MATCH_LEN_MIN as u32
                     && change_pair(new_dist as _, main_dist as _))
             {
-                return 1;
+                return Ok(1);
             }
         }
 
@@ -127,12 +127,12 @@ impl LzmaEncoderTrait for FastEncoderMode {
                 .get_match_len(encoder.coder.reps[rep], limit as i32)
                 == limit as usize
             {
-                return 1;
+                return Ok(1);
             }
         }
 
         encoder.data.back = (main_dist + REPS as i32) as _;
-        encoder.skip((main_len - 2) as _);
-        main_len
+        encoder.skip((main_len - 2) as _)?;
+        Ok(main_len)
     }
 }

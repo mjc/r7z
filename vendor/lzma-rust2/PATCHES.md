@@ -51,3 +51,23 @@ existing 100 ms error-check interval. Workers check cancellation and shutdown
 between 64 KiB input writes, so abort joins no longer require compressing the
 remainder of an independent block. Cancellation has a distinct I/O error payload;
 output errors retain their original cause.
+
+Single-block match finding can run concurrently with the normal encoder. The
+existing BT4 tree moves to one worker; a mirrored input window and queues are
+bounded by bytes and positions. The encoder retains its original lookahead,
+write cadence, and independent-block boundaries. Short matches transfer as
+length/distance pairs; the main encoder extends nice-length matches using its
+own window. Output errors stop and join the worker, and resets release the old
+worker before creating its replacement. Differential tests require identical
+compressed output through fragmented writes, flushes, window moves and resets.
+R7Z selects this scheduling path only for sufficiently large single blocks,
+when the thread and memory allowances permit it and the initial input prefix
+contains more than 1024 distinct adjacent byte pairs. Repetitive or short
+prefixes retain the local finder without changing compression settings.
+
+Local matcher dispatch stays inlined; the pipeline implementations remain
+separate so their size does not force local matching through extra calls.
+Known multiblock inputs start the admitted MT writer directly, avoiding the
+first-block staging copy. Dispatch replaces the producer buffer with one
+reserved to the block size, avoiding repeated growth and copying on later
+blocks. Unknown input lengths still defer MT activation until a second block.

@@ -147,7 +147,63 @@ fn select_workers(
     }
 }
 
+fn use_parallel_match_finder(
+    compression: &CompressionOptions,
+    options: &Lzma2Options,
+    known_size: Option<u64>,
+    threads: ThreadRequest,
+) -> bool {
+    let requested = match threads {
+        ThreadRequest::Single => 1,
+        ThreadRequest::Fixed(count) => count.get(),
+        ThreadRequest::Auto => std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .try_into()
+            .unwrap_or(MAX_WORKERS),
+    };
+    let lzma = &options.lzma_options;
+    let required = required_bytes(options, 1)
+        .and_then(|bytes| bytes.checked_add(options.parallel_match_finder_overhead()))
+        .and_then(|bytes| bytes.checked_add(WORKER_OVERHEAD));
+    requested >= 2
+        && known_size.is_some_and(|size| {
+            size >= MIB
+                && options
+                    .chunk_size
+                    .is_some_and(|chunk| size <= chunk.get().max(u64::from(lzma.dict_size)))
+        })
+        && lzma.mode == lzma_rust2::EncodeMode::Normal
+        && lzma.mf == lzma_rust2::MfType::Bt4
+        && lzma.preset_dict.is_none()
+        && required.is_some_and(|bytes| {
+            bytes
+                <= compression
+                    .encoder_memory_limit
+                    .unwrap_or_else(default_budget)
+        })
+}
+
+// Speculative match finding helps diverse input but does unnecessary work on
+// long repetitions. Choose the scheduling path before allocating its worker.
+fn benefits_from_parallel_matching(input: &[u8]) -> bool {
+    let sample = &input[..input.len().min(64 * 1024)];
+    let mut seen = [0_u64; 1024];
+    let mut distinct = 0;
+    for pair in sample.windows(2) {
+        let value = usize::from(u16::from_le_bytes([pair[0], pair[1]]));
+        let bit = 1_u64 << (value % 64);
+        let slot = &mut seen[value / 64];
+        distinct += usize::from(*slot & bit == 0);
+        *slot |= bit;
+    }
+    sample.len() >= 4096 && distinct > 1024
+}
+
 enum State<W: Write> {
+    PendingMatcher {
+        out: W,
+        options: Lzma2Options,
+    },
     Buffered {
         out: W,
         options: Lzma2Options,
@@ -173,7 +229,14 @@ impl<W: Write> Encoder<W> {
         let options = encode::lzma2_options(compression);
         let workers = select_workers(compression, &options, known_size, thread_request)?;
         let state = if workers == 1 {
-            State::Single(Box::new(Lzma2Writer::new(out, options)))
+            if use_parallel_match_finder(compression, &options, known_size, thread_request) {
+                State::PendingMatcher { out, options }
+            } else {
+                State::Single(Box::new(Lzma2Writer::new(out, options)))
+            }
+        } else if known_size.is_some() {
+            // Admission has already capped workers to the number of blocks.
+            State::Parallel(Box::new(Lzma2WriterMt::new(out, options, workers)?))
         } else {
             State::Buffered {
                 out,
@@ -189,6 +252,9 @@ impl<W: Write> Encoder<W> {
     }
 
     pub(super) fn with_control(mut self, control: Option<crate::OperationControl>) -> Self {
+        if let (Some(State::Parallel(writer)), Some(control)) = (&mut self.state, &control) {
+            writer.set_cancellation(control.cancellation_flag());
+        }
         self.control = control;
         self
     }
@@ -198,26 +264,35 @@ impl<W: Write> Encoder<W> {
         parallel: bool,
         control: Option<&crate::OperationControl>,
     ) -> io::Result<State<W>> {
-        let State::Buffered {
-            out,
-            options,
-            workers,
-            data,
-        } = state
-        else {
-            return Ok(state);
-        };
-        if parallel {
-            let mut writer = Lzma2WriterMt::new(out, options, workers)?;
-            if let Some(control) = control {
-                writer.set_cancellation(control.cancellation_flag());
+        match state {
+            State::PendingMatcher { out, options } => {
+                let writer = if parallel {
+                    Lzma2Writer::new_parallel_match_finder(out, options)?
+                } else {
+                    Lzma2Writer::new(out, options)
+                };
+                Ok(State::Single(Box::new(writer)))
             }
-            writer.write_all(&data).map_err(encoder_io_error)?;
-            Ok(State::Parallel(Box::new(writer)))
-        } else {
-            let mut writer = Lzma2Writer::new(out, options);
-            writer.write_all(&data)?;
-            Ok(State::Single(Box::new(writer)))
+            State::Buffered {
+                out,
+                options,
+                workers,
+                data,
+            } => {
+                if parallel {
+                    let mut writer = Lzma2WriterMt::new(out, options, workers)?;
+                    if let Some(control) = control {
+                        writer.set_cancellation(control.cancellation_flag());
+                    }
+                    writer.write_all(&data).map_err(encoder_io_error)?;
+                    Ok(State::Parallel(Box::new(writer)))
+                } else {
+                    let mut writer = Lzma2Writer::new(out, options);
+                    writer.write_all(&data)?;
+                    Ok(State::Single(Box::new(writer)))
+                }
+            }
+            state => Ok(state),
         }
     }
 
@@ -229,13 +304,21 @@ impl<W: Write> Encoder<W> {
         match Self::start(state, false, self.control.as_ref())? {
             State::Single(writer) => writer.finish(),
             State::Parallel(writer) => writer.finish().map_err(encoder_io_error),
-            State::Buffered { .. } => unreachable!(),
+            State::Buffered { .. } | State::PendingMatcher { .. } => unreachable!(),
         }
     }
 }
 
 impl<W: Write> Write for Encoder<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if matches!(self.state, Some(State::PendingMatcher { .. })) {
+            let state = self.state.take().expect("encoder state exists");
+            self.state = Some(Self::start(
+                state,
+                benefits_from_parallel_matching(buf),
+                self.control.as_ref(),
+            )?);
+        }
         let Some(state) = self.state.as_mut() else {
             return Err(io::Error::other("encoder is unavailable after an error"));
         };
@@ -257,7 +340,7 @@ impl<W: Write> Write for Encoder<W> {
         match self.state.as_mut().expect("encoder state exists") {
             State::Single(writer) => writer.write(buf),
             State::Parallel(writer) => writer.write(buf).map_err(encoder_io_error),
-            State::Buffered { .. } => unreachable!(),
+            State::Buffered { .. } | State::PendingMatcher { .. } => unreachable!(),
         }
     }
 
@@ -265,14 +348,17 @@ impl<W: Write> Write for Encoder<W> {
         if self.state.is_none() {
             return Err(io::Error::other("encoder is unavailable after an error"));
         }
-        if matches!(self.state, Some(State::Buffered { .. })) {
+        if matches!(
+            self.state,
+            Some(State::Buffered { .. } | State::PendingMatcher { .. })
+        ) {
             let state = self.state.take().expect("encoder state exists");
             self.state = Some(Self::start(state, false, self.control.as_ref())?);
         }
         match self.state.as_mut().expect("encoder state exists") {
             State::Single(writer) => writer.flush(),
             State::Parallel(writer) => writer.flush().map_err(encoder_io_error),
-            State::Buffered { .. } => unreachable!(),
+            State::Buffered { .. } | State::PendingMatcher { .. } => unreachable!(),
         }
     }
 }
@@ -356,5 +442,150 @@ mod tests {
             select_workers(&compression, &options, None, threads),
             Err(R7zError::LimitExceeded("encoder memory"))
         ));
+    }
+
+    #[test]
+    fn match_pipeline_requires_a_large_single_block_and_two_threads() {
+        let compression = CompressionOptions::default();
+        let options = encode::lzma2_options(&compression);
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        assert!(use_parallel_match_finder(
+            &compression,
+            &options,
+            Some(16 * MIB),
+            two
+        ));
+        for size in [None, Some(0), Some(MIB - 1), Some(128 * MIB)] {
+            assert!(!use_parallel_match_finder(
+                &compression,
+                &options,
+                size,
+                two
+            ));
+        }
+        assert!(!use_parallel_match_finder(
+            &compression,
+            &options,
+            Some(16 * MIB),
+            ThreadRequest::Single
+        ));
+    }
+
+    #[test]
+    fn match_pipeline_respects_its_additional_memory_allowance() {
+        let mut compression = CompressionOptions::default();
+        let options = encode::lzma2_options(&compression);
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        let required = required_bytes(&options, 1).unwrap()
+            + options.parallel_match_finder_overhead()
+            + WORKER_OVERHEAD;
+        compression.encoder_memory_limit = Some(required - 1);
+        assert!(!use_parallel_match_finder(
+            &compression,
+            &options,
+            Some(16 * MIB),
+            two
+        ));
+        compression.encoder_memory_limit = Some(required);
+        assert!(use_parallel_match_finder(
+            &compression,
+            &options,
+            Some(16 * MIB),
+            two
+        ));
+    }
+
+    #[test]
+    fn repetitive_prefixes_keep_the_local_match_finder() {
+        assert!(!benefits_from_parallel_matching(&vec![0; 64 * 1024]));
+        let text = b"the quick brown fox jumps over the lazy dog\n".repeat(1600);
+        assert!(!benefits_from_parallel_matching(&text));
+        assert!(!benefits_from_parallel_matching(b"short prefix"));
+        let cycle: Vec<_> = (0..64 * 1024)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        for size in [4096, 8192, 64 * 1024] {
+            assert!(!benefits_from_parallel_matching(&cycle[..size]));
+            assert!(!benefits_from_parallel_matching(&text[..size]));
+        }
+        let mut state = 0x1234_5678_u32;
+        let random: Vec<_> = (0..64 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        assert!(benefits_from_parallel_matching(&random));
+    }
+
+    #[test]
+    fn known_multiblock_input_starts_without_staging_a_copy() {
+        let compression = CompressionOptions {
+            dictionary_size: Some(64 * 1024),
+            lzma2_chunk_size: std::num::NonZeroU64::new(64 * 1024),
+            encoder_memory_limit: Some(256 * MIB),
+            ..CompressionOptions::default()
+        };
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        let known = Encoder::new(Vec::new(), &compression, Some(128 * 1024), two).unwrap();
+        assert!(matches!(known.state, Some(State::Parallel(_))));
+        let unknown = Encoder::new(Vec::new(), &compression, None, two).unwrap();
+        assert!(matches!(unknown.state, Some(State::Buffered { .. })));
+    }
+
+    #[test]
+    fn direct_multiblock_writer_receives_operation_cancellation() {
+        let compression = CompressionOptions {
+            dictionary_size: Some(64 * 1024),
+            lzma2_chunk_size: std::num::NonZeroU64::new(64 * 1024),
+            encoder_memory_limit: Some(256 * MIB),
+            ..CompressionOptions::default()
+        };
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        let control = crate::OperationControl::new();
+        let mut writer = Encoder::new(Vec::new(), &compression, Some(128 * 1024), two)
+            .unwrap()
+            .with_control(Some(control.clone()));
+        control.cancel();
+        assert!(matches!(
+            writer
+                .write_all(&vec![0; 128 * 1024])
+                .map_err(R7zError::from),
+            Err(R7zError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn direct_and_deferred_multiblock_writers_emit_identical_output() {
+        use std::io::Read;
+
+        let compression = CompressionOptions {
+            dictionary_size: Some(64 * 1024),
+            lzma2_chunk_size: std::num::NonZeroU64::new(64 * 1024),
+            encoder_memory_limit: Some(256 * MIB),
+            ..CompressionOptions::default()
+        };
+        let two = ThreadRequest::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        let data: Vec<_> = (0..128 * 1024 + 31)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        for fragment in [1, 8193, data.len()] {
+            let encode = |known_size| {
+                let mut writer = Encoder::new(Vec::new(), &compression, known_size, two).unwrap();
+                for chunk in data.chunks(fragment) {
+                    writer.write_all(chunk).unwrap();
+                }
+                writer.finish().unwrap()
+            };
+            let direct = encode(Some(data.len() as u64));
+            assert_eq!(direct, encode(None));
+            let mut decoded = Vec::new();
+            lzma_rust2::Lzma2Reader::new(direct.as_slice(), 64 * 1024, None)
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, data);
+        }
     }
 }

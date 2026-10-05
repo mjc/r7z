@@ -86,7 +86,10 @@ impl<W: Write> Lzma2WriterMt<W> {
             }
         }
 
-        let work_data = core::mem::take(&mut self.current_work_unit);
+        let work_data = core::mem::replace(
+            &mut self.current_work_unit,
+            Vec::with_capacity(self.chunk_size),
+        );
         let mut single_chunk_options = self.options.clone();
         single_chunk_options.chunk_size = None;
         single_chunk_options.lzma_options.preset_dict = None;
@@ -281,5 +284,22 @@ impl<W: Write> Write for Lzma2WriterMt<W> {
 impl<W: Write> AutoFinish for Lzma2WriterMt<W> {
     fn finish_ignore_error(self) {
         let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_retains_a_reserved_producer_buffer() {
+        let mut options = Lzma2Options::with_preset(5);
+        options.lzma_options.dict_size = 64 * 1024;
+        options.set_chunk_size(std::num::NonZeroU64::new(64 * 1024));
+        let mut writer = Lzma2WriterMt::new(Vec::new(), options, 2).unwrap();
+        writer.write_all(&vec![0; 64 * 1024]).unwrap();
+        assert!(writer.current_work_unit.is_empty());
+        assert!(writer.current_work_unit.capacity() >= writer.chunk_size);
+        writer.finish().unwrap();
     }
 }

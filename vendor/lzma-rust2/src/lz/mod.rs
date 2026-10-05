@@ -3,6 +3,8 @@ mod hash234;
 mod hc4;
 mod lz_decoder;
 mod lz_encoder;
+#[cfg(feature = "std")]
+mod match_pipeline;
 
 pub(crate) use lz_decoder::*;
 pub use lz_encoder::*;
