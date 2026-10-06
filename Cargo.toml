@@ -29,7 +29,7 @@ bzip2-rs = "0.1.2"
 crc32fast = "1.5.0"
 deflate64 = "0.1.12"
 flate2 = "1"
-lzma-rust2 = { version = "=0.21.0", features = ["encoder", "optimization"] }
+lzma-rust2 = { git = "https://github.com/mjc/lzma-rust2", rev = "2747e26442df081653f8960ce46a03a7a4ad9879", features = ["encoder", "optimization"] }
 memmap2 = "0.9"
 nom = "8"
 num = "0.4"
@@ -45,9 +45,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 cap-std = { version = "4.0.3", default-features = false }
 tempfile = "3.26.0"
 zeroize = "1.8"
-
-[patch.crates-io]
-lzma-rust2 = { path = "vendor/lzma-rust2" }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

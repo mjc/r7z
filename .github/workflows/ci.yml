@@ -62,9 +62,6 @@ jobs:
 
       - name: Test
         run: |
-          cargo test -p lzma-rust2 --lib work_
-          cargo test -p lzma-rust2 --lib lz::
-          cargo test --manifest-path vendor/lzma-rust2/Cargo.toml --target-dir target --no-default-features --features std,encoder --lib lz::
           cargo test --no-fail-fast -- --skip large_
 
       - name: CLI performance smoke
