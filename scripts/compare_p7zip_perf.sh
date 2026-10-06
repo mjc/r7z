@@ -209,11 +209,11 @@ time_command() {
 
   samples="$(
     for _ in $(seq 1 "$RUNS"); do
-      bash -lc "$prep" >/dev/null 2>&1
+      bash -lc "$prep" >/dev/null 2>&1 || exit $?
       TIMEFORMAT='%3R'
-      { time bash -lc "$cmd" >/dev/null; } 2>&1
+      { time bash -lc "$cmd" >/dev/null; } 2>&1 || exit $?
     done
-  )"
+  )" || return $?
   printf '%s\n' "$samples" | average_seconds
 }
 
