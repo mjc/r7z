@@ -164,10 +164,6 @@ if [[ "$FLAMEGRAPHS" == "1" ]]; then
   mkdir -p "$FLAMEGRAPH_DIR"
 fi
 
-shell_quote() {
-  printf '%q' "$1"
-}
-
 average_seconds() {
   awk '{sum += $1; count += 1} END {if (count == 0) exit 1; printf "%.6f", sum / count}'
 }
@@ -185,9 +181,20 @@ median_and_range() {
   }'
 }
 
-time_direct() {
+time_command() {
   TIMEFORMAT='%3R'
-  { time "$@" >/dev/null; } 2>&1
+  { time "$@" >/dev/null 2>&1; } 2>&1
+}
+
+time_average() {
+  local samples
+
+  samples="$(
+    for _ in $(seq 1 "$RUNS"); do
+      time_command "$@" || exit $?
+    done
+  )" || return $?
+  printf '%s\n' "$samples" | average_seconds
 }
 
 op_selected() {
@@ -200,21 +207,6 @@ op_selected() {
     fi
   done
   return 1
-}
-
-time_command() {
-  local prep="$1"
-  local cmd="$2"
-  local samples
-
-  samples="$(
-    for _ in $(seq 1 "$RUNS"); do
-      bash -lc "$prep" >/dev/null 2>&1
-      TIMEFORMAT='%3R'
-      { time bash -lc "$cmd" >/dev/null; } 2>&1
-    done
-  )"
-  printf '%s\n' "$samples" | average_seconds
 }
 
 materialize_payload() {
@@ -284,23 +276,16 @@ for size in "${size_list[@]}"; do
   materialize_payload "$size" "$payload"
   "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$source_archive" "$payload" >/dev/null
 
-  payload_q="$(shell_quote "$payload")"
-  source_archive_q="$(shell_quote "$source_archive")"
-  r7z_archive_q="$(shell_quote "$r7z_archive")"
-  p7zip_archive_q="$(shell_quote "$p7zip_archive")"
-  r7z_q="$(shell_quote "$R7Z_BIN")"
-  p7z_q="$(shell_quote "$P7Z_BIN")"
-
-  r7z_list="$(time_command "true" "$r7z_q l $source_archive_q >/dev/null")"
-  p7zip_list="$(time_command "true" "$p7z_q l $source_archive_q >/dev/null")"
+  r7z_list="$(time_average "$R7Z_BIN" l "$source_archive")"
+  p7zip_list="$(time_average "$P7Z_BIN" l "$source_archive")"
   printf '| %s | l | %s | %s | %s |\n' \
     "$size" "$r7z_list" "$p7zip_list" "$(ratio_string "$r7z_list" "$p7zip_list")"
   if [[ "$FLAMEGRAPHS" == "1" ]] && op_selected "l"; then
     generate_flamegraph "list-$size" l "$source_archive"
   fi
 
-  r7z_test="$(time_command "true" "$r7z_q t $source_archive_q >/dev/null")"
-  p7zip_test="$(time_command "true" "$p7z_q t $source_archive_q >/dev/null")"
+  r7z_test="$(time_average "$R7Z_BIN" t "$source_archive")"
+  p7zip_test="$(time_average "$P7Z_BIN" t "$source_archive")"
   printf '| %s | t | %s | %s | %s |\n' \
     "$size" "$r7z_test" "$p7zip_test" "$(ratio_string "$r7z_test" "$p7zip_test")"
   if [[ "$FLAMEGRAPHS" == "1" ]] && op_selected "t"; then
@@ -312,14 +297,14 @@ for size in "${size_list[@]}"; do
   for ((run = 1; run <= RUNS; run++)); do
     if ((run % 2 == 1)); then
       rm -f "$r7z_archive"
-      r7z_samples+=("$(time_direct "$R7Z_BIN" a "-mx=$MX" "${r7z_thread_args[@]}" "$r7z_archive" "$payload")")
+      r7z_samples+=("$(time_command "$R7Z_BIN" a "-mx=$MX" "${r7z_thread_args[@]}" "$r7z_archive" "$payload")")
       rm -f "$p7zip_archive"
-      p7zip_samples+=("$(time_direct "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$p7zip_archive" "$payload")")
+      p7zip_samples+=("$(time_command "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$p7zip_archive" "$payload")")
     else
       rm -f "$p7zip_archive"
-      p7zip_samples+=("$(time_direct "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$p7zip_archive" "$payload")")
+      p7zip_samples+=("$(time_command "$P7Z_BIN" a -bd -bb0 "${p7zip_thread_args[@]}" "-mx=$MX" "$p7zip_archive" "$payload")")
       rm -f "$r7z_archive"
-      r7z_samples+=("$(time_direct "$R7Z_BIN" a "-mx=$MX" "${r7z_thread_args[@]}" "$r7z_archive" "$payload")")
+      r7z_samples+=("$(time_command "$R7Z_BIN" a "-mx=$MX" "${r7z_thread_args[@]}" "$r7z_archive" "$payload")")
     fi
   done
   read -r r7z_create r7z_min r7z_max <<<"$(printf '%s\n' "${r7z_samples[@]}" | median_and_range)"
