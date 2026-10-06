@@ -66,7 +66,11 @@ jobs:
           cargo test -p lzma-rust2 --lib lz::
           cargo test --manifest-path vendor/lzma-rust2/Cargo.toml --target-dir target --no-default-features --features std,encoder --lib lz::
           cargo test --no-fail-fast -- --skip large_
-          cargo test --release --test lzma_perf_test lzma_rust_vs_c_performance -- --ignored --nocapture
+
+      - name: CLI performance smoke
+        run: |
+          cargo build --release --bin r7z
+          scripts/compare_p7zip_perf.sh --sizes 1M --runs 1 --mx 5 --r7z-threads 1 --p7zip-threads 1 --pattern random
 
   msrv:
     name: Minimum Rust version
