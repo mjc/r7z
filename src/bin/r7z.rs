@@ -1733,10 +1733,10 @@ fn write_archive_entries(
         let result = write_volumes_from_file(archive_path, &tmp_archive, volume_sizes);
         let cleanup = fs::remove_file(&tmp_archive);
         result?;
-        if let Err(err) = cleanup {
-            if err.kind() != io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
+        if let Err(err) = cleanup
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(err.into());
         }
     }
     Ok(())
@@ -1865,19 +1865,18 @@ fn entry_meta_from_archive(files: &r7z::raw::FilesInfo, index: usize) -> EntryMe
 }
 
 fn entry_meta_from_fs(metadata: &fs::Metadata) -> EntryMeta {
-    let mut meta = EntryMeta {
+    EntryMeta {
         mtime: metadata.modified().ok(),
         atime: metadata.accessed().ok(),
         ctime: metadata.created().ok(),
+        #[cfg(unix)]
+        attributes: {
+            use std::os::unix::fs::MetadataExt;
+            let mode = metadata.mode();
+            Some((mode << 16) | if metadata.is_dir() { 0x10 } else { 0x20 })
+        },
         ..EntryMeta::default()
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mode = metadata.mode();
-        meta.attributes = Some((mode << 16) | if metadata.is_dir() { 0x10 } else { 0x20 });
     }
-    meta
 }
 
 fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
@@ -2008,7 +2007,9 @@ enum NameSymbol {
 fn wildcard_match_raw(pattern: &str, text: &r7z::raw::RawEntryName) -> bool {
     let units = text
         .as_utf16le()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|unit| u16::from_le_bytes([unit[0], unit[1]]));
     let text = char::decode_utf16(units).map(|decoded| match decoded {
         Ok(character) => NameSymbol::Unicode(character),
@@ -2309,11 +2310,11 @@ mod tests {
                 .unwrap(),
             b"retained"
         );
-        assert!(
+        assert_eq!(
             updated
                 .extract_to_memory(r7z::ArchiveEntryIndex::new(1))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [u8; 0]
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
@@ -2385,7 +2386,7 @@ mod tests {
         assert_eq!(action, CollisionAction::Skip { warning: true });
         assert_eq!(mode, OverwriteMode::Ask);
         assert_eq!(ui.warned, vec!["exists.txt"]);
-        assert!(ui.prompts.is_empty());
+        assert_eq!(ui.prompts, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2397,8 +2398,8 @@ mod tests {
 
         assert_eq!(action, CollisionAction::Overwrite);
         assert_eq!(mode, OverwriteMode::Ask);
-        assert!(ui.warned.is_empty());
-        assert!(ui.prompts.is_empty());
+        assert_eq!(ui.warned, [] as [std::string::String; 0]);
+        assert_eq!(ui.prompts, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2413,7 +2414,7 @@ mod tests {
         assert_eq!(second, CollisionAction::Overwrite);
         assert_eq!(mode, OverwriteMode::Overwrite);
         assert_eq!(ui.prompts, vec!["first.txt"]);
-        assert!(ui.warned.is_empty());
+        assert_eq!(ui.warned, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2441,7 +2442,7 @@ mod tests {
         assert_eq!(action, CollisionAction::Quit);
         assert_eq!(mode, OverwriteMode::Ask);
         assert_eq!(ui.prompts, vec!["exists.txt"]);
-        assert!(ui.warned.is_empty());
+        assert_eq!(ui.warned, [] as [std::string::String; 0]);
     }
 
     #[test]

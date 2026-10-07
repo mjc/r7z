@@ -508,7 +508,7 @@ mod tests {
         // SubStreamsInfo tag (0x08), then END (0x00)
         let input = [0x08u8, 0x00];
         let (rem, ()) = scan_substream_info(&input, 1).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// `NumUnPackStream` + `Size`: 2 folders with `[2, 1]` streams → 1 size to skip.
@@ -518,7 +518,7 @@ mod tests {
         // sizes_to_read=(2-1)+(1-1)=1, Size (0x09): one varint, END (0x00)
         let input = [0x08u8, 0x0D, 0x02, 0x01, 0x09, 0x64, 0x00];
         let (rem, ()) = scan_substream_info(&input, 2).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     #[test]
@@ -582,7 +582,7 @@ mod tests {
     fn scan_stream_info_empty() {
         let input = [0x00u8];
         let (rem, ()) = scan_stream_info(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// `PackInfo` + `UnpackInfo` + `END`.
@@ -596,7 +596,7 @@ mod tests {
             0x00,
         ];
         let (rem, ()) = scan_stream_info(input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// `PackInfo` + `UnpackInfo` + `SubStreamsInfo` + `END`.
@@ -611,7 +611,7 @@ mod tests {
             0x00,
         ];
         let (rem, ()) = scan_stream_info(input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// Trailing bytes after END are preserved in the remainder.

@@ -558,7 +558,7 @@ mod tests {
         // 0x06=PackInfo, pack_pos=0, num_streams=1, 0x09=Size, 100, 0x00=END
         let input = [0x06u8, 0x00, 0x01, 0x09, 0x64, 0x00];
         let (rem, ()) = scan_pack_info(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// Three streams; trailing byte left in remainder.
@@ -579,7 +579,7 @@ mod tests {
 
         let (rem, pack_info) = PackInfo::parse(&input).unwrap();
 
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(pack_info.pack_pos, 0);
         assert_eq!(pack_info.num_pack_streams, 2);
         assert_eq!(pack_info.pack_size.as_slice(), &[86, 362]);
@@ -599,7 +599,7 @@ mod tests {
             0xB0, 0xB1, 0xB2, 0xB3, 0x00,
         ];
         let (rem, pack_info) = PackInfo::parse(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(
             pack_info.digests.as_slice(),
             &[Some(0xA3A2_A1A0), None, Some(0xB3B2_B1B0)]
@@ -615,7 +615,7 @@ mod tests {
             Bytes::from_static(&[0x01, 0x01, 0x00]),
         ];
         let (rest, unpack) = UnpackInfo::parse_with_external(&input, &backing, &external).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, []);
         assert_eq!(unpack.unpack_sizes.as_slice(), &[3]);
         assert_eq!(unpack.folder_bytes(0).unwrap(), &[0x01, 0x01, 0x00]);
         assert_eq!(unpack.parse_folder(0).unwrap().coders.len(), 1);
@@ -650,7 +650,7 @@ mod tests {
 
         let (rest, unpack) = UnpackInfo::parse(&backing[1..backing.len() - 1], &backing).unwrap();
 
-        assert!(rest.is_empty());
+        assert_eq!(rest, []);
         assert_eq!(unpack.folder_bytes(0).unwrap(), &[0x01, 0x01, 0x00]);
     }
 
@@ -697,7 +697,7 @@ mod tests {
         // folder=[copy coder], CodersUnPackSize, 100, END
         let input = [0x07u8, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x64, 0x00];
         let (rem, nf) = scan_unpack_info(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(nf, 1);
     }
 
@@ -712,7 +712,7 @@ mod tests {
             0x00,
         ];
         let (rem, nf) = scan_unpack_info(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(nf, 2);
     }
 
@@ -727,7 +727,7 @@ mod tests {
             0x00,
         ];
         let (rem, nf) = scan_unpack_info(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(nf, 1);
     }
 

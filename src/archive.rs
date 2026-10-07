@@ -1578,13 +1578,12 @@ impl Archive {
         }
 
         let requested_safe_name = safe_archive_name(name).ok();
-        if let Some(requested_safe_name) = requested_safe_name {
-            if let Some(entry) = self
+        if let Some(requested_safe_name) = requested_safe_name
+            && let Some(entry) = self
                 .entries()
                 .find(|entry| entry.safe_name.as_deref() == Some(requested_safe_name.as_path()))
-            {
-                return Ok(entry.index);
-            }
+        {
+            return Ok(entry.index);
         }
 
         Err(R7zError::EntryNotFound(name.to_string()))
@@ -1931,14 +1930,14 @@ fn verify_additional_pack_crcs(
 
 fn archive_method_names(streams: Option<&StreamInfo>) -> Result<Vec<String>, R7zError> {
     let mut names = Vec::new();
-    if let Some(streams) = streams {
-        if let Some(unpack) = &streams.unpack_info {
-            for idx in 0..unpack.num_folders_usize() {
-                let folder = unpack.parse_folder(idx)?;
-                for name in folder.coders.iter().map(archive_method_name) {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
+    if let Some(streams) = streams
+        && let Some(unpack) = &streams.unpack_info
+    {
+        for idx in 0..unpack.num_folders_usize() {
+            let folder = unpack.parse_folder(idx)?;
+            for name in folder.coders.iter().map(archive_method_name) {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
         }
@@ -2260,7 +2259,7 @@ mod selected_stream_tests {
             let error = copy_entry(&mut reader, &mut output).unwrap_err();
             assert_eq!(std::mem::discriminant(&error), variant);
             assert_eq!(error.to_string(), message);
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 

@@ -530,7 +530,7 @@ mod tests {
 
         let (rem, parsed) = Header::parse(&header).unwrap();
 
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(parsed.num_files(), 0);
         assert!(matches!(
             Header::resolve_archive(&header),
@@ -544,7 +544,7 @@ mod tests {
         // rejects it because its external flag is missing.
         let bytes = Bytes::from_static(&[0x01, 0x05, 0x01, 0x11, 0x00, 0x00, 0x00]);
         let (rem, header) = Header::parse(&bytes).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert!(matches!(header.try_files_info(), Err(R7zError::Parse)));
         assert!(header.files_info().is_none());
     }
@@ -559,7 +559,7 @@ mod tests {
             0x00, // END Header
         ]);
         let (rem, header) = Header::parse(&bytes).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(header.try_files_info().unwrap().unwrap().num_files, 1);
     }
 

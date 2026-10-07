@@ -10,16 +10,16 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1.15.1
+        uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
           cache: false
           rustflags: ""
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -36,7 +36,7 @@ jobs:
 
       - name: Cache p7zip-zstd oracle
         id: p7zip-oracle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/r7z-p7zip-oracle
           key: ${{ runner.os }}-p7zip-oracle-6819e2dc1917e1267babddc6391cea56ead7123d-${{ hashFiles('scripts/ensure_p7zip_oracle.sh') }}
@@ -73,10 +73,10 @@ jobs:
     name: Minimum Rust version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.1
+      - uses: actions/checkout@v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
-          toolchain: 1.87.0
+          toolchain: 1.99.0
           cache: false
           rustflags: ""
       - name: Build workspace
@@ -90,8 +90,8 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.1
+      - uses: actions/checkout@v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
           cache: false
           rustflags: ""
@@ -102,8 +102,8 @@ jobs:
     name: Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.1
+      - uses: actions/checkout@v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
           cache: false
           rustflags: ""

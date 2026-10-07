@@ -10,7 +10,9 @@ use nom::{IResult, bytes::complete::take};
 /// Decode UTF-16LE, replacing unpaired surrogates with U+FFFD.
 pub(crate) fn decode_name(data: &[u8]) -> String {
     char::decode_utf16(
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
     )
     .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
@@ -428,12 +430,10 @@ fn validate_name_data<'a>(
     num_names: usize,
     error_input: &'a [u8],
 ) -> Result<(), ParseError<'a>> {
-    let mut code_units = data.chunks_exact(2);
-    let every_name_is_terminated = (0..num_names).all(|_| code_units.any(|unit| unit == [0, 0]));
-    if !every_name_is_terminated
-        || code_units.next().is_some()
-        || !code_units.remainder().is_empty()
-    {
+    let (code_units, remainder) = data.as_chunks::<2>();
+    let mut code_units = code_units.iter();
+    let every_name_is_terminated = (0..num_names).all(|_| code_units.any(|unit| *unit == [0, 0]));
+    if !every_name_is_terminated || code_units.next().is_some() || !remainder.is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             error_input,
             nom::error::ErrorKind::Verify,
@@ -593,7 +593,7 @@ mod tests {
         // FilesInfo (0x05), num_files=3, END (0x00)
         let input = [0x05u8, 0x03, 0x00];
         let (rem, n) = scan_files_info_with_external(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(n, (3, false));
     }
 
@@ -602,7 +602,7 @@ mod tests {
     fn scan_files_info_zero_files() {
         let input = [0x05u8, 0x00, 0x00];
         let (rem, n) = scan_files_info_with_external(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(n, (0, false));
     }
 
@@ -612,7 +612,7 @@ mod tests {
         // FilesInfo, num_files=2, MTime (0x14), size=5, 5 dummy bytes, END
         let input = [0x05u8, 0x02, 0x14, 0x05, 0x01, 0x00, 0x03, 0x04, 0x05, 0x00];
         let (rem, n) = scan_files_info_with_external(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(n, (2, false));
     }
 
@@ -669,7 +669,7 @@ mod tests {
         let (remaining, files) =
             FilesInfo::parse_with_external(&input, &backing, &external).unwrap();
 
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, []);
         assert_eq!(files.name(0).as_deref(), Some("A"));
         assert_eq!(files.ctimes, [Some(0x0102_0304_0506_0708)]);
         assert_eq!(files.atimes, [Some(0x0102_0304_0506_0708)]);

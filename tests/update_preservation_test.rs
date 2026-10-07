@@ -169,7 +169,7 @@ fn update_rejects_retained_data_over_the_operation_limit() {
             limit: 4,
         })
     ));
-    assert!(output.get_ref().is_empty());
+    assert_eq!(output.get_ref().as_slice(), []);
 }
 
 #[test]

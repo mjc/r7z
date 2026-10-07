@@ -21,8 +21,8 @@
 
 use crate::R7zError;
 use aes::Aes256;
-use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
-use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+use aes::cipher::{Block, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
 use sha2::{Digest, Sha256};
 use std::io;
 
@@ -149,10 +149,10 @@ pub(crate) fn derive_key_with_control(
 
     let mut hasher = Sha256::new();
     for i in 0..num_rounds {
-        if i % 1024 == 0 {
-            if let Some(control) = control {
-                control.check()?;
-            }
+        if i % 1024 == 0
+            && let Some(control) = control
+        {
+            control.check()?;
         }
         // Write counter as 8-byte LE into the last 8 bytes
         buf[prefix_len..].copy_from_slice(&i.to_le_bytes());
@@ -354,7 +354,7 @@ pub(crate) fn encrypt_aes256_cbc_zero_pad(
     buf[..data.len()].copy_from_slice(data);
     let encryptor = Aes256CbcEnc::new(key.into(), iv.into());
     let out = encryptor
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, padded_len)
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, padded_len)
         .map_err(|_| R7zError::Decompression)?;
     Ok(out.to_vec())
 }
@@ -485,7 +485,7 @@ mod tests {
         let props = [19u8];
         let p = AesProperties::parse(&props).unwrap();
         assert_eq!(p.num_cycles_power, 19);
-        assert!(p.salt.is_empty());
+        assert_eq!(p.salt, [] as [u8; 0]);
         assert_eq!(p.iv, [0u8; 16]);
     }
 
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn aes_cbc_decrypt_roundtrip() {
         use aes::Aes256;
-        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
         type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
         let key = [0x42u8; 32];
@@ -666,7 +666,7 @@ mod tests {
         let mut buf = plaintext.to_vec();
         let encryptor = Aes256CbcEnc::new((&key).into(), (&iv).into());
         let ct = encryptor
-            .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, 16)
+            .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, 16)
             .unwrap();
         let ciphertext = ct.to_vec();
 

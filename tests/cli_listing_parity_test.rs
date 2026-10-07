@@ -303,14 +303,14 @@ fn parse_technical_listing(text: &str) -> NormalizedArchiveListing {
             }
             continue;
         }
-        if let Some(value) = line.strip_prefix("Folder = ") {
-            if let Some(entry) = current.as_mut() {
-                entry.kind = if value == "Directory" {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::File
-                };
-            }
+        if let Some(value) = line.strip_prefix("Folder = ")
+            && let Some(entry) = current.as_mut()
+        {
+            entry.kind = if value == "Directory" {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            };
         }
     }
     if let Some(entry) = current {
