@@ -34,6 +34,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Check fuzz targets
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+          cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
       - name: Cache p7zip-zstd oracle
         id: p7zip-oracle-cache
         uses: actions/cache@v6.1.0
