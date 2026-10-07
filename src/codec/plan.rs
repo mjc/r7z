@@ -874,7 +874,7 @@ mod tests {
             .unwrap()
             .materialize(None, &mut budget)
             .unwrap();
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
     }
 
     #[test]
@@ -1152,7 +1152,7 @@ mod tests {
             (MAX_MATERIALIZED_OUTPUT_BYTES - expected.0) / 2
         );
         let mut budget = operation_budget();
-        assert!(ready.materialize(None, &mut budget).unwrap().is_empty());
+        assert_eq!(ready.materialize(None, &mut budget).unwrap(), [] as [u8; 0]);
     }
 
     fn pair(first: crate::CoderInfo, second: crate::CoderInfo) -> Folder {

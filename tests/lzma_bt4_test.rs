@@ -65,7 +65,7 @@ fn bt4_word_scan_preserves_reference_bitstream() {
         }
         let compressed = writer.finish().unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(&compressed)),
+            hex::encode(Sha256::digest(&compressed)),
             expected,
             "BT4 bitstream changed with nice_len={nice_len}"
         );

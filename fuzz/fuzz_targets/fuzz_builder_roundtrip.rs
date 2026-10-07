@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    if let Ok(archive) = r7z::Archive::from_bytes(bytes) {
-        let _ = archive.extract_to_memory(0);
+    if let Ok(archive) = r7z::Archive::from_bytes(bytes.into()) {
+        let _ = archive.extract_to_memory(r7z::ArchiveEntryIndex::new(0));
     }
 });

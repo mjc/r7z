@@ -158,7 +158,7 @@ mod tests {
     fn scan_digests_bitmap_all_set() {
         let input = [0x00u8, 0xC0, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
         let (rem, ()) = scan_digests(&input, 2).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// `all_defined=0`, only entry 2 set for 3 entries → 1 CRC read.
@@ -166,7 +166,7 @@ mod tests {
     fn scan_digests_bitmap_sparse() {
         let input = [0x00u8, 0x20, 0xDE, 0xAD, 0xBE, 0xEF];
         let (rem, ()) = scan_digests(&input, 3).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// `num=0`: only the `all_defined` flag is consumed.
@@ -174,7 +174,7 @@ mod tests {
     fn scan_digests_zero_count() {
         let input = [0x01u8];
         let (rem, ()) = scan_digests(&input, 0).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
     }
 
     /// Truncated: `all_defined=1` but no CRC bytes.

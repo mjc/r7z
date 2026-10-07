@@ -680,7 +680,7 @@ mod tests {
         // num_coders=1, flags=0x01 (id_size=1, simple, no props), codec_id=[0x00]
         let input = [0x01u8, 0x01, 0x00];
         let (rem, out) = scan_folder(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(out, 1);
     }
 
@@ -693,7 +693,7 @@ mod tests {
             0x01u8, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5d, 0x00, 0x10, 0x00, 0x00,
         ];
         let (rem, out) = scan_folder(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(out, 1);
     }
 
@@ -714,7 +714,7 @@ mod tests {
         // bind_pairs=0 (out-1=0), num_packed=2 → two packed-index varints
         let input = [0x01u8, 0x12, 0x21, 0x00, 0x02, 0x01, 0x00, 0x01];
         let (rem, out) = scan_folder(&input).unwrap();
-        assert!(rem.is_empty());
+        assert_eq!(rem, []);
         assert_eq!(out, 1);
     }
 

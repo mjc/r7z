@@ -20,7 +20,7 @@ impl RawEntryName {
                 "UTF-16LE name has odd byte length",
             ));
         }
-        if bytes.chunks_exact(2).any(|unit| unit == [0, 0]) {
+        if bytes.as_chunks::<2>().0.contains(&[0, 0]) {
             return Err(R7zError::InvalidOptions(
                 "UTF-16LE name contains a null terminator",
             ));
@@ -44,7 +44,9 @@ impl RawEntryName {
     #[must_use]
     pub fn matches_text(&self, text: &str) -> bool {
         self.0
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
             .eq(text.encode_utf16())
     }

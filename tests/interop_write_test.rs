@@ -445,7 +445,7 @@ fn archive_writer_mtime_r7z_reads() {
     use std::time::{Duration, UNIX_EPOCH};
 
     // A known Unix timestamp: 2024-03-15 12:00:00 UTC = 1710504000
-    let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000);
+    let ts = UNIX_EPOCH + Duration::from_hours(475_140);
     let meta = r7z::EntryMeta {
         mtime: Some(ts),
         ..Default::default()
@@ -537,7 +537,7 @@ fn archive_writer_mtime_p7zip_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    let ts = UNIX_EPOCH + Duration::from_secs(1_710_504_000); // 2024-03-15T12:00:00Z
+    let ts = UNIX_EPOCH + Duration::from_hours(475_140); // 2024-03-15T12:00:00Z
     let meta = r7z::EntryMeta {
         mtime: Some(ts),
         ..Default::default()
@@ -2173,7 +2173,7 @@ fn temporary_spool_write_limit_covers_temp_file_and_auto_spill() {
                 limit,
             }) if limit == 0
         ));
-        assert!(output.0.is_empty());
+        assert_eq!(output.0, [] as [u8; 0]);
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 
         let mut unlimited_output = WriteOnly(Vec::new());
@@ -2278,7 +2278,7 @@ fn memory_spool_enforces_the_retained_output_limit() {
             limit: 0,
         })
     ));
-    assert!(output.0.is_empty());
+    assert_eq!(output.0, [] as [u8; 0]);
 }
 
 #[test]
@@ -2316,7 +2316,7 @@ fn resource_limits_cap_lzma2_encoder_memory() {
         result,
         Err(r7z::R7zError::LimitExceeded("encoder memory"))
     ));
-    assert!(output.0.is_empty());
+    assert_eq!(output.0, [] as [u8; 0]);
 }
 
 #[test]
@@ -2347,7 +2347,7 @@ fn resource_limits_cap_lzma_and_ppmd_encoder_memory() {
             ),
             Err(r7z::R7zError::LimitExceeded("encoder memory"))
         ));
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
 
         assert!(matches!(
             r7z::ArchiveBuilder::new()
@@ -2430,7 +2430,7 @@ fn memory_spool_accepts_the_exact_retained_output_limit() {
             limit,
         }) if limit == exact_limit - 1
     ));
-    assert!(output.is_empty());
+    assert_eq!(output, [] as [u8; 0]);
 }
 
 #[test]
@@ -2542,7 +2542,7 @@ fn auto_spool_spills_before_exceeding_its_retained_memory_limit() {
             limit: 0,
         })
     ));
-    assert!(output.0.is_empty());
+    assert_eq!(output.0, [] as [u8; 0]);
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 

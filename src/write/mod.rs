@@ -1052,10 +1052,10 @@ fn stage_preserved_entries(
 
     let mut folder_order = Vec::new();
     for entry in &staged_entries {
-        if let Some(folder_id) = entry.folder_id() {
-            if !folder_order.contains(&folder_id) {
-                folder_order.push(folder_id);
-            }
+        if let Some(folder_id) = entry.folder_id()
+            && !folder_order.contains(&folder_id)
+        {
+            folder_order.push(folder_id);
         }
     }
 
