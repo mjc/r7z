@@ -11,6 +11,7 @@ use crate::folder::{Bcj2Layout, FolderGraph, PackedStreamIndex};
 #[cfg(test)]
 use crate::resources::ResourceLimits;
 use crate::resources::{DecoderWorkingSetBytes, OperationBudget};
+use lzma_rust2::filter::bcj2::Bcj2Reader;
 
 /// An executable topology with parsed codec properties and admitted memory usage.
 pub(crate) struct DecoderPlan<'a> {
@@ -369,7 +370,8 @@ impl<'a> DecoderPlan<'a> {
             .flatten()
             .try_fold(WorkingSet::default(), |total, coder| {
                 total.add(coder.working_set()?)
-            })?;
+            })?
+            .add(WorkingSet(super::BCJ2_READER_WORKING_SET_BYTES))?;
         ensure_bcj2_working_budget(output_size, memory.0)?;
         let memory = memory.add(WorkingSet(output_size))?.admit(budget)?;
         Ok(Self {
@@ -495,15 +497,44 @@ impl<R: Read> ReadyDecoder<R> {
                 }
                 Ok(FolderReader::Stream(reader))
             }
-            BoundTopology::Bcj2(bcj2) => crate::bcj2::decode_with_control(
-                bcj2.main.open(password, budget)?,
-                bcj2.call.open(password, budget)?,
-                bcj2.jump.open(password, budget)?,
-                bcj2.control.open(password, budget)?,
-                bcj2.output_size,
-                &mut budget.monitor,
-            )
-            .map(|bytes| FolderReader::Buffered(Cursor::new(bytes))),
+            BoundTopology::Bcj2(bcj2) => {
+                budget.monitor.check()?;
+                let mut reader = Bcj2Reader::try_new(
+                    vec![
+                        bcj2.main.open(password, budget)?,
+                        bcj2.call.open(password, budget)?,
+                        bcj2.jump.open(password, budget)?,
+                        bcj2.control.open(password, budget)?,
+                    ],
+                    u64::try_from(bcj2.output_size).map_err(|_| R7zError::Decompression)?,
+                )
+                .map_err(|_| R7zError::Decompression)?;
+                let mut output = Vec::with_capacity(bcj2.output_size);
+
+                while output.len() < bcj2.output_size {
+                    budget.monitor.check()?;
+                    let before = output.len();
+                    let end = before
+                        .checked_add(budget.monitor.buffer_size(bcj2.output_size - before))
+                        .ok_or(R7zError::Decompression)?;
+                    output.resize(end, 0);
+                    let read = reader
+                        .read(&mut output[before..])
+                        .map_err(|_| R7zError::Decompression)?;
+                    output.truncate(before + read);
+                    budget.monitor.advance(read)?;
+                    if read == 0 {
+                        break;
+                    }
+                }
+
+                if output.len() != bcj2.output_size {
+                    return Err(R7zError::Decompression);
+                }
+                reader.finish().map_err(|_| R7zError::Decompression)?;
+                budget.monitor.check()?;
+                Ok(FolderReader::Buffered(Cursor::new(output)))
+            }
         }
     }
 }
@@ -564,14 +595,18 @@ pub(super) enum CoderPlan {
     Lzma(LzmaProperties),
     Lzma2(u32),
     X86,
-    Branch(crate::bcj::BranchFilter),
+    Arm,
+    ArmThumb,
+    Ia64,
+    Ppc,
+    Sparc,
     Arm64(usize),
     Riscv(usize),
     Deflate,
     Bzip2,
     Ppmd { order: u32, memory: u32, size: u64 },
     Deflate64,
-    Delta(u8),
+    Delta(usize),
     Swap(usize),
     Aes(crate::aes::AesProperties),
 }
@@ -596,23 +631,23 @@ impl CoderPlan {
             }
             Method::Arm => {
                 no_properties(coder)?;
-                Self::Branch(crate::bcj::BranchFilter::Arm)
+                Self::Arm
             }
             Method::ArmThumb => {
                 no_properties(coder)?;
-                Self::Branch(crate::bcj::BranchFilter::ArmThumb)
+                Self::ArmThumb
             }
             Method::Ia64 => {
                 no_properties(coder)?;
-                Self::Branch(crate::bcj::BranchFilter::Ia64)
+                Self::Ia64
             }
             Method::Ppc => {
                 no_properties(coder)?;
-                Self::Branch(crate::bcj::BranchFilter::Ppc)
+                Self::Ppc
             }
             Method::Sparc => {
                 no_properties(coder)?;
-                Self::Branch(crate::bcj::BranchFilter::Sparc)
+                Self::Sparc
             }
             Method::Arm64 => Self::Arm64(branch_start_pos(coder.properties.as_deref(), 4)?),
             Method::Riscv => Self::Riscv(branch_start_pos(coder.properties.as_deref(), 2)?),
@@ -640,7 +675,7 @@ impl CoderPlan {
                 let &[distance] = properties()? else {
                     return Err(R7zError::Decompression);
                 };
-                Self::Delta(distance)
+                Self::Delta(usize::from(distance) + 1)
             }
             Method::Swap2 => {
                 no_properties(coder)?;
@@ -668,10 +703,13 @@ impl CoderPlan {
             Self::Aes(_) => AES_CBC_WORKING_SET_BYTES
                 .checked_add(DECODER_OVERHEAD_BYTES)
                 .ok_or(R7zError::Decompression)?,
-            Self::Copy | Self::X86 | Self::Branch(_) | Self::Delta(_) | Self::Swap(_) => 0,
-            Self::Arm64(_) | Self::Riscv(_) | Self::Deflate | Self::Bzip2 | Self::Deflate64 => {
-                OTHER_CODER_WORKING_SET_BYTES
+            Self::Copy | Self::Swap(_) => 0,
+            Self::X86 | Self::Arm | Self::ArmThumb | Self::Ia64 | Self::Ppc | Self::Sparc => {
+                super::BCJ_READER_WORKING_SET_BYTES
             }
+            Self::Delta(_) => super::DELTA_READER_WORKING_SET_BYTES,
+            Self::Arm64(_) | Self::Riscv(_) => super::BCJ_READER_WORKING_SET_BYTES,
+            Self::Deflate | Self::Bzip2 | Self::Deflate64 => OTHER_CODER_WORKING_SET_BYTES,
         };
         Ok(WorkingSet(bytes))
     }
@@ -681,7 +719,11 @@ impl CoderPlan {
             self,
             Self::Copy
                 | Self::X86
-                | Self::Branch(_)
+                | Self::Arm
+                | Self::ArmThumb
+                | Self::Ia64
+                | Self::Ppc
+                | Self::Sparc
                 | Self::Arm64(_)
                 | Self::Riscv(_)
                 | Self::Delta(_)
@@ -721,10 +763,12 @@ impl CoderPlan {
             Self::Lzma2(dictionary) => {
                 checked_reader(Lzma2Reader::new(input, dictionary, None), output)
             }
-            Self::X86 => checked_reader(crate::bcj::BcjX86Reader::new(input), output),
-            Self::Branch(filter) => {
-                checked_reader(crate::bcj::BranchReader::new(input, filter), output)
-            }
+            Self::X86 => checked_reader(BcjReader::new_x86(input, 0), output),
+            Self::Arm => checked_reader(BcjReader::new_arm(input, 0), output),
+            Self::ArmThumb => checked_reader(BcjReader::new_arm_thumb(input, 0), output),
+            Self::Ia64 => checked_reader(BcjReader::new_ia64(input, 0), output),
+            Self::Ppc => checked_reader(BcjReader::new_ppc(input, 0), output),
+            Self::Sparc => checked_reader(BcjReader::new_sparc(input, 0), output),
             Self::Arm64(position) => checked_reader(BcjReader::new_arm64(input, position), output),
             Self::Riscv(position) => checked_reader(BcjReader::new_riscv(input, position), output),
             Self::Deflate => checked_reader(DeflateDecoder::new(input), output),
@@ -738,9 +782,10 @@ impl CoderPlan {
                 size,
             )),
             Self::Deflate64 => checked_reader(Deflate64Decoder::new(input), output),
-            Self::Delta(distance) => {
-                checked_reader(crate::delta::DeltaReader::new(input, &[distance])?, output)
-            }
+            Self::Delta(distance) => checked_reader(
+                lzma_rust2::filter::delta::DeltaReader::new(input, distance),
+                output,
+            ),
             Self::Swap(width) => {
                 checked_reader(crate::byte_swap::ByteSwapReader::new(input, width), output)
             }
@@ -814,6 +859,30 @@ mod tests {
 
     fn operation_budget() -> OperationBudget {
         OperationBudget::new(crate::resources::ResourceLimits::default())
+    }
+
+    fn bcj2_ready(
+        packed: [Vec<u8>; 4],
+        output_size: u64,
+    ) -> Result<ReadyDecoder<Cursor<Vec<u8>>>, R7zError> {
+        let folder = Folder {
+            coders: smallvec::smallvec![coder(&[0x14, 3, 3, 1, 0x1b, 4, 1])],
+            packed_indices: smallvec::smallvec![0, 1, 2, 3],
+            bind_pairs: smallvec::SmallVec::new(),
+        };
+        let graph = folder.graph()?;
+        let packed_sizes: Vec<_> = packed.iter().map(|bytes| bytes.len() as u64).collect();
+        let plan =
+            DecoderPlan::compile(&folder, &graph, output_size, &[output_size], &packed_sizes)?;
+        let inputs = packed
+            .into_iter()
+            .zip(packed_sizes.iter().copied())
+            .map(|(bytes, size)| PackedInput {
+                reader: Cursor::new(bytes),
+                size: usize::try_from(size).unwrap(),
+            })
+            .collect();
+        plan.bind(inputs)
     }
 
     struct Unreadable(usize);
@@ -1002,6 +1071,83 @@ mod tests {
                 limit: actual,
             }) if actual == limit as u64
         ));
+    }
+
+    #[test]
+    fn bcj2_materialization_observes_cancellation() {
+        let output_size = 128 * 1024;
+        let ready = bcj2_ready(
+            [vec![0x90; output_size], Vec::new(), Vec::new(), vec![0; 5]],
+            output_size as u64,
+        )
+        .unwrap();
+        let control = crate::OperationControl::with_progress(|_| std::ops::ControlFlow::Break(()));
+        let mut budget = operation_budget().with_control(Some(control));
+
+        assert!(matches!(
+            ready.start(None, &mut budget),
+            Err(R7zError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn bcj2_uses_separate_call_and_jump_channels() {
+        let control = vec![0, 0x7f, 0xff, 0xfc, 0];
+        let absolute = 9u32.to_be_bytes().to_vec();
+        for (opcode, call, jump) in [
+            (0xe8, absolute.clone(), Vec::new()),
+            (0xe9, Vec::new(), absolute),
+        ] {
+            let ready = bcj2_ready([vec![opcode], call, jump, control.clone()], 5).unwrap();
+            assert_eq!(
+                ready.materialize(None, &mut operation_budget()).unwrap(),
+                [opcode, 4, 0, 0, 0],
+            );
+        }
+    }
+
+    #[test]
+    fn bcj2_rejects_truncated_and_trailing_channels() {
+        let control = vec![0, 0x7f, 0xff, 0xfc, 0];
+        let cases = [
+            ([vec![0xe8], Vec::new(), Vec::new(), control.clone()], 1),
+            ([vec![0x90, 0x90], vec![1], Vec::new(), control.clone()], 3),
+            ([vec![0x90, 0x90], Vec::new(), vec![1], control], 3),
+            (
+                [
+                    vec![0x90],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![0, 0x7f, 0xff, 0xfc, 0, 1],
+                ],
+                1,
+            ),
+        ];
+        for (packed, output_size) in cases {
+            let ready = bcj2_ready(packed, output_size).unwrap();
+            assert!(matches!(
+                ready.materialize(None, &mut operation_budget()),
+                Err(R7zError::Decompression)
+            ));
+        }
+    }
+
+    #[test]
+    fn bcj2_branch_can_cross_a_cancellation_buffer_boundary() {
+        let mut main = vec![0x90; crate::operation::CHECK_INTERVAL - 1];
+        main.extend_from_slice(&[0x0f, 0x85]);
+        let absolute = u32::try_from(main.len() + 8).unwrap().to_be_bytes();
+        let control = vec![0, 0x7f, 0xff, 0xfc, 0];
+        let mut expected = main.clone();
+        expected.extend_from_slice(&[4, 0, 0, 0]);
+        let ready = bcj2_ready(
+            [main.clone(), Vec::new(), absolute.to_vec(), control],
+            expected.len() as u64,
+        )
+        .unwrap();
+        let mut budget = operation_budget().with_control(Some(crate::OperationControl::new()));
+
+        assert_eq!(ready.materialize(None, &mut budget).unwrap(), expected);
     }
 
     fn coder(bytes: &[u8]) -> crate::CoderInfo {

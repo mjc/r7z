@@ -29,6 +29,11 @@ pub(crate) const MAX_DECODER_WORKING_SET_BYTES: usize = 512 * 1024 * 1024;
 const OTHER_CODER_WORKING_SET_BYTES: usize = 2 * 1024 * 1024;
 const DECODER_OVERHEAD_BYTES: usize = 128 * 1024;
 const AES_CBC_WORKING_SET_BYTES: usize = 1024;
+// lzma-rust2's BcjReader owns a 4 KiB filter buffer; DeltaReader owns 256 bytes.
+pub(super) const BCJ_READER_WORKING_SET_BYTES: usize = 4096;
+pub(super) const DELTA_READER_WORKING_SET_BYTES: usize = 256;
+// lzma-rust2's Bcj2Reader owns four 256 KiB channel buffers.
+pub(super) const BCJ2_READER_WORKING_SET_BYTES: usize = 4 * 256 * 1024;
 const MAX_FOLDER_CODERS: usize = 64;
 // Remaining buffered paths use this cap for packed folder bytes.
 pub(crate) const MAX_BUFFERED_PACKED_FOLDER_BYTES: usize = 512 * 1024 * 1024;

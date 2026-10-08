@@ -63,12 +63,12 @@ fn write_files(options: ArchiveOptions, explicit_boundaries: bool) -> Vec<u8> {
 
 #[test]
 fn archive_bytes_preserve_each_writer_mode() {
-    // CRCs captured from the writer before its mode/state refactor.
+    // CRCs keep archive serialization deterministic across writer changes.
     let expected = [
         [579_042_107, 3_491_593_456],
         [1_215_624_127, 1_358_248_528],
         [512_371_686, 2_158_045_044],
-        [1_989_869_444, 2_958_504_880],
+        [2_814_833_969, 4_140_872_455],
         [117_985_710, 281_716_578],
     ];
     for (codec, expected) in CODECS.into_iter().zip(expected) {

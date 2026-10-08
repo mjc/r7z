@@ -3,7 +3,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="${R7Z_COMMONS_COMPRESS_CORPUS_DIR:-$root/target/corpus/7z/apache-commons-compress}"
-base_url="${R7Z_COMMONS_COMPRESS_RAW_URL:-https://raw.githubusercontent.com/apache/commons-compress/master/src/test/resources}"
+commons_compress_revision="ddce121235c211358d95b43a601e82a39e399a0b"
+base_url="https://raw.githubusercontent.com/apache/commons-compress/$commons_compress_revision/src/test/resources"
 manifest="$out_dir/manifest.tsv"
 
 files=(

@@ -10,8 +10,10 @@ use super::model::{
     WriteEntry, WriteEntryIndex,
 };
 use crate::resources::{KdfCycles, OperationBudget, WriterOperation};
-use crate::{R7zError, aes, bcj, codec};
-use lzma_rust2::{EncodeMode, Lzma2Options, LzmaOptions, LzmaWriter, MfType};
+use crate::{R7zError, aes, codec};
+use lzma_rust2::{
+    EncodeMode, Lzma2Options, LzmaOptions, LzmaWriter, MfType, filter::bcj::BcjWriter,
+};
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
 };
@@ -673,8 +675,11 @@ fn encode_payload_with_options(
             })
         }
         PreparedCodec::Lzma2Bcj(threads) => {
-            let mut filtered = data.to_vec();
-            bcj::bcj_x86_encode(&mut filtered);
+            let mut filter = BcjWriter::new_x86(Vec::with_capacity(data.len()), 0);
+            data.chunks(super::BCJ_INPUT_CHUNK_BYTES)
+                .try_for_each(|chunk| filter.write_all(chunk))
+                .map_err(|_| R7zError::Decompression)?;
+            let filtered = filter.finish().map_err(|_| R7zError::Decompression)?;
             let (prop, compressed) = compress_lzma2(&filtered, compression, threads)?;
             Ok(EncodedPayload {
                 packed: PackedBytes(compressed),

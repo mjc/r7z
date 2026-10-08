@@ -172,6 +172,116 @@ fn branch_filters_handle_instruction_boundaries_across_reads_and_short_inputs() 
     }
 }
 
+#[test]
+fn r7z_decodes_all_branch_filters_through_lzma_rust2() {
+    use lzma_rust2::filter::bcj::BcjWriter;
+
+    for method in [
+        r7z::CODEC_BCJ_X86,
+        r7z::CODEC_BCJ_ARM,
+        r7z::CODEC_BCJ_ARM_THUMB,
+        r7z::CODEC_BCJ_IA64,
+        r7z::CODEC_BCJ_PPC,
+        r7z::CODEC_BCJ_SPARC,
+        r7z::CODEC_BCJ_ARM64,
+        r7z::CODEC_BCJ_RISCV,
+    ] {
+        let payload = branch_filter_payload(method);
+        let encoded = match method {
+            r7z::CODEC_BCJ_X86 => {
+                let mut writer = BcjWriter::new_x86(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_ARM => {
+                let mut writer = BcjWriter::new_arm(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_ARM_THUMB => {
+                let mut writer = BcjWriter::new_arm_thumb(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_IA64 => {
+                let mut writer = BcjWriter::new_ia64(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_PPC => {
+                let mut writer = BcjWriter::new_ppc(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_SPARC => {
+                let mut writer = BcjWriter::new_sparc(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_ARM64 => {
+                let mut writer = BcjWriter::new_arm64(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            r7z::CODEC_BCJ_RISCV => {
+                let mut writer = BcjWriter::new_riscv(Vec::new(), 0);
+                writer.write_all(&payload).unwrap();
+                writer.finish().unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let folder = branch_folder(method, None);
+        assert_eq!(
+            r7z::raw::decompress_folder(&folder, &encoded, payload.len() as u64).unwrap(),
+            payload,
+            "{method:?}"
+        );
+    }
+}
+
+#[test]
+fn delta_method_uses_7z_distance_properties() {
+    let folder = branch_folder(r7z::CODEC_DELTA, Some(&[1]));
+    let encoded = [10, 20, 1, 2, 1];
+    assert_eq!(
+        r7z::raw::decompress_folder(&folder, &encoded, 5).unwrap(),
+        [10, 20, 11, 22, 12],
+    );
+}
+
+fn branch_filter_payload(method: &[u8]) -> Vec<u8> {
+    if method == r7z::CODEC_BCJ_ARM64 {
+        return branch_payload(true);
+    }
+    if method == r7z::CODEC_BCJ_RISCV {
+        return branch_payload(false);
+    }
+
+    let mut data = vec![0; 256];
+    for pos in (0..data.len()).step_by(16) {
+        match method {
+            r7z::CODEC_BCJ_X86 => {
+                data[pos] = 0xE8;
+                data[pos + 4] = 0;
+            }
+            r7z::CODEC_BCJ_ARM => {
+                data[pos + 3] = 0xEB;
+            }
+            r7z::CODEC_BCJ_ARM_THUMB => {
+                data[pos..pos + 4].copy_from_slice(&[0x00, 0xF0, 0x00, 0xF8]);
+            }
+            r7z::CODEC_BCJ_IA64 => {
+                data[pos] = 0x16;
+                data[pos + 5] = 0x14;
+            }
+            r7z::CODEC_BCJ_PPC => data[pos..pos + 4].copy_from_slice(&[0x48, 0, 0, 1]),
+            r7z::CODEC_BCJ_SPARC => data[pos..pos + 4].copy_from_slice(&[0x40, 0, 0, 0]),
+            _ => unreachable!(),
+        }
+    }
+    data
+}
+
 fn coder_id(id: &[u8]) -> ArrayVec<u8, 15> {
     let mut out = ArrayVec::new();
     out.try_extend_from_slice(id).unwrap();

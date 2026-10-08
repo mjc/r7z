@@ -8,15 +8,12 @@ use crate::resources::{
     OpenVolumeBudget, OperationBudget, RetainedOutputBytes, SpoolBudget, TemporaryStorageBudget,
     TemporaryStorageBytes, VolumeCountBudget, WriterBudgets, WriterOperation,
 };
-use crate::{
-    Archive, ArchiveEntryIndex, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle,
-    bcj::BcjX86Writer,
-};
+use crate::{Archive, ArchiveEntryIndex, R7zError, RawEntryName, RawFolderBlock, RawFolderHandle};
 use header::{
     CoderSpec, encode_coder_info_aes_then, encode_coder_info_bcj_lzma2, encode_coder_info_copy,
     encode_coder_info_lzma, encode_coder_info_lzma2, encode_coder_info_ppmd,
 };
-use lzma_rust2::LzmaWriter;
+use lzma_rust2::{LzmaWriter, filter::bcj::BcjWriter};
 use ppmd_rust::Ppmd7Encoder;
 use std::{
     fs::{File, OpenOptions},
@@ -32,6 +29,8 @@ pub use model::{
 };
 
 use model::{WriteEntry, WriteEntryIndex, WriteEntryStream, WriteFolderId};
+
+const BCJ_INPUT_CHUNK_BYTES: usize = 4096;
 
 /// Archive entry used by [`write_archive_update`] to retain or add an item.
 pub struct PreservedArchiveEntry {
@@ -198,7 +197,7 @@ enum StreamingEncoder<W: Write> {
         writer: Box<Ppmd7Encoder<PayloadWriter<W>>>,
         props: Vec<u8>,
     },
-    BcjLzma2(BcjX86Writer<lzma2::Encoder<PayloadWriter<W>>>),
+    BcjLzma2(BcjWriter<lzma2::Encoder<PayloadWriter<W>>>),
 }
 
 struct StreamingFolder<W: Write> {
@@ -221,7 +220,9 @@ impl<W: Write> Write for StreamingFolder<W> {
             StreamingEncoder::Lzma2(writer) => writer.write(bytes),
             StreamingEncoder::Lzma { writer, .. } => writer.write(bytes),
             StreamingEncoder::Ppmd { writer, .. } => writer.write(bytes),
-            StreamingEncoder::BcjLzma2(writer) => writer.write(bytes),
+            StreamingEncoder::BcjLzma2(writer) => {
+                writer.write(&bytes[..bytes.len().min(BCJ_INPUT_CHUNK_BYTES)])
+            }
         }
     }
 
@@ -281,9 +282,10 @@ impl<W: Write> StreamingFolder<W> {
                 StreamingEncoder::Ppmd { writer, props }
             }
             encode::PreparedCodec::Lzma2Bcj(threads) => {
-                StreamingEncoder::BcjLzma2(BcjX86Writer::new(
+                StreamingEncoder::BcjLzma2(BcjWriter::new_x86(
                     lzma2::Encoder::new(payload, &options.compression, known_size, threads)?
                         .with_control(budget.monitor.control().cloned())?,
+                    0,
                 ))
             }
         };
