@@ -252,7 +252,7 @@ impl<W: Write> StreamingFolder<W> {
             encode::PreparedCodec::Copy => StreamingEncoder::Copy(payload),
             encode::PreparedCodec::Lzma2(threads) => StreamingEncoder::Lzma2(
                 lzma2::Encoder::new(payload, &options.compression, known_size, threads)?
-                    .with_control(budget.monitor.control().cloned()),
+                    .with_control(budget.monitor.control().cloned())?,
             ),
             encode::PreparedCodec::Lzma => {
                 let lzma_options = encode::lzma_options(&options.compression);
@@ -283,7 +283,7 @@ impl<W: Write> StreamingFolder<W> {
             encode::PreparedCodec::Lzma2Bcj(threads) => {
                 StreamingEncoder::BcjLzma2(BcjX86Writer::new(
                     lzma2::Encoder::new(payload, &options.compression, known_size, threads)?
-                        .with_control(budget.monitor.control().cloned()),
+                        .with_control(budget.monitor.control().cloned())?,
                 ))
             }
         };

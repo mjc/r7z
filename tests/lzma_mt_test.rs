@@ -22,7 +22,7 @@ fn cancellation_rejects_encoder_input_and_finishing_pending_work() {
     for dispatched in [false, true] {
         let flag = Arc::new(AtomicBool::new(false));
         let mut writer = Lzma2WriterMt::new(Vec::new(), options(), 2).unwrap();
-        writer.set_cancellation(Arc::clone(&flag));
+        writer.set_cancellation(Arc::clone(&flag)).unwrap();
         if dispatched {
             writer.write_all(&payload(BLOCK_SIZE * 4)).unwrap();
         }
