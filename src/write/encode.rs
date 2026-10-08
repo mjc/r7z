@@ -388,7 +388,10 @@ fn validate_compression_options(options: &ArchiveOptions) -> Result<CodecSetting
         Codec::Ppmd => &[crate::SevenZMethod::Ppmd],
         Codec::Lzma2Bcj => &[crate::SevenZMethod::Lzma2, crate::SevenZMethod::Bcj],
     };
-    if methods.iter().any(|method| !method.support().can_encode()) {
+    if methods
+        .iter()
+        .any(|method| !method.encode_status().is_implemented())
+    {
         return Err(R7zError::InvalidOptions(
             "selected codec is not supported for writing",
         ));

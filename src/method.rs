@@ -47,26 +47,36 @@ pub enum SevenZMethod {
     Aes256Cbc,
 }
 
-/// How a recognized 7z method can be handled by r7z.
+/// Evidence-backed state of one method operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MethodSupport {
-    /// r7z can decode and encode this method.
-    DecodeAndEncode,
-    /// r7z can decode but cannot encode this method.
-    DecodeOnly,
-    /// r7z recognizes and lists this method, but can only preserve it by raw copy.
-    RawCopyOnly,
+pub enum MethodStatus {
+    /// Covered by passing interoperability or behavior tests.
+    Tested,
+    /// Works for the listed property or coder arrangements only.
+    Partial,
+    /// The operation is not implemented.
+    Unsupported,
+    /// Implementation exists but a known blocker prevents use.
+    Blocked,
+    /// Not yet evaluated by tests.
+    Untested,
 }
 
-impl MethodSupport {
+impl MethodStatus {
     #[must_use]
-    pub const fn can_decode(self) -> bool {
-        matches!(self, Self::DecodeAndEncode | Self::DecodeOnly)
+    pub const fn is_implemented(self) -> bool {
+        matches!(self, Self::Tested | Self::Partial)
     }
 
-    #[must_use]
-    pub const fn can_encode(self) -> bool {
-        matches!(self, Self::DecodeAndEncode)
+    #[cfg(test)]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tested => "tested",
+            Self::Partial => "partial",
+            Self::Unsupported => "unsupported",
+            Self::Blocked => "blocked",
+            Self::Untested => "untested",
+        }
     }
 }
 
@@ -81,8 +91,10 @@ pub struct MethodInfo {
     pub name: &'static str,
     /// Whether this method compresses, filters, or encrypts.
     pub kind: MethodKind,
-    /// Decode and encode support provided by r7z.
-    pub support: MethodSupport,
+    /// Status of reading archives that use this method.
+    pub decode: MethodStatus,
+    /// Status of creating archives that use this method.
+    pub encode: MethodStatus,
     stream_arity: (u64, u64),
 }
 
@@ -142,7 +154,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_COPY,
         name: "Copy",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -150,7 +163,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_LZMA,
         name: "LZMA",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -158,7 +172,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_LZMA2,
         name: "LZMA2",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -166,7 +181,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BZIP2,
         name: "BZip2",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -174,7 +190,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_PPMD,
         name: "PPMd",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -182,7 +199,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_DEFLATE,
         name: "Deflate",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -190,7 +208,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_DEFLATE64,
         name: "Deflate64",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -198,7 +217,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_X86,
         name: "BCJ",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -206,7 +226,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ2,
         name: "BCJ2",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Partial,
+        encode: MethodStatus::Unsupported,
         stream_arity: (4, 1),
     },
     MethodInfo {
@@ -214,7 +235,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_ARM,
         name: "ARM",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -222,7 +244,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_ARM64,
         name: "ARM64",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -230,7 +253,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_ARM_THUMB,
         name: "ARMT",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -238,7 +262,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_IA64,
         name: "IA64",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -246,7 +271,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_PPC,
         name: "PPC",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -254,7 +280,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_SPARC,
         name: "SPARC",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -262,7 +289,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_BCJ_RISCV,
         name: "RISCV",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -270,7 +298,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_DELTA,
         name: "Delta",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -278,7 +307,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_SWAP2,
         name: "Swap2",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -286,7 +316,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_SWAP4,
         name: "Swap4",
         kind: MethodKind::Filter,
-        support: MethodSupport::DecodeOnly,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -294,7 +325,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_ZSTD,
         name: "ZSTD",
         kind: MethodKind::Compression,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -302,7 +334,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_BROTLI,
         name: "BROTLI",
         kind: MethodKind::Compression,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -310,7 +343,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_LZ4,
         name: "LZ4",
         kind: MethodKind::Compression,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -318,7 +352,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_LZ5,
         name: "LZ5",
         kind: MethodKind::Compression,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -326,7 +361,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_LIZARD,
         name: "LIZARD",
         kind: MethodKind::Compression,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -334,7 +370,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_FAST_LZMA2,
         name: "FLZMA2",
         kind: MethodKind::Compression,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -342,7 +379,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_LZHAM,
         name: "LZHAM",
         kind: MethodKind::Compression,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -350,7 +388,8 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: CODEC_AES_256_SHA_256,
         name: "7zAES",
         kind: MethodKind::Crypto,
-        support: MethodSupport::DecodeAndEncode,
+        decode: MethodStatus::Tested,
+        encode: MethodStatus::Tested,
         stream_arity: (1, 1),
     },
     MethodInfo {
@@ -358,12 +397,13 @@ const METHOD_REGISTRY_DATA: [MethodInfo; 28] = [
         id: ID_AES256CBC,
         name: "AES256CBC",
         kind: MethodKind::Crypto,
-        support: MethodSupport::RawCopyOnly,
+        decode: MethodStatus::Unsupported,
+        encode: MethodStatus::Unsupported,
         stream_arity: (1, 1),
     },
 ];
 
-/// Known 7z methods and their read, write, and raw-copy capabilities.
+/// Known 7z method IDs and their per-direction support status.
 pub const METHOD_REGISTRY: &[MethodInfo] = &METHOD_REGISTRY_DATA;
 
 const fn registry_methods<const N: usize>(registry: &[MethodInfo; N]) -> [SevenZMethod; N] {
@@ -411,26 +451,51 @@ impl SevenZMethod {
     }
 
     #[must_use]
-    pub fn support(self) -> MethodSupport {
-        self.info().support
+    pub fn decode_status(self) -> MethodStatus {
+        self.info().decode
     }
 
     #[must_use]
-    pub fn supported_by_r7z(self) -> bool {
-        self.info().can_decode()
+    pub fn encode_status(self) -> MethodStatus {
+        self.info().encode
     }
 }
 
 impl MethodInfo {
     #[must_use]
     pub const fn can_decode(self) -> bool {
-        self.support.can_decode()
+        self.decode.is_implemented()
     }
 
     #[must_use]
     pub const fn can_encode(self) -> bool {
-        self.support.can_encode()
+        self.encode.is_implemented()
     }
+}
+
+#[cfg(test)]
+fn method_support_markdown() -> String {
+    use std::fmt::Write as _;
+
+    let mut table = String::from(
+        "| Method | ID | Recognized | Decode | Encode |\n| --- | --- | --- | --- | --- |\n",
+    );
+    for info in METHOD_REGISTRY {
+        let id = info
+            .id
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(
+            table,
+            "| {} | `{id}` | yes | {} | {} |",
+            info.name,
+            info.decode.as_str(),
+            info.encode.as_str(),
+        );
+    }
+    table
 }
 
 #[must_use]
@@ -460,3 +525,22 @@ pub fn method_from_name(name: &str) -> Option<SevenZMethod> {
 pub const P7ZIP_ORACLE_SHA: &str = "6819e2dc1917e1267babddc6391cea56ead7123d";
 
 pub const ALL_METHODS: &[SevenZMethod] = &ALL_METHODS_DATA;
+
+#[cfg(test)]
+mod tests {
+    use super::method_support_markdown;
+
+    #[test]
+    fn support_document_matches_the_method_registry() {
+        let expected = concat!(
+            "| Method | ID | Recognized | Decode | Encode |\n",
+            "| --- | --- | --- | --- | --- |\n",
+            "| Copy | `00` | yes | tested | tested |\n",
+            "| LZMA | `03 01 01` | yes | tested | tested |\n",
+            "| LZMA2 | `21` | yes | tested | tested |\n",
+        );
+        let generated = method_support_markdown();
+        assert!(generated.starts_with(expected));
+        assert!(include_str!("../docs/method-support.md").starts_with(&generated));
+    }
+}

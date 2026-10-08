@@ -140,7 +140,7 @@ pub use codec::{
 pub use error::R7zError;
 pub use files_info::EntryType;
 pub use method::{
-    ALL_METHODS, METHOD_REGISTRY, MethodInfo, MethodKind, MethodSupport, P7ZIP_ORACLE_SHA,
+    ALL_METHODS, METHOD_REGISTRY, MethodInfo, MethodKind, MethodStatus, P7ZIP_ORACLE_SHA,
     SevenZMethod, method_from_id, method_from_name, method_info,
 };
 pub use operation::{OperationControl, OperationPhase, OperationProgress, ReadVerification};

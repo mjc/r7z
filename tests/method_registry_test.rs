@@ -1,5 +1,5 @@
 use r7z::{
-    MethodSupport, P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name, method_info,
+    MethodStatus, P7ZIP_ORACLE_SHA, SevenZMethod, method_from_id, method_from_name, method_info,
 };
 
 #[test]
@@ -34,20 +34,23 @@ fn method_registry_tracks_current_p7zip_extension_ids() {
 }
 
 #[test]
-fn method_registry_separates_decode_encode_and_raw_copy_support() {
+fn method_registry_separates_recognition_decode_and_encode_status() {
     let lzma = method_info(r7z::CODEC_LZMA).unwrap();
-    assert_eq!(lzma.support, MethodSupport::DecodeAndEncode);
+    assert_eq!(lzma.decode, MethodStatus::Tested);
+    assert_eq!(lzma.encode, MethodStatus::Tested);
     assert!(lzma.can_decode());
     assert!(lzma.can_encode());
 
     let deflate = method_info(r7z::CODEC_DEFLATE).unwrap();
-    assert_eq!(deflate.support, MethodSupport::DecodeOnly);
+    assert_eq!(deflate.decode, MethodStatus::Tested);
+    assert_eq!(deflate.encode, MethodStatus::Unsupported);
     assert!(deflate.can_decode());
     assert!(!deflate.can_encode());
 
     let zstd = method_info(&[0x04, 0xF7, 0x11, 0x01]).unwrap();
     assert_eq!(zstd.method, SevenZMethod::Zstd);
-    assert_eq!(zstd.support, MethodSupport::RawCopyOnly);
+    assert_eq!(zstd.decode, MethodStatus::Unsupported);
+    assert_eq!(zstd.encode, MethodStatus::Unsupported);
     assert!(!zstd.can_decode());
     assert!(!zstd.can_encode());
     assert!(method_info(&[0xFF]).is_none());
@@ -64,7 +67,8 @@ fn method_enum_and_registry_metadata_stay_in_sync() {
         assert_eq!(method.id(), info.id);
         assert_eq!(method.name(), info.name);
         assert_eq!(method.kind(), info.kind);
-        assert_eq!(method.supported_by_r7z(), info.can_decode());
+        assert_eq!(method.decode_status(), info.decode);
+        assert_eq!(method.encode_status(), info.encode);
     }
     assert_eq!(method_from_id(r7z::CODEC_LZMA2), Some(SevenZMethod::Lzma2));
 }

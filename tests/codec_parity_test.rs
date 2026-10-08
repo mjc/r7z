@@ -43,7 +43,7 @@ fn branch_method_ids_and_names_are_registered() {
         assert_eq!(r7z::method_from_id(id), Some(method));
         assert_eq!(r7z::method_from_name(name), Some(method));
         assert_eq!(method.kind(), r7z::MethodKind::Filter);
-        assert!(method.supported_by_r7z());
+        assert!(method.decode_status().is_implemented());
     }
 }
 
