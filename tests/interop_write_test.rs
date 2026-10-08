@@ -2734,3 +2734,168 @@ fn symlink_entries_round_trip_as_metadata_and_regular_extraction() {
             .is_symlink()
     );
 }
+
+#[ignore = "writes and reads two encrypted archives larger than 256 MiB"]
+#[test]
+fn large_aes_streams_interoperate_with_official_7zip() {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    const PASSWORD: &str = "streaming-secret";
+    const SIZE: u64 = 256 * 1024 * 1024 + 1;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let source_path = dir.join("source.bin");
+    let expected = write_incompressible_file(&source_path, SIZE);
+
+    let r7z_archive_path = dir.join("r7z.7z");
+    let options = r7z::ArchiveOptions {
+        encryption: Some(r7z::EncryptionOptions::default_for_password(PASSWORD)),
+        ..Default::default()
+    };
+    let file = std::fs::File::create(&r7z_archive_path).unwrap();
+    let mut writer = r7z::ArchiveWriter::new(file, options)
+        .expect("create encrypted writer")
+        .compression(r7z::Codec::Copy)
+        .expect("select Copy")
+        .start();
+    writer
+        .append_file(
+            "source.bin",
+            PatternReader::new().take(SIZE),
+            r7z::EntryMeta::archive_file(),
+        )
+        .expect("write large encrypted stream");
+    writer.finish().expect("finish encrypted archive");
+    assert!(std::fs::metadata(&r7z_archive_path).unwrap().len() > 256 * 1024 * 1024);
+    let archive = r7z::Archive::open_with_password(&r7z_archive_path, Some(PASSWORD))
+        .expect("open r7z encrypted archive");
+    let pack_size = archive
+        .raw_streams_info()
+        .unwrap()
+        .pack_info
+        .as_ref()
+        .unwrap()
+        .pack_size[0];
+    assert!(pack_size > 256 * 1024 * 1024);
+    drop(archive);
+
+    let out = run_7z(
+        &[
+            "t",
+            "-mmt=1",
+            &format!("-p{PASSWORD}"),
+            r7z_archive_path.to_str().unwrap(),
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z t failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let official_archive_path = dir.join("official.7z");
+    let out = run_7z(
+        &[
+            "a",
+            "-t7z",
+            "-mx=0",
+            "-m0=Copy",
+            "-mmt=1",
+            &format!("-p{PASSWORD}"),
+            "-mhe=off",
+            official_archive_path.to_str().unwrap(),
+            "source.bin",
+        ],
+        dir,
+    );
+    assert!(
+        out.status.success(),
+        "7z a failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let archive = r7z::Archive::open_with_password(&official_archive_path, Some(PASSWORD))
+        .expect("open official encrypted archive");
+    let pack_size = archive
+        .raw_streams_info()
+        .unwrap()
+        .pack_info
+        .as_ref()
+        .unwrap()
+        .pack_size[0];
+    assert!(pack_size > 256 * 1024 * 1024);
+    let mut actual = HashWriter(Sha256::new());
+    let written = archive
+        .extract_to_writer_with_password(
+            r7z::ArchiveEntryIndex::new(0),
+            &mut actual,
+            Some(PASSWORD),
+        )
+        .expect("stream-decrypt official archive");
+    assert_eq!(written, SIZE);
+    assert_eq!(actual.0.finalize().as_slice(), expected);
+}
+
+fn write_incompressible_file(path: &Path, size: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+
+    let mut file = std::fs::File::create(path).unwrap();
+    let mut reader = PatternReader::new().take(size);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).unwrap();
+        hasher.update(&buffer[..read]);
+    }
+    hasher.finalize().into()
+}
+
+struct PatternReader(u64);
+
+impl PatternReader {
+    fn new() -> Self {
+        Self(0x4d59_5df4_d0f3_3173)
+    }
+
+    fn next_byte(&mut self) -> u8 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0 = self.0.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        (self.0 >> 56) as u8
+    }
+}
+
+impl std::io::Read for PatternReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        for byte in bytes.iter_mut() {
+            *byte = self.next_byte();
+        }
+        Ok(bytes.len())
+    }
+}
+
+struct HashWriter(sha2::Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
