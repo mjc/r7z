@@ -149,27 +149,7 @@ fn swap_groups_scalar(bytes: &mut [u8], width: usize) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn swap_groups_avx512(bytes: &mut [u8], width: usize) {
-    use std::arch::x86_64::{
-        _mm_setr_epi8, _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_shuffle_epi8,
-        _mm512_storeu_si512,
-    };
-
-    let lane_mask = match width {
-        2 => _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14),
-        4 => _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12),
-        _ => unreachable!("supported byte-swap widths are 2 and 4"),
-    };
-    let shuffle = _mm512_broadcast_i32x4(lane_mask);
-    let vector_length = bytes.len() / 64 * 64;
-    let (vectors, tail) = bytes.split_at_mut(vector_length);
-
-    for chunk in vectors.chunks_exact_mut(64) {
-        let input = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
-        let output = _mm512_shuffle_epi8(input, shuffle);
-        unsafe { _mm512_storeu_si512(chunk.as_mut_ptr().cast(), output) };
-    }
-
-    swap_groups_scalar(tail, width);
+    swap_groups_scalar(bytes, width);
 }
 
 #[cfg(test)]
