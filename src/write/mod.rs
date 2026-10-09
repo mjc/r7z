@@ -17,7 +17,7 @@ use lzma_rust2::{LzmaWriter, filter::bcj::BcjWriter};
 use ppmd_rust::Ppmd7Encoder;
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
 };
@@ -31,6 +31,7 @@ pub use model::{
 use model::{WriteEntry, WriteEntryIndex, WriteEntryStream, WriteFolderId};
 
 const BCJ_INPUT_CHUNK_BYTES: usize = 4096;
+const ENCODED_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Archive entry used by [`write_archive_update`] to retain or add an item.
 pub struct PreservedArchiveEntry {
@@ -103,6 +104,7 @@ enum PayloadWriter<W: Write> {
         writer: Box<Aes256CbcEncryptWriter<CountingWriter<W>>>,
         props: Vec<u8>,
     },
+    Failed,
 }
 
 struct EncryptedPayload {
@@ -159,23 +161,36 @@ impl<W: Write> PayloadWriter<W> {
                     }),
                 })
             }
+            Self::Failed => Err(writer_failed()),
         }
     }
 }
 
 impl<W: Write> Write for PayloadWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self {
+        let result = match self {
             Self::Plain(writer) => writer.write(bytes),
             Self::Aes { writer, .. } => writer.write(bytes),
-        }
+            Self::Failed => Err(io::Error::other(writer_failed())),
+        };
+        result.inspect_err(|error| {
+            if error.kind() != io::ErrorKind::Interrupted {
+                *self = Self::Failed;
+            }
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
+        let result = match self {
             Self::Plain(writer) => writer.flush(),
             Self::Aes { writer, .. } => writer.flush(),
-        }
+            Self::Failed => Err(io::Error::other(writer_failed())),
+        };
+        result.inspect_err(|error| {
+            if error.kind() != io::ErrorKind::Interrupted {
+                *self = Self::Failed;
+            }
+        })
     }
 }
 
@@ -190,11 +205,11 @@ enum StreamingEncoder<W: Write> {
     Copy(PayloadWriter<W>),
     Lzma2(lzma2::Encoder<PayloadWriter<W>>),
     Lzma {
-        writer: Box<LzmaWriter<PayloadWriter<W>>>,
+        writer: Box<LzmaWriter<BufWriter<PayloadWriter<W>>>>,
         props: Vec<u8>,
     },
     Ppmd {
-        writer: Box<Ppmd7Encoder<PayloadWriter<W>>>,
+        writer: Box<Ppmd7Encoder<BufWriter<PayloadWriter<W>>>>,
         props: Vec<u8>,
     },
     BcjLzma2(BcjWriter<lzma2::Encoder<PayloadWriter<W>>>),
@@ -258,6 +273,7 @@ impl<W: Write> StreamingFolder<W> {
             encode::PreparedCodec::Lzma => {
                 let lzma_options = encode::lzma_options(&options.compression);
                 let dict_size = lzma_options.dict_size;
+                let payload = BufWriter::with_capacity(ENCODED_OUTPUT_BUFFER_BYTES, payload);
                 let writer = LzmaWriter::new_no_header(payload, &lzma_options, false)?;
                 let mut props = Vec::with_capacity(5);
                 props.push(writer.props());
@@ -272,6 +288,7 @@ impl<W: Write> StreamingFolder<W> {
                 let mut props = Vec::with_capacity(5);
                 props.push(order);
                 props.extend_from_slice(&memory_size.to_le_bytes());
+                let payload = BufWriter::with_capacity(ENCODED_OUTPUT_BUFFER_BYTES, payload);
                 let writer = Box::new(
                     Ppmd7Encoder::new(payload, u32::from(order), memory_size).map_err(|_| {
                         R7zError::InvalidOptions(
@@ -421,13 +438,19 @@ impl<W: Write> StreamingFolder<W> {
                 )
             }
             StreamingEncoder::Lzma { writer, props } => (
-                writer.finish()?,
+                writer
+                    .finish()?
+                    .into_inner()
+                    .map_err(io::IntoInnerError::into_error)?,
                 encode_coder_info_lzma(&props),
                 vec![unpack_size],
                 smallvec::smallvec![CoderSpec::Lzma(props)],
             ),
             StreamingEncoder::Ppmd { writer, props } => (
-                (*writer).finish(false)?,
+                (*writer)
+                    .finish(false)?
+                    .into_inner()
+                    .map_err(io::IntoInnerError::into_error)?,
                 encode_coder_info_ppmd(&props),
                 vec![unpack_size],
                 smallvec::smallvec![CoderSpec::Ppmd(props)],

@@ -124,7 +124,7 @@ inside the plain-payload variant left the encryption selection per byte
 and barely affected the gap. Putting it directly after LZMA/PPMd, before
 `PayloadWriter`, reduced LZMA time by 3.99–4.55% and source PPMd time by
 1.80–2.49% in two opposite timing orders. Both probes preserved extracted
-contents. The production encoder has not been changed by these experiments.
+contents. These experiments did not change the production encoder.
 
 An untimed run with a counted output cursor confirmed the write reduction:
 
@@ -163,3 +163,74 @@ Probe sources, patches, write counts, logs, and Criterion samples are retained
 with the earlier artifacts. `results/inner-buffer/` records the first placement;
 `results/outer-buffer-pass1/` and `results/outer-buffer-pass2/` record the
 placement before encryption dispatch.
+
+## Production output buffer — 2026-10-09
+
+R7Z now buffers LZMA and PPMd compressed output in a 64 KiB `BufWriter`
+before payload encryption selection and byte accounting. The buffer drains
+before AES finalization and folder metadata creation, and encoder memory
+admission includes its capacity. Payload I/O errors make the sink terminal
+so buffer cleanup cannot retry into a failed AES writer.
+
+The pinned lzma-rust2 LZMA2 writer already buffers compressed chunks up to
+64 KiB internally. Its LZMA writer writes range-coded bytes directly to its
+sink. Copy, LZMA2, and BCJ-LZMA2 receive no additional output buffer.
+
+Before uses Rust sources at `8c22a2b9de6370be95adfa4abe6948a3489f69eb`,
+which are identical to `93fc0a0` under `src/`. After includes the production
+buffer, memory admission, and terminal payload-error state in this commit.
+The corpus, library revision, toolchain, linker, compression settings, CPU
+pinning, and Criterion configuration match the earlier comparison.
+
+Pass 1 measured before first; pass 2 measured after first. Actual CPU
+activity before the passes was 0.42–1.66%, with no I/O wait. The worker
+remained stopped. Each route was extracted and checked against every input
+before timing in both passes. All 24 saved archives passed `7z t`; before
+and after sizes matched for every workload.
+
+```sh
+taskset -c 2 /home/mjc/projects/r7z/target/release/deps/encoding_paths-f28f8d9dd975fe21 --bench --noplot
+```
+
+Median milliseconds; Δ is `(after / before − 1) × 100`.
+
+| Workload | Before 1 | After 1 | Δ 1 | Before 2 | After 2 | Δ 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| executable-Lzma-1-solid | 189.0926 | 185.6678 | -1.81% | 189.6528 | 186.9597 | -1.42% |
+| executable-Ppmd-1-solid | 86.1874 | 85.6168 | -0.66% | 86.2891 | 85.6768 | -0.71% |
+| random-Lzma-1-solid | 80.8779 | 76.8785 | -4.94% | 80.6358 | 76.4214 | -5.23% |
+| random-Ppmd-1-solid | 152.2010 | 155.6750 | +2.28% | 153.0478 | 156.0624 | +1.97% |
+| source-Copy-1-solid | 0.0998 | 0.1009 | +1.16% | 0.1010 | 0.1002 | -0.79% |
+| source-Lzma-1-solid | 110.5411 | 109.2029 | -1.21% | 111.2577 | 109.8049 | -1.31% |
+| source-Lzma-64-solid | 110.7427 | 109.6118 | -1.02% | 110.8832 | 109.4679 | -1.28% |
+| source-Lzma2-1-solid | 109.4853 | 109.2460 | -0.22% | 109.5267 | 109.7020 | +0.16% |
+| source-Ppmd-1-solid | 22.7586 | 22.1139 | -2.83% | 22.9096 | 22.2007 | -3.09% |
+| source-Ppmd-64-solid | 22.7916 | 22.1878 | -2.65% | 22.9378 | 22.1797 | -3.30% |
+| zero-Lzma-1-solid | 23.7790 | 23.7888 | +0.04% | 23.7992 | 23.7689 | -0.13% |
+| zero-Ppmd-1-solid | 4.1262 | 4.0670 | -1.44% | 4.1298 | 4.0849 | -1.09% |
+
+Random LZMA took 4.94–5.23% less time, source LZMA 1.02–1.31% less,
+and source PPMd 2.65–3.30% less. Random PPMd took 1.97–2.28% more time
+in both orders. The optimization has that tradeoff; it is not a general
+speedup for every input. Copy changed direction between passes, and the
+LZMA2 control changed by less than 0.3%. Zero LZMA changed by less than 0.2%.
+
+An 8 KiB probe did not consistently remove the random PPMd regression.
+Its four-case run measured a faster buffered result, but the unbuffered
+baseline also moved to about 158 ms. Restoring the full workload list
+returned the unbuffered baseline to about 152 ms and the buffered route
+still took about 156 ms. These probes ran after first and were not used
+to claim an improvement over the paired 64 KiB measurements. The cause
+of the random PPMd difference remains unisolated.
+
+The new tests cover batched sink writes, plain and encrypted folder
+boundaries with a final partial buffer, original sink-error propagation
+at append and finalization, and the exact encoder-memory admission
+boundary. The PPMd interoperability test uses incompressible input to
+check that full buffers drain during append and that 7z extracts the result.
+
+Raw samples and logs are retained in `results/production-pass1/` and
+`results/production-pass2/` under the existing benchmark artifact directory.
+The smaller-buffer probes are in `results/output-buffer-8k-focused/` and
+`results/output-buffer-8k-full/`. The latter also retains its source and
+harness snapshots. Production uses the 64 KiB implementation.

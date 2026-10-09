@@ -2,11 +2,11 @@ use super::header::{
     CoderSpec, build_encoded_header_descriptor, build_header, encode_coder_info_aes_then,
     encode_coder_info_lzma,
 };
-use super::lzma2;
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions, EncoderThreads,
     EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, SolidMode, WriteEntry,
 };
+use super::{ENCODED_OUTPUT_BUFFER_BYTES, lzma2};
 use crate::resources::{KdfCycles, WriterOperation};
 use crate::{R7zError, aes, codec};
 use lzma_rust2::{EncodeMode, Lzma2Options, LzmaOptions, MfType};
@@ -124,6 +124,13 @@ impl PreparedArchiveOptions {
                 return Ok(());
             }
         };
+
+        let estimate = EncoderWorkingSetBytes(
+            estimate
+                .0
+                .checked_add(ENCODED_OUTPUT_BUFFER_BYTES as u64)
+                .ok_or(R7zError::LimitExceeded("encoder memory"))?,
+        );
 
         if estimate.0 > limit {
             return Err(R7zError::LimitExceeded("encoder memory"));

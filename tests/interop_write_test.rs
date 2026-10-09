@@ -1232,7 +1232,14 @@ fn archive_writer_ppmd_streams_payload_before_finish() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let archive_path = dir.join("writer_ppmd_streamed.7z");
-    let payload = (0u8..=255).cycle().take(1024 * 1024).collect::<Vec<_>>();
+    let payload = std::iter::successors(Some(0x1234_5678_9abc_def0_u64), |state| {
+        let state = state ^ (state << 13);
+        let state = state ^ (state >> 7);
+        Some(state ^ (state << 17))
+    })
+    .flat_map(u64::to_le_bytes)
+    .take(1024 * 1024)
+    .collect::<Vec<_>>();
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut writer = r7z::ArchiveWriter::new(file, r7z::ArchiveOptions::default())
         .expect("new failed")
@@ -1248,8 +1255,8 @@ fn archive_writer_ppmd_streams_payload_before_finish() {
         )
         .expect("append failed");
     assert!(
-        std::fs::metadata(&archive_path).unwrap().len() > 32,
-        "PPMd writer should emit compressed payload bytes during append"
+        std::fs::metadata(&archive_path).unwrap().len() > 32 + 64 * 1024,
+        "PPMd writer should drain full output buffers during append"
     );
 
     writer.finish().expect("finish failed");
