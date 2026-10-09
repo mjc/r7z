@@ -29,7 +29,7 @@ bzip2-rs = "0.1.2"
 crc32fast = "1.5.2"
 deflate64 = "0.1.12"
 flate2 = "1"
-lzma-rust2 = { git = "https://github.com/hasenbanck/lzma-rust2", rev = "72a7582c047e604e15c76a52d7c5136f5fb7df72", features = ["encoder", "optimization"] }
+lzma-rust2 = { git = "https://github.com/mjc/lzma-rust2", rev = "72a7582c047e604e15c76a52d7c5136f5fb7df72", features = ["encoder", "optimization"] }
 memmap2 = "0.9"
 nom = "8"
 num = "0.4"
