@@ -113,6 +113,7 @@ pub enum SolidMode {
 pub struct StreamingOptions {
     /// Optional cancellation and progress shared by this write operation.
     pub control: Option<crate::OperationControl>,
+    /// Input read buffer size in bytes. Defaults to 64 KiB.
     pub buffer_size: usize,
     pub spool: SpoolMode,
     /// Resource limits applied while building this archive.
@@ -123,7 +124,7 @@ impl Default for StreamingOptions {
     fn default() -> Self {
         Self {
             control: None,
-            buffer_size: 8192,
+            buffer_size: 64 * 1024,
             spool: SpoolMode::Auto {
                 memory_threshold: 16 * 1024 * 1024,
                 dir: None,

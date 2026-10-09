@@ -1,5 +1,117 @@
 # Benchmarks
 
+## Input chunk size and codec sinks — 2026-10-09
+
+Changing input reads from 8 KiB to 64 KiB reduced cached-file Copy time by
+39.59–43.12% in two timing orders. Random LZMA took 0.50–0.93% less time.
+Random PPMd changed by less than 0.1%. In-memory Copy took 4.98–8.99% more
+time. The default input buffer is now 64 KiB; callers can still set
+`StreamingOptions::buffer_size`. This adds 56 KiB to the per-entry input
+allocation. The 64 KiB LZMA/PPMd output buffer is unchanged.
+
+### Input comparison
+
+Both sizes used the same writer source from `85e3d74`, dependencies,
+corpora, host, CPU affinity, compression settings, and Criterion protocol
+as the comparison below. Each pass compared both sizes in one executable;
+pass 1 measured 8 KiB first, pass 2 measured 64 KiB first. Input chunk size
+was the only archive option changed. Compressed archive sizes matched for
+all cases. All 48 saved archives were extracted and compared with their
+inputs before timing; all 48 also passed `7z t`.
+
+Median milliseconds. Δ is `(64 KiB / 8 KiB − 1) × 100`.
+
+| Workload | 8 KiB 1 | 64 KiB 1 | Δ 1 | 8 KiB 2 | 64 KiB 2 | Δ 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| executable-Lzma-1-solid | 186.1968 | 186.3376 | +0.08% | 185.6463 | 185.6971 | +0.03% |
+| executable-Ppmd-1-solid | 83.2663 | 83.2359 | -0.04% | 83.1277 | 83.1717 | +0.05% |
+| random-Lzma-1-solid | 76.1078 | 75.7303 | -0.50% | 76.4894 | 75.7768 | -0.93% |
+| random-Ppmd-1-solid | 146.7139 | 146.6361 | -0.05% | 146.3872 | 146.2665 | -0.08% |
+| source-Copy-1-solid | 0.0951 | 0.1037 | +8.99% | 0.0974 | 0.1023 | +4.98% |
+| source-Lzma-1-solid | 109.9433 | 109.9110 | -0.03% | 110.6831 | 110.3624 | -0.29% |
+| source-Lzma-64-solid | 110.3242 | 109.8636 | -0.42% | 109.8611 | 110.1795 | +0.29% |
+| source-Lzma2-1-solid | 110.2018 | 109.8629 | -0.31% | 110.2172 | 110.1230 | -0.09% |
+| source-Ppmd-1-solid | 22.1055 | 22.1752 | +0.32% | 22.1220 | 22.1429 | +0.09% |
+| source-Ppmd-64-solid | 22.1390 | 22.1242 | -0.07% | 22.0978 | 22.1243 | +0.12% |
+| zero-Lzma-1-solid | 23.8392 | 23.8323 | -0.03% | 23.8477 | 23.8537 | +0.03% |
+| zero-Ppmd-1-solid | 4.0475 | 4.0470 | -0.01% | 4.0456 | 4.0569 | +0.28% |
+
+The file comparison measured `ArchiveWriter::append()` and `finish()` for
+the same source corpus using Copy and a `File` reader. File opening and
+writer construction were outside timing. Warmup kept the input in the
+page cache; this measures the read path, not physical disk throughput.
+Both sizes round-tripped through R7Z. The two passes used the same
+executable, with the route order reversed at runtime.
+
+| Pass | 8 KiB (ms) | 64 KiB (ms) | Δ |
+| --- | ---: | ---: | ---: |
+| 1 | 0.0864 | 0.0522 | -39.59% |
+| 2 | 0.0911 | 0.0518 | -43.12% |
+
+CPU activity before the completed runs was below 2%, with at most 0.08% I/O
+wait. The reencodarr worker stayed stopped. These chunk-size comparisons
+are independent of the earlier old-route timings; absolute times across
+different benchmark executables are not interchangeable.
+
+### Isolating output sinks
+
+A direct-library benchmark removed archive metadata, checksums,
+encryption dispatch, and input copying. It compared `Vec<u8>` with
+`BufWriter<Cursor<Vec<u8>>>` using a 64 KiB output buffer, each with one
+whole-input write and 64 KiB input writes. LZMA and PPMd settings and
+corpora matched the archive comparison. All four combinations produced
+identical compressed bytes before timing. Both timing orders used the
+same executable.
+
+Median milliseconds.
+
+| Workload | Pass | Vec, whole | Vec, 64 KiB | Buffered cursor, whole | Buffered cursor, 64 KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| source-Lzma | 1 | 108.6597 | 108.7750 | 108.2860 | 108.4282 |
+| source-Lzma | 2 | 108.7260 | 108.8083 | 108.6432 | 108.4273 |
+| source-Ppmd | 1 | 22.0760 | 22.0460 | 22.1218 | 22.1227 |
+| source-Ppmd | 2 | 22.0172 | 22.0292 | 22.0623 | 22.0908 |
+| random-Lzma | 1 | 80.5152 | 80.9730 | 75.3672 | 75.1543 |
+| random-Lzma | 2 | 80.7639 | 81.2825 | 75.0555 | 74.7357 |
+| random-Ppmd | 1 | 154.9592 | 154.9718 | 155.4495 | 155.1547 |
+| random-Ppmd | 2 | 155.1781 | 155.1269 | 155.3300 | 155.3892 |
+
+This does not reproduce the full archive route's 2.01–2.23% random PPMd
+gap: the buffered cursor penalty was 0.10–0.32% with whole-input writes.
+Buffering also made isolated random LZMA faster, so a generic claim that
+`BufWriter` explains every remaining slowdown is unsupported. Different
+writer types produce different codec monomorphizations; the isolated
+sink uses a cursor, while R7Z uses its payload writer inside the buffer.
+
+In the earlier archive benchmark executable, PPMd's `shift_low` compiled
+to 227 bytes for a Vec sink and 256 bytes for the buffered payload sink.
+The buffered fast path has an extra spare-capacity calculation and stack
+store; it still appends directly to the buffer without an out-of-line
+write call on every byte. This identifies a code difference, not its
+share of the measured slowdown.
+
+Focused CPU profiles encoded 64 random-data archives per route with the
+same pinned writer sources, CPU affinity, and release settings. PPMd's
+`encode_symbol`, `update_model`, and `create_successors` accounted for
+95.01% of old-route samples and 91.46% of current-route samples. The
+range coder's `shift_low` accounted for 1.62% and 1.74%, respectively.
+The current builder itself accounted for 0.24%. These are sample shares
+from a separate profiling executable, not before/after timing results.
+
+An apparent memory-clearing increase in the first current-route profile
+did not reproduce in a second capture with call stacks. It is not an
+established cause. The direct sink and input comparisons narrow the
+investigation, but do not fully attribute the earlier PPMd regression;
+codec code generation for R7Z's payload sink remains to be isolated.
+Raw profiles and assembly are retained in the artifact root's
+`results/diagnosis/` directory.
+
+Harnesses, samples, logs, and archives are retained in
+`target/benchmarks/encoding-paths/results/input-chunks-pass{1,2}/`,
+`file-input-pass{1,2}/`, and `codec-sinks-pass{1,2}/`, locally and on Tali.
+The input regression test checks actual read requests across two full
+chunks and a short final chunk, then checks extracted contents.
+
 ## Current writer versus old whole-folder route — 2026-10-09
 
 Compared directly with the old buffered route, current random LZMA took

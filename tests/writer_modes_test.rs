@@ -15,6 +15,41 @@ const CODECS: [Codec; 5] = [
 const FIRST: &[u8] = b"first file: abcabcabcabcabcabc\xe8\x12\0\0\0";
 const SECOND: &[u8] = b"second file: abcabcabcabcabcabc\xe9\x12\0\0\0";
 
+struct RecordingReader<'a> {
+    input: &'a [u8],
+    requests: Vec<usize>,
+}
+
+impl std::io::Read for RecordingReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.requests.push(buffer.len());
+        std::io::Read::read(&mut self.input, buffer)
+    }
+}
+
+#[test]
+fn default_writer_reads_input_in_64_kib_chunks() {
+    let input: Vec<_> = (0u8..=255).cycle().take(2 * 64 * 1024 + 17).collect();
+    let mut reader = RecordingReader {
+        input: &input,
+        requests: Vec::new(),
+    };
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options(Codec::Copy, false))
+        .unwrap()
+        .start();
+    writer.append("payload", &mut reader).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+
+    assert_eq!(reader.requests, vec![64 * 1024; 4]);
+    let archive = Archive::from_bytes(bytes.into()).unwrap();
+    assert_eq!(
+        archive
+            .extract_to_memory(r7z::ArchiveEntryIndex::new(0))
+            .unwrap(),
+        input
+    );
+}
+
 fn options(codec: Codec, encrypted: bool) -> ArchiveOptions {
     let mut options = ArchiveOptions {
         codec,
