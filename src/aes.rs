@@ -21,12 +21,13 @@
 
 use crate::R7zError;
 use aes::Aes256;
-use aes::cipher::{Block, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
+use aes::cipher::Block;
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::{Digest, Sha256};
 use std::io;
 
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
 const CIPHERTEXT_BUFFER_SIZE: usize = 8192;
 
 /// Bound p7zip's default AES KDF cost while rejecting maliciously huge values.
@@ -170,8 +171,7 @@ pub(crate) fn derive_key_with_control(
 
 pub(crate) struct Aes256CbcDecryptReader<R> {
     inner: R,
-    cipher: Aes256,
-    previous: [u8; 16],
+    cipher: Aes256CbcDec,
     plaintext: [u8; 16],
     plaintext_position: usize,
     plaintext_length: usize,
@@ -208,8 +208,7 @@ impl<R: io::Read> Aes256CbcDecryptReader<R> {
 
         Ok(Self {
             inner,
-            cipher: Aes256::new(key.into()),
-            previous: *iv,
+            cipher: Aes256CbcDec::new(key.into(), iv.into()),
             plaintext: [0; 16],
             plaintext_position: 0,
             plaintext_length: 0,
@@ -259,12 +258,7 @@ impl<R: io::Read> Aes256CbcDecryptReader<R> {
             return Ok(false);
         }
         self.inner.read_exact(&mut block[1..])?;
-        let ciphertext = block;
         self.cipher.decrypt_block(&mut block);
-        for (byte, previous) in block.iter_mut().zip(self.previous) {
-            *byte ^= previous;
-        }
-        self.previous.copy_from_slice(&ciphertext);
         self.ciphertext_read = self
             .ciphertext_read
             .checked_add(16)
@@ -361,8 +355,7 @@ pub(crate) fn encrypt_aes256_cbc_zero_pad(
 
 pub(crate) struct Aes256CbcEncryptWriter<W> {
     inner: W,
-    cipher: Aes256,
-    previous: [u8; 16],
+    cipher: Aes256CbcEnc,
     pending: [u8; 16],
     pending_len: usize,
     ciphertext: [u8; CIPHERTEXT_BUFFER_SIZE],
@@ -375,8 +368,7 @@ impl<W: io::Write> Aes256CbcEncryptWriter<W> {
     pub(crate) fn new(inner: W, key: &[u8; 32], iv: &[u8; 16]) -> Self {
         Self {
             inner,
-            cipher: Aes256::new(key.into()),
-            previous: *iv,
+            cipher: Aes256CbcEnc::new(key.into(), iv.into()),
             pending: [0; 16],
             pending_len: 0,
             ciphertext: [0; CIPHERTEXT_BUFFER_SIZE],
@@ -399,14 +391,10 @@ impl<W: io::Write> Aes256CbcEncryptWriter<W> {
         self.pending[self.pending_len..].fill(0);
         let mut block = Block::<Aes256>::default();
         block.copy_from_slice(&self.pending);
-        for (byte, previous) in block.iter_mut().zip(self.previous) {
-            *byte ^= previous;
-        }
         self.cipher.encrypt_block(&mut block);
         let ciphertext_end = self.ciphertext_len + block.len();
         self.ciphertext[self.ciphertext_len..ciphertext_end].copy_from_slice(&block);
         self.ciphertext_len = ciphertext_end;
-        self.previous.copy_from_slice(&block);
         self.pending = [0; 16];
         self.pending_len = 0;
         self.encrypted_block = true;
