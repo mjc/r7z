@@ -61,6 +61,10 @@ harness = false
 name = "comparison"
 harness = false
 
+[[bench]]
+name = "byte_swap"
+harness = false
+
 [profile.release]
 debug = true
 
