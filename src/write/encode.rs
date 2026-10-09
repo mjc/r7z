@@ -1,27 +1,18 @@
 use super::header::{
     CoderSpec, build_encoded_header_descriptor, build_header, encode_coder_info_aes_then,
-    encode_coder_info_bcj_lzma2, encode_coder_info_copy, encode_coder_info_lzma,
-    encode_coder_info_lzma2, encode_coder_info_ppmd,
+    encode_coder_info_lzma,
 };
 use super::lzma2;
 use super::model::{
     ArchiveOptions, Codec, CompletedFolder, CompressionLevel, CompressionOptions, EncoderThreads,
-    EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, PreparedFolder, SolidMode,
-    WriteEntry, WriteEntryIndex,
+    EncryptionOptions, HeaderMode, LzmaAlgorithm, MatchFinder, SolidMode, WriteEntry,
 };
-use crate::resources::{KdfCycles, OperationBudget, WriterOperation};
+use crate::resources::{KdfCycles, WriterOperation};
 use crate::{R7zError, aes, codec};
-use lzma_rust2::{
-    EncodeMode, Lzma2Options, LzmaOptions, LzmaWriter, MfType, filter::bcj::BcjWriter,
-};
-use ppmd_rust::{
-    PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Encoder,
-};
+use lzma_rust2::{EncodeMode, Lzma2Options, LzmaOptions, MfType};
+use ppmd_rust::{PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER};
 use std::io::{Seek, SeekFrom, Write};
-use std::{
-    collections::BTreeMap,
-    num::{NonZeroU32, NonZeroU64},
-};
+use std::num::{NonZeroU32, NonZeroU64};
 
 struct PackedBytes(Vec<u8>);
 
@@ -33,10 +24,6 @@ impl PackedBytes {
     fn as_slice(&self) -> &[u8] {
         &self.0
     }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.0
-    }
 }
 
 struct CoderInfo(Vec<u8>);
@@ -44,10 +31,6 @@ struct CoderInfo(Vec<u8>);
 impl CoderInfo {
     fn as_slice(&self) -> &[u8] {
         &self.0
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.0
     }
 }
 
@@ -57,17 +40,6 @@ impl UnpackSizes {
     fn as_slice(&self) -> &[u64] {
         &self.0
     }
-
-    fn into_vec(self) -> Vec<u64> {
-        self.0
-    }
-}
-
-struct EncodedPayload {
-    packed: PackedBytes,
-    coder_info: CoderInfo,
-    unpack_sizes: UnpackSizes,
-    coders: Vec<CoderSpec>,
 }
 
 struct EncodedHeader {
@@ -208,99 +180,6 @@ pub(super) enum ThreadRequest {
     Auto,
     Single,
     Fixed(NonZeroU32),
-}
-
-pub(crate) fn build_archive(
-    entries: &[WriteEntry],
-    options: &ArchiveOptions,
-) -> Result<Vec<u8>, R7zError> {
-    let prepared = prepare_archive_options(options.clone())?;
-    if let Some(control) = &options.streaming.control {
-        control.check()?;
-    }
-    let budget = OperationBudget::new(options.streaming.resource_limits)
-        .with_control(options.streaming.control.clone());
-    let mut operation = budget.into_writer_budgets().operation;
-    build_archive_with_settings(entries, &prepared, &mut operation)
-}
-
-pub(super) fn build_archive_with_settings(
-    entries: &[WriteEntry],
-    prepared: &PreparedArchiveOptions,
-    budget: &mut WriterOperation,
-) -> Result<Vec<u8>, R7zError> {
-    let mut folders = Vec::new();
-    let mut by_folder: BTreeMap<super::model::WriteFolderId, Vec<WriteEntryIndex>> =
-        BTreeMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        if entry.stream.has_stream() {
-            by_folder
-                .entry(entry.folder_id)
-                .or_default()
-                .push(WriteEntryIndex::from_index(idx));
-        }
-    }
-
-    for file_indices in by_folder.into_values() {
-        let folder = encode_folder(entries, file_indices, prepared, budget)?;
-        folders.push(folder);
-    }
-
-    build_archive_from_prepared(entries, &folders, prepared, budget)
-}
-
-pub(crate) fn build_archive_from_prepared(
-    entries: &[WriteEntry],
-    folders: &[PreparedFolder],
-    prepared: &PreparedArchiveOptions,
-    budget: &mut WriterOperation,
-) -> Result<Vec<u8>, R7zError> {
-    let options = &prepared.archive;
-    let mut packed_data = Vec::new();
-    for folder in folders {
-        for stream in &folder.packed_streams {
-            packed_data.extend_from_slice(stream);
-        }
-    }
-    let folder_metadata = folders
-        .iter()
-        .map(|folder| folder.metadata.clone())
-        .collect::<Vec<_>>();
-
-    let raw_header = build_header(entries, &folder_metadata);
-    let should_encode = match options.header_mode {
-        HeaderMode::Plain => false,
-        HeaderMode::Encoded => true,
-        HeaderMode::P7zipDefault => {
-            entries.len() > 1
-                || options.encryption.is_some()
-                || options
-                    .encryption
-                    .as_ref()
-                    .is_some_and(|enc| enc.encrypt_header)
-        }
-    };
-
-    let (next_header, next_header_offset) = if should_encode {
-        let encoded = encode_header_stream(&raw_header, prepared, budget)?;
-        let pack_pos = packed_data.len() as u64;
-        packed_data.extend_from_slice(encoded.packed.as_slice());
-        let descriptor = build_encoded_header_descriptor(
-            pack_pos,
-            encoded.packed.len() as u64,
-            encoded.coder_info.as_slice(),
-            encoded.unpack_sizes.as_slice(),
-        );
-        (descriptor, packed_data.len() as u64)
-    } else {
-        (raw_header, packed_data.len() as u64)
-    };
-
-    let mut archive = vec![0u8; 32];
-    archive.extend_from_slice(&packed_data);
-    archive.extend_from_slice(&next_header);
-    write_signature(&mut archive, next_header_offset, &next_header);
-    Ok(archive)
 }
 
 pub(crate) fn validate_archive_options(
@@ -586,114 +465,6 @@ pub(crate) fn finish_streamed_archive<W: Write + Seek>(
     Ok(out)
 }
 
-pub(crate) fn encode_folder(
-    entries: &[WriteEntry],
-    file_indices: Vec<WriteEntryIndex>,
-    prepared: &PreparedArchiveOptions,
-    budget: &mut WriterOperation,
-) -> Result<PreparedFolder, R7zError> {
-    let mut data = Vec::new();
-    let mut file_sizes = Vec::new();
-    let mut file_crcs = Vec::new();
-    for &idx in &file_indices {
-        let bytes = entries[idx.index()]
-            .stream
-            .buffered_data()
-            .ok_or(R7zError::Parse)?;
-        file_sizes.push(bytes.len() as u64);
-        file_crcs.push(Some(crc32fast::hash(bytes)));
-        data.extend_from_slice(bytes);
-    }
-
-    let mut encoded = encode_payload_with_options(&data, prepared)?;
-
-    if let Some(encryption) = prepared.encryption() {
-        let aes = make_aes_material(encryption, budget)?;
-        let before_padding = encoded.packed.len() as u64;
-        encoded.packed = PackedBytes(aes::encrypt_aes256_cbc_zero_pad(
-            encoded.packed.as_slice(),
-            &aes.key,
-            &aes.iv,
-        )?);
-        encoded.coder_info = CoderInfo(encode_coder_info_aes_then(&encoded.coders, &aes.props));
-        let mut sizes = vec![before_padding];
-        sizes.extend(encoded.unpack_sizes.into_vec());
-        encoded.unpack_sizes = UnpackSizes(sizes);
-    }
-
-    let pack_size = encoded.packed.len() as u64;
-    Ok(PreparedFolder {
-        metadata: CompletedFolder {
-            file_indices,
-            pack_sizes: vec![pack_size],
-            coder_info: encoded.coder_info.into_vec(),
-            coder_unpack_sizes: encoded.unpack_sizes.into_vec(),
-            folder_crc: None,
-            file_sizes,
-            file_crcs,
-        },
-        packed_streams: vec![encoded.packed.into_vec()],
-    })
-}
-
-fn encode_payload_with_options(
-    data: &[u8],
-    prepared: &PreparedArchiveOptions,
-) -> Result<EncodedPayload, R7zError> {
-    prepared.validate_encoder_working_set()?;
-    let options = &prepared.archive;
-    let compression = &options.compression;
-    match prepared.settings.codec {
-        PreparedCodec::Copy => Ok(EncodedPayload {
-            packed: PackedBytes(data.to_vec()),
-            coder_info: CoderInfo(encode_coder_info_copy()),
-            unpack_sizes: UnpackSizes(vec![data.len() as u64]),
-            coders: vec![CoderSpec::Copy],
-        }),
-        PreparedCodec::Lzma => {
-            let (props, compressed) = compress_lzma(data, compression)?;
-            Ok(EncodedPayload {
-                packed: PackedBytes(compressed),
-                coder_info: CoderInfo(encode_coder_info_lzma(&props)),
-                unpack_sizes: UnpackSizes(vec![data.len() as u64]),
-                coders: vec![CoderSpec::Lzma(props)],
-            })
-        }
-        PreparedCodec::Lzma2(threads) => {
-            let (prop, compressed) = compress_lzma2(data, compression, threads)?;
-            Ok(EncodedPayload {
-                packed: PackedBytes(compressed),
-                coder_info: CoderInfo(encode_coder_info_lzma2(prop)),
-                unpack_sizes: UnpackSizes(vec![data.len() as u64]),
-                coders: vec![CoderSpec::Lzma2(prop)],
-            })
-        }
-        PreparedCodec::Ppmd(ppmd) => {
-            let (props, compressed) = compress_ppmd(data, ppmd)?;
-            Ok(EncodedPayload {
-                packed: PackedBytes(compressed),
-                coder_info: CoderInfo(encode_coder_info_ppmd(&props)),
-                unpack_sizes: UnpackSizes(vec![data.len() as u64]),
-                coders: vec![CoderSpec::Ppmd(props)],
-            })
-        }
-        PreparedCodec::Lzma2Bcj(threads) => {
-            let mut filter = BcjWriter::new_x86(Vec::with_capacity(data.len()), 0);
-            data.chunks(super::BCJ_INPUT_CHUNK_BYTES)
-                .try_for_each(|chunk| filter.write_all(chunk))
-                .map_err(|_| R7zError::Decompression)?;
-            let filtered = filter.finish().map_err(|_| R7zError::Decompression)?;
-            let (prop, compressed) = compress_lzma2(&filtered, compression, threads)?;
-            Ok(EncodedPayload {
-                packed: PackedBytes(compressed),
-                coder_info: CoderInfo(encode_coder_info_bcj_lzma2(prop)),
-                unpack_sizes: UnpackSizes(vec![data.len() as u64, data.len() as u64]),
-                coders: vec![CoderSpec::Lzma2(prop), CoderSpec::Bcj],
-            })
-        }
-    }
-}
-
 fn encode_header_stream(
     raw_header: &[u8],
     prepared: &PreparedArchiveOptions,
@@ -824,56 +595,6 @@ fn compression_level_preset(level: CompressionLevel) -> u32 {
     }
 }
 
-fn compress_lzma(
-    data: &[u8],
-    compression: &CompressionOptions,
-) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
-    let options = lzma_options(compression);
-    let dict_size = options.dict_size;
-    let mut writer = LzmaWriter::new_no_header(Vec::new(), &options, false)
-        .map_err(|_| R7zError::Decompression)?;
-    writer
-        .write_all(data)
-        .map_err(|_| R7zError::Decompression)?;
-    let props_byte = writer.props();
-    let compressed = writer.finish().map_err(|_| R7zError::Decompression)?;
-    let mut props = Vec::with_capacity(5);
-    props.push(props_byte);
-    props.extend_from_slice(&dict_size.to_le_bytes());
-    Ok((props, compressed))
-}
-
-fn compress_lzma2(
-    data: &[u8],
-    compression: &CompressionOptions,
-    threads: ThreadRequest,
-) -> Result<(u8, Vec<u8>), R7zError> {
-    let options = lzma2_options(compression);
-    let prop = encode_lzma2_dict_size(options.lzma_options.dict_size)?;
-    let mut writer =
-        lzma2::Encoder::new(Vec::new(), compression, Some(data.len() as u64), threads)?;
-    writer.write_all(data)?;
-    let compressed = writer.finish()?;
-    Ok((prop, compressed))
-}
-
-fn compress_ppmd(data: &[u8], settings: PpmdSettings) -> Result<(Vec<u8>, Vec<u8>), R7zError> {
-    let PpmdSettings { order, memory_size } = settings;
-    let mut writer =
-        Ppmd7Encoder::new(Vec::new(), u32::from(order), memory_size).map_err(|_| {
-            R7zError::InvalidOptions("PPMd order or memory size is outside supported range")
-        })?;
-    writer
-        .write_all(data)
-        .map_err(|_| R7zError::Decompression)?;
-    let compressed = writer.finish(false).map_err(|_| R7zError::Decompression)?;
-
-    let mut props = Vec::with_capacity(5);
-    props.push(order);
-    props.extend_from_slice(&memory_size.to_le_bytes());
-    Ok((props, compressed))
-}
-
 fn ppmd_order(compression: &CompressionOptions) -> Result<u8, R7zError> {
     let order = compression.fast_bytes.unwrap_or(6);
     if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&order) {
@@ -968,10 +689,6 @@ pub(super) fn make_aes_material(
         iv,
         props,
     })
-}
-
-fn write_signature(archive: &mut [u8], next_header_offset: u64, next_header: &[u8]) {
-    archive[..32].copy_from_slice(&signature_bytes(next_header_offset, next_header));
 }
 
 fn signature_bytes(next_header_offset: u64, next_header: &[u8]) -> [u8; 32] {

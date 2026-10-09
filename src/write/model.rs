@@ -345,9 +345,3 @@ pub(crate) struct CompletedFolder {
     pub file_sizes: Vec<u64>,
     pub file_crcs: Vec<Option<u32>>,
 }
-
-#[derive(Clone)]
-pub(crate) struct PreparedFolder {
-    pub metadata: CompletedFolder,
-    pub packed_streams: Vec<Vec<u8>>,
-}

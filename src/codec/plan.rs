@@ -1,7 +1,7 @@
 use super::{
     AES_CBC_WORKING_SET_BYTES, BcjReader, Bzip2Decoder, CoderOutputSizes, Cursor,
     DECODER_OVERHEAD_BYTES, Deflate64Decoder, DeflateDecoder, ExactSizeReader, Folder,
-    FolderReader, Lzma2Reader, LzmaReader, MAX_LZMA_DICTIONARY_BYTES, MAX_LZMA2_PROBABILITY_BYTES,
+    FolderReader, Lzma2Reader, LzmaReader, MAX_LZMA_DICTIONARY_BYTES,
     MAX_MATERIALIZED_OUTPUT_BYTES, OTHER_CODER_WORKING_SET_BYTES, OutputSize, PackedInput,
     Ppmd7Decoder, R7zError, Read, SmallVec, aes_coder_reader, bcj2_output_size, branch_start_pos,
     ensure_bcj2_working_budget, growth_safe_output_limit, lzma2_dict_size, ppmd_properties,
@@ -24,6 +24,15 @@ pub(crate) struct DecoderPlan<'a> {
 struct WorkingSet(usize);
 
 impl WorkingSet {
+    fn decoder(memory_kib: u32) -> Result<Self, R7zError> {
+        usize::try_from(memory_kib)
+            .ok()
+            .and_then(|n| n.checked_mul(1024))
+            .and_then(|n| n.checked_add(DECODER_OVERHEAD_BYTES))
+            .map(Self)
+            .ok_or(R7zError::Decompression)
+    }
+
     fn add(self, other: Self) -> Result<Self, R7zError> {
         self.0
             .checked_add(other.0)
@@ -693,10 +702,9 @@ impl CoderPlan {
     fn working_set(&self) -> Result<WorkingSet, R7zError> {
         let bytes = match self {
             Self::Lzma(properties) => properties.memory,
-            Self::Lzma2(dictionary) => (*dictionary as usize)
-                .checked_add(MAX_LZMA2_PROBABILITY_BYTES)
-                .and_then(|n| n.checked_add(DECODER_OVERHEAD_BYTES))
-                .ok_or(R7zError::Decompression)?,
+            Self::Lzma2(dictionary) => {
+                WorkingSet::decoder(lzma_rust2::lzma2_get_memory_usage(*dictionary))?.0
+            }
             Self::Ppmd { memory, .. } => (*memory as usize)
                 .checked_add(DECODER_OVERHEAD_BYTES)
                 .ok_or(R7zError::Decompression)?,
@@ -745,15 +753,13 @@ impl CoderPlan {
                 OutputSize::Unknown => input,
             },
             Self::Lzma(properties) => checked_reader(
-                LzmaReader::new(
+                LzmaReader::new_with_props(
                     input,
                     match output {
                         OutputSize::Known(size) => size,
                         OutputSize::Unknown => u64::MAX,
                     },
-                    properties.lc,
-                    properties.lp,
-                    properties.pb,
+                    properties.props,
                     properties.dictionary,
                     None,
                 )
@@ -806,9 +812,7 @@ fn checked_reader<'a>(reader: impl Read + 'a, output: OutputSize) -> Box<dyn Rea
 
 /// Validated LZMA parameters shared by memory admission and reader construction.
 pub(super) struct LzmaProperties {
-    lc: u32,
-    lp: u32,
-    pb: u32,
+    props: u8,
     dictionary: u32,
     memory: usize,
 }
@@ -825,23 +829,11 @@ impl LzmaProperties {
                 MAX_LZMA_DICTIONARY_BYTES as usize,
             ));
         }
-        if props >= 9 * 5 * 5 {
-            return Err(R7zError::Decompression);
-        }
-        let lc = u32::from(props % 9);
-        let lp = u32::from(props / 9 % 5);
-        let pb = u32::from(props / (9 * 5));
-        let memory_kib = lzma_rust2::lzma_get_memory_usage(dictionary, lc, lp)
+        let memory_kib = lzma_rust2::lzma_get_memory_usage_by_props(dictionary, props)
             .map_err(|_| R7zError::Decompression)?;
-        let memory = usize::try_from(memory_kib)
-            .ok()
-            .and_then(|n| n.checked_mul(1024))
-            .and_then(|n| n.checked_add(DECODER_OVERHEAD_BYTES))
-            .ok_or(R7zError::Decompression)?;
+        let memory = WorkingSet::decoder(memory_kib)?.0;
         Ok(Self {
-            lc,
-            lp,
-            pb,
+            props,
             dictionary,
             memory,
         })
@@ -1210,7 +1202,7 @@ mod tests {
         let lzma2 = CoderPlan::compile(&coder(&[0x21, 0x21, 1, 0]), OutputSize::Known(0)).unwrap();
         assert_eq!(
             lzma2.working_set().unwrap().0,
-            4096 + MAX_LZMA2_PROBABILITY_BYTES + DECODER_OVERHEAD_BYTES
+            lzma_rust2::lzma2_get_memory_usage(4096) as usize * 1024 + DECODER_OVERHEAD_BYTES
         );
         let ppmd = CoderPlan::compile(
             &coder(&[0x23, 3, 4, 1, 5, 6, 0, 0, 16, 0]),
@@ -1243,10 +1235,7 @@ mod tests {
         for props in 0..225 {
             let bytes = [props, 0, 0, 16, 0];
             let parsed = LzmaProperties::parse(&bytes).unwrap();
-            assert_eq!(
-                parsed.lc + 9 * (parsed.lp + 5 * parsed.pb),
-                u32::from(props)
-            );
+            assert_eq!(parsed.props, props);
             assert_eq!(
                 parsed.memory,
                 lzma_rust2::lzma_get_memory_usage_by_props(1024 * 1024, props).unwrap() as usize
@@ -1440,7 +1429,7 @@ mod tests {
         let plan = DecoderPlan::compile(&folder, &graph, 0, &[4096, 0], &[16]).unwrap();
         assert_eq!(
             plan.memory.0,
-            4096 + MAX_LZMA2_PROBABILITY_BYTES
+            lzma_rust2::lzma2_get_memory_usage(4096) as usize * 1024
                 + DECODER_OVERHEAD_BYTES
                 + AES_CBC_WORKING_SET_BYTES
                 + DECODER_OVERHEAD_BYTES

@@ -684,43 +684,35 @@ impl ArchiveBuilder {
     pub fn build(self) -> Result<Vec<u8>, R7zError> {
         let mut options = self.options;
         lzma2::set_default_budget(&mut options);
-        if matches!(
-            options.codec,
-            Codec::Copy | Codec::Lzma | Codec::Lzma2 | Codec::Ppmd | Codec::Lzma2Bcj
-        ) && self.entries.iter().any(|entry| entry.stream.has_stream())
-        {
-            let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
-            let mut folder_sizes = std::collections::BTreeMap::<WriteFolderId, u64>::new();
-            for entry in &entries {
-                if entry.stream.has_stream() {
-                    let size = entry
-                        .stream
-                        .buffered_data()
-                        .map(|data| data.len() as u64)
-                        .ok_or(R7zError::Parse)?;
-                    let folder_size = folder_sizes.entry(entry.folder_id).or_default();
-                    *folder_size = folder_size.checked_add(size).ok_or(R7zError::Parse)?;
-                }
+        let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
+        let mut folder_sizes = std::collections::BTreeMap::<WriteFolderId, u64>::new();
+        for entry in &entries {
+            if entry.stream.has_stream() {
+                let size = entry
+                    .stream
+                    .buffered_data()
+                    .map(|data| data.len() as u64)
+                    .ok_or(R7zError::Parse)?;
+                let folder_size = folder_sizes.entry(entry.folder_id).or_default();
+                *folder_size = folder_size.checked_add(size).ok_or(R7zError::Parse)?;
             }
-            let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)?.start();
-            for entry in entries {
-                let folder_size = folder_sizes.get(&entry.folder_id).copied().unwrap_or(0);
-                match entry.folder_id.cmp(&writer.next_folder_id()?) {
-                    std::cmp::Ordering::Less => return Err(R7zError::Parse),
-                    std::cmp::Ordering::Equal => {}
-                    std::cmp::Ordering::Greater => {
-                        writer.new_folder()?;
-                        if entry.folder_id != writer.next_folder_id()? {
-                            return Err(R7zError::Parse);
-                        }
+        }
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new()), options)?.start();
+        for entry in entries {
+            let folder_size = folder_sizes.get(&entry.folder_id).copied().unwrap_or(0);
+            match entry.folder_id.cmp(&writer.next_folder_id()?) {
+                std::cmp::Ordering::Less => return Err(R7zError::Parse),
+                std::cmp::Ordering::Equal => {}
+                std::cmp::Ordering::Greater => {
+                    writer.new_folder()?;
+                    if entry.folder_id != writer.next_folder_id()? {
+                        return Err(R7zError::Parse);
                     }
                 }
-                writer.append_builder_entry(entry, folder_size)?;
             }
-            return Ok(writer.finish()?.into_inner());
+            writer.append_builder_entry(entry, folder_size)?;
         }
-        let entries = entries_with_solid_folders(self.entries, &options.compression.solid)?;
-        encode::build_archive(&entries, &options)
+        Ok(writer.finish()?.into_inner())
     }
 }
 
@@ -1507,9 +1499,6 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
         if matches!(self.state, WriterState::Failed) {
             return Err(writer_failed());
         }
-        if !self.entries.iter().any(|entry| entry.stream.has_stream()) {
-            return self.finish_buffered();
-        }
         self.seal_streaming_folder()?;
         let WriterState::Ready {
             output: out,
@@ -1525,22 +1514,6 @@ impl<W: Write + Seek> ArchiveWriter<W, true> {
             &self.prepared,
             &mut self.budget,
         )
-    }
-
-    fn finish_buffered(mut self) -> Result<W, R7zError> {
-        let bytes =
-            encode::build_archive_with_settings(&self.entries, &self.prepared, &mut self.budget)?;
-        let WriterState::Ready {
-            output: mut out, ..
-        } = std::mem::replace(&mut self.state, WriterState::Failed)
-        else {
-            return Err(R7zError::Parse);
-        };
-        out.seek(SeekFrom::Start(0))?;
-        out.write_all(&bytes)?;
-        out.flush()?;
-        self.budget.monitor.check()?;
-        Ok(out)
     }
 
     fn append_streaming(

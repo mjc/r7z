@@ -21,7 +21,6 @@ use smallvec::SmallVec;
 use std::io::{Cursor, Read, Write};
 
 const MAX_LZMA_DICTIONARY_BYTES: u32 = 256 * 1024 * 1024;
-const MAX_LZMA2_PROBABILITY_BYTES: usize = 24 * 1024;
 const MAX_PPMD_MEMORY_BYTES: u32 = 256 * 1024 * 1024;
 const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BCJ2_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
