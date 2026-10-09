@@ -111,3 +111,55 @@ is Tali's Bash binary. Random is deterministic xorshift64 data seeded with
 | executable | 1,213,640 | `58256e0bb8fe5c7661eea40900c1e8fc960316ff7bd401b05ef7fcdf28398c1f` |
 | random | 1,048,576 | `4ef0e7f5a107fd0fdbf805d6f0d305b75bb8a77584878f3f324dc9ce69c3f88b` |
 | zero | 1,048,576 | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+
+## Output buffering diagnosis — 2026-10-09
+
+LZMA and PPMd range encoders emit individual bytes. The streaming encoder
+sends each byte through `PayloadWriter`'s encryption selection,
+`CountingWriter`'s checked counter, and the archive cursor. The former
+buffered encoder wrote those bytes directly to a `Vec<u8>`.
+
+Two benchmark-only probes added a 64 KiB `std::io::BufWriter`. Putting it
+inside the plain-payload variant left the encryption selection per byte
+and barely affected the gap. Putting it directly after LZMA/PPMd, before
+`PayloadWriter`, reduced LZMA time by 3.99–4.55% and source PPMd time by
+1.80–2.49% in two opposite timing orders. Both probes preserved extracted
+contents. The production encoder has not been changed by these experiments.
+
+An untimed run with a counted output cursor confirmed the write reduction:
+
+| Workload | Streaming writes | Buffered output writes |
+| --- | ---: | ---: |
+| Random LZMA, one file | 1,062,886 | 20 |
+| Source PPMd, one file | 128,919 | 5 |
+
+These counts include headers; both routes produced identical archive sizes
+and extracted contents. The input corpus and encoder settings were unchanged.
+
+Median times in milliseconds. Δ compares the output-buffer probe with the
+current streaming route in the same pass. Pass 1 measured the probe first;
+pass 2 measured it last. The earlier machine, linker, and Criterion settings
+were retained, and the worker was stopped again after being found active.
+
+| Workload | Pass | Former buffered route | Current streaming | Output buffer | Δ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| empty-128 | 1 | 0.0595 | 0.0620 | 0.0626 | +1.11% |
+| random-Lzma-1-solid | 1 | 76.5207 | 79.9660 | 76.7777 | -3.99% |
+| source-Ppmd-1-solid | 1 | 22.2898 | 22.8853 | 22.4744 | -1.80% |
+| source-Ppmd-64-solid | 1 | 22.4316 | 22.8192 | 22.2579 | -2.46% |
+| empty-128 | 2 | 0.0592 | 0.0616 | 0.0615 | -0.14% |
+| random-Lzma-1-solid | 2 | 76.9341 | 81.7607 | 78.0391 | -4.55% |
+| source-Ppmd-1-solid | 2 | 22.3723 | 22.8244 | 22.2552 | -2.49% |
+| source-Ppmd-64-solid | 2 | 22.3755 | 22.7995 | 22.3439 | -2.00% |
+
+The result supports buffering compressed output before encryption dispatch
+and byte accounting. It recovers a substantial part of the measured gap
+without collecting a whole folder. The remaining LZMA difference against
+the former route is not fully isolated. Empty archives have no payload
+encoder; their overhead remains in per-entry metadata/writer processing.
+The buffer probe does not address that path.
+
+Probe sources, patches, write counts, logs, and Criterion samples are retained
+with the earlier artifacts. `results/inner-buffer/` records the first placement;
+`results/outer-buffer-pass1/` and `results/outer-buffer-pass2/` record the
+placement before encryption dispatch.
