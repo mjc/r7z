@@ -1,5 +1,109 @@
 # Benchmarks
 
+## Current writer versus old whole-folder route — 2026-10-09
+
+Compared directly with the old buffered route, current random LZMA took
+0.57–1.18% more time and random PPMd took 2.01–2.23% more time. Source
+LZMA took 0.69–1.25% less time, source PPMd 0.48–1.88% less, and every
+Copy workload took 10.35–88.49% less. These are comparisons with the old
+whole-folder encoder, separate from the unbuffered streaming comparison.
+
+### Scope and measurement
+
+Old: `aa7c8619a12b764dadb7906391da5109688cf93f`, with the builder forced
+to call its existing whole-folder buffered encoder. All 35 baseline source
+files were checked against that commit; only the saved route-selection
+patch differs. The encoder implementation is unchanged.
+
+Current: signed commit `85e3d74129ae32cab29b8779a93155ebb77289ae`, including
+the 64 KiB LZMA/PPMd output buffer, its memory admission, and the terminal
+payload-error state. Both use lzma-rust2
+`f9887afa12a4c7e5edba7e909f8ccc6dddabfde8` with shared dependencies in one
+benchmark executable.
+
+Tali: Ryzen 5 8600G, rustc 1.99.0, Linux x86-64, release with debug
+information, default CPU target, Clang/LLD. Logical CPU 2, one encoder
+thread, Normal compression, 1 MiB dictionary for compressed codecs,
+plain headers, no encryption.
+The four corpora and their hashes are unchanged from the table below.
+
+Criterion 0.8 measured `ArchiveBuilder::build()` with setup and input
+cloning outside the timed closure: 30 samples, 1-second warmup, at least
+3 seconds per route and case. Pass 1 measured old first; pass 2 measured
+current first. Actual CPU activity before the passes was 0.33–0.75%, with
+no I/O wait. The reencodarr worker remained stopped.
+
+All 29 workloads were extracted and checked byte-for-byte against their
+inputs before timing in each pass. All 116 saved archives passed `7z t`.
+Archive sizes matched except for the two source BCJ workloads, where the
+current output was one byte larger in both passes.
+
+```sh
+taskset -c 2 /home/mjc/projects/r7z/target/release/deps/encoding_paths-f28f8d9dd975fe21 --bench --noplot
+```
+
+### Results
+
+Median milliseconds. Δ is `(current / old − 1) × 100`; negative means
+current takes less time. Each comparison uses medians from the same pass.
+
+| Workload | Old 1 | Current 1 | Δ 1 | Old 2 | Current 2 | Δ 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| empty-0 | 0.0550 | 0.0552 | +0.35% | 0.0532 | 0.0528 | -0.70% |
+| empty-128 | 0.0600 | 0.0624 | +4.00% | 0.0574 | 0.0600 | +4.57% |
+| executable-Bcj-1-solid | 187.7550 | 187.7482 | -0.00% | 187.2562 | 187.5417 | +0.15% |
+| executable-Copy-1-solid | 0.1520 | 0.1267 | -16.66% | 0.1505 | 0.1099 | -26.99% |
+| executable-Lzma-1-solid | 188.3438 | 185.5871 | -1.46% | 188.7643 | 187.6947 | -0.57% |
+| executable-Lzma2-1-solid | 186.0232 | 186.4123 | +0.21% | 186.4639 | 186.3247 | -0.07% |
+| executable-Ppmd-1-solid | 84.7367 | 85.2801 | +0.64% | 85.1357 | 85.2853 | +0.18% |
+| random-Bcj-1-solid | 78.3199 | 78.0957 | -0.29% | 78.0147 | 78.0844 | +0.09% |
+| random-Copy-1-solid | 0.1384 | 0.1049 | -24.18% | 0.1373 | 0.1044 | -23.97% |
+| random-Lzma-1-solid | 75.2122 | 75.6423 | +0.57% | 75.4808 | 76.3710 | +1.18% |
+| random-Lzma2-1-solid | 77.6350 | 77.8685 | +0.30% | 77.7211 | 78.1423 | +0.54% |
+| random-Ppmd-1-solid | 151.6766 | 154.7244 | +2.01% | 151.9000 | 155.2890 | +2.23% |
+| source-Bcj-1-solid | 109.3957 | 109.9475 | +0.50% | 109.7219 | 109.9360 | +0.20% |
+| source-Bcj-64-solid | 109.8392 | 109.5721 | -0.24% | 110.5257 | 110.9095 | +0.35% |
+| source-Copy-1-solid | 0.6893 | 0.0979 | -85.79% | 0.7327 | 0.0843 | -88.49% |
+| source-Copy-64-solid | 0.1305 | 0.1170 | -10.35% | 0.1254 | 0.1096 | -12.58% |
+| source-Copy-8-nonsolid | 0.1266 | 0.1016 | -19.73% | 0.1333 | 0.1024 | -23.18% |
+| source-Lzma-1-solid | 110.1944 | 109.1043 | -0.99% | 110.3973 | 109.1022 | -1.17% |
+| source-Lzma-64-solid | 110.7481 | 109.3660 | -1.25% | 110.7393 | 109.9774 | -0.69% |
+| source-Lzma2-1-solid | 109.5070 | 109.8404 | +0.30% | 109.7430 | 109.4056 | -0.31% |
+| source-Lzma2-64-solid | 109.1541 | 109.9683 | +0.75% | 109.9058 | 110.7483 | +0.77% |
+| source-Lzma2-8-nonsolid | 94.4828 | 95.2551 | +0.82% | 94.9182 | 94.8793 | -0.04% |
+| source-Ppmd-1-solid | 22.4500 | 22.1222 | -1.46% | 22.5452 | 22.1215 | -1.88% |
+| source-Ppmd-64-solid | 22.4279 | 22.3204 | -0.48% | 22.5025 | 22.1224 | -1.69% |
+| zero-Bcj-1-solid | 24.1609 | 24.1155 | -0.19% | 24.1537 | 24.1130 | -0.17% |
+| zero-Copy-1-solid | 0.1378 | 0.1062 | -22.96% | 0.1374 | 0.1056 | -23.15% |
+| zero-Lzma-1-solid | 23.7888 | 23.8015 | +0.05% | 23.8220 | 23.7716 | -0.21% |
+| zero-Lzma2-1-solid | 23.8132 | 23.8042 | -0.04% | 23.8246 | 23.7945 | -0.13% |
+| zero-Ppmd-1-solid | 4.1466 | 4.0562 | -2.18% | 4.1482 | 4.0629 | -2.06% |
+
+The random LZMA gap is much smaller than the earlier 5.03–5.26% gap with
+unbuffered streaming, but it remains positive in both orders. Random PPMd
+also remains slower. The 95% bootstrap confidence intervals for each
+route's median do not overlap for either random workload in either pass;
+these measurements do not establish parity with the old route.
+
+| Random workload | Pass | Old median, 95% CI (ms) | Current median, 95% CI (ms) |
+| --- | ---: | --- | --- |
+| LZMA | 1 | 75.2122 [75.0471, 75.3345] | 75.6423 [75.4974, 75.9201] |
+| LZMA | 2 | 75.4808 [75.3099, 75.6680] | 76.3710 [76.2219, 76.5517] |
+| PPMd | 1 | 151.6766 [151.5840, 151.7361] | 154.7244 [154.6391, 154.8106] |
+| PPMd | 2 | 151.9000 [151.8314, 152.0059] | 155.2890 [155.2067, 155.4286] |
+
+Copy gains varied with timing order but held for every workload. LZMA2
+and BCJ comparisons stayed within 1%; several changed direction between
+passes. The 128-empty-file case took 4.00–4.57% more time, about
+2.4–2.6 microseconds. That path has no payload encoder and is unaffected
+by the new output buffer.
+
+Harness snapshots, samples, logs, and archives are retained under
+`target/benchmarks/encoding-paths/results/old-vs-current-pass1/` and
+`old-vs-current-pass2/`, and in the corresponding directories on Tali.
+The artifact root also contains `old-vs-current-medians.json`, the generated
+table, and `old-vs-current-verification.json`.
+
 ## Buffered and streaming archive encoding — 2026-10-09
 
 Streaming was faster for every Copy workload in both timing orders. It was
