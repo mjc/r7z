@@ -134,11 +134,11 @@ fn swap_groups(bytes: &mut [u8], width: usize) {
 
 fn swap_groups_scalar(bytes: &mut [u8], width: usize) {
     match width {
-        2 => bytes.chunks_exact_mut(2).for_each(|chunk| {
+        2 => bytes.as_chunks_mut::<2>().0.iter_mut().for_each(|chunk| {
             let word = u16::from_ne_bytes([chunk[0], chunk[1]]).swap_bytes();
             chunk.copy_from_slice(&word.to_ne_bytes());
         }),
-        4 => bytes.chunks_exact_mut(4).for_each(|chunk| {
+        4 => bytes.as_chunks_mut::<4>().0.iter_mut().for_each(|chunk| {
             let word = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]).swap_bytes();
             chunk.copy_from_slice(&word.to_ne_bytes());
         }),
@@ -233,7 +233,9 @@ mod tests {
     #[test]
     fn swap_groups_reverses_groups_across_vector_boundaries() {
         for width in [2, 4] {
-            let mut bytes: Vec<_> = (0..128 + width).map(|byte| byte as u8).collect();
+            let mut bytes: Vec<_> = (0..128 + width)
+                .map(|byte| u8::try_from(byte).unwrap())
+                .collect();
             let expected: Vec<_> = bytes
                 .chunks_exact(width)
                 .flat_map(|group| group.iter().rev().copied())

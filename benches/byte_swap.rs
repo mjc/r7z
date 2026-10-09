@@ -17,19 +17,17 @@ fn input() -> Vec<u8> {
 
 fn reverse_groups(input: &[u8], width: usize, output: &mut Vec<u8>) {
     output.extend_from_slice(input);
-    output
-        .chunks_exact_mut(width)
-        .for_each(|group| group.reverse());
+    output.chunks_exact_mut(width).for_each(<[u8]>::reverse);
 }
 
 fn swap_words(input: &[u8], width: usize, output: &mut Vec<u8>) {
     output.extend_from_slice(input);
     match width {
-        2 => output.chunks_exact_mut(2).for_each(|chunk| {
+        2 => output.as_chunks_mut::<2>().0.iter_mut().for_each(|chunk| {
             let word = u16::from_ne_bytes([chunk[0], chunk[1]]).swap_bytes();
             chunk.copy_from_slice(&word.to_ne_bytes());
         }),
-        4 => output.chunks_exact_mut(4).for_each(|chunk| {
+        4 => output.as_chunks_mut::<4>().0.iter_mut().for_each(|chunk| {
             let word = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]).swap_bytes();
             chunk.copy_from_slice(&word.to_ne_bytes());
         }),
@@ -68,7 +66,7 @@ fn bench_byte_swap(c: &mut Criterion) {
                     reader.read_to_end(&mut output).unwrap();
                     black_box(output);
                 },
-                BatchSize::SmallInput,
+                BatchSize::LargeInput,
             );
         });
 
@@ -82,7 +80,7 @@ fn bench_byte_swap(c: &mut Criterion) {
                         reverse_groups(black_box(&input), width, &mut output);
                         black_box(output);
                     },
-                    BatchSize::SmallInput,
+                    BatchSize::LargeInput,
                 );
             },
         );
@@ -97,7 +95,7 @@ fn bench_byte_swap(c: &mut Criterion) {
                         swap_words(black_box(&input), width, &mut output);
                         black_box(output);
                     },
-                    BatchSize::SmallInput,
+                    BatchSize::LargeInput,
                 );
             },
         );
