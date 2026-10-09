@@ -119,6 +119,20 @@ impl<R: Read> Read for ByteSwapReader<R> {
 }
 
 fn swap_groups(bytes: &mut [u8], width: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 64
+        && std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
+    {
+        // SAFETY: Runtime feature detection confirms AVX-512F and AVX-512BW support.
+        unsafe { swap_groups_avx512(bytes, width) };
+        return;
+    }
+
+    swap_groups_scalar(bytes, width);
+}
+
+fn swap_groups_scalar(bytes: &mut [u8], width: usize) {
     match width {
         2 => bytes.chunks_exact_mut(2).for_each(|chunk| {
             let word = u16::from_ne_bytes([chunk[0], chunk[1]]).swap_bytes();
@@ -130,6 +144,32 @@ fn swap_groups(bytes: &mut [u8], width: usize) {
         }),
         _ => unreachable!("supported byte-swap widths are 2 and 4"),
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn swap_groups_avx512(bytes: &mut [u8], width: usize) {
+    use std::arch::x86_64::{
+        _mm_setr_epi8, _mm512_broadcast_i32x4, _mm512_loadu_si512, _mm512_shuffle_epi8,
+        _mm512_storeu_si512,
+    };
+
+    let lane_mask = match width {
+        2 => _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14),
+        4 => _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12),
+        _ => unreachable!("supported byte-swap widths are 2 and 4"),
+    };
+    let shuffle = _mm512_broadcast_i32x4(lane_mask);
+    let vector_length = bytes.len() / 64 * 64;
+    let (vectors, tail) = bytes.split_at_mut(vector_length);
+
+    for chunk in vectors.chunks_exact_mut(64) {
+        let input = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
+        let output = _mm512_shuffle_epi8(input, shuffle);
+        unsafe { _mm512_storeu_si512(chunk.as_mut_ptr().cast(), output) };
+    }
+
+    swap_groups_scalar(tail, width);
 }
 
 #[cfg(test)]
@@ -207,6 +247,21 @@ mod tests {
 
                 assert_eq!(output, expected, "width {width}, buffer {buffer_size}");
             }
+        }
+    }
+
+    #[test]
+    fn swap_groups_reverses_groups_across_vector_boundaries() {
+        for width in [2, 4] {
+            let mut bytes: Vec<_> = (0..128 + width).map(|byte| byte as u8).collect();
+            let expected: Vec<_> = bytes
+                .chunks_exact(width)
+                .flat_map(|group| group.iter().rev().copied())
+                .collect();
+
+            super::swap_groups(&mut bytes, width);
+
+            assert_eq!(bytes, expected, "width {width}");
         }
     }
 }
