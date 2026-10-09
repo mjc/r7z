@@ -1,16 +1,14 @@
 use std::io::{self, Read};
 
-const BUFFER_SIZE: usize = 8192;
 const MAX_SWAP_WIDTH: usize = 4;
 
 pub(crate) struct ByteSwapReader<R> {
     inner: R,
     width: usize,
-    buffer: [u8; BUFFER_SIZE + MAX_SWAP_WIDTH],
-    position: usize,
-    length: usize,
     pending: [u8; MAX_SWAP_WIDTH],
     pending_len: usize,
+    pending_output_position: usize,
+    pending_output_length: usize,
     eof: bool,
 }
 
@@ -20,40 +18,55 @@ impl<R> ByteSwapReader<R> {
         Self {
             inner,
             width,
-            buffer: [0; BUFFER_SIZE + MAX_SWAP_WIDTH],
-            position: 0,
-            length: 0,
             pending: [0; MAX_SWAP_WIDTH],
             pending_len: 0,
+            pending_output_position: 0,
+            pending_output_length: 0,
             eof: false,
         }
     }
 }
 
 impl<R: Read> ByteSwapReader<R> {
-    fn fill_buffer(&mut self) -> io::Result<()> {
-        self.position = 0;
-        self.length = 0;
-        while self.length == 0 && !self.eof {
-            self.buffer[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
+    fn drain_pending_output(&mut self, buf: &mut [u8]) -> usize {
+        let remaining = self.pending_output_length - self.pending_output_position;
+        let read = remaining.min(buf.len());
+        let start = self.pending_output_position;
+        buf[..read].copy_from_slice(&self.pending[start..start + read]);
+        self.pending_output_position += read;
+        if self.pending_output_position == self.pending_output_length {
+            self.pending_output_position = 0;
+            self.pending_output_length = 0;
+        }
+        read
+    }
+
+    fn read_small(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pending_output_length > 0 {
+            return Ok(self.drain_pending_output(buf));
+        }
+
+        while self.pending_len < self.width && !self.eof {
             let read = self
                 .inner
-                .read(&mut self.buffer[self.pending_len..self.pending_len + BUFFER_SIZE])?;
+                .read(&mut self.pending[self.pending_len..self.width])?;
             if read == 0 {
                 self.eof = true;
-                self.length = self.pending_len;
-                self.pending_len = 0;
-                break;
+            } else {
+                self.pending_len += read;
             }
-
-            let input_len = self.pending_len + read;
-            self.length = input_len / self.width * self.width;
-            swap_groups(&mut self.buffer[..self.length], self.width);
-            self.pending_len = input_len - self.length;
-            self.pending[..self.pending_len].copy_from_slice(&self.buffer[self.length..input_len]);
-            self.position = 0;
         }
-        Ok(())
+
+        if self.pending_len == 0 {
+            return Ok(0);
+        }
+
+        if self.pending_len == self.width {
+            swap_groups(&mut self.pending[..self.width], self.width);
+        }
+        self.pending_output_length = self.pending_len;
+        self.pending_len = 0;
+        Ok(self.drain_pending_output(buf))
     }
 }
 
@@ -63,15 +76,45 @@ impl<R: Read> Read for ByteSwapReader<R> {
             return Ok(0);
         }
 
-        if self.position == self.length {
-            self.fill_buffer()?;
+        if self.pending_output_length > 0 {
+            return Ok(self.drain_pending_output(buf));
         }
 
-        let available = self.length - self.position;
-        let read = available.min(buf.len());
-        buf[..read].copy_from_slice(&self.buffer[self.position..self.position + read]);
-        self.position += read;
-        Ok(read)
+        if buf.len() < self.width {
+            return self.read_small(buf);
+        }
+
+        let mut filled = self.pending_len;
+        buf[..filled].copy_from_slice(&self.pending[..filled]);
+        self.pending_len = 0;
+
+        loop {
+            if self.eof {
+                return Ok(filled);
+            }
+
+            match self.inner.read(&mut buf[filled..]) {
+                Ok(0) => self.eof = true,
+                Ok(read) => filled += read,
+                Err(error) => {
+                    self.pending[..filled].copy_from_slice(&buf[..filled]);
+                    self.pending_len = filled;
+                    return Err(error);
+                }
+            }
+
+            let complete = filled / self.width * self.width;
+            if complete > 0 {
+                self.pending_len = filled - complete;
+                self.pending[..self.pending_len].copy_from_slice(&buf[complete..filled]);
+                swap_groups(&mut buf[..complete], self.width);
+                return Ok(complete);
+            }
+
+            if self.eof {
+                return Ok(filled);
+            }
+        }
     }
 }
 
@@ -140,6 +183,30 @@ mod tests {
             let mut output = Vec::new();
             reader.read_to_end(&mut output).unwrap();
             assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn byte_swap_reader_handles_small_and_odd_output_buffers() {
+        for (width, input, expected) in [
+            (2, b"abcdefg".as_slice(), b"badcfeg".as_slice()),
+            (4, b"abcdefghij".as_slice(), b"dcbahgfeij".as_slice()),
+        ] {
+            for buffer_size in [1, 2, 3, 5] {
+                let mut reader = ByteSwapReader::new(ShortReader(input), width);
+                let mut output = Vec::new();
+                let mut buffer = [0; 5];
+
+                loop {
+                    let read = reader.read(&mut buffer[..buffer_size]).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    output.extend_from_slice(&buffer[..read]);
+                }
+
+                assert_eq!(output, expected, "width {width}, buffer {buffer_size}");
+            }
         }
     }
 }
