@@ -1,6 +1,8 @@
 /target
 /fuzz/target
 Cargo.lock
+!/Cargo.lock
+!/fuzz/Cargo.lock
 .direnv
 
 .envrc

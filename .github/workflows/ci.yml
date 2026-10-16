@@ -30,19 +30,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Format check
         run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Check fuzz targets
         run: |
           cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-          cargo check --manifest-path fuzz/Cargo.toml --all-targets
+          cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 
       - name: Cache p7zip-zstd oracle
         id: p7zip-oracle-cache
@@ -72,11 +72,11 @@ jobs:
 
       - name: Test
         run: |
-          cargo test --no-fail-fast -- --skip large_
+          cargo test --locked --no-fail-fast -- --skip large_
 
       - name: CLI performance smoke
         run: |
-          cargo build --release --bin r7z
+          cargo build --locked --release --bin r7z
           scripts/compare_p7zip_perf.sh --sizes 1M --runs 1 --mx 5 --r7z-threads 1 --p7zip-threads 1 --pattern random
 
   msrv:
@@ -92,7 +92,7 @@ jobs:
           cache: false
           rustflags: ""
       - name: Build workspace
-        run: cargo build --workspace --all-features
+        run: cargo build --locked --workspace --all-features
 
   platform-build:
     name: Build (${{ matrix.os }})
@@ -110,7 +110,7 @@ jobs:
           cache: false
           rustflags: ""
       - name: Build workspace
-        run: cargo build --workspace --all-features
+        run: cargo build --locked --workspace --all-features
 
   docs:
     name: Docs
@@ -124,6 +124,6 @@ jobs:
           cache: false
           rustflags: ""
       - name: Check docs
-        run: cargo doc --no-deps --document-private-items
+        run: cargo doc --locked --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings

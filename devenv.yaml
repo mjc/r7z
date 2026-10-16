@@ -4,6 +4,8 @@ nixpkgs:
     - minio-2025-10-15T17-29-55Z
 
 inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
   git-hooks:
     url: github:cachix/git-hooks.nix
   rust-overlay:
