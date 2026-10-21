@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use memmap2::Mmap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,29 @@ impl criterion::profiler::Profiler for FlamegraphProfiler<'_> {
             let report = guard.report().build().expect("pprof report failed");
             std::fs::create_dir_all(dir).unwrap();
             let svg = File::create(dir.join("flamegraph.svg")).unwrap();
-            report.flamegraph(svg).expect("flamegraph write failed");
+            let stacks: Vec<_> = report
+                .data
+                .iter()
+                .map(|(frames, count)| {
+                    let mut stack = frames.thread_name_or_id();
+                    frames
+                        .frames
+                        .iter()
+                        .rev()
+                        .flat_map(|frame| frame.iter().rev())
+                        .for_each(|symbol| write!(stack, ";{symbol}").unwrap());
+                    write!(stack, " {count}").unwrap();
+                    stack
+                })
+                .collect();
+            if !stacks.is_empty() {
+                inferno::flamegraph::from_lines(
+                    &mut inferno::flamegraph::Options::default(),
+                    stacks.iter().map(String::as_str),
+                    svg,
+                )
+                .expect("flamegraph write failed");
+            }
         }
     }
 }

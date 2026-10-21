@@ -12,6 +12,7 @@
   };
 
   packages = with pkgs; [
+    cargo-audit
     clang
     cmake
     curl

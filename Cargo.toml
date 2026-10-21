@@ -26,16 +26,16 @@ arrayvec = "0.7"
 smallvec = "1"
 bytes = "1"
 bzip2-rs = "0.1.2"
-crc32fast = "1.5.2"
+crc32fast = "1.5.3"
 deflate64 = "0.1.12"
 flate2 = "1"
-lzma-rust2 = { git = "https://github.com/hasenbanck/lzma-rust2", rev = "d6268a287ceb288114a02a5f29da28acaaaf9e52", features = ["encoder", "optimization"] }
+lzma-rust2 = { git = "https://github.com/hasenbanck/lzma-rust2", rev = "79f8509b643911208ae203d0911f3146e1111619", features = ["encoder", "optimization"] }
 memmap2 = "0.9"
 nom = "8"
 num = "0.4"
 num-derive = "0.5"
 num-traits = "0.2"
-ppmd-rust = "1.5.0"
+ppmd-rust = "1.5.1"
 thiserror = "2"
 aes = { version = "0.9", features = ["zeroize"] }
 cbc = "0.2"
@@ -49,7 +49,8 @@ zeroize = "1.9"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 hex = "0.4"
-pprof = { version = "0.15", features = ["flamegraph"] }
+inferno = { version = "0.12.8", default-features = false, features = ["nameattr"] }
+pprof = "0.15"
 xz2 = "0.1.7"
 walkdir = "2.5.0"
 
